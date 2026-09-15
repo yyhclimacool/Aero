@@ -1,0 +1,16 @@
+[package]
+name = "spike-md-parser"
+description = "M0 spike: comrak vs markdown-rs on source-position fidelity, extension coverage and speed"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spike-md-parser"
+path = "src/main.rs"
+
+[dependencies]
+# 关掉默认特性（cli / syntect），只要解析器和属性列表支持
+comrak = { version = "0.55", default-features = false, features = ["attributes"] }
+markdown = "1.0"

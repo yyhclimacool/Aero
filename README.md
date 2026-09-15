@@ -1,2 +1,2 @@
 # Aero
-A blazzing fast, AI Native, local-first knowledge IDE.
+A blazing fast, AI Native, local-first knowledge IDE.

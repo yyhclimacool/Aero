@@ -1,0 +1,5 @@
+# zvec 的 C 库不在构建时联网下载：先运行 scripts/fetch-zvec.sh 把校验过的预编译包放进 vendor/zvec/lib，
+# 这里把 ZVEC_LIB_DIR 指过去并关掉 bundled 的自动下载 / 自动编译，保证构建可离线、可复现。
+[env]
+ZVEC_LIB_DIR = { value = "vendor/zvec/lib", relative = true }
+ZVEC_AUTO_BUILD = "0"

@@ -1,0 +1,8 @@
+[package]
+name = "aero-core"
+description = "Vault, Knowledge Markdown parsing/serialization, block model, links and index traits"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

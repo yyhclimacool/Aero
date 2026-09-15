@@ -1,0 +1,13 @@
+[package]
+name = "aero-app"
+description = "Aero desktop application (GPUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aero"
+path = "src/main.rs"
+
+[dependencies]
+aero-core.workspace = true

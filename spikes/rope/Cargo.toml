@@ -1,0 +1,19 @@
+[package]
+name = "spike-rope"
+description = "M0 spike: ropey vs crop (vs plain String) for the document text model — edit latency at 1/10 MB, O(1) snapshots, byte/char/line conversions, and block-range anchor drift via a marker table"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spike-rope"
+path = "src/main.rs"
+
+[dependencies]
+ropey = "1.6"
+# gpui-base 0.6.1 内部就是这个版本 + 这三个 metric，InputBaseState.text 是它的 Rope、光标/选区是字节偏移。
+# 与之同型可以让 Document 与聚焦块控件共用一份 Rope 类型，不做 String 往返。
+ropey2 = { package = "ropey", version = "=2.0.0-beta.1", features = ["metric_chars", "metric_lines_lf", "metric_utf16"] }
+crop = "0.4"
+comrak = { version = "0.55", default-features = false }
