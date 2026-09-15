@@ -21,6 +21,17 @@ if [[ "$#" -gt 1 ]]; then
   exit 1
 fi
 
+aero_lib_dir="${ZVEC_LIB_DIR:-$aero_root/vendor/zvec/lib}"
+for resource in libzvec_c_api.dylib data/jieba_dict/jieba.dict.utf8 data/jieba_dict/hmm_model.utf8; do
+  if [[ ! -f "$aero_lib_dir/$resource" ]]; then
+    printf 'Missing zvec resource: %s\nRun scripts/fetch-zvec.sh or set ZVEC_LIB_DIR.\n' "$aero_lib_dir/$resource" >&2
+    exit 1
+  fi
+done
+aero_lib_dir="$(cd "$aero_lib_dir" && pwd)"
+# 构建和打包必须使用同一份动态库。
+export ZVEC_LIB_DIR="$aero_lib_dir"
+
 # 从 Cargo 的实际构建结果读取路径，兼容自定义 target 目录与构建 target。
 aero_binary="$(cargo build "${aero_build_flags[@]}" | python3 -c '
 import json, sys
@@ -42,15 +53,35 @@ print(next(p["version"] for p in metadata["packages"] if p["name"] == "aero-app"
 ')"
 
 aero_app="$(dirname "$aero_binary")/bundle/Aero.app"
-mkdir -p "$aero_app/Contents/MacOS" "$aero_app/Contents/Resources"
+mkdir -p "$aero_app/Contents/MacOS" "$aero_app/Contents/Resources" "$aero_app/Contents/Frameworks"
 cp "$aero_binary" "$aero_app/Contents/MacOS/aero"
+cp "$aero_lib_dir/libzvec_c_api.dylib" "$aero_app/Contents/Frameworks/libzvec_c_api.dylib"
+LC_ALL=C SRC_DIR="$aero_lib_dir/data/jieba_dict" \
+  bash "$aero_root/scripts/trim-jieba-dict.sh" "$aero_app/Contents/Resources/jieba_dict"
 cp assets/branding/aero-icon-v1.icns "$aero_app/Contents/Resources/Aero.icns"
 cp crates/aero-app/resources/macos/Info.plist "$aero_app/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$aero_version" "$aero_app/Contents/Info.plist"
 plutil -replace CFBundleShortVersionString -string "$aero_version" "$aero_app/Contents/Info.plist"
 plutil -lint "$aero_app/Contents/Info.plist"
 
-# 本地 ad-hoc 签名；当前 aero-app 仅链接系统动态库，图片与字体均已内嵌。
+# 只修改包内副本，避免开发机的绝对 rpath 掩盖漏装的动态库。
+python3 - "$aero_app/Contents/MacOS/aero" <<'PY'
+import re
+import subprocess
+import sys
+
+binary = sys.argv[1]
+commands = subprocess.check_output(["otool", "-l", binary], text=True)
+paths = re.findall(r"^\s*path (.*?) \(offset \d+\)$", commands, re.MULTILINE)
+if "@executable_path/../Frameworks" not in paths:
+    sys.exit("Aero executable is missing the bundle Frameworks rpath.")
+for path in paths:
+    if path.startswith("/"):
+        subprocess.run(["install_name_tool", "-delete_rpath", path, binary], check=True)
+PY
+
+# 嵌套代码先签名，外层签名才能封存完整资源。
+codesign --force --sign - --timestamp=none "$aero_app/Contents/Frameworks/libzvec_c_api.dylib"
 codesign --force --sign - --timestamp=none "$aero_app"
 codesign --verify --deep --strict "$aero_app"
 printf 'Built: %s\n' "$aero_app"
