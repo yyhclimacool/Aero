@@ -16,6 +16,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 ignore = "0.4"
 # .aero/vault.toml
 serde = { version = "1", features = ["derive"] }
+serde-saphyr = "1.2"
 toml = "1"
 ulid = "3"
 thiserror = "2"

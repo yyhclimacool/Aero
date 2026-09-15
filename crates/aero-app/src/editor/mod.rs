@@ -10,6 +10,7 @@
 //! 或粘贴出多个块时，控件仍然有归属，不会因为块消失而失焦。
 
 mod ops;
+mod preview;
 mod slash;
 #[cfg(test)]
 mod tests;
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant};
 use aero_core::{Block, BlockId, BlockKind, Document, Edit, FileStamp, Vault, VaultError, VaultPath};
 use gpui_kit::base::input::{Backspace, Escape, Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::text::{TextView, TextViewStyle};
+use gpui_kit::component::text::TextViewStyle;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -107,6 +108,8 @@ pub struct Editor {
     /// 上次读 / 写磁盘时文件的指纹，用来发现外部修改（5.5）
     stamp: FileStamp,
     units: Vec<Unit>,
+    preview: Entity<preview::PreviewState>,
+    _preview_subscription: Subscription,
     focused: Option<Focused>,
     title_edit: Option<TitleEdit>,
     slash: Option<SlashMenu>,
@@ -114,6 +117,7 @@ pub struct Editor {
     scroll: ScrollHandle,
     /// 搜索命中定位：下一帧把这个块滚到视口上三分之一处
     reveal: Option<BlockId>,
+    reveal_generation: u64,
     /// 短暂高亮的块（定位后 1.5 s）
     highlight: Option<BlockId>,
     highlight_task: Option<Task<()>>,
@@ -140,6 +144,8 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Self {
         let units = units::units(&doc);
+        let preview = cx.new(|_| preview::PreviewState::default());
+        let preview_subscription = cx.observe(&preview, |_, _, cx| cx.notify());
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(EXTERNAL_POLL).await;
@@ -154,12 +160,15 @@ impl Editor {
             doc,
             stamp,
             units,
+            preview,
+            _preview_subscription: preview_subscription,
             focused: None,
             title_edit: None,
             slash: None,
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             reveal: None,
+            reveal_generation: 0,
             highlight: None,
             highlight_task: None,
             dirty: false,
@@ -290,7 +299,14 @@ impl Editor {
     /// 索引可能落后于文档，`ord` 越界时定位到最后一个块。
     pub fn reveal_indexed_block(&mut self, ord: u32, cx: &mut Context<Self>) {
         let leaves = aero_core::index::indexable_leaves(&self.doc);
-        let Some(id) = leaves.get(ord as usize).or(leaves.last()).map(|b| b.id) else { return };
+        let Some(block) = leaves.get(ord as usize).or(leaves.last()) else { return };
+        let range = self.doc.content_range(block);
+        let id = self
+            .units
+            .iter()
+            .find(|unit| unit.range.start <= range.start && range.end <= unit.range.end)
+            .map_or(block.id, |unit| unit.id);
+        self.reveal_generation += 1;
         self.reveal = Some(id);
         self.highlight = Some(id);
         self.highlight_task = Some(cx.spawn(async move |this, cx| {
@@ -982,6 +998,7 @@ impl Editor {
         self.doc = doc;
         self.stamp = stamp;
         self.units = units::units(&self.doc);
+        self.preview.update(cx, |state, _| *state = preview::PreviewState::default());
         self.dirty = false;
         self.save_task = None;
         self.last_edit_at = None;
@@ -1059,6 +1076,11 @@ impl Editor {
             })),
             highlight_theme: theme.highlight_theme.clone(),
             is_dark: theme.mode.is_dark(),
+            table: StyleRefinement {
+                overflow: PointRefinement { x: Some(Overflow::Scroll), y: None },
+                ..Default::default()
+            },
+            table_head: StyleRefinement::default().font_weight(FontWeight::SEMIBOLD),
             ..Default::default()
         }
     }
@@ -1309,7 +1331,9 @@ impl Editor {
                 let text = if text.is_empty() { SharedString::from("\u{200b}") } else { text };
                 // TextView 的解析状态按元素 id 缓存；带上编辑器实体 id，切换笔记后不会复用上一篇的状态
                 let view_id = SharedString::from(format!("blk-{}-{}", cx.entity_id(), id.0));
-                TextView::markdown(view_id, text).style(self.text_view_style(cx)).w_full().into_any_element()
+                let reveal = if self.highlight == Some(id) { self.reveal_generation } else { 0 };
+                preview::markdown(view_id, text, self.text_view_style(cx), reveal, self.preview.clone())
+                    .into_any_element()
             }
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });

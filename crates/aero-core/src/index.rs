@@ -24,6 +24,7 @@ pub struct IndexBlock {
     pub title: String,
     /// 块的正文（源文本去掉标记）
     pub body: String,
+    /// 所属笔记的标签（front matter `tags` + 正文行内 `#tag`），笔记级：同一篇的每个块都带同一组
     pub tags: Vec<String>,
 }
 
@@ -34,13 +35,16 @@ impl IndexBlock {
 }
 
 /// 全文查询。`text` 的语法由引擎决定（zvec：`+term -term "phrase"`），内存实现按空白切词做 AND。
+///
+/// `text` 为空而 `tags` 非空是**纯标签查询**：标签是笔记级的（见 [`blocks_for_note`]），
+/// 引擎每篇笔记只返回 `block_ord == 0` 那一块，否则一篇长笔记的几百个块会把 `limit` 吃满、挤掉别的笔记。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FtsQuery {
     pub text: String,
     pub limit: usize,
     /// 只在某篇笔记内搜
     pub note_id: Option<String>,
-    /// 必须全部命中的标签
+    /// 必须全部命中的标签（小写、不带 `#`）
     pub tags: Vec<String>,
 }
 
@@ -48,6 +52,51 @@ impl FtsQuery {
     pub fn new(text: impl Into<String>) -> Self {
         FtsQuery { text: text.into(), limit: 50, note_id: None, tags: Vec::new() }
     }
+
+    pub fn parse(text: &str) -> Self {
+        let mut query = Self::new("");
+        let mut terms = Vec::new();
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut start = 0;
+        for (i, c) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+            if c.is_whitespace() && !quoted && !escaped {
+                let token = &text[start..i];
+                if !token.is_empty() {
+                    let tag = token.strip_prefix("tag:#").or_else(|| token.strip_prefix('#'));
+                    if let Some(tag) = tag.and_then(normalize_tag) {
+                        if !query.tags.contains(&tag) {
+                            query.tags.push(tag);
+                        }
+                    } else {
+                        terms.push(token);
+                    }
+                }
+                start = i + c.len_utf8();
+            }
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                quoted = !quoted;
+            }
+        }
+        if start < text.len() {
+            terms.push(&text[start..]);
+        }
+        query.text = terms.join(" ");
+        query
+    }
+}
+
+fn tag_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '/')
+}
+
+fn normalize_tag(tag: &str) -> Option<String> {
+    let first = tag.chars().next()?;
+    (!first.is_numeric() && tag.chars().all(tag_char)).then(|| tag.to_lowercase())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,19 +177,13 @@ pub fn indexable_leaves(doc: &Document) -> Vec<&Block> {
 
 /// 把一篇文档拆成索引文档（10.3：索引粒度到块）。`ord` 连续，删除旧块时只需知道旧的块数。
 pub fn blocks_for_note(doc: &Document, note_id: &str, path: &str, title: &str) -> Vec<IndexBlock> {
+    let tags = note_tags(doc);
     indexable_leaves(doc)
         .into_iter()
         .enumerate()
         .map(|(ord, b)| {
             let src = doc.slice(doc.content_range(b)).to_string();
             let body = plain_text(&src, &b.kind);
-            let tags = body
-                .split_whitespace()
-                .filter_map(|w| w.strip_prefix('#'))
-                .filter(|t| !t.is_empty() && !t.starts_with('#'))
-                .map(|t| t.trim_end_matches(['，', '。', ',', '.', ';', '；', ')', '）']).to_owned())
-                .filter(|t| !t.is_empty())
-                .collect();
             IndexBlock {
                 pk: IndexBlock::pk_of(note_id, ord as u32),
                 note_id: note_id.to_owned(),
@@ -148,10 +191,167 @@ pub fn blocks_for_note(doc: &Document, note_id: &str, path: &str, title: &str) -
                 path: path.to_owned(),
                 title: title.to_owned(),
                 body,
-                tags,
+                tags: tags.clone(),
             }
         })
         .collect()
+}
+
+/// front matter 里的 `tags:` / `tag:`（Obsidian 两个键都认）。
+/// 值可以是一个标量、标量列表；字符串再按逗号 / 空白拆开（`tags: rust, cli` 是老写法）。
+/// 数字、布尔照字面转成字符串再走 `normalize_tag`（`2024` 因首字符是数字被丢，`v2` 留下）；
+/// 嵌套结构、null 单独跳过，**不能**因为一项不合规就丢掉整组。
+fn front_matter_tags(yaml: &str) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct FrontMatter {
+        tags: Option<TagValues>,
+        tag: Option<TagValues>,
+    }
+
+    let Ok(FrontMatter { tags, tag }) = serde_saphyr::from_str::<FrontMatter>(yaml) else {
+        return Vec::new();
+    };
+    [tags, tag].into_iter().flatten().flat_map(|v| v.0).collect()
+}
+
+/// `tags:` 的值：一个标量、标量列表，或者别的什么（映射、嵌套列表——整体忽略）。
+/// 手写 Visitor 走 `deserialize_any`，逐项容错；`#[serde(untagged)]` 会在任一项类型不符时让整组失败。
+struct TagValues(Vec<String>);
+
+/// 列表里的一项：只接受标量，嵌套结构丢弃。
+struct TagItem(Vec<String>);
+
+fn split_tag_text(text: &str) -> Vec<String> {
+    text.split([',', ' ', '\t']).map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned).collect()
+}
+
+macro_rules! scalar_visits {
+    () => {
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Self::Value::from(split_tag_text(v)))
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Self::Value::from(vec![v.to_string()]))
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Self::Value::from(vec![v.to_string()]))
+        }
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Self::Value::from(vec![v.to_string()]))
+        }
+        fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+            Ok(Self::Value::from(vec![v.to_string()]))
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Self::Value::from(Vec::new()))
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Self::Value::from(Vec::new()))
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            while map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+            Ok(Self::Value::from(Vec::new()))
+        }
+    };
+}
+
+impl From<Vec<String>> for TagValues {
+    fn from(v: Vec<String>) -> Self {
+        TagValues(v)
+    }
+}
+
+impl From<Vec<String>> for TagItem {
+    fn from(v: Vec<String>) -> Self {
+        TagItem(v)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TagValues {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = TagValues;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tag or a list of tags")
+            }
+            scalar_visits!();
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<TagValues, A::Error> {
+                let mut out = Vec::new();
+                while let Some(TagItem(v)) = seq.next_element::<TagItem>()? {
+                    out.extend(v);
+                }
+                Ok(TagValues(out))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TagItem {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = TagItem;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tag")
+            }
+            scalar_visits!();
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<TagItem, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(TagItem(Vec::new()))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+fn note_tags(doc: &Document) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut add = |tag: &str| {
+        if let Some(tag) = normalize_tag(tag)
+            && !tags.contains(&tag)
+        {
+            tags.push(tag);
+        }
+    };
+    if let Some(fm) = doc.blocks().roots.first().filter(|b| b.kind == BlockKind::FrontMatter) {
+        let source = doc.block_text(fm);
+        let yaml = source.lines().skip(1).take_while(|line| *line != "---").collect::<Vec<_>>().join("\n");
+        for tag in front_matter_tags(&yaml) {
+            add(tag.strip_prefix('#').unwrap_or(&tag));
+        }
+    }
+    for source in crate::parse::tag_sources(&doc.to_string()) {
+        let mut chars = source.char_indices().peekable();
+        let mut previous = None;
+        while let Some((i, c)) = chars.next() {
+            if c == '\\' {
+                previous = chars.next().map(|(_, c)| c);
+                continue;
+            }
+            if c == '#' && previous.is_none_or(|p| !tag_char(p) && p != '#') {
+                // comrak 的自动链接不会识别单标签主机名等 URL。
+                let prefix = source[..i].rsplit(char::is_whitespace).next().unwrap_or("");
+                if prefix.contains("://") {
+                    previous = Some(c);
+                    continue;
+                }
+                let start = i + 1;
+                let mut end = start;
+                while let Some(&(pos, next)) = chars.peek() {
+                    if !tag_char(next) {
+                        break;
+                    }
+                    end = pos + next.len_utf8();
+                    chars.next();
+                }
+                add(&source[start..end]);
+            }
+            previous = Some(c);
+        }
+    }
+    tags
 }
 
 /// 块源码去掉 Markdown 标记后的正文，供全文索引与结果摘要用。
@@ -326,14 +526,18 @@ impl FullTextIndex for MemoryFullTextIndex {
 
     fn search(&self, q: &FtsQuery) -> Result<Vec<Hit>, IndexError> {
         let terms: Vec<String> = q.text.split_whitespace().map(|t| t.to_lowercase()).collect();
-        if terms.is_empty() {
+        if terms.is_empty() && q.tags.is_empty() {
             return Ok(Vec::new());
         }
+        let tags: Vec<String> = q.tags.iter().map(|tag| tag.to_lowercase()).collect();
+        // 纯标签查询：标签是笔记级的，每篇只回第一块（见 FtsQuery 文档）
+        let tag_only = terms.is_empty();
         let mut hits: Vec<Hit> = self
             .docs
             .values()
+            .filter(|d| !tag_only || d.block_ord == 0)
             .filter(|d| q.note_id.as_ref().is_none_or(|n| *n == d.note_id))
-            .filter(|d| q.tags.iter().all(|t| d.tags.iter().any(|dt| dt.eq_ignore_ascii_case(t))))
+            .filter(|d| tags.iter().all(|t| d.tags.iter().any(|dt| dt.to_lowercase() == *t)))
             .filter_map(|d| {
                 let hay = format!("{}\n{}\n{}", d.title, d.body, d.tags.join(" ")).to_lowercase();
                 let mut score = 0usize;
@@ -474,6 +678,142 @@ mod tests {
             body: body.into(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn parses_tag_filters_without_changing_quoted_or_boolean_text() {
+        let q = FtsQuery::parse("anchor #Rust tag:#CLI #rust/cli #RUST +must -omit \"literal #keep\"");
+        assert_eq!(q.text, "anchor +must -omit \"literal #keep\"");
+        assert_eq!(q.tags, ["rust", "cli", "rust/cli"]);
+        assert_eq!(FtsQuery::parse("#中文标签").tags, ["中文标签"]);
+        assert_eq!(FtsQuery::parse("tag:#rust #cli").text, "");
+        let literal = r##""#rust" \#escaped #123 ##heading tag:# -#omit +#required"##;
+        assert_eq!(FtsQuery::parse(literal).text, literal);
+        assert!(FtsQuery::parse(literal).tags.is_empty());
+        let escaped = r##""a \" #literal" #filter"##;
+        assert_eq!(FtsQuery::parse(escaped).tags, ["filter"]);
+        assert_eq!(FtsQuery::parse(escaped).text, r##""a \" #literal""##);
+        assert!(FtsQuery::parse("\"unclosed #literal").tags.is_empty());
+    }
+
+    #[test]
+    fn note_tags_merge_front_matter_and_inline_tags_for_every_block() {
+        for yaml in ["tags: [Rust, '#cli', 中文标签]", "tags:\n  - Rust\n  - '#cli'\n  - 中文标签"] {
+            let doc = Document::from_text(&format!(
+                "---\n{yaml}\n---\n\n# Title\n\n第一段 #rust/cli #RUST\n\n没有标签的 anchor\n"
+            ));
+            let blocks = blocks_for_note(&doc, "n", "n.md", "N");
+            assert_eq!(blocks.len(), 3);
+            for block in blocks {
+                assert_eq!(block.tags, ["rust", "cli", "中文标签", "rust/cli"]);
+            }
+        }
+        let doc = Document::from_text("---\ntags: Rust\n---\n\nanchor\n");
+        assert_eq!(blocks_for_note(&doc, "n", "n.md", "N")[0].tags, ["rust"]);
+    }
+
+    /// 一项不合规（数字、嵌套、null）只丢那一项，不能连累同组其他标签；
+    /// 字符串按逗号 / 空白拆；`tag:` 单数键与 `tags:` 等价。
+    #[test]
+    fn front_matter_tags_survive_non_string_items_and_legacy_formats() {
+        let tags_of = |yaml: &str| {
+            let doc = Document::from_text(&format!("---\n{yaml}\n---\n\nanchor\n"));
+            blocks_for_note(&doc, "n", "n.md", "N")[0].tags.clone()
+        };
+        assert_eq!(tags_of("tags: [2024, rust]"), ["rust"]);
+        assert_eq!(tags_of("tags: [rust, 1.5, true, v2]"), ["rust", "true", "v2"]);
+        assert_eq!(tags_of("tags:\n  - rust\n  - [nested]\n  - {k: v}\n  -\n  - cli"), ["rust", "cli"]);
+        assert_eq!(tags_of("tags: rust, cli"), ["rust", "cli"]);
+        assert_eq!(tags_of("tags: \"rust cli,  #中文\""), ["rust", "cli", "中文"]);
+        assert_eq!(tags_of("tag: rust"), ["rust"]);
+        assert_eq!(tags_of("tag: [a]\ntags: [b, a]"), ["b", "a"]);
+        assert!(tags_of("tags:").is_empty());
+        assert!(tags_of("tags: 2024").is_empty());
+        assert!(tags_of("tags: {rust: 1}").is_empty());
+        assert!(tags_of("title: only").is_empty());
+    }
+
+    /// wikilink 目标里的 `#` 是标题 / 块锚点，不是标签。
+    #[test]
+    fn note_tags_exclude_wikilink_anchors() {
+        let doc = Document::from_text(
+            "see [[#heading]] [[note#sec]] [[note#^blk]] [[note#sec|alias]] #real\n\n# heading\n",
+        );
+        assert_eq!(blocks_for_note(&doc, "n", "n.md", "N")[0].tags, ["real"]);
+    }
+
+    #[test]
+    fn note_tags_follow_markdown_context_and_tag_boundaries() {
+        let doc = Document::from_text(concat!(
+            "# Heading #not-heading\n\n",
+            "(#rust), **#bold** #中文标签。 #rust_cli #rust-cli #v2 #ÉCOLE\n\n",
+            "`#inline-code` \\#escaped #123 ##double https://host/#fragment https://host/?q=#query\n\n",
+            "[link](https://host/#url) ![image](#image) {.red #attribute}\n\n",
+            "```sh\n#fenced\n```\n\n    #indented\n\n",
+            "<div>\n#html\n</div>\n\n",
+            "> #quoted\n\n- #listed\n\n| cell |\n| --- |\n| #table |\n"
+        ));
+        let blocks = blocks_for_note(&doc, "n", "n.md", "N");
+        assert_eq!(
+            blocks[0].tags,
+            ["rust", "bold", "中文标签", "rust_cli", "rust-cli", "v2", "école", "quoted", "listed", "table"]
+        );
+        assert!(blocks.iter().all(|b| b.tags == blocks[0].tags));
+        let invalid = Document::from_text("---\ntags: [broken\n---\n\n#inline\n");
+        assert_eq!(blocks_for_note(&invalid, "n", "n.md", "N")[0].tags, ["inline"]);
+    }
+
+    #[test]
+    fn note_tags_exclude_www_autolinks() {
+        let doc = Document::from_text("anchor www.example.com/?q=#ghost\n");
+        assert!(blocks_for_note(&doc, "n", "n.md", "N")[0].tags.is_empty());
+    }
+
+    #[test]
+    fn note_tags_exclude_attributes_split_by_inline_markup() {
+        let doc = Document::from_text("anchor {#private title=\"*value*\"}\n");
+        assert!(blocks_for_note(&doc, "n", "n.md", "N")[0].tags.is_empty());
+    }
+
+    #[test]
+    fn memory_tag_only_queries_are_exact_and_filtered_before_limit() {
+        let mut idx = MemoryFullTextIndex::new();
+        idx.upsert(&[
+            block("a", 0, "anchor anchor anchor", &[]),
+            block("b", 0, "anchor", &["Rust", "CLI", "École"]),
+            block("b", 1, "anchor again", &["Rust", "CLI", "École"]),
+            block("c", 0, "anchor anchor", &["rust/cli"]),
+        ])
+        .unwrap();
+        let pks = |hits: Vec<Hit>| hits.into_iter().map(|h| h.pk).collect::<Vec<_>>();
+        let mut q = FtsQuery::new("");
+        q.tags = vec!["RUST".into(), "cli".into(), "école".into()];
+        // 纯标签查询每篇只回第一块
+        assert_eq!(pks(idx.search(&q).unwrap()), ["b#0"]);
+        // 带文本就回所有命中的块
+        q.text = "anchor".into();
+        assert_eq!(pks(idx.search(&q).unwrap()), ["b#0", "b#1"]);
+        q.limit = 1;
+        assert_eq!(idx.search(&q).unwrap()[0].pk, "b#0");
+        q.note_id = Some("c".into());
+        assert!(idx.search(&q).unwrap().is_empty());
+        assert!(idx.search(&FtsQuery::new("")).unwrap().is_empty());
+    }
+
+    /// 纯标签查询下，一篇长笔记不能把 `limit` 吃满、挤掉别的带标签笔记。
+    #[test]
+    fn memory_tag_only_queries_return_one_hit_per_note() {
+        let mut idx = MemoryFullTextIndex::new();
+        let mut blocks: Vec<IndexBlock> = (0..50).map(|i| block("long", i, "para", &["rust"])).collect();
+        blocks.push(block("short", 0, "para", &["rust"]));
+        blocks.push(block("untagged", 0, "para", &[]));
+        idx.upsert(&blocks).unwrap();
+        let mut q = FtsQuery::new("");
+        q.tags = vec!["rust".into()];
+        q.limit = 10;
+        let mut pks: Vec<String> = idx.search(&q).unwrap().into_iter().map(|h| h.pk).collect();
+        pks.sort();
+        assert_eq!(pks, ["long#0", "short#0"]);
     }
 
     #[test]

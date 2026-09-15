@@ -65,7 +65,8 @@ impl Meta {
 
     /// 清空全部状态（全量重建前调用）。
     pub fn reset(&mut self) -> rusqlite::Result<()> {
-        self.conn.execute_batch(&format!(
+        let tx = self.conn.transaction()?;
+        tx.execute_batch(&format!(
             "DROP TABLE IF EXISTS notes;
              DROP TABLE IF EXISTS index_state;
              CREATE TABLE notes (
@@ -79,7 +80,24 @@ impl Meta {
              );
              CREATE TABLE index_state (name TEXT PRIMARY KEY, version INTEGER NOT NULL);
              INSERT INTO index_state (name, version) VALUES ('meta', {SCHEMA_VERSION});"
-        ))
+        ))?;
+        tx.commit()
+    }
+
+    pub fn fts_version(&self) -> rusqlite::Result<i64> {
+        self.conn
+            .query_row("SELECT version FROM index_state WHERE name = 'fts'", [], |r| r.get(0))
+            .optional()
+            .map(|v| v.unwrap_or(0))
+    }
+
+    pub fn set_fts_version(&mut self, version: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO index_state (name, version) VALUES ('fts', ?1)
+             ON CONFLICT(name) DO UPDATE SET version = excluded.version",
+            [version],
+        )?;
+        Ok(())
     }
 
     pub fn note_by_path(&self, path: &str) -> rusqlite::Result<Option<NoteRow>> {
@@ -192,6 +210,27 @@ mod tests {
         assert_eq!(m.all_notes().unwrap().len(), 1);
         m.remove_note("n1").unwrap();
         assert_eq!(m.note_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn reset_rolls_back_when_ddl_fails() {
+        let mut m = Meta::in_memory().unwrap();
+        m.upsert_note(&NoteRow {
+            note_id: "n".into(),
+            path: "a.md".into(),
+            title: "a".into(),
+            stamp: stamp(1),
+            block_count: 1,
+        })
+        .unwrap();
+        m.conn
+            .execute_batch(
+                "DROP TABLE index_state; CREATE VIEW index_state AS SELECT 'meta' AS name, 1 AS version;",
+            )
+            .unwrap();
+        assert!(m.reset().is_err());
+        assert!(m.conn.is_autocommit());
+        assert_eq!(m.note_count().unwrap(), 1);
     }
 
     #[test]

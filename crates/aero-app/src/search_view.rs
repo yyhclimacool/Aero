@@ -2,12 +2,12 @@
 //!
 //! 输入 150 ms 防抖后查全文索引，结果按笔记分组、块级命中、关键词高亮；
 //! `↑↓` 在命中间移动并让编辑区定位到该块，`⏎` 打开，`Esc` 回到编辑器。
-//! 语义开关、`tag:` / `path:` 过滤、搜索历史随后续里程碑加入。
+//! `#tag` / `tag:#tag` 按笔记级标签过滤；语义开关、`path:` 与搜索历史随后续里程碑加入。
 
 use std::ops::Range;
 use std::time::Duration;
 
-use aero_core::VaultPath;
+use aero_core::{FtsQuery, VaultPath};
 use aero_index::SearchHit;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::input::{InputEvent, InputState};
@@ -62,7 +62,7 @@ pub struct SearchView {
 
 impl SearchView {
     pub fn new(service: Entity<SearchService>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索全文…  \"短语\" +必含 -排除"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索全文…  #标签 tag:#标签"));
         let input_sub = cx.subscribe_in(&input, window, Self::on_input_event);
         // 索引刚建好时把当前查询再跑一遍——用户可能在索引完成前就开始输入了
         let service_sub = cx.observe(&service, |this, service, cx| {
@@ -133,6 +133,9 @@ impl SearchView {
         let text = self.input.read(cx).value().to_string();
         if text.trim().is_empty() {
             self.debounce = None;
+            self.generation += 1;
+            self.searching = false;
+            self.error = None;
             self.query.clear();
             self.set_results(Vec::new(), cx);
             return;
@@ -313,7 +316,8 @@ impl SearchView {
 }
 
 pub fn query_terms(query: &str) -> Vec<String> {
-    query
+    FtsQuery::parse(query)
+        .text
         .split_whitespace()
         .filter(|t| !t.starts_with('-'))
         .map(|t| t.trim_start_matches('+').trim_matches('"'))
@@ -406,14 +410,19 @@ impl Render for SearchView {
             })
         };
         let groups: Vec<AnyElement> = self.groups.iter().map(|g| self.render_group(g, &terms, cx)).collect();
-        let empty_hint =
-            if !self.query.is_empty() && !self.searching && self.hits.is_empty() && self.error.is_none() {
-                Some("没有匹配的块。")
-            } else if self.query.is_empty() {
-                Some("输入关键词搜索所有笔记；结果按笔记分组，点击命中定位到块。")
-            } else {
-                None
-            };
+        let empty_hint = if !self.query.is_empty()
+            && !self.searching
+            && self.hits.is_empty()
+            && self.error.is_none()
+        {
+            Some("没有匹配的块。")
+        } else if self.query.is_empty() {
+            Some(
+                "输入关键词、\"短语\"、+必含 -排除；用 #标签 或 tag:#标签 筛选笔记，多标签须全部匹配，点击结果定位到块。",
+            )
+        } else {
+            None
+        };
 
         v_flex()
             .id("search-view")
@@ -465,6 +474,9 @@ mod tests {
     fn terms_drop_operators_and_exclusions() {
         assert_eq!(query_terms("+brew \"upgrade\" -ripgrep zvec"), ["brew", "upgrade", "zvec"]);
         assert!(query_terms("-only").is_empty());
+        assert_eq!(query_terms("anchor #rust tag:#cli"), ["anchor"]);
+        assert!(query_terms("#rust tag:#cli").is_empty());
+        assert_eq!(query_terms("\"#literal\" #filter"), ["#literal"]);
     }
 
     #[test]
@@ -498,8 +510,16 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("a.md"), "# Alpha\n\n第一段 anchor\n\n第二段也有 anchor\n").unwrap();
-        std::fs::write(dir.path().join("sub/b.md"), "---\ntitle: Bravo\n---\n\nanchor 在这里\n").unwrap();
+        std::fs::write(
+            dir.path().join("a.md"),
+            "---\ntags: [rust]\n---\n\n# Alpha\n\n第一段 anchor #cli\n\n第二段也有 anchor\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("sub/b.md"),
+            "---\ntitle: Bravo\ntags: [rust/cli]\n---\n\nanchor 在这里\n",
+        )
+        .unwrap();
         let data = tempfile::tempdir().unwrap();
         let vault = Arc::new(Vault::open(dir.path()).unwrap());
         let service = cx.update(|cx| cx.new(|cx| SearchService::new(vault, data.path().to_path_buf(), cx)));
@@ -570,8 +590,41 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(200));
         cx.run_until_parked();
         cx.update(|_, cx| assert_eq!(view.read(cx).hits().len(), 2));
-        view.update_in(cx, |v, window, cx| v.input.update(cx, |s, cx| s.set_value("", window, cx)));
-        view.update_in(cx, |v, _, cx| v.schedule(cx));
-        cx.update(|_, cx| assert!(view.read(cx).hits().is_empty()));
+        for (query, count, path) in [
+            ("anchor #RUST tag:#cli", 2, "a.md"),
+            // 纯标签：标签是笔记级的，一篇只列一条
+            ("#rust", 1, "a.md"),
+            ("tag:#rust/cli", 1, "sub/b.md"),
+            ("#rust #rust/cli", 0, ""),
+            ("anchor #missing", 0, ""),
+        ] {
+            view.update_in(cx, |v, window, cx| v.input.update(cx, |s, cx| s.set_value(query, window, cx)));
+            view.update_in(cx, |v, _, cx| v.schedule(cx));
+            cx.executor().advance_clock(Duration::from_millis(200));
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                let v = view.read(cx);
+                assert!(v.error.is_none(), "{:?}", v.error);
+                assert_eq!(v.hits().len(), count, "{query}");
+                assert!(v.hits().iter().all(|hit| hit.path.as_str() == path), "{query}");
+            });
+            if count > 0 {
+                view.update_in(cx, |v, _, cx| v.open_selected(cx));
+                assert!(events.borrow().last().unwrap().starts_with(&format!("open {path}#")));
+            }
+        }
+        view.update_in(cx, |v, window, cx| {
+            v.input.update(cx, |s, cx| s.set_value("anchor #rust", window, cx));
+            v.run_search(cx);
+            v.input.update(cx, |s, cx| s.set_value("", window, cx));
+            v.schedule(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            assert!(v.hits().is_empty(), "clearing must invalidate in-flight tag queries");
+            assert!(v.query().is_empty());
+            assert!(!v.searching);
+        });
     }
 }

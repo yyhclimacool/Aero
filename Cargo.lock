@@ -123,6 +123,7 @@ dependencies = [
  "proptest",
  "ropey 2.0.0-beta.1",
  "serde",
+ "serde-saphyr",
  "tempfile",
  "thiserror 2.0.20",
  "toml 1.1.6+spec-1.1.0",

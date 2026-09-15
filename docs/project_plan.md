@@ -1029,7 +1029,11 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
   搜索视图（`⌘⇧F`，左侧栏 文件 / 搜索 分段切换）：150 ms 防抖，结果按笔记分组，snippet 与高亮在客户端基于块正文做（zvec 无 snippet API），↑↓ / ⏎ / Esc 键盘可用；点击命中打开笔记并滚到该块（放在视口 1/3 处）、短暂高亮 1.5 s。滚动定位靶在块 `div` 的 `on_children_prepainted` 里算偏移写回 `ScrollHandle`——GPUI 的普通滚动容器没有 scroll-to-element。
   快速打开（`⌘P`）：标题 / 路径模糊匹配（前缀、连续、词首加分，长路径轻罚），空查询列最近打开；无匹配时 ⏎ 直接新建同名笔记。它就是命令面板的雏形，命令面板后续复用这个壳。
   无头测试覆盖：索引往返（内存引擎与真 zvec 各一份）、同步计划 / 增量三条路径、搜索视图端到端、快速打开过滤与新建、编辑器 reveal 滚动与高亮。
-  尚未做：`optimize()` 的定时策略、`notify` 文件监听（现在只在启动同步 + 编辑器自己的 2 s stat）、搜索结果的 `#tag` 过滤、callout / 表格渲染、分发链路。
+  尚未做：`optimize()` 的定时策略、`notify` 文件监听（现在只在启动同步 + 编辑器自己的 2 s stat）、分发链路。
+- **进展（2026-09-15，第二刀）**：`#tag` 过滤与 callout / 表格只读渲染。
+  标签是**笔记级**的：front matter `tags:` / `tag:`（标量、列表、逗号分隔的老写法都认，单项不合规只丢那一项）+ 正文行内 `#tag`（comrak 树上只看 Text 节点：标题、图片 alt、链接 URL、`[[#heading]]` 一类 wikilink 锚点、代码、`{...}` 属性都不算），归一成小写；同一篇的每个 `IndexBlock` 带同一组。查询语法 `#tag` / `tag:#tag`，多个标签 AND；`FtsQuery::parse` 把它们从查询文本里摘出来，引号内的 `#` 保留字面。zvec 侧多一个 `tags_filter` 字段，存 `|<hex(tag)>|` 串，用 `LIKE '%|hex|%'` 做精确匹配（hex 里没有通配符，也不会被 SQL 注入）；`FTS_VERSION` 记在 `meta.sqlite`，不符或 `fts/` 被重建时整体重索引。**纯标签查询每篇笔记只返回 `block_ord == 0`**——标签是笔记级的，否则一篇长笔记的几百个块会吃满 `limit`、挤掉别的笔记；带文本仍是块级。
+  callout（`editor/preview.rs`）：借 `TextView::markdown_block_parser` 把 Blockquote 节点识别成 `[!kind]±`，自绘标题栏（图标 / 颜色 / 折叠按钮），正文再起一个 TextView 递归渲染（嵌套 callout 天然支持）；折叠状态放 `PreviewState`（按 视图 id + 块内偏移 存），不写回源码，外部重载时清空；搜索定位到折叠 callout 里的块会把它展开。表格：`TextViewStyle.table` 加横向 overflow scroll，表头半粗，横向滚动手势不冒泡到文档。
+  尚未做：`-#tag` 排除与 `tag:rust`（不带 `#`）语法、`#rust` 匹配子标签 `rust/cli`（现在是精确匹配）、查询里 `#rust,` 这类带尾标点的标签不识别。
 
 ### M2 · 知识互联（约 155 小时，2027-05 → 2027-09 初）
 

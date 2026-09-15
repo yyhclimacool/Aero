@@ -17,6 +17,8 @@
 
 mod markers;
 
+pub use markers::callout_header;
+
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -101,6 +103,53 @@ pub fn parse(text: &str) -> ParseOutput {
     let mut roots = cx.convert_children(root, 0..text.len());
     cx.fill_gaps(&mut roots);
     ParseOutput { blocks: roots, report: cx.report }
+}
+
+pub(crate) fn tag_sources(text: &str) -> Vec<&str> {
+    let arena = Arena::new();
+    let root = parse_document(&arena, text, &comrak_options());
+    let cx = Cx { text, line_starts: line_starts(text), report: ParseReport::default() };
+    // 属性值中的 Markdown 会把一段属性拆成多个 Text 节点，须按原文区间排除。
+    let attributes: Vec<Range<usize>> = text
+        .match_indices('{')
+        .filter_map(|(start, _)| {
+            if text[..start].chars().rev().take_while(|&c| c == '\\').count() % 2 == 1 {
+                return None;
+            }
+            let end = start + text[start..].find('}')? + 1;
+            Attrs::parse_inner(&text[start + 1..end - 1]).map(|_| start..end)
+        })
+        .collect();
+    let mut sources = Vec::new();
+    for node in root.descendants().filter(|node| matches!(node.data().value, NodeValue::Text(_))) {
+        if node.ancestors().any(|parent| match &parent.data().value {
+            // 标题不算标签；图片 alt、`[[#heading]]` / `[[note#^id]]` 的链接目标里的 `#` 是锚点不是标签
+            NodeValue::Heading(_) | NodeValue::Image(_) | NodeValue::WikiLink(_) => true,
+            NodeValue::Link(link) => {
+                matches!(&node.data().value, NodeValue::Text(value) if value.as_ref() == link.url
+                    || (value.starts_with("www.") && link.url.strip_prefix("http://") == Some(value.as_ref())))
+            }
+            _ => false,
+        }) {
+            continue;
+        }
+        let Some(range) = cx.sourcepos_range(node.data().sourcepos) else { continue };
+        let mut start = range.start;
+        for attr in attributes.iter().filter(|attr| attr.end > range.start && attr.start < range.end) {
+            if start < attr.start
+                && let Some(source) = text.get(start..attr.start)
+            {
+                sources.push(source);
+            }
+            start = start.max(attr.end).min(range.end);
+        }
+        if start < range.end
+            && let Some(source) = text.get(start..range.end)
+        {
+            sources.push(source);
+        }
+    }
+    sources
 }
 
 fn line_starts(text: &str) -> Vec<usize> {

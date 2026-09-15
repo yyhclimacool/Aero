@@ -56,6 +56,7 @@ pub struct SyncPlan {
 
 /// 全量重建时每写多少块 `flush()` 一次（ADR 0003：不分批峰值内存 900 MB，分批 ≈ 280 MB）。
 const FLUSH_EVERY_BLOCKS: usize = 10_000;
+const FTS_VERSION: i64 = 2;
 
 pub struct Indexer {
     vault: Arc<Vault>,
@@ -67,8 +68,18 @@ impl Indexer {
     /// 打开 `data_dir/<vault_id>/` 下的索引（`meta.sqlite` + `fts/`），没有则建。
     pub fn open(vault: Arc<Vault>, data_dir: &Path) -> Result<Self, IndexerError> {
         let dir = data_dir.join(vault.id());
-        let meta = Meta::open(&dir.join("meta.sqlite"))?;
-        let fts = crate::zvec_fts::ZvecFts::open(&dir.join("fts"))?;
+        let mut meta = Meta::open(&dir.join("meta.sqlite"))?;
+        let version = meta.fts_version()?;
+        // open 可能恢复为空集合；提前记为未完成，防止恢复中断后沿用旧指纹。
+        meta.set_fts_version(0)?;
+        let mut fts = crate::zvec_fts::ZvecFts::open(&dir.join("fts"))?;
+        if version != FTS_VERSION || fts.was_recreated() {
+            meta.reset()?;
+            if !fts.was_recreated() {
+                fts.clear()?;
+            }
+        }
+        meta.set_fts_version(FTS_VERSION)?;
         Ok(Self::with_parts(vault, meta, Box::new(fts)))
     }
 
@@ -247,7 +258,7 @@ impl Indexer {
 
     /// 全文搜索，结果带正文与标题，按分数降序。
     pub fn search(&self, text: &str, limit: usize) -> Result<Vec<SearchHit>, IndexerError> {
-        let mut q = FtsQuery::new(text);
+        let mut q = FtsQuery::parse(text);
         q.limit = limit;
         let hits = self.fts.search(&q)?;
         if hits.is_empty() {
@@ -300,8 +311,9 @@ impl Indexer {
 
     /// 清空并全量重建。
     pub fn rebuild(&mut self, progress: impl FnMut(usize, usize)) -> Result<SyncReport, IndexerError> {
-        self.fts.clear()?;
         self.meta.reset()?;
+        self.fts.clear()?;
+        self.meta.set_fts_version(FTS_VERSION)?;
         Ok(self.sync_all(progress))
     }
 }
@@ -360,6 +372,143 @@ mod tests {
     }
 
     #[test]
+    fn search_parses_note_wide_tag_filters() {
+        let (_dir, mut ix) = setup(&[
+            ("a.md", "---\ntags: [rust, cli]\n---\n\nanchor\n\nsecond\n"),
+            ("b.md", "anchor #rust/cli\n"),
+        ]);
+        let report = ix.sync_all(|_, _| {});
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(paths(&ix.search("anchor #RUST tag:#cli", 1).unwrap()), [("a.md".into(), 0)]);
+        // 带文本：a.md 的两块都命中；纯标签：每篇只回第一块
+        assert_eq!(paths(&ix.search("anchor #rust", 10).unwrap()), [("a.md".into(), 0)]);
+        assert_eq!(ix.search("second #rust", 10).unwrap().len(), 1);
+        assert_eq!(paths(&ix.search("#rust", 10).unwrap()), [("a.md".into(), 0)]);
+        assert_eq!(paths(&ix.search("#rust/cli", 10).unwrap()), [("b.md".into(), 0)]);
+        assert!(ix.search("#rust #missing", 10).unwrap().is_empty());
+    }
+
+    /// 纯标签查询：一篇长笔记不能挤掉别的带标签笔记（limit 小于长笔记的块数）。
+    #[test]
+    fn tag_only_search_lists_every_tagged_note_once() {
+        let long = format!(
+            "---\ntags: [rust]\n---\n\n{}",
+            (0..30).map(|i| format!("para {i}\n\n")).collect::<String>()
+        );
+        let (_dir, mut ix) =
+            setup(&[("long.md", &long), ("short.md", "#rust one\n"), ("plain.md", "rust\n")]);
+        let report = ix.sync_all(|_, _| {});
+        assert!(report.errors.is_empty(), "{report:?}");
+        let hits = ix.search("#rust", 5).unwrap();
+        assert_eq!(paths(&hits), [("long.md".into(), 0), ("short.md".into(), 0)]);
+        // 带文本仍按块返回
+        assert_eq!(ix.search("para #rust", 100).unwrap().len(), 30);
+    }
+
+    #[test]
+    fn legacy_index_rebuilds_unchanged_notes_and_removes_stale_blocks() {
+        use zvec_rust::{Collection, CollectionSchema, DataType, Doc, FieldSchema, IndexParams};
+
+        let (dir, _) = setup(&[("a.md", "---\ntags: [rust]\n---\n\nanchor\n\nsecond\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let index_dir = data.path().join(vault.id());
+        let path = VaultPath::new("a.md").unwrap();
+        let (_, stamp) = vault.read(&path).unwrap();
+        let mut meta = Meta::open(&index_dir.join("meta.sqlite")).unwrap();
+        meta.upsert_note(&crate::meta::NoteRow {
+            note_id: "legacy".into(),
+            path: "a.md".into(),
+            title: "a".into(),
+            stamp,
+            block_count: 1,
+        })
+        .unwrap();
+        drop(meta);
+        crate::zvec_fts::ensure_initialized().unwrap();
+        let mut schema = CollectionSchema::builder("aero_fts");
+        for name in ["note_id", "path", "title", "tags"] {
+            schema = schema.add_field(FieldSchema::new(name, DataType::String, false, 0).unwrap());
+        }
+        let schema = schema
+            .add_field(FieldSchema::new("block_ord", DataType::Int32, false, 0).unwrap())
+            .add_indexed_field(
+                "body",
+                DataType::String,
+                IndexParams::fts(Some("jieba"), Some(&["lowercase"]), None).unwrap(),
+            )
+            .build()
+            .unwrap();
+        let col =
+            Collection::create_and_open(&index_dir.join("fts").to_string_lossy(), &schema, None).unwrap();
+        for pk in ["legacy#0", "ghost#0"] {
+            let mut doc = Doc::new().unwrap();
+            doc.set_pk(pk);
+            for (name, value) in
+                [("note_id", "legacy"), ("path", "a.md"), ("title", "a"), ("tags", ""), ("body", "outdated")]
+            {
+                doc.add_string(name, value).unwrap();
+            }
+            doc.add_i32("block_ord", 0).unwrap();
+            assert_eq!(col.upsert(&[&doc]).unwrap().error_count, 0);
+        }
+        col.flush().unwrap();
+        drop(col);
+
+        let mut ix = Indexer::open(vault.clone(), data.path()).unwrap();
+        let report = ix.sync_all(|_, _| {});
+        assert_eq!((report.indexed, report.unchanged), (1, 0), "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(ix.stats(), (1, 2));
+        assert_eq!(paths(&ix.search("#rust", 10).unwrap()), [("a.md".into(), 0)]);
+        assert_eq!(ix.search("second #rust", 10).unwrap().len(), 1);
+        assert!(ix.search("outdated", 10).unwrap().is_empty());
+        assert!(ix.fts().fetch(&["legacy#0".into(), "ghost#0".into()]).unwrap().is_empty());
+        drop(ix);
+        let mut ix = Indexer::open(vault, data.path()).unwrap();
+        let report = ix.sync_all(|_, _| {});
+        assert_eq!((report.indexed, report.unchanged), (0, 1));
+        assert_eq!(ix.search("anchor #rust", 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recreated_fts_reindexes_unchanged_notes() {
+        let (dir, _) = setup(&[("a.md", "anchor #rust\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let mut ix = Indexer::open(vault.clone(), data.path()).unwrap();
+        assert_eq!(ix.sync_all(|_, _| {}).indexed, 1);
+        drop(ix);
+        std::fs::remove_dir_all(data.path().join(vault.id()).join("fts")).unwrap();
+        let mut ix = Indexer::open(vault, data.path()).unwrap();
+        let report = ix.sync_all(|_, _| {});
+        assert_eq!((report.indexed, report.unchanged), (1, 0), "{report:?}");
+        assert_eq!(ix.search("anchor #rust", 1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_fts_open_keeps_rebuild_pending() {
+        let (dir, _) = setup(&[("a.md", "anchor #rust\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let mut ix = Indexer::open(vault.clone(), data.path()).unwrap();
+        assert_eq!(ix.sync_all(|_, _| {}).indexed, 1);
+        drop(ix);
+        let index_dir = data.path().join(vault.id());
+        let fts_dir = index_dir.join("fts");
+        std::fs::remove_dir_all(&fts_dir).unwrap();
+        std::fs::write(&fts_dir, "not a directory").unwrap();
+        assert!(Indexer::open(vault.clone(), data.path()).is_err());
+        assert_eq!(Meta::open(&index_dir.join("meta.sqlite")).unwrap().fts_version().unwrap(), 0);
+        std::fs::remove_file(&fts_dir).unwrap();
+        drop(crate::zvec_fts::ZvecFts::open(&fts_dir).unwrap());
+        let mut ix = Indexer::open(vault, data.path()).unwrap();
+        let report = ix.sync_all(|_, _| {});
+        assert_eq!((report.indexed, report.unchanged), (1, 0), "{report:?}");
+        assert_eq!(ix.search("#rust", 10).unwrap().len(), 1);
+    }
+
+    #[test]
     fn open_with_zvec_engine_and_reopen() {
         let (dir, _) = setup(&[("a.md", "# A\n\nzvec 引擎 roundtrip\n"), ("b.md", "别的\n")]);
         let data = tempfile::tempdir().unwrap();
@@ -379,6 +528,32 @@ mod tests {
         let r = ix.rebuild(|_, _| {}).unwrap();
         assert_eq!(r.indexed, 2);
         assert_eq!(ix.stats(), (2, 3));
+    }
+
+    #[test]
+    fn tag_filters_follow_save_rename_and_remove() {
+        let (dir, _) = setup(&[("a.md", "---\ntags: [rust]\n---\n\nanchor #cli\n\nsecond\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let mut ix = Indexer::open(vault, data.path()).unwrap();
+        assert_eq!(ix.sync_all(|_, _| {}).indexed, 1);
+        assert_eq!(paths(&ix.search("#rust #cli", 10).unwrap()), [("a.md".into(), 0)]);
+        assert_eq!(ix.search("second #rust #cli", 10).unwrap().len(), 1);
+        let old = VaultPath::new("a.md").unwrap();
+        let text = "---\ntags: [new]\n---\n\nanchor\n\nsecond\n";
+        std::fs::write(dir.path().join("a.md"), text).unwrap();
+        let (_, stamp) = ix.vault().read(&old).unwrap();
+        ix.index_text(&old, text, stamp).unwrap();
+        assert!(ix.search("#rust", 10).unwrap().is_empty());
+        assert!(ix.search("#cli", 10).unwrap().is_empty());
+        assert_eq!(paths(&ix.search("#new", 10).unwrap()), [("a.md".into(), 0)]);
+        assert_eq!(ix.search("second #new", 10).unwrap().len(), 1);
+        let new = VaultPath::new("moved.md").unwrap();
+        ix.vault().rename(&old, &new).unwrap();
+        ix.rename_note(&old, &new).unwrap();
+        assert_eq!(paths(&ix.search("anchor #new", 10).unwrap()), [("moved.md".into(), 0)]);
+        ix.remove_note(&new).unwrap();
+        assert!(ix.search("#new", 10).unwrap().is_empty());
     }
 
     #[test]

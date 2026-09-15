@@ -40,6 +40,247 @@ fn open(cx: &mut TestAppContext, body: &str) -> (tempfile::TempDir, Arc<Vault>, 
 }
 
 #[gpui_kit::test]
+fn callout_preview_folds_without_editing_source(cx: &mut TestAppContext) {
+    let source =
+        "> [!warning]- Caution\n> **Body**\n>\n> - first\n> - second\n\n> [!mystery] Unknown\n> kept\n";
+    let (dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-title-Caution").is_some());
+    assert!(cx.debug_bounds("callout-body-Caution").is_none());
+    assert!(cx.debug_bounds("callout-body-Unknown").is_some());
+    assert!(cx.debug_bounds("callout-toggle-Unknown").is_none());
+    let toggle = cx.debug_bounds("callout-toggle-Caution").unwrap();
+    cx.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-Caution").is_some());
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.focused.is_none(), "folding must not enter the source editor");
+        assert!(!e.dirty);
+        assert_eq!(e.units.len(), 2);
+    });
+    assert_eq!(text(&editor, cx), source);
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+    let toggle = cx.debug_bounds("callout-toggle-Caution").unwrap();
+    cx.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-Caution").is_none());
+}
+
+#[gpui_kit::test]
+fn callout_preview_renders_all_default_titles(cx: &mut TestAppContext) {
+    let source = ["note", "TiP", "warning", "danger", "info", "question", "example", "quote"]
+        .into_iter()
+        .map(|kind| format!("> [!{kind}]\n> body\n\n"))
+        .collect::<String>();
+    let (_dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "callout-title-Note",
+        "callout-title-Tip",
+        "callout-title-Warning",
+        "callout-title-Danger",
+        "callout-title-Info",
+        "callout-title-Question",
+        "callout-title-Example",
+        "callout-title-Quote",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector}");
+    }
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn callout_fold_button_is_keyboard_accessible(cx: &mut TestAppContext) {
+    let source = "> [!info]- Keyboard\n> body\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let (_, cx) = cx.add_window_view(|window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.focus(&editor.read(cx).focus_handle.clone(), cx);
+        window.draw(cx).clear(cx);
+    });
+    cx.simulate_keystrokes("tab");
+    for (key, open) in [("space", true), ("enter", false)] {
+        let keystroke = gpui_kit::Keystroke::parse(key).unwrap();
+        cx.simulate_event(gpui_kit::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui_kit::KeyUpEvent { keystroke });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(cx.debug_bounds("callout-body-Keyboard").is_some(), open, "{key}");
+    }
+    cx.update(|_, cx| assert!(editor.read(cx).focused.is_none()));
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn nested_callouts_keep_independent_folds_and_atomic_source_editing(cx: &mut TestAppContext) {
+    let source = "> [!note]+ Outer\n> intro\n>\n> > [!tip]- Inner\n> > hidden\n>\n> | A | B |\n> | --- | ---: |\n> | **x** | 2 |\n";
+    let (dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-Outer").is_some());
+    assert!(cx.debug_bounds("callout-title-Inner").is_some());
+    assert!(cx.debug_bounds("callout-body-Inner").is_none());
+    let toggle = cx.debug_bounds("callout-toggle-Inner").unwrap();
+    cx.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-Inner").is_some());
+    assert!(cx.debug_bounds("callout-body-Outer").is_some());
+    for expanded in [false, true] {
+        let toggle = cx.debug_bounds("callout-toggle-Outer").unwrap();
+        cx.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(cx.debug_bounds("callout-body-Outer").is_some(), expanded);
+    }
+    assert!(cx.debug_bounds("callout-body-Inner").is_some(), "parent folding retains the child choice");
+    let title = cx.debug_bounds("callout-title-Inner").unwrap();
+    cx.simulate_click(title.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.units.len(), 1);
+        let f = e.focused.as_ref().expect("clicking nested content edits the outer source unit");
+        assert!(f.enter_newline);
+        assert_eq!(f.textarea.read(cx).value(), source.trim_end());
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-Inner").is_some(), "source editing retains the child choice");
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("cmd-down");
+    cx.simulate_input("!");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-title-Outer").is_some());
+}
+
+#[gpui_kit::test]
+fn callout_preview_handles_quotes_lists_empty_and_literal_markers(cx: &mut TestAppContext) {
+    let source = "> ordinary quote\n>\n> > [!example] Nested\n> > body\n\n- > [!question] Listed\n  > answer\n\n> [!note]\n\n```md\n> [!danger] Literal\n```\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in ["callout-body-Nested", "callout-body-Listed", "callout-title-Note"] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector}");
+    }
+    assert!(cx.debug_bounds("callout-title-Literal").is_none());
+    assert!(cx.debug_bounds("callout-body-Note").is_none());
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn search_reveals_content_inside_collapsed_callouts(cx: &mut TestAppContext) {
+    let source = "> [!note]- Outer\n> > [!tip]- Inner\n> > needle\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_indexed_block(0, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-Outer").is_some());
+    assert!(cx.debug_bounds("callout-body-Inner").is_some());
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.highlight, Some(e.units[0].id));
+        assert!(e.reveal.is_none());
+        assert!(e.focused.is_none());
+        assert!(!e.dirty);
+    });
+    cx.executor().advance_clock(Duration::from_millis(1600));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-Inner").is_some(), "remains open after highlight fades");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn table_preview_enables_horizontal_overflow(cx: &mut TestAppContext) {
+    let source = "| Name | 中间 | Count |\n| :--- | :---: | ---: |\n| **bold** | `code` | 42 |\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.units.len(), 1);
+        let style = e.text_view_style(cx);
+        assert_eq!(style.table.overflow.x, Some(gpui_kit::Overflow::Scroll));
+        assert_eq!(style.table_head.text.font_weight, Some(gpui_kit::FontWeight::SEMIBOLD));
+    });
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let f = e.focused.as_ref().unwrap();
+        assert!(f.enter_newline);
+        assert_eq!(f.textarea.read(cx).value(), source.trim_end());
+    });
+    cx.simulate_keystrokes("escape");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn wide_table_scroll_keeps_vertical_document_navigation(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+    let mut source = format!(
+        "| {} |\n| {} |\n| {} |\n\n",
+        ["Heading"; 12].join(" | "),
+        ["---"; 12].join(" | "),
+        ["wide cell with content"; 12].join(" | ")
+    );
+    source.push_str(&(0..60).map(|i| format!("paragraph {i}\n\n")).collect::<String>());
+    let (_dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(gpui_kit::size(px(420.), px(600.)));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let bounds = cx.debug_bounds("unit-1").unwrap();
+    assert!(bounds.size.width <= px(420.));
+    let position = bounds.origin + point(px(20.), px(20.));
+    for touch_phase in [TouchPhase::Started, TouchPhase::Ended] {
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(-150.), px(0.))),
+            modifiers: Modifiers::default(),
+            touch_phase,
+        });
+    }
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.scroll.offset().y, px(0.), "horizontal gestures stay in the table");
+        assert!(e.focused.is_none());
+    });
+    cx.simulate_event(ScrollWheelEvent {
+        position,
+        delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Started,
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(editor.read(cx).scroll.offset().y < px(0.), "vertical scrolling bubbles out"));
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
 fn typing_enter_backspace_undo_and_save(cx: &mut TestAppContext) {
     let (dir, _vault, _path, editor) = open(cx, "hello\n\nworld\n");
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -362,6 +603,35 @@ fn click_positions_cursor_in_block(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.simulate_input("!");
     assert_eq!(text(&editor, cx), "Xhello\n\nworld!\n");
+}
+
+#[gpui_kit::test]
+fn external_reload_resets_callout_fold_choices(cx: &mut TestAppContext) {
+    let source = "> [!note]- Before\n> old\n";
+    let (dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let toggle = cx.debug_bounds("callout-toggle-Before").unwrap();
+    cx.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-Before").is_some());
+    let old_id = cx.update(|_, cx| editor.read(cx).units[0].id);
+
+    let replacement = "> [!note]- After\n> new from disk\n";
+    let file = dir.path().join("a.md");
+    std::fs::write(&file, replacement).unwrap();
+    let past = std::time::SystemTime::now() - Duration::from_secs(5);
+    std::fs::File::open(&file).unwrap().set_modified(past).unwrap();
+    cx.executor().advance_clock(Duration::from_millis(2100));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(text(&editor, cx), replacement);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).units[0].id, old_id));
+    assert!(cx.debug_bounds("callout-title-After").is_some());
+    assert!(cx.debug_bounds("callout-body-After").is_none(), "new document uses its own fold defaults");
+    assert_eq!(std::fs::read_to_string(file).unwrap(), replacement);
 }
 
 /// 外部改了文件、这里没有未保存修改：下一次轮询静默重载（方案 12）。
