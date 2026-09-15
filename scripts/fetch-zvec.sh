@@ -39,3 +39,10 @@ fi
 rm -rf "${DEST:?}"/*
 tar -xzf "${TMP}/${ASSET}" -C "${DEST}"
 echo "ok: $(ls "${DEST}") -> ${DEST}"
+
+# 裁剪 jieba 主词典（project_plan 10.3）：全词典 349k 词常驻 ≈150 MB，裁到 ~100k 词后 ≈110 MB。
+# 生成到 data/jieba_dict_trimmed，运行时优先加载它（见 crates/aero-index/src/zvec_fts.rs）。
+FULL_DICT="${DEST}/data/jieba_dict"
+if [[ -f "${FULL_DICT}/jieba.dict.utf8" ]]; then
+  SRC_DIR="${FULL_DICT}" "${ROOT}/scripts/trim-jieba-dict.sh" "${DEST}/data/jieba_dict_trimmed"
+fi

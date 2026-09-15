@@ -843,7 +843,7 @@ M0 实测（`bench-10k`，120k block，Apple M5 Pro）：查询 p95 ≤ 3 ms；�
 - **保存路径 = `upsert(新 block)` + `delete(旧有而新无的 pk)`**。旧 pk 列表来自 SQLite 的 block 表。**禁用 `delete_by_filter`**：它会留下僵尸主键——doc 查不到了，但同一 pk `insert` 报 `AlreadyExists`、`delete` 报 `NotFound`，`flush` / `optimize` 都救不回，只有 `upsert` 能覆盖。
 - **正在编辑的文档**：写入即可见，所以不做内存 overlay；编辑中的 block 以 300 ms 节流 `upsert` 进引擎即可（原方案的"简单倒排 overlay"取消）。
 - 刷盘与整理：保存后不 flush；空闲 30 s 无编辑时 `flush()`；后台全量重建**每 1 万 block `flush()` 一次**（否则峰值内存冲到 900 MB，分批后 ≈ 280 MB）；碎片段会让 p95 从 3 ms 涨到 9 ms，每日或段数超阈值时 `optimize()`（10k 上 0.5 s）。
-- **jieba 词典裁剪**：全词典（349k 词）在进程里占 ≈ 200 MB，是索引侧最大的内存项；随应用分发按词频截到 ~100k 词（1.4 MB，省 150 MB），长尾交给 HMM 与 search 模式的子词切分，领域词放 Aero 自己的 `user.dict.utf8`。词典目录运行时用 `ConfigBuilder::jieba_dict_dir` 指到 `Resources/jieba_dict`。
+- **jieba 词典裁剪（已实现）**：全词典（349k 词）常驻 ≈150 MB，是索引侧最大的内存项。`scripts/trim-jieba-dict.sh` 按词频截到 ~100k 词（磁盘 1.4 MB），长尾交给 HMM 与 search 模式的子词切分。实测常驻并非线性下降——cppjieba 的 `DictTrie` 节点开销高，100k 词裁剪后仍 ≈110 MB（省 ≈60 MB；裁到 50k 省 ≈85 MB），原先"裁后 45 MB / 省 150 MB"的估计过于乐观。领域词：zvec 的 `JiebaTokenizer` 只加载 `jieba.dict.utf8` + `hmm_model.utf8`，**不读**单独的 `user.dict.utf8`，故 `assets/jieba/user.dict.utf8` 里的领域词由脚本直接并进主词典。裁剪词典由 `fetch-zvec.sh` 产出到 `vendor/zvec/lib/data/jieba_dict_trimmed`（不入库，随 fetch 重生）；运行时 `aero-index` 显式 `set_default_jieba_dict_dir` 覆盖 zvec 自动发现的全词典，打包时装进 `Resources/jieba_dict`。
 - `ngram` tokenizer 不作备选：构建慢 2 倍、磁盘 2.5 倍，英文按字母二元组匹配 precision 太差。
 
 ### 10.4 语义索引（Phase 3）
@@ -1029,7 +1029,7 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
   搜索视图（`⌘⇧F`，左侧栏 文件 / 搜索 分段切换）：150 ms 防抖，结果按笔记分组，snippet 与高亮在客户端基于块正文做（zvec 无 snippet API），↑↓ / ⏎ / Esc 键盘可用；点击命中打开笔记并滚到该块（放在视口 1/3 处）、短暂高亮 1.5 s。滚动定位靶在块 `div` 的 `on_children_prepainted` 里算偏移写回 `ScrollHandle`——GPUI 的普通滚动容器没有 scroll-to-element。
   快速打开（`⌘P`）：标题 / 路径模糊匹配（前缀、连续、词首加分，长路径轻罚），空查询列最近打开；无匹配时 ⏎ 直接新建同名笔记。它就是命令面板的雏形，命令面板后续复用这个壳。
   无头测试覆盖：索引往返（内存引擎与真 zvec 各一份）、同步计划 / 增量三条路径、搜索视图端到端、快速打开过滤与新建、编辑器 reveal 滚动与高亮。
-  尚未做：jieba 词典裁剪（现在用全词典，≈200 MB，10.3）、`optimize()` 的定时策略、`notify` 文件监听（现在只在启动同步 + 编辑器自己的 2 s stat）、搜索结果的 `#tag` 过滤、callout / 表格渲染、分发链路。
+  尚未做：`optimize()` 的定时策略、`notify` 文件监听（现在只在启动同步 + 编辑器自己的 2 s stat）、搜索结果的 `#tag` 过滤、callout / 表格渲染、分发链路。
 
 ### M2 · 知识互联（约 155 小时，2027-05 → 2027-09 初）
 
@@ -1069,7 +1069,7 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
 - 全文搜索：`bench-100k` 上 p95 < 50 ms。
 - 增量索引：单篇保存后 < 300 ms 内可搜索到（M0 实测 zvec 2 ms，余量留给解析与 SQLite 事务）。
 - 全量重建：`bench-100k` 元数据 + FTS < 3 min（M0 从 10k 外推 zvec 部分 ≈ 3 min，卡在边缘，M3 用真实数据复测；重建期间峰值内存 < 300 MB，靠每 1 万 block flush 一次）。
-- 常驻内存：`bench-10k` 打开 10 个文档 < 300 MB，其中索引引擎（zvec FTS 索引 ≈ 100 MB + 裁剪后的 jieba 词典 ≈ 45 MB）< 150 MB。
+- 常驻内存：`bench-10k` 打开 10 个文档 < 300 MB，其中索引引擎 ≈ 210 MB（zvec FTS 索引 ≈ 100 MB + 裁剪后的 jieba 词典 ≈ 110 MB）。注：原定索引引擎 < 150 MB 假设词典裁后 ≈45 MB，实测 cppjieba `DictTrie` 常驻远高于此（10.3），100k 词裁剪只能压到 ≈110 MB，此预算已按实测上修。
 - 滚动：`bench` 中最长文档 60 fps 无卡顿。
 - 重内容渲染（9.9，缓存未命中时）：行内公式 < 5 ms、块级公式 < 20 ms；典型 mermaid 图 < 200 ms；PDF 单页 < 1 s；均在后台线程，不计入输入延迟。缓存命中时与普通图片无差别。
 

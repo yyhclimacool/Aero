@@ -20,21 +20,18 @@ fn engine(e: zvec_rust::Error) -> IndexError {
     IndexError::Engine(e.to_string())
 }
 
-/// 进程级初始化：`initialize()` 一次，并保证 jieba 词典目录可用。
-/// 词典查找顺序：zvec 自己发现的（dylib 旁的 `data/jieba_dict`）→ `ZVEC_JIEBA_DICT_DIR` 环境变量
-/// → 编译期 `ZVEC_LIB_DIR/data/jieba_dict` → 可执行文件旁的 `../Resources/jieba_dict`（.app 打包）。
+/// 进程级初始化：`initialize()` 一次，并把 jieba 词典目录固定到裁剪词典。
+/// zvec 默认会自动发现 dylib 旁的全词典（349k 词，常驻 ≈150 MB），这里显式覆盖成裁剪词典
+/// （~100k 词，≈110 MB，10.3）。查找顺序（第一个含 `jieba.dict.utf8` 的目录胜出）：
+/// `ZVEC_JIEBA_DICT_DIR` 环境变量 → 编译期 `ZVEC_LIB_DIR/data/jieba_dict_trimmed`
+/// → 可执行文件旁的 `../Resources/jieba_dict`（.app 打包，只装裁剪词典）
+/// → `ZVEC_LIB_DIR/data/jieba_dict`（全词典兜底）→ zvec 自动发现的目录。
 pub fn ensure_initialized() -> Result<(), IndexError> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     INIT.get_or_init(|| {
         zvec_rust::initialize(None).map_err(|e| e.to_string())?;
-        if zvec_rust::get_default_jieba_dict_dir().is_empty() {
-            for dir in jieba_candidates() {
-                if dir.join("jieba.dict.utf8").is_file() {
-                    zvec_rust::set_default_jieba_dict_dir(&dir.to_string_lossy())
-                        .map_err(|e| e.to_string())?;
-                    break;
-                }
-            }
+        if let Some(dir) = jieba_candidates().into_iter().find(|d| d.join("jieba.dict.utf8").is_file()) {
+            zvec_rust::set_default_jieba_dict_dir(&dir.to_string_lossy()).map_err(|e| e.to_string())?;
         }
         let dict = zvec_rust::get_default_jieba_dict_dir();
         if dict.is_empty() {
@@ -52,14 +49,14 @@ fn jieba_candidates() -> Vec<PathBuf> {
     if let Ok(d) = std::env::var("ZVEC_JIEBA_DICT_DIR") {
         out.push(PathBuf::from(d));
     }
-    if let Some(lib) = option_env!("ZVEC_LIB_DIR") {
-        out.push(Path::new(lib).join("data").join("jieba_dict"));
-    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         out.push(dir.join("../Resources/jieba_dict"));
-        out.push(dir.join("../Frameworks/data/jieba_dict"));
+    }
+    if let Some(lib) = option_env!("ZVEC_LIB_DIR") {
+        out.push(Path::new(lib).join("data").join("jieba_dict_trimmed"));
+        out.push(Path::new(lib).join("data").join("jieba_dict"));
     }
     out
 }
