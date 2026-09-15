@@ -8,6 +8,7 @@
 //! - [`actions`]：快捷键总表（第 14 节）中 M1a 的部分
 
 mod actions;
+mod branding;
 mod editor;
 mod file_tree;
 mod paths;
@@ -15,7 +16,6 @@ mod workspace;
 
 use std::path::PathBuf;
 
-use gpui_kit::assets::Assets;
 use gpui_kit::component::{Root, TitleBar};
 use gpui_kit::*;
 
@@ -55,9 +55,10 @@ fn main() {
     // `aero <vault 目录>` 直接打开；否则进入首次运行页 / 最近的 vault
     let initial_vault: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
 
-    gpui_kit::application().with_assets(Assets).run(move |cx| {
+    gpui_kit::application().with_assets(branding::AppAssets).run(move |cx| {
         gpui_kit::init(cx);
         actions::init(cx);
+        branding::set_application_icon();
 
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {

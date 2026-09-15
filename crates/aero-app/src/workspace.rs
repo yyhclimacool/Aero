@@ -17,6 +17,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::actions::*;
+use crate::branding;
 use crate::editor::{Editor, EditorEvent, SaveState};
 use crate::file_tree::{FileTree, FileTreeEvent, unique_note_name};
 use crate::paths::{PersistedState, display_path};
@@ -326,6 +327,7 @@ impl Workspace {
             v_flex()
                 .w(px(440.))
                 .gap_4()
+                .child(img(branding::ICON_PATH).size(px(88.)).object_fit(ObjectFit::Contain))
                 .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("Aero"))
                 .child(
                     div().text_sm().text_color(muted).child(

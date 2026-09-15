@@ -21,6 +21,12 @@ log = "0.4"
 # 本地时间：冲突副本文件名、daily 笔记（锁到已在依赖树里的版本）
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# GPUI 当前没有设置 macOS 应用图标的 API；复用它已依赖的 AppKit 绑定。
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"] }
+
 [dev-dependencies]
 # 无头 GPUI 测试（TestAppContext）：在测试里真正渲染编辑器并模拟按键
 gpui-kit = { workspace = true, features = ["test-support"] }
