@@ -10,6 +10,7 @@
 //! 或粘贴出多个块时，控件仍然有归属，不会因为块消失而失焦。
 
 mod ops;
+mod slash;
 #[cfg(test)]
 mod tests;
 mod text_ops;
@@ -20,15 +21,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aero_core::{Block, BlockId, BlockKind, Document, Edit, FileStamp, Vault, VaultError, VaultPath};
-use gpui_kit::base::input::{Backspace, Escape, InputEvent, Textarea, TextareaState};
+use gpui_kit::base::input::{Backspace, Escape, Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::actions::{BlockDown, BlockUp, BlurEditor, DocRedo, DocUndo, SplitBlock};
-use ops::Plan;
+use crate::actions::{
+    BlockDown, BlockUp, BlurEditor, ConvertBlock, DocRedo, DocUndo, MenuConfirm, SplitBlock,
+};
+use ops::{BlockType, Plan};
+use slash::SlashAction;
 use text_ops::*;
 use units::{Unit, unit_at};
 
@@ -50,6 +54,8 @@ pub enum EditorEvent {
     Reloaded,
     /// 磁盘内容与未保存修改冲突：磁盘版本已另存到该路径，本地版本照常落盘
     Conflict(VaultPath),
+    /// 用户在标题处输入了新文件名（不含 `.md`）：真正的重命名由工作区做，文件树与路径要一起变
+    RenameRequested(String),
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -61,6 +67,24 @@ pub enum SaveState {
     Saving,
     Saved(Instant),
     Failed(String),
+}
+
+/// `/` 菜单态（6 / 7.1）：`/query` 字面留在文档里，确认时删掉再转换当前块；Esc 只关菜单、保留字符。
+struct SlashMenu {
+    /// `/` 在文档中的偏移
+    anchor: usize,
+    /// 所在编辑区间的起点：删命令时最多把它前面的空格吃到这里
+    block_start: usize,
+    query: String,
+    /// 过滤后的条目（`slash::ITEMS` 下标）
+    matches: Vec<usize>,
+    selected: usize,
+}
+
+/// 标题编辑态（5.1）：单行输入框替换标题；⏎ 提交、Esc / 失焦取消。
+struct TitleEdit {
+    input: Entity<InputState>,
+    _subscription: Subscription,
 }
 
 struct Focused {
@@ -82,6 +106,8 @@ pub struct Editor {
     stamp: FileStamp,
     units: Vec<Unit>,
     focused: Option<Focused>,
+    title_edit: Option<TitleEdit>,
+    slash: Option<SlashMenu>,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
     dirty: bool,
@@ -122,6 +148,8 @@ impl Editor {
             stamp,
             units,
             focused: None,
+            title_edit: None,
+            slash: None,
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             dirty: false,
@@ -137,8 +165,101 @@ impl Editor {
         &self.path
     }
 
-    pub fn title(&self) -> &str {
-        self.path.stem()
+    /// 文件已被工作区重命名 / 移动：换掉路径，内容与脏状态不变。
+    pub fn set_path(&mut self, path: VaultPath, cx: &mut Context<Self>) {
+        self.path = path;
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
+    }
+
+    /// 标题：front matter 的 `title`，没有则是文件名（5.1）。
+    pub fn title(&self) -> String {
+        self.front_matter_title().map(|(_, t)| t).unwrap_or_else(|| self.path.stem().to_owned())
+    }
+
+    /// front matter 里 `title:` 值在文档中的区间与文本。
+    fn front_matter_title(&self) -> Option<(Range<usize>, String)> {
+        let fm = self.doc.blocks().roots.first().filter(|b| b.kind == BlockKind::FrontMatter)?;
+        let range = self.doc.content_range(fm);
+        let src = self.doc.slice(range.clone()).to_string();
+        let (r, text) = front_matter_title(&src)?;
+        Some((range.start + r.start..range.start + r.end, text))
+    }
+
+    // ---- 标题编辑（5.1） ----
+
+    /// 点击标题：换成单行输入框，全选当前标题。
+    fn start_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.exit_edit(cx);
+        let title = self.title();
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("未命名"));
+        let subscription = cx.subscribe_in(&input, window, Self::on_title_input_event);
+        input.update(cx, |st, cx| {
+            st.set_value(title.clone(), window, cx);
+            st.set_selected_range(0..title.len(), cx);
+            st.focus(window, cx);
+        });
+        self.title_edit = Some(TitleEdit { input, _subscription: subscription });
+        cx.notify();
+    }
+
+    fn on_title_input_event(
+        &mut self,
+        _: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::PressEnter { .. } => self.commit_title(window, cx),
+            InputEvent::Blur => self.cancel_title_edit(false, window, cx),
+            InputEvent::Change | InputEvent::Focus => {}
+        }
+    }
+
+    fn cancel_title_edit(&mut self, refocus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.take().is_some() {
+            if refocus {
+                self.focus_handle.focus(window, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// 提交标题：有 front matter `title` 时改它；否则请工作区重命名文件。
+    fn commit_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.title_edit.take() else { return };
+        let new = edit.input.read(cx).value().trim().to_owned();
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+        if new.is_empty() || new == self.title() {
+            return;
+        }
+        match self.front_matter_title() {
+            Some((range, _)) => {
+                // 值里有 YAML 特殊字符时加引号
+                let needs_quote = new.contains([':', '#', '"', '\''])
+                    || new.starts_with(['[', '{', '&', '*', '!', '|', '>', '%', '@', '`']);
+                let text = if needs_quote {
+                    format!("\"{}\"", new.replace('\\', "\\\\").replace('"', "\\\""))
+                } else {
+                    new
+                };
+                // 引号内的区间已去掉引号；带引号写回时把原引号一并替换
+                let (range, text) =
+                    match self.doc.slice(range.start.saturating_sub(1)..range.start).to_string().as_str() {
+                        "\"" | "'" => (range.start - 1..range.end + 1, text),
+                        _ => (range, text),
+                    };
+                if let Err(err) = self.doc.edit(Edit::replace(range, text)) {
+                    log::error!("title edit rejected: {err}");
+                    return;
+                }
+                self.last_edit_at = None;
+                self.after_doc_change(cx);
+            }
+            None => cx.emit(EditorEvent::RenameRequested(new)),
+        }
     }
 
     pub fn save_state(&self) -> &SaveState {
@@ -186,7 +307,13 @@ impl Editor {
     /// 点击浏览态的块：进入编辑态，然后把这次点击重放给刚出现的控件，由它按像素位置放光标。
     /// 渲染文本与源码只差行内标记（`**`、`[[`），所以落点是"近似到字符"；不重放的话光标总在块尾。
     /// 控件要先画一帧才有布局，而 `on_next_frame` 的回调在绘制之前跑，所以隔两帧再派发。
-    fn focus_block_at(&mut self, id: BlockId, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    fn focus_block_at(
+        &mut self,
+        id: BlockId,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.focus_block(id, window, cx);
         if self.replaying_click || !self.is_focused_block(id) {
             return;
@@ -211,7 +338,12 @@ impl Editor {
                     cx,
                 );
                 window.dispatch_event(
-                    PlatformInput::MouseUp(MouseUpEvent { button: MouseButton::Left, position, modifiers, click_count: 1 }),
+                    PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position,
+                        modifiers,
+                        click_count: 1,
+                    }),
                     cx,
                 );
                 editor.update(cx, |e, _| e.replaying_click = false);
@@ -278,6 +410,7 @@ impl Editor {
 
     /// 退出编辑态（不改焦点）。失焦即落盘（10.1）。
     fn exit_edit(&mut self, cx: &mut Context<Self>) {
+        self.slash = None;
         if self.focused.take().is_some() {
             self.last_edit_at = None;
             self.save_now(cx);
@@ -287,6 +420,14 @@ impl Editor {
     }
 
     fn blur_to_browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            self.cancel_title_edit(true, window, cx);
+            return;
+        }
+        if self.slash.take().is_some() {
+            cx.notify();
+            return;
+        }
         self.exit_edit(cx);
         self.focus_handle.focus(window, cx);
     }
@@ -331,6 +472,125 @@ impl Editor {
         f.range.end = (f.range.end as isize + delta).max(f.range.start as isize) as usize;
         self.last_edit_at = Some(now);
         self.after_doc_change(cx);
+        self.update_slash(cx);
+    }
+
+    // ---- `/` 菜单（7.1） ----
+
+    /// 每次控件文本变化后：光标前有 `/query` 就开着菜单并实时过滤，否则关掉。
+    fn update_slash(&mut self, cx: &mut Context<Self>) {
+        let Some((text, cursor)) = self.textarea_text_and_cursor(cx) else { return };
+        let Some(f) = self.focused.as_ref() else { return };
+        // 代码块等源码单位里 `/` 只是字符
+        if f.enter_newline {
+            return;
+        }
+        let next = slash::trigger(&text, cursor).and_then(|(at, query)| {
+            let matches = slash::filter(query);
+            (!matches.is_empty()).then(|| (f.range.start + at, query.to_owned(), matches))
+        });
+        let block_start = f.range.start;
+        match next {
+            Some((anchor, query, matches)) => {
+                let selected = match self.slash.as_ref() {
+                    Some(m) if m.anchor == anchor && m.query == query => m.selected.min(matches.len() - 1),
+                    _ => 0,
+                };
+                self.slash = Some(SlashMenu { anchor, block_start, query, matches, selected });
+            }
+            None => self.slash = None,
+        }
+        cx.notify();
+    }
+
+    fn slash_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(m) = self.slash.as_mut() {
+            let n = m.matches.len() as isize;
+            m.selected = ((m.selected as isize + delta).rem_euclid(n)) as usize;
+            cx.notify();
+        }
+    }
+
+    /// 确认菜单条目：删掉 `/query`，再把所在块转换成目标类型（或插入日期）。两步合成一个撤销组。
+    fn slash_confirm(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.slash.take() else { return };
+        let Some(&item_ix) = index.or(Some(menu.selected)).and_then(|i| menu.matches.get(i)) else { return };
+        let action = slash::ITEMS[item_ix].action;
+        // 命令前面的空格（"hello /h" 里的那个）一起删掉，但不越过编辑区间起点
+        let mut start = menu.anchor;
+        while start > menu.block_start && self.doc.slice(start - 1..start) == " " {
+            start -= 1;
+        }
+        let command = start..menu.anchor + 1 + menu.query.len();
+        match action {
+            SlashAction::InsertDate => {
+                let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let end = command.start + date.len();
+                self.structural_edit(Edit::replace(command, date), end, window, cx);
+            }
+            SlashAction::Convert(target) => {
+                if let Err(err) = self.doc.edit(Edit::delete(command.clone())) {
+                    log::error!("edit rejected: {err}");
+                    return;
+                }
+                self.focused = None;
+                self.after_doc_change(cx);
+                self.convert_at(command.start, target, true, window, cx);
+            }
+        }
+    }
+
+    /// 把 `offset` 所在的单位转成 `target`；那里没有块时写出骨架。`coalesce` 时并入上一个撤销组。
+    fn convert_at(
+        &mut self,
+        offset: usize,
+        target: BlockType,
+        coalesce: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 落在单位上、或只隔着同一行的空白（"hello |" 里的光标）都算那个单位
+        let hit = unit_at(&self.units, offset).or_else(|| {
+            let ix = self.units.iter().rposition(|u| u.range.end <= offset)?;
+            let gap = self.doc.slice(self.units[ix].range.end..offset).to_string();
+            gap.chars().all(|c| c == ' ' || c == '\t').then_some(ix)
+        });
+        let plan = match hit {
+            Some(ix) => ops::convert(&self.doc, &self.units, ix, target),
+            None => Some(ops::insert_block(offset, target)),
+        };
+        let Some(plan) = plan else {
+            self.focus_at(offset, None, window, cx);
+            return;
+        };
+        let result = if coalesce { self.doc.edit_coalescing(plan.edit) } else { self.doc.edit(plan.edit) };
+        if let Err(err) = result {
+            log::error!("edit rejected: {err}");
+            return;
+        }
+        self.focused = None;
+        self.after_doc_change(cx);
+        self.focus_at(plan.focus_offset, None, window, cx);
+    }
+
+    /// `⌘⌥0–8`：转换当前块类型。
+    fn on_convert_block(&mut self, action: &ConvertBlock, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = BlockType::from_shortcut(action.0) else { return };
+        let Some(f) = self.focused.as_ref() else {
+            cx.propagate();
+            return;
+        };
+        let offset = f.range.start;
+        self.slash = None;
+        self.convert_at(offset, target, false, window, cx);
+    }
+
+    fn on_menu_confirm(&mut self, _: &MenuConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.slash.is_some() {
+            self.slash_confirm(None, window, cx);
+        } else {
+            cx.propagate();
+        }
     }
 
     /// 文本已改：重解析、刷新单位、标脏、排队保存。
@@ -383,8 +643,18 @@ impl Editor {
     /// ⏎：段落末新建段落、段落中拆块；列表项续行、空项退出列表（6、7.3）。
     /// 代码块等多行单位 propagate，让文本控件自己插入换行。
     fn on_split_block(&mut self, _: &SplitBlock, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((_, cursor)) = self.textarea_text_and_cursor(cx) else { cx.propagate(); return };
-        let Some(f) = self.focused.as_ref() else { cx.propagate(); return };
+        if self.slash.is_some() {
+            self.slash_confirm(None, window, cx);
+            return;
+        }
+        let Some((_, cursor)) = self.textarea_text_and_cursor(cx) else {
+            cx.propagate();
+            return;
+        };
+        let Some(f) = self.focused.as_ref() else {
+            cx.propagate();
+            return;
+        };
         if f.enter_newline {
             cx.propagate();
             return;
@@ -426,6 +696,10 @@ impl Editor {
     // ---- ↑ / ↓ 跨块 ----
 
     fn on_block_up(&mut self, _: &BlockUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.slash.is_some() {
+            self.slash_move(-1, cx);
+            return;
+        }
         let Some((text, cursor)) = self.textarea_text_and_cursor(cx) else {
             cx.propagate();
             return;
@@ -443,6 +717,10 @@ impl Editor {
     }
 
     fn on_block_down(&mut self, _: &BlockDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.slash.is_some() {
+            self.slash_move(1, cx);
+            return;
+        }
         let Some((text, cursor)) = self.textarea_text_and_cursor(cx) else {
             cx.propagate();
             return;
@@ -493,12 +771,20 @@ impl Editor {
     // ---- 撤销 / 重做 ----
 
     fn on_undo(&mut self, _: &DocUndo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            cx.propagate();
+            return;
+        }
         if let Some(affected) = self.doc.undo() {
             self.after_history(affected, window, cx);
         }
     }
 
     fn on_redo(&mut self, _: &DocRedo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            cx.propagate();
+            return;
+        }
         if let Some(affected) = self.doc.redo() {
             self.after_history(affected, window, cx);
         }
@@ -576,7 +862,9 @@ impl Editor {
         }
         self.save_task = None;
         let conflict = match self.external_change() {
-            Some((disk, _)) => Some(self.vault.write_bytes(&self.conflict_path(), &disk).map(|_| self.conflict_path())?),
+            Some((disk, _)) => {
+                Some(self.vault.write_bytes(&self.conflict_path(), &disk).map(|_| self.conflict_path())?)
+            }
             None => None,
         };
         let stamp = self.vault.write_bytes(&self.path, &self.doc.to_bytes())?;
@@ -653,7 +941,11 @@ impl Editor {
         let conflict = self.conflict_path();
         match self.vault.write_bytes(&conflict, disk) {
             Ok(_) => {
-                log::warn!("{}: changed on disk while dirty; disk version saved as {}", self.path.as_str(), conflict.as_str());
+                log::warn!(
+                    "{}: changed on disk while dirty; disk version saved as {}",
+                    self.path.as_str(),
+                    conflict.as_str()
+                );
                 // 记下磁盘当前指纹：接下来的写盘不该再把同一份外部修改当成新冲突
                 self.stamp = stamp;
                 cx.emit(EditorEvent::Conflict(conflict));
@@ -667,6 +959,28 @@ impl Editor {
     }
 
     // ---- 渲染 ----
+
+    /// 文档标题（5.1）：浏览时是大字，点击变成单行输入框。
+    fn render_title(&self, cx: &mut Context<Self>) -> AnyElement {
+        let base = div()
+            .pb_4()
+            .mb_2()
+            .text_size(px(28.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .line_height(relative(1.3));
+        match &self.title_edit {
+            Some(edit) => base.w_full().child(Input::new(&edit.input)).into_any_element(),
+            None => base
+                .id("title")
+                .cursor_text()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.start_title_edit(window, cx)),
+                )
+                .child(self.title())
+                .into_any_element(),
+        }
+    }
 
     fn text_view_style(&self, cx: &App) -> TextViewStyle {
         let theme = cx.theme();
@@ -719,7 +1033,74 @@ impl Editor {
             }
             _ => {}
         }
+        if self.slash.is_some() {
+            el = el.child(self.render_slash_menu(cx));
+        }
         el.into_any_element()
+    }
+
+    /// `/` 菜单浮层：锚在光标下一行，越出窗口时贴边。
+    fn render_slash_menu(&self, cx: &Context<Self>) -> AnyElement {
+        let (Some(menu), Some(f)) = (self.slash.as_ref(), self.focused.as_ref()) else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme();
+        let ta = f.textarea.read(cx);
+        let position = match ta.cursor_layout() {
+            Some((bounds, line_height)) => bounds.origin + point(px(0.), line_height + px(4.)),
+            None => {
+                let b = ta.input_bounds();
+                b.origin + point(px(0.), b.size.height + px(4.))
+            }
+        };
+        let rows: Vec<AnyElement> = menu
+            .matches
+            .iter()
+            .enumerate()
+            .map(|(i, &item_ix)| {
+                let item = &slash::ITEMS[item_ix];
+                let active = i == menu.selected;
+                h_flex()
+                    .id(("slash-item", i))
+                    .w_full()
+                    .h(px(28.))
+                    .px_2()
+                    .rounded(px(4.))
+                    .items_center()
+                    .justify_between()
+                    .when(active, |el| el.bg(theme.list_active))
+                    .hover(|el| el.bg(theme.list_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.slash_confirm(Some(i), window, cx);
+                        }),
+                    )
+                    .child(div().text_size(px(13.)).child(item.label))
+                    .child(div().text_size(px(11.)).text_color(theme.muted_foreground).child(item.hint))
+                    .into_any_element()
+            })
+            .collect();
+        deferred(
+            anchored().position(position).snap_to_window_with_margin(px(8.)).child(
+                v_flex()
+                    .id("slash-menu")
+                    .occlude()
+                    .w(px(240.))
+                    .max_h(px(320.))
+                    .overflow_y_scroll()
+                    .p_1()
+                    .gap(px(1.))
+                    .bg(theme.popover)
+                    .text_color(theme.popover_foreground)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(8.))
+                    .shadow_lg()
+                    .children(rows),
+            ),
+        )
+        .into_any_element()
     }
 
     fn render_blocks(&self, blocks: &[Block], cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -864,10 +1245,7 @@ impl Editor {
                 let text = if text.is_empty() { SharedString::from("\u{200b}") } else { text };
                 // TextView 的解析状态按元素 id 缓存；带上编辑器实体 id，切换笔记后不会复用上一篇的状态
                 let view_id = SharedString::from(format!("blk-{}-{}", cx.entity_id(), id.0));
-                TextView::markdown(view_id, text)
-                    .style(self.text_view_style(cx))
-                    .w_full()
-                    .into_any_element()
+                TextView::markdown(view_id, text).style(self.text_view_style(cx)).w_full().into_any_element()
             }
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });
@@ -909,6 +1287,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_backspace))
+            .on_action(cx.listener(Self::on_convert_block))
+            .on_action(cx.listener(Self::on_menu_confirm))
             .on_action(cx.listener(|this, _: &Escape, window, cx| this.blur_to_browse(window, cx)))
             .on_action(cx.listener(|this, _: &BlurEditor, window, cx| this.blur_to_browse(window, cx)))
             .size_full()
@@ -924,15 +1304,7 @@ impl Render for Editor {
                     .text_size(px(BODY_FONT_SIZE))
                     .line_height(relative(BODY_LINE_HEIGHT))
                     .text_color(foreground)
-                    .child(
-                        div()
-                            .pb_4()
-                            .mb_2()
-                            .text_size(px(28.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .line_height(relative(1.3))
-                            .child(self.title().to_owned()),
-                    )
+                    .child(self.render_title(cx))
                     .child(v_flex().w_full().gap(px(8.)).children(blocks))
                     .when(empty, |el| el.child(div().text_color(muted).child("点击这里开始写，或按 ⏎")))
                     .child(

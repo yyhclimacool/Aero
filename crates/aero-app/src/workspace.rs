@@ -187,6 +187,7 @@ impl Workspace {
                         );
                     }
                     EditorEvent::Conflict(copy) => this.notify_conflict(copy, window, cx),
+                    EditorEvent::RenameRequested(name) => this.rename_current(name.clone(), window, cx),
                 });
                 open._subscriptions.truncate(1);
                 open._subscriptions.push(sub);
@@ -226,9 +227,145 @@ impl Workspace {
         }
     }
 
+    /// ⌘⇧D：今日日记 `daily/YYYY-MM-DD.md`，不存在则按模板创建（3.4）。
+    fn on_open_daily(&mut self, _: &OpenDaily, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        let vault = open.vault.clone();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let path = VaultPath::new(&format!("daily/{today}.md")).expect("date is a valid file name");
+        let created = if vault.exists(&path) {
+            false
+        } else {
+            let doc = aero_core::Document::from_text(&format!("# {today}\n\n"));
+            if let Err(err) = vault.write(&path, &doc) {
+                window.push_notification(Notification::error(format!("无法创建今日日记：{err}")), cx);
+                return;
+            }
+            open.tree.update(cx, |t, cx| {
+                t.rescan();
+                cx.notify();
+            });
+            true
+        };
+        self.open_note(path, window, cx);
+        if created && let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
+            editor.update(cx, |e, cx| e.start_writing(window, cx));
+        }
+    }
+
     fn on_save_now(&mut self, _: &SaveNow, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
             editor.update(cx, |e, cx| e.save_now(cx));
+        }
+    }
+
+    // ---- 删除 / 定位（4.1） ----
+
+    /// ⌘⌫ / 文件菜单：树里选中的笔记，没有则是打开中的那篇。
+    fn on_delete_note(&mut self, _: &DeleteNote, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        let target = open
+            .tree
+            .read(cx)
+            .selected()
+            .cloned()
+            .or_else(|| open.editor.as_ref().map(|e| e.read(cx).path().clone()));
+        if let Some(path) = target {
+            self.trash_note(&path, window, cx);
+        }
+    }
+
+    fn on_trash_note(&mut self, action: &TrashNote, window: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(path) = VaultPath::new(&action.0) {
+            self.trash_note(&path, window, cx);
+        }
+    }
+
+    /// 移到系统废纸篓。打开中的笔记被删时先丢掉编辑器——它排队中的自动保存会把文件写回来。
+    fn trash_note(&mut self, path: &VaultPath, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_mut() else { return };
+        let was_open = open.editor.as_ref().is_some_and(|e| e.read(cx).path() == path);
+        if was_open {
+            open.editor = None;
+            open._subscriptions.truncate(1);
+        }
+        let fs_path = open.vault.fs_path(path);
+        match crate::trash::move_to_trash(&fs_path) {
+            Ok(()) => {
+                open.tree.update(cx, |t, cx| {
+                    t.rescan();
+                    if t.selected() == Some(path) {
+                        t.select(None, cx);
+                    }
+                    cx.notify();
+                });
+                window.push_notification(
+                    Notification::info(format!("已移到废纸篓：{}", path.as_str())).title("Aero"),
+                    cx,
+                );
+                if was_open {
+                    self.focus_handle.focus(window, cx);
+                }
+            }
+            Err(err) => {
+                window.push_notification(
+                    Notification::error(format!("无法移到废纸篓：{err}")).title("Aero"),
+                    cx,
+                );
+                // 文件还在：重新打开
+                if was_open {
+                    self.open_note(path.clone(), window, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_reveal_in_finder(&mut self, action: &RevealInFinder, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        if let Ok(path) = VaultPath::new(&action.0) {
+            cx.reveal_path(&open.vault.fs_path(&path));
+        }
+    }
+
+    fn on_copy_note_path(&mut self, action: &CopyNotePath, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        if let Ok(path) = VaultPath::new(&action.0) {
+            let fs = open.vault.fs_path(&path).display().to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(fs));
+        }
+    }
+
+    /// 标题处改了名字：在同一目录下重命名文件（5.1）。链接同步更新是 M2 的事。
+    fn rename_current(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        let Some(editor) = open.editor.clone() else { return };
+        let old = editor.read(cx).path().clone();
+        let target = match note_path_in(old.parent(), &name) {
+            Ok(p) => p,
+            Err(msg) => {
+                window.push_notification(Notification::error(msg).title("重命名"), cx);
+                return;
+            }
+        };
+        if open.vault.exists(&target) {
+            window.push_notification(
+                Notification::error(format!("已有同名笔记：{}", target.as_str())).title("重命名"),
+                cx,
+            );
+            return;
+        }
+        match open.vault.rename(&old, &target) {
+            Ok(()) => {
+                editor.update(cx, |e, cx| e.set_path(target.clone(), cx));
+                open.tree.update(cx, |t, cx| {
+                    t.rescan();
+                    t.select(Some(target), cx);
+                });
+                cx.notify();
+            }
+            Err(err) => window
+                .push_notification(Notification::error(format!("无法重命名：{err}")).title("重命名"), cx),
         }
     }
 
@@ -252,7 +389,9 @@ impl Workspace {
         match result {
             Ok(Some(copy)) => self.notify_conflict(&copy, window, cx),
             Ok(None) => {}
-            Err(err) => window.push_notification(Notification::error(format!("保存失败：{err}")).title("Aero"), cx),
+            Err(err) => {
+                window.push_notification(Notification::error(format!("保存失败：{err}")).title("Aero"), cx)
+            }
         }
     }
 
@@ -265,8 +404,11 @@ impl Workspace {
             });
         }
         window.push_notification(
-            Notification::warning(format!("这篇笔记在磁盘上被别的程序改过。磁盘版本已另存为 {}，当前内容照常保存。", copy.as_str()))
-                .title("外部修改"),
+            Notification::warning(format!(
+                "这篇笔记在磁盘上被别的程序改过。磁盘版本已另存为 {}，当前内容照常保存。",
+                copy.as_str()
+            ))
+            .title("外部修改"),
             cx,
         );
     }
@@ -587,6 +729,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_new_vault))
             .on_action(cx.listener(Self::on_close_vault))
             .on_action(cx.listener(Self::on_new_note))
+            .on_action(cx.listener(Self::on_open_daily))
+            .on_action(cx.listener(Self::on_delete_note))
+            .on_action(cx.listener(Self::on_trash_note))
+            .on_action(cx.listener(Self::on_reveal_in_finder))
+            .on_action(cx.listener(Self::on_copy_note_path))
             .on_action(cx.listener(Self::on_save_now))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_panel))
@@ -599,6 +746,23 @@ impl Render for Workspace {
 }
 
 /// 最近修改的笔记，作为打开 vault 时的默认文档。
+/// `dir/<name>.md`；名字不能为空、不能含路径分隔符或以 `.` 开头。
+fn note_path_in(dir: &str, name: &str) -> Result<VaultPath, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("名字不能为空".into());
+    }
+    if name.contains(['/', '\\']) {
+        return Err("名字里不能有 / 或 \\".into());
+    }
+    if name.starts_with('.') {
+        return Err("名字不能以 . 开头".into());
+    }
+    let file = format!("{name}.md");
+    let s = if dir.is_empty() { file } else { format!("{dir}/{file}") };
+    VaultPath::new(&s).map_err(|e| e.to_string())
+}
+
 fn most_recent_note(vault: &Vault) -> Option<VaultPath> {
     let notes = vault.notes().ok()?;
     notes

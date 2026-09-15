@@ -104,6 +104,8 @@ pub enum VaultError {
     Utf8 { path: PathBuf },
     #[error("walk: {0}")]
     Walk(String),
+    #[error("{0} already exists")]
+    AlreadyExists(String),
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> VaultError + '_ {
@@ -239,6 +241,34 @@ impl Vault {
     pub fn write(&self, p: &VaultPath, doc: &Document) -> Result<FileStamp, VaultError> {
         self.write_bytes(p, &doc.to_bytes())
     }
+
+    /// 重命名 / 移动一篇笔记；`<note>.assets/` 存在时一起搬（5.4）。目标已存在时拒绝，绝不覆盖。
+    /// 链接的同步更新是 M2 的事（方案 11 节），这里只动文件。
+    pub fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<(), VaultError> {
+        if from == to {
+            return Ok(());
+        }
+        let (src, dst) = (self.fs_path(from), self.fs_path(to));
+        if dst.exists() {
+            return Err(VaultError::AlreadyExists(to.as_str().to_owned()));
+        }
+        if let Some(dir) = dst.parent() {
+            fs::create_dir_all(dir).map_err(io_err(dir))?;
+        }
+        fs::rename(&src, &dst).map_err(io_err(&src))?;
+        if let (Some(a), Some(b)) = (from.assets_dir(), to.assets_dir()) {
+            let (a, b) = (self.fs_path(&a), self.fs_path(&b));
+            if a.is_dir() && !b.exists() {
+                fs::rename(&a, &b).map_err(io_err(&a))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 笔记是否已存在（用于重命名前的校验与生成不冲突的名字）。
+    pub fn exists(&self, p: &VaultPath) -> bool {
+        self.fs_path(p).exists()
+    }
 }
 
 /// 写临时文件、fsync、rename 覆盖。目标已存在时沿用其权限位。
@@ -325,6 +355,33 @@ mod tests {
         let q = VaultPath::new("new/dir/note.md").unwrap();
         v.write_bytes(&q, b"x\n").unwrap();
         assert!(v.notes().unwrap().contains(&q));
+    }
+
+    #[test]
+    fn rename_moves_note_and_assets_but_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("a.assets")).unwrap();
+        fs::write(root.join("a.md"), "A\n").unwrap();
+        fs::write(root.join("a.assets/img.png"), b"png").unwrap();
+        fs::write(root.join("taken.md"), "T\n").unwrap();
+        let v = Vault::open(root).unwrap();
+        let a = VaultPath::new("a.md").unwrap();
+
+        // 目标已存在：拒绝，且什么都没动
+        let taken = VaultPath::new("taken.md").unwrap();
+        assert!(matches!(v.rename(&a, &taken), Err(VaultError::AlreadyExists(_))));
+        assert!(root.join("a.md").is_file());
+
+        // 移到子目录：目录自动创建，附件目录跟着走
+        let b = VaultPath::new("sub/b.md").unwrap();
+        v.rename(&a, &b).unwrap();
+        assert!(!root.join("a.md").exists());
+        assert!(!root.join("a.assets").exists());
+        assert_eq!(fs::read_to_string(root.join("sub/b.md")).unwrap(), "A\n");
+        assert!(root.join("sub/b.assets/img.png").is_file());
+        assert!(v.exists(&b));
+        assert!(!v.exists(&a));
     }
 
     #[test]

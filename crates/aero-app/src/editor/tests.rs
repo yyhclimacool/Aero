@@ -156,6 +156,172 @@ fn list_items_continue_and_exit(cx: &mut TestAppContext) {
     assert_eq!(text(&editor, cx), "- one\n- two!\n\npara\n");
 }
 
+/// `/` 菜单（7.1）：块首输入 `/` 打开、继续输入过滤、↑↓ 选择、⏎ 确认 = 转换当前块并删掉命令；
+/// Esc 只关菜单、保留字符；空段落上确认写出骨架；一次 ⌘Z 撤掉整个动作。
+#[gpui_kit::test]
+fn slash_menu_converts_block(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "hello\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let menu_open = |cx: &mut VisualTestContext| cx.update(|_, cx| editor.read(cx).slash.is_some());
+    let selected_label = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let m = editor.read(cx).slash.as_ref().expect("menu open");
+            super::slash::ITEMS[m.matches[m.selected]].label
+        })
+    };
+
+    // 词中间的 `/` 不触发；空格后触发
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("/");
+    assert!(!menu_open(cx));
+    cx.simulate_keystrokes("backspace");
+    cx.simulate_input(" /");
+    assert!(menu_open(cx));
+    assert_eq!(selected_label(cx), "文本");
+    // 过滤 + ↓ 选择
+    cx.simulate_input("h");
+    assert_eq!(selected_label(cx), "标题 1");
+    cx.simulate_keystrokes("down");
+    assert_eq!(selected_label(cx), "标题 2");
+    // ⏎ 确认：命令删掉，块变成二级标题
+    cx.simulate_keystrokes("enter");
+    assert!(!menu_open(cx));
+    assert_eq!(text(&editor, cx), "## hello\n");
+    // 焦点仍在块尾，可以继续输入
+    cx.simulate_input("!");
+    assert_eq!(text(&editor, cx), "## hello!\n");
+    // 一次撤销回到转换前（命令删除与转换合成一组）
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "## hello\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "hello /h\n");
+    cx.simulate_keystrokes("cmd-shift-z");
+    assert_eq!(text(&editor, cx), "## hello\n");
+
+    // Esc 只关菜单、保留字符
+    cx.simulate_input(" /co");
+    assert!(menu_open(cx));
+    assert_eq!(selected_label(cx), "代码块");
+    cx.simulate_keystrokes("escape");
+    assert!(!menu_open(cx));
+    assert_eq!(text(&editor, cx), "## hello /co\n");
+    cx.update(|_, cx| assert!(editor.read(cx).focused.is_some()));
+    cx.simulate_keystrokes("backspace backspace backspace backspace");
+    assert_eq!(text(&editor, cx), "## hello\n");
+
+    // 空段落：⏎ 新段落后 `/任务` Tab 确认，写出 `- [ ] ` 并在其后继续输入
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("/任务");
+    assert_eq!(selected_label(cx), "任务");
+    cx.simulate_keystrokes("tab");
+    assert_eq!(text(&editor, cx), "## hello\n\n- [ ] \n");
+    cx.simulate_input("buy milk");
+    assert_eq!(text(&editor, cx), "## hello\n\n- [ ] buy milk\n");
+
+    // 没有匹配时菜单关闭
+    cx.simulate_input(" /zzz");
+    assert!(!menu_open(cx));
+    cx.simulate_keystrokes("backspace backspace backspace backspace backspace");
+    assert_eq!(text(&editor, cx), "## hello\n\n- [ ] buy milk\n");
+}
+
+/// `⌘⌥0–8` 直接转换当前块。
+#[gpui_kit::test]
+fn convert_shortcuts(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "a\n\nb\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 1, cx);
+    cx.simulate_keystrokes("cmd-alt-4");
+    assert_eq!(text(&editor, cx), "a\n\n- b\n");
+    cx.simulate_keystrokes("cmd-alt-6");
+    assert_eq!(text(&editor, cx), "a\n\n- [ ] b\n");
+    cx.simulate_keystrokes("cmd-alt-1");
+    assert_eq!(text(&editor, cx), "a\n\n# b\n");
+    cx.simulate_keystrokes("cmd-alt-8");
+    assert_eq!(text(&editor, cx), "a\n\n```\nb\n```\n");
+    // 代码块里光标在正文末：继续输入进正文
+    cx.simulate_input("2");
+    assert_eq!(text(&editor, cx), "a\n\n```\nb2\n```\n");
+    cx.simulate_keystrokes("cmd-alt-0");
+    assert_eq!(text(&editor, cx), "a\n\nb2\n");
+    cx.simulate_keystrokes("cmd-alt-7");
+    assert_eq!(text(&editor, cx), "a\n\n> b2\n");
+}
+
+/// 标题编辑（5.1）：没有 front matter 时提交 = 请工作区重命名；有 `title:` 时直接改文档。
+#[gpui_kit::test]
+fn title_edit_renames_or_edits_front_matter(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let (_dir, _vault, _path, editor) = open(cx, "body\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let renames: Rc<RefCell<Vec<String>>> = Rc::default();
+    let sink = renames.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&editor, move |_, ev, _| {
+            if let super::EditorEvent::RenameRequested(name) = ev {
+                sink.borrow_mut().push(name.clone());
+            }
+        })
+        .detach();
+    });
+
+    // 文件名即标题；全选后输入替换，⏎ 提交
+    cx.update(|_, cx| assert_eq!(editor.read(cx).title(), "a"));
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_input("新名字");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(renames.borrow().as_slice(), ["新名字".to_string()]);
+    cx.update(|_, cx| assert!(editor.read(cx).title_edit.is_none()));
+    // 文档没被动
+    assert_eq!(text(&editor, cx), "body\n");
+
+    // Esc 取消：不发事件
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_input("x");
+    cx.simulate_keystrokes("escape");
+    assert_eq!(renames.borrow().len(), 1);
+}
+
+/// 有 front matter `title:` 时，标题提交改的是文档里的值（必要时加引号），不重命名文件。
+#[gpui_kit::test]
+fn title_edit_with_front_matter_edits_document(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "---\ntitle: 旧题\ntags: [x]\n---\n\nbody\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).title(), "旧题"));
+
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_input("新题");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "---\ntitle: 新题\ntags: [x]\n---\n\nbody\n");
+    cx.update(|_, cx| assert_eq!(editor.read(cx).title(), "新题"));
+
+    // 含冒号的值加引号；再改回去时引号一并替换
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_input("a: b");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "---\ntitle: \"a: b\"\ntags: [x]\n---\n\nbody\n");
+    cx.update(|_, cx| assert_eq!(editor.read(cx).title(), "a: b"));
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
+    cx.run_until_parked();
+    cx.simulate_input("plain");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "---\ntitle: plain\ntags: [x]\n---\n\nbody\n");
+
+    // 改标题也走自动保存
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
+        "---\ntitle: plain\ntags: [x]\n---\n\nbody\n"
+    );
+}
+
 /// 点击浏览态的块：先进入编辑态（光标在块尾），两帧后把点击重放给控件，光标落到点击处。
 #[gpui_kit::test]
 fn click_positions_cursor_in_block(cx: &mut TestAppContext) {
@@ -253,9 +419,9 @@ fn external_change_while_dirty_writes_conflict_copy(cx: &mut TestAppContext) {
     cx.executor().advance_clock(Duration::from_millis(600));
     cx.run_until_parked();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "base!?\n");
-    let n = std::fs::read_dir(dir.path()).unwrap().filter(|e| {
-        e.as_ref().is_ok_and(|e| e.file_name().to_string_lossy().starts_with("a.conflict-"))
-    });
+    let n = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter(|e| e.as_ref().is_ok_and(|e| e.file_name().to_string_lossy().starts_with("a.conflict-")));
     assert_eq!(n.count(), 1);
 }
 

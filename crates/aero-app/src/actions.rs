@@ -17,12 +17,29 @@ actions!(
         /// 回到首次运行页
         CloseVault,
         NewNote,
+        /// 今日日记 `daily/YYYY-MM-DD.md`，不存在则创建（3.4）
+        OpenDaily,
         ToggleSidebar,
         TogglePanel,
         /// 手动立即保存
         SaveNow,
+        /// 把文件树里选中的笔记（没有则是打开中的笔记）移到废纸篓
+        DeleteNote,
     ]
 );
+
+/// 文件树右键菜单：对某一篇笔记（vault 相对路径）的操作
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = aero, no_json)]
+pub struct TrashNote(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = aero, no_json)]
+pub struct RevealInFinder(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = aero, no_json)]
+pub struct CopyNotePath(pub String);
 
 actions!(
     editor,
@@ -40,15 +57,24 @@ actions!(
         DocRedo,
         /// 编辑态 → 浏览态
         BlurEditor,
+        /// `/` 菜单开着时 Tab 确认；否则交给文本控件
+        MenuConfirm,
     ]
 );
+
+/// `⌘⌥0–8` 转换块类型（`ui_design.md` 6 / 7.1）
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = editor, no_json)]
+pub struct ConvertBlock(pub u8);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-o", OpenVault, None),
         KeyBinding::new("cmd-n", NewNote, None),
+        KeyBinding::new("cmd-shift-d", OpenDaily, None),
         KeyBinding::new("cmd-s", SaveNow, None),
+        KeyBinding::new("cmd-backspace", DeleteNote, Some("FileTree")),
         KeyBinding::new("cmd-\\", ToggleSidebar, None),
         KeyBinding::new("cmd-shift-\\", TogglePanel, None),
         KeyBinding::new("cmd-|", TogglePanel, None),
@@ -56,12 +82,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("up", BlockUp, Some("Input")),
         KeyBinding::new("down", BlockDown, Some("Input")),
         KeyBinding::new("enter", SplitBlock, Some("Input")),
+        KeyBinding::new("tab", MenuConfirm, Some("Input")),
         KeyBinding::new("cmd-z", DocUndo, Some("Input")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Input")),
         // 浏览态（编辑器容器持有焦点）下的撤销 / 重做
         KeyBinding::new("cmd-z", DocUndo, Some("Editor")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Editor")),
     ]);
+    cx.bind_keys((0..=8u8).map(|n| KeyBinding::new(&format!("cmd-alt-{n}"), ConvertBlock(n), Some("Input"))));
 
     // 窗口里没人处理时的兜底
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
@@ -74,7 +102,10 @@ pub fn init(cx: &mut App) {
             MenuItem::action("关闭 Vault", CloseVault),
             MenuItem::separator(),
             MenuItem::action("新建笔记", NewNote),
+            MenuItem::action("今日日记", OpenDaily),
             MenuItem::action("保存", SaveNow),
+            MenuItem::separator(),
+            MenuItem::action("移到废纸篓", DeleteNote),
         ]),
         Menu::new("编辑").items(vec![
             MenuItem::action("撤销", DocUndo),

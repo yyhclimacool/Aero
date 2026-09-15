@@ -25,7 +25,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # GPUI 当前没有设置 macOS 应用图标的 API；复用它已依赖的 AppKit 绑定。
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"] }
+# NSData：内嵌图标；NSFileManager/NSURL/NSError/NSString：移到废纸篓（trash.rs）
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData", "NSFileManager", "NSURL", "NSError", "NSString"] }
 
 [dev-dependencies]
 # 无头 GPUI 测试（TestAppContext）：在测试里真正渲染编辑器并模拟按键

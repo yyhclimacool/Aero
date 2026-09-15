@@ -12,6 +12,7 @@ mod branding;
 mod editor;
 mod file_tree;
 mod paths;
+mod trash;
 mod workspace;
 
 use std::path::PathBuf;

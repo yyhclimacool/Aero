@@ -160,6 +160,152 @@ pub fn append_paragraph(doc: &Document) -> (Option<Edit>, usize) {
     if insert.is_empty() { (None, len) } else { (Some(Edit::insert(len, insert)), len + insert.len()) }
 }
 
+/// `/` 菜单与 `⌘⌥0–8` 能切换到的块类型（`ui_design.md` 7.1 的最小集合）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockType {
+    Text,
+    Heading(u8),
+    Bullet,
+    Numbered,
+    Task,
+    Quote,
+    Code,
+    Divider,
+}
+
+impl BlockType {
+    /// `⌘⌥0–8` 的顺序：0 文本、1–3 标题、4 无序、5 有序、6 任务、7 引用、8 代码块。
+    pub fn from_shortcut(n: u8) -> Option<Self> {
+        Some(match n {
+            0 => Self::Text,
+            1..=3 => Self::Heading(n),
+            4 => Self::Bullet,
+            5 => Self::Numbered,
+            6 => Self::Task,
+            7 => Self::Quote,
+            8 => Self::Code,
+            _ => return None,
+        })
+    }
+}
+
+/// 单位当前的块类型；不属于上面任何一种（表格、数学块…）时为 `None`。
+pub fn block_type(unit: &Unit) -> Option<BlockType> {
+    Some(match (&unit.kind, unit.list.as_ref()) {
+        // 空列表项自身是单位（kind 是 ListItem）
+        (BlockKind::Paragraph | BlockKind::ListItem { .. }, Some(ctx)) if ctx.task => BlockType::Task,
+        (BlockKind::Paragraph | BlockKind::ListItem { .. }, Some(ctx)) if ctx.ordered.is_some() => {
+            BlockType::Numbered
+        }
+        (BlockKind::Paragraph | BlockKind::ListItem { .. }, Some(_)) => BlockType::Bullet,
+        (BlockKind::Paragraph, None) => BlockType::Text,
+        (BlockKind::Heading { level }, _) => BlockType::Heading(*level),
+        (BlockKind::BlockQuote, _) => BlockType::Quote,
+        (BlockKind::CodeFence { .. } | BlockKind::CodeBlock, _) => BlockType::Code,
+        (BlockKind::ThematicBreak, _) => BlockType::Divider,
+        _ => return None,
+    })
+}
+
+/// 把单位 `ix` 转成 `target`（7.1："在非空块上使用 `/` 菜单选择块类型 = 转换当前块"）。
+/// 只改源码前缀：标题去 `#`、列表项去标记、引用去 `> `、代码块去围栏，再套上目标前缀。
+/// 分割线特殊：空块直接变成 `---`；非空块在其后插入 `---` 与一个新段落，焦点落到新段落。
+/// 已经是目标类型、或单位不是文本类时返回 `None`。
+pub fn convert(doc: &Document, units: &[Unit], ix: usize, target: BlockType) -> Option<Plan> {
+    let unit = &units[ix];
+    let current = block_type(unit)?;
+    if current == target {
+        return None;
+    }
+    let doc_text = doc.to_string();
+    // 替换区间的起点：列表项是标记所在行的行首（吃掉缩进与标记），其余是单位起点
+    let start = match &unit.list {
+        Some(ctx) => line_start(&doc_text, ctx.item_range.start),
+        None => unit.range.start,
+    };
+    let src = &doc_text[unit.range.clone()];
+    let content: String = match current {
+        BlockType::Heading(_) => src[heading_prefix_len(src)..].to_owned(),
+        BlockType::Quote => return None, // 引用整体是源码单位，转换留给以后
+        BlockType::Code if matches!(unit.kind, BlockKind::CodeBlock) => {
+            src.lines().map(|l| l.strip_prefix("    ").unwrap_or(l)).collect::<Vec<_>>().join("\n")
+        }
+        BlockType::Code => strip_fence(src).to_owned(),
+        BlockType::Divider => String::new(),
+        _ => src.to_owned(),
+    };
+    let content = content.trim_end_matches('\n').to_owned();
+
+    if target == BlockType::Divider {
+        return Some(if content.trim().is_empty() {
+            Plan { focus_offset: start + 3, edit: Edit::replace(start..unit.range.end, "---") }
+        } else {
+            let at = unit.range.end;
+            Plan { focus_offset: at + "\n\n---\n\n".len(), edit: Edit::insert(at, "\n\n---\n\n") }
+        });
+    }
+
+    let (text, cursor) = match target {
+        BlockType::Text => (content.clone(), content.len()),
+        BlockType::Heading(n) => {
+            let t = format!("{} {content}", "#".repeat(n as usize));
+            (t.clone(), t.len())
+        }
+        BlockType::Bullet => (format!("- {content}"), 2 + content.len()),
+        BlockType::Numbered => (format!("1. {content}"), 3 + content.len()),
+        BlockType::Task => (format!("- [ ] {content}"), 6 + content.len()),
+        BlockType::Quote => {
+            let t: String = if content.is_empty() {
+                "> ".to_owned()
+            } else {
+                content.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
+            };
+            (t.clone(), t.len())
+        }
+        BlockType::Code => (format!("```\n{content}\n```"), 4 + content.len()),
+        BlockType::Divider => unreachable!(),
+    };
+    Some(Plan { focus_offset: start + cursor, edit: Edit::replace(start..unit.range.end, text) })
+}
+
+/// 在没有块的空位 `at` 直接写出目标类型的骨架（`/` 菜单用在刚 ⏎ 出来的空段落上）。
+pub fn insert_block(at: usize, target: BlockType) -> Plan {
+    let (text, cursor) = match target {
+        BlockType::Text => (String::new(), 0),
+        BlockType::Heading(n) => {
+            let t = format!("{} ", "#".repeat(n as usize));
+            let l = t.len();
+            (t, l)
+        }
+        BlockType::Bullet => ("- ".to_owned(), 2),
+        BlockType::Numbered => ("1. ".to_owned(), 3),
+        BlockType::Task => ("- [ ] ".to_owned(), 6),
+        BlockType::Quote => ("> ".to_owned(), 2),
+        BlockType::Code => ("```\n\n```".to_owned(), 4),
+        BlockType::Divider => ("---\n\n".to_owned(), 5),
+    };
+    Plan { focus_offset: at + cursor, edit: Edit::insert(at, text) }
+}
+
+/// 去掉围栏代码块的首尾围栏行，留下正文（不含末尾换行）。缩进代码块则去掉每行 4 空格。
+fn strip_fence(src: &str) -> &str {
+    let first_nl = match src.find('\n') {
+        Some(i) => i,
+        None => return "",
+    };
+    let body = &src[first_nl + 1..];
+    match body.trim_end_matches('\n').rfind('\n') {
+        Some(last_nl)
+            if body[last_nl + 1..].trim_start().starts_with("```")
+                || body[last_nl + 1..].trim_start().starts_with("~~~") =>
+        {
+            &body[..last_nl]
+        }
+        _ if body.trim().starts_with("```") || body.trim().starts_with("~~~") => "",
+        _ => body,
+    }
+}
+
 /// `- `、`3) `、`- [x] `（可带缩进）是否只是列表标记。
 pub fn is_list_marker(s: &str) -> bool {
     let s = s.trim_start_matches([' ', '\t']);
@@ -203,6 +349,90 @@ mod tests {
         assert!(is_list_marker("- [ ] "));
         assert!(!is_list_marker("- a "));
         assert!(!is_list_marker(""));
+    }
+
+    #[test]
+    fn convert_between_block_types() {
+        // 段落 → 二级标题 → 无序列表 → 任务 → 有序 → 文本
+        let mut doc = Document::from_text("intro\n\nhello\n\nend\n");
+        let us = units(&doc);
+        assert_eq!(block_type(&us[1]), Some(BlockType::Text));
+        let plan = convert(&doc, &us, 1, BlockType::Heading(2)).unwrap();
+        let (text, focused) = apply(&mut doc, plan);
+        assert_eq!(text, "intro\n\n## hello\n\nend\n");
+        assert_eq!(focused.as_deref(), Some("## hello"));
+
+        let us = units(&doc);
+        assert_eq!(block_type(&us[1]), Some(BlockType::Heading(2)));
+        let plan = convert(&doc, &us, 1, BlockType::Bullet).unwrap();
+        let (text, _) = apply(&mut doc, plan);
+        assert_eq!(text, "intro\n\n- hello\n\nend\n");
+
+        let us = units(&doc);
+        assert_eq!(block_type(&us[1]), Some(BlockType::Bullet));
+        let plan = convert(&doc, &us, 1, BlockType::Task).unwrap();
+        let (text, _) = apply(&mut doc, plan);
+        assert_eq!(text, "intro\n\n- [ ] hello\n\nend\n");
+
+        let us = units(&doc);
+        assert_eq!(block_type(&us[1]), Some(BlockType::Task));
+        let plan = convert(&doc, &us, 1, BlockType::Numbered).unwrap();
+        let (text, _) = apply(&mut doc, plan);
+        assert_eq!(text, "intro\n\n1. hello\n\nend\n");
+
+        let us = units(&doc);
+        assert_eq!(block_type(&us[1]), Some(BlockType::Numbered));
+        // 已是目标类型：无事发生
+        assert!(convert(&doc, &us, 1, BlockType::Numbered).is_none());
+        let plan = convert(&doc, &us, 1, BlockType::Text).unwrap();
+        let (text, focused) = apply(&mut doc, plan);
+        assert_eq!(text, "intro\n\nhello\n\nend\n");
+        assert_eq!(focused.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn convert_to_code_quote_and_divider() {
+        let mut doc = Document::from_text("a\n\nb\n");
+        let us = units(&doc);
+        let plan = convert(&doc, &us, 0, BlockType::Code).unwrap();
+        // 光标在正文末尾（围栏之前）
+        assert_eq!(plan.focus_offset, 5);
+        let (text, focused) = apply(&mut doc, plan);
+        assert_eq!(text, "```\na\n```\n\nb\n");
+        assert_eq!(focused.as_deref(), Some("```\na\n```"));
+        // 代码块 → 文本：去围栏
+        let us = units(&doc);
+        assert_eq!(block_type(&us[0]), Some(BlockType::Code));
+        let plan = convert(&doc, &us, 0, BlockType::Text).unwrap();
+        let (text, _) = apply(&mut doc, plan);
+        assert_eq!(text, "a\n\nb\n");
+
+        // 引用
+        let us = units(&doc);
+        let plan = convert(&doc, &us, 1, BlockType::Quote).unwrap();
+        let (text, _) = apply(&mut doc, plan);
+        assert_eq!(text, "a\n\n> b\n");
+        let us = units(&doc);
+        assert_eq!(block_type(&us[1]), Some(BlockType::Quote));
+
+        // 分割线：非空块在后面插一条并新开段落（焦点落在新段落的空位）；空块（空列表项）直接变
+        let mut doc = Document::from_text("x\n");
+        let us = units(&doc);
+        let plan = convert(&doc, &us, 0, BlockType::Divider).unwrap();
+        assert_eq!(plan.focus_offset, 8);
+        let (text, _) = apply(&mut doc, plan);
+        assert_eq!(text, "x\n\n---\n\n\n");
+        let mut doc = Document::from_text("- \n");
+        let us = units(&doc);
+        let plan = convert(&doc, &us, 0, BlockType::Divider).unwrap();
+        let (text, _) = apply(&mut doc, plan);
+        assert_eq!(text, "---\n");
+        let mut doc = Document::from_text("- item\n");
+        let us = units(&doc);
+        let plan = convert(&doc, &us, 0, BlockType::Heading(1)).unwrap();
+        let (text, focused) = apply(&mut doc, plan);
+        assert_eq!(text, "# item\n");
+        assert_eq!(focused.as_deref(), Some("# item"));
     }
 
     #[test]

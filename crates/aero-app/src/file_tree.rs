@@ -9,10 +9,13 @@ use std::sync::Arc;
 
 use aero_core::{Vault, VaultPath};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, VirtualListScrollHandle, h_flex, v_flex, v_virtual_list};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+
+use crate::actions::{CopyNotePath, RevealInFinder, TrashNote};
 
 pub const ROW_HEIGHT: f32 = 28.;
 
@@ -92,11 +95,13 @@ pub struct FileTree {
     row_sizes: Rc<Vec<Size<Pixels>>>,
     selected: Option<VaultPath>,
     scroll: VirtualListScrollHandle,
+    /// 点击行后树持有焦点，`⌘⌫` 等树内快捷键（上下文 `FileTree`）才有处可去
+    focus_handle: FocusHandle,
     pub error: Option<String>,
 }
 
 impl FileTree {
-    pub fn new(vault: Arc<Vault>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(vault: Arc<Vault>, cx: &mut Context<Self>) -> Self {
         let mut this = FileTree {
             vault,
             root: Folder::default(),
@@ -105,6 +110,7 @@ impl FileTree {
             row_sizes: Rc::new(Vec::new()),
             selected: None,
             scroll: VirtualListScrollHandle::new(),
+            focus_handle: cx.focus_handle(),
             error: None,
         };
         this.rescan();
@@ -131,6 +137,10 @@ impl FileTree {
     /// 当前选中的文件夹（选中的是笔记时取其所在目录），用于新建笔记的位置规则（3.5）。
     pub fn selected_dir(&self) -> Option<String> {
         self.selected.as_ref().map(|p| p.parent().to_owned())
+    }
+
+    pub fn selected(&self) -> Option<&VaultPath> {
+        self.selected.as_ref()
     }
 
     pub fn select(&mut self, path: Option<VaultPath>, cx: &mut Context<Self>) {
@@ -188,8 +198,9 @@ impl FileTree {
         cx.notify();
     }
 
-    fn open(&mut self, path: VaultPath, cx: &mut Context<Self>) {
+    fn open(&mut self, path: VaultPath, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(path.clone());
+        self.focus_handle.focus(window, cx);
         cx.emit(FileTreeEvent::Open(path));
         cx.notify();
     }
@@ -224,6 +235,7 @@ impl FileTree {
                 .into_any_element(),
             Row::Note { path, depth } => {
                 let selected = self.selected.as_ref() == Some(&path);
+                let rel = path.as_str().to_owned();
                 h_flex()
                     .id(("note", ix))
                     .h(px(ROW_HEIGHT))
@@ -238,7 +250,14 @@ impl FileTree {
                     .text_sm()
                     .child(Icon::new(IconName::FileText).size(px(14.)).text_color(muted))
                     .child(div().flex_1().truncate().child(path.stem().to_owned()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.open(path.clone(), cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open(path.clone(), window, cx)))
+                    // 右键菜单（4.1 的 M1a 子集；重命名走标题，新建走 ⌘N）
+                    .context_menu(move |menu, _, _| {
+                        menu.menu("移到废纸篓", Box::new(TrashNote(rel.clone())))
+                            .separator()
+                            .menu("在 Finder 中显示", Box::new(RevealInFinder(rel.clone())))
+                            .menu("复制路径", Box::new(CopyNotePath(rel.clone())))
+                    })
                     .into_any_element()
             }
         }
@@ -263,6 +282,9 @@ impl Render for FileTree {
             .vertical_scrollbar(&self.scroll);
 
         v_flex()
+            .id("file-tree")
+            .track_focus(&self.focus_handle)
+            .key_context("FileTree")
             .size_full()
             .when_some(self.error.clone(), |this, err| {
                 this.child(div().p_3().text_xs().text_color(cx.theme().danger).child(err))
