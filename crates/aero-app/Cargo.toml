@@ -11,3 +11,17 @@ path = "src/main.rs"
 
 [dependencies]
 aero-core.workspace = true
+# UI 底座（ADR 0001）。GPUI 本体经 `gpui_kit::*` 使用，组件库经 `gpui_kit::component`
+gpui-kit.workspace = true
+# 应用数据目录下的 state.toml（最近 vault、面板状态）
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# 日志门面；输出到 stderr 的极简 logger 在 main.rs 里（`AERO_LOG=debug`）
+log = "0.4"
+# 本地时间：冲突副本文件名、daily 笔记（锁到已在依赖树里的版本）
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+# 无头 GPUI 测试（TestAppContext）：在测试里真正渲染编辑器并模拟按键
+gpui-kit = { workspace = true, features = ["test-support"] }
+tempfile = "3"

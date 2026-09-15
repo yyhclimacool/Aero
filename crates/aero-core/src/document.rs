@@ -192,6 +192,20 @@ impl Document {
         Ok(())
     }
 
+    /// 应用一次编辑并并入上一个 undo 组（9.5：相邻字符输入合并为一组），没有上一组时新开一组。
+    /// 由调用方决定何时合并（例如 300 ms 内的连续输入）。
+    pub fn edit_coalescing(&mut self, edit: Edit) -> Result<(), EditError> {
+        text::check_edit(&self.text, &edit)?;
+        let inverse = self.apply_raw(&edit);
+        match self.undo.last_mut() {
+            // 组内逆编辑按顺序应用，新编辑的逆必须最先应用
+            Some(group) => group.insert(0, inverse),
+            None => self.undo.push(vec![inverse]),
+        }
+        self.redo.clear();
+        Ok(())
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
@@ -200,24 +214,45 @@ impl Document {
         !self.redo.is_empty()
     }
 
-    pub fn undo(&mut self) -> bool {
-        let Some(group) = self.undo.pop() else { return false };
-        let redo_group = self.apply_group(&group);
+    /// 撤销一组编辑。返回新文本中受影响的区间（编辑器据此放光标）；没有可撤销的内容时为 `None`。
+    pub fn undo(&mut self) -> Option<Range<usize>> {
+        let group = self.undo.pop()?;
+        let (redo_group, affected) = self.apply_group(&group);
         self.redo.push(redo_group);
-        true
+        Some(affected)
     }
 
-    pub fn redo(&mut self) -> bool {
-        let Some(group) = self.redo.pop() else { return false };
-        let undo_group = self.apply_group(&group);
+    pub fn redo(&mut self) -> Option<Range<usize>> {
+        let group = self.redo.pop()?;
+        let (undo_group, affected) = self.apply_group(&group);
         self.undo.push(undo_group);
-        true
+        Some(affected)
     }
 
-    fn apply_group(&mut self, group: &[Edit]) -> Vec<Edit> {
-        let mut inverses: Vec<Edit> = group.iter().map(|e| self.apply_raw(e)).collect();
+    /// 顺序应用一组编辑，返回逆组与新文本中受影响区间的并集。
+    fn apply_group(&mut self, group: &[Edit]) -> (Vec<Edit>, Range<usize>) {
+        let mut inverses: Vec<Edit> = Vec::with_capacity(group.len());
+        let mut affected: Option<Range<usize>> = None;
+        for e in group {
+            let new_range = e.new_range();
+            // 前面已应用的编辑区间要按本次编辑的位移平移
+            if let Some(a) = affected.as_mut() {
+                let delta = e.delta();
+                if a.start >= e.range.end {
+                    a.start = (a.start as isize + delta) as usize;
+                }
+                if a.end >= e.range.end {
+                    a.end = (a.end as isize + delta) as usize;
+                }
+                a.start = a.start.min(new_range.start);
+                a.end = a.end.max(new_range.end);
+            } else {
+                affected = Some(new_range);
+            }
+            inverses.push(self.apply_raw(e));
+        }
         inverses.reverse();
-        inverses
+        (inverses, affected.unwrap_or(0..0))
     }
 
     /// 改 Rope + 平移 anchor + 版本号。调用方保证编辑合法。
@@ -453,15 +488,57 @@ mod tests {
         d.edit(Edit::insert(3, "d")).unwrap();
         d.edit_group(vec![Edit::delete(0..1), Edit::insert(0, "X")]).unwrap();
         assert_eq!(d.to_string(), "Xbcd");
-        assert!(d.undo());
+        assert!(d.undo().is_some());
         assert_eq!(d.to_string(), "abcd");
-        assert!(d.undo());
+        assert!(d.undo().is_some());
         assert_eq!(d.to_string(), "abc");
-        assert!(!d.undo());
-        assert!(d.redo());
-        assert!(d.redo());
+        assert!(d.undo().is_none());
+        assert!(d.redo().is_some());
+        assert!(d.redo().is_some());
         assert_eq!(d.to_string(), "Xbcd");
-        assert!(!d.redo());
+        assert!(d.redo().is_none());
+    }
+
+    #[test]
+    fn undo_redo_report_affected_range() {
+        let mut d = Document::from_text("abc");
+        d.edit(Edit::insert(3, "def")).unwrap();
+        // 撤销插入 → 删除，受影响区间收缩为插入点
+        assert_eq!(d.undo(), Some(3..3));
+        // 重做 → 插入的新文本区间
+        assert_eq!(d.redo(), Some(3..6));
+        // 合并组：三个字符依次输入，撤销后回到起点
+        d.edit(Edit::insert(0, "1")).unwrap();
+        d.edit_coalescing(Edit::insert(1, "2")).unwrap();
+        d.edit_coalescing(Edit::insert(2, "3")).unwrap();
+        assert_eq!(d.to_string(), "123abcdef");
+        assert_eq!(d.undo(), Some(0..0));
+        assert_eq!(d.redo(), Some(0..3));
+        // 替换：撤销后区间是原文本的位置
+        d.edit(Edit::replace(0..3, "X")).unwrap();
+        assert_eq!(d.to_string(), "Xabcdef");
+        assert_eq!(d.undo(), Some(0..3));
+    }
+
+    #[test]
+    fn coalesced_edits_undo_together() {
+        let mut d = Document::from_text("");
+        d.edit(Edit::insert(0, "a")).unwrap();
+        d.edit_coalescing(Edit::insert(1, "b")).unwrap();
+        d.edit_coalescing(Edit::insert(2, "c")).unwrap();
+        d.edit(Edit::insert(3, "!")).unwrap();
+        assert_eq!(d.to_string(), "abc!");
+        assert!(d.undo().is_some());
+        assert_eq!(d.to_string(), "abc");
+        assert!(d.undo().is_some());
+        assert_eq!(d.to_string(), "");
+        assert!(d.redo().is_some());
+        assert_eq!(d.to_string(), "abc");
+        // 没有上一组时自成一组
+        let mut e = Document::from_text("x");
+        e.edit_coalescing(Edit::insert(1, "y")).unwrap();
+        assert!(e.undo().is_some());
+        assert_eq!(e.to_string(), "x");
     }
 
     #[test]
