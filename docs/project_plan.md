@@ -1022,6 +1022,14 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
 - 分发链路：签名、公证、`.dmg`、自动更新。
 - **M1b 结束时公开仓库。**
 - 砍单清单：自动更新 → 表格只读渲染 → 命令面板。
+- **进展（2026-09-15，第一刀，提前动工）**：全文搜索这条垂直切片先做了，因为它决定 `aero-core` 的块抽取形态。
+  `aero-core::index`：`blocks_for_note` 把文档的叶子块变成 `IndexBlock`（front matter / 空块不进索引），`plain_text` 去掉标题 `#`、列表标记、围栏、行内标记与 `[[a|b]]` 的别名侧（`![[img|400]]` 取目标侧），`{...}` 属性整段丢弃。主键 `note_id#ord`——zvec 的 pk 不允许 `:`。
+  `crates/aero-index`（新）：`ZvecFts` 实现 `FullTextIndex`（jieba + lowercase，`+term -term "phrase"` 走布尔表达式，其余按自然语言、相邻词 AND；集合损坏时删掉重建）；`Meta`（SQLite，`notes` 表记 `mtime/size/hash` 与块数，带 `index_state` 版本号，版本不符就重建）；`Indexer` 串起 Vault / Meta / FTS：`plan_sync` 列出变化与消失的笔记，`sync_step` 逐篇处理，保存路径严格是 `upsert` + `delete(旧 pk)`（10.3），每 1 万块 flush 一次。索引在 `~/Library/Application Support/Aero/index/<vault-id>/{meta.sqlite,fts/}`。
+  `aero-app`：`SearchService` 在专用 OS 线程跑全量同步（每篇一次拿锁，搜索与增量更新可以插队），状态栏显示"正在索引 n/m"；保存 / 重命名 / 删除 / 外部重载都走增量；空闲 30 s `flush()`，退出时同步 flush。`build.rs` 给二进制加 rpath（10.4 的 bug 绕过）。
+  搜索视图（`⌘⇧F`，左侧栏 文件 / 搜索 分段切换）：150 ms 防抖，结果按笔记分组，snippet 与高亮在客户端基于块正文做（zvec 无 snippet API），↑↓ / ⏎ / Esc 键盘可用；点击命中打开笔记并滚到该块（放在视口 1/3 处）、短暂高亮 1.5 s。滚动定位靶在块 `div` 的 `on_children_prepainted` 里算偏移写回 `ScrollHandle`——GPUI 的普通滚动容器没有 scroll-to-element。
+  快速打开（`⌘P`）：标题 / 路径模糊匹配（前缀、连续、词首加分，长路径轻罚），空查询列最近打开；无匹配时 ⏎ 直接新建同名笔记。它就是命令面板的雏形，命令面板后续复用这个壳。
+  无头测试覆盖：索引往返（内存引擎与真 zvec 各一份）、同步计划 / 增量三条路径、搜索视图端到端、快速打开过滤与新建、编辑器 reveal 滚动与高亮。
+  尚未做：jieba 词典裁剪（现在用全词典，≈200 MB，10.3）、`optimize()` 的定时策略、`notify` 文件监听（现在只在启动同步 + 编辑器自己的 2 s stat）、搜索结果的 `#tag` 过滤、callout / 表格渲染、分发链路。
 
 ### M2 · 知识互联（约 155 小时，2027-05 → 2027-09 初）
 

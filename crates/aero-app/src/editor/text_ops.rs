@@ -124,49 +124,9 @@ pub fn heading_prefix_len(text: &str) -> usize {
     }
 }
 
-/// front matter 源码里 `title:` 一行的值：返回值在 `src` 内的字节区间（不含引号）与去引号后的文本。
-/// 只认最常见的写法（顶层 `title: xxx`，可带单/双引号）；别的形式当作没有 title。
-pub fn front_matter_title(src: &str) -> Option<(std::ops::Range<usize>, String)> {
-    let mut at = 0;
-    for line in src.split_inclusive('\n') {
-        let start = at;
-        at += line.len();
-        let body = line.trim_end_matches(['\n', '\r']);
-        let Some(rest) = body.strip_prefix("title:") else { continue };
-        let value_start = start + "title:".len() + (rest.len() - rest.trim_start().len());
-        let value = rest.trim();
-        let value_end = value_start + value.len();
-        let (range, text) = match value.as_bytes() {
-            [q @ (b'"' | b'\''), .., last] if *last == *q && value.len() >= 2 => {
-                (value_start + 1..value_end - 1, value[1..value.len() - 1].to_owned())
-            }
-            _ => (value_start..value_end, value.to_owned()),
-        };
-        return Some((range, text));
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn front_matter_title_value_range() {
-        let src = "---\ntags: [a]\ntitle: 我的标题\n---";
-        let (r, t) = front_matter_title(src).unwrap();
-        assert_eq!(t, "我的标题");
-        assert_eq!(&src[r], "我的标题");
-        let src = "---\ntitle:   \"quoted: yes\"  \n---";
-        let (r, t) = front_matter_title(src).unwrap();
-        assert_eq!(t, "quoted: yes");
-        assert_eq!(&src[r], "quoted: yes");
-        assert!(front_matter_title("---\nsubtitle: x\n---").is_none());
-        // 空值：区间为空，可以往里写
-        let (r, t) = front_matter_title("---\ntitle:\n---").unwrap();
-        assert_eq!(t, "");
-        assert!(r.is_empty());
-    }
 
     #[test]
     fn minimal_edit_shrinks_to_changed_span() {

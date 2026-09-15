@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 aero-core.workspace = true
+# 全文索引（zvec）与增量索引管线；C 库 rpath 见 build.rs
+aero-index.workspace = true
 # UI 底座（ADR 0001）。GPUI 本体经 `gpui_kit::*` 使用，组件库经 `gpui_kit::component`
 gpui-kit.workspace = true
 # 应用数据目录下的 state.toml（最近 vault、面板状态）

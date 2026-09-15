@@ -443,3 +443,47 @@ fn empty_note_starts_writing(cx: &mut TestAppContext) {
         assert_eq!(e.word_count(), 2);
     });
 }
+
+/// 搜索命中定位：第 n 个可索引块高亮 1.5 s，并被滚到视口上 1/3 处（越界时定位到最后一个块）。
+#[gpui_kit::test]
+fn reveal_indexed_block_scrolls_and_highlights(cx: &mut TestAppContext) {
+    // 60 段：测试窗口 1080 px 高，要保证目标块上下都有足够内容可滚
+    let body: String = (0..60).map(|i| format!("paragraph {i}\n\n")).collect();
+    let (_dir, _vault, _path, editor) = open(cx, &body);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let draw = |cx: &mut VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| editor.read(cx).scroll.offset().y), gpui_kit::px(0.));
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_indexed_block(25, cx)));
+    let target = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let leaves = aero_core::index::indexable_leaves(&e.doc);
+        assert_eq!(leaves.len(), 60);
+        leaves[25].id
+    });
+    cx.update(|_, cx| assert_eq!(editor.read(cx).highlighted_block(), Some(target)));
+
+    // 第一帧：子元素布局完成后改 offset；第二帧按新 offset 画
+    draw(cx);
+    cx.run_until_parked();
+    let offset = cx.update(|_, cx| editor.read(cx).scroll.offset().y);
+    assert!(offset < gpui_kit::px(-100.), "scrolled down, got {offset:?}");
+    cx.update(|_, cx| assert!(editor.read(cx).reveal.is_none(), "one-shot"));
+    draw(cx);
+    let container = cx.update(|_, cx| editor.read(cx).scroll.bounds());
+    let selector: &'static str = Box::leak(format!("unit-{}", target.0).into_boxed_str());
+    let unit = cx.debug_bounds(selector).expect("target block is laid out");
+    let rel = (unit.origin.y - container.origin.y) / container.size.height;
+    assert!((0.28..0.38).contains(&rel), "target sits at the upper third of the viewport, got {rel}");
+
+    // 1.5 s 后高亮消失
+    cx.executor().advance_clock(Duration::from_millis(1600));
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(editor.read(cx).highlighted_block(), None));
+
+    // 越界：落到最后一个块
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_indexed_block(999, cx)));
+    let last = cx.update(|_, cx| aero_core::index::indexable_leaves(&editor.read(cx).doc).last().unwrap().id);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).highlighted_block(), Some(last)));
+}

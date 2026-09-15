@@ -12,15 +12,20 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
+use gpui_kit::component::tab::TabBar;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::actions::QuickOpen as QuickOpen_;
 use crate::actions::*;
 use crate::branding;
 use crate::editor::{Editor, EditorEvent, SaveState};
 use crate::file_tree::{FileTree, FileTreeEvent, unique_note_name};
-use crate::paths::{PersistedState, display_path};
+use crate::paths::{PersistedState, app_data_dir, display_path};
+use crate::quick_open::{QuickOpen, QuickOpenEvent};
+use crate::search::{Phase, SearchService};
+use crate::search_view::{SearchView, SearchViewEvent};
 
 const SIDEBAR_WIDTH: f32 = 260.;
 const PANEL_WIDTH: f32 = 300.;
@@ -30,12 +35,27 @@ struct VaultSession {
     vault: Arc<Vault>,
     tree: Entity<FileTree>,
     editor: Option<Entity<Editor>>,
+    /// 全文索引（后台）；状态栏显示进度，搜索视图查询它
+    search: Entity<SearchService>,
+    search_view: Entity<SearchView>,
+    /// 本次会话里打开过的笔记，最近的在前（快速打开的"最近优先"）
+    recent: Vec<VaultPath>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// 左侧栏当前视图（`ui_design.md` 2.1：文件 / 搜索 / 标签；标签视图 M2）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarTab {
+    Files,
+    Search,
 }
 
 pub struct Workspace {
     state: PersistedState,
     open: Option<VaultSession>,
+    /// ⌘P 弹层
+    quick_open: Option<(Entity<QuickOpen>, Subscription)>,
+    sidebar_tab: SidebarTab,
     sidebar_visible: bool,
     panel_visible: bool,
     resizable: Entity<ResizableState>,
@@ -62,6 +82,8 @@ impl Workspace {
             }
         });
         let mut this = Workspace {
+            quick_open: None,
+            sidebar_tab: SidebarTab::Files,
             sidebar_visible: state.sidebar_visible.unwrap_or(true),
             panel_visible: state.panel_visible.unwrap_or(true),
             state,
@@ -92,11 +114,32 @@ impl Workspace {
                 let sub = cx.subscribe_in(&tree, window, |this, _, event, window, cx| match event {
                     FileTreeEvent::Open(path) => this.open_note(path.clone(), window, cx),
                 });
+                // 先丢掉上一个 vault 的索引服务（它的同步线程看到 cancelled 会停）
+                self.open = None;
+                let search = cx.new(|cx| SearchService::new(vault.clone(), app_data_dir().join("index"), cx));
+                let search_sub = cx.observe(&search, |_, _, cx| cx.notify());
+                let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
+                let view_sub =
+                    cx.subscribe_in(&search_view, window, |this, _, event, window, cx| match event {
+                        SearchViewEvent::Open { path, block_ord } => {
+                            this.open_hit(path.clone(), *block_ord, window, cx)
+                        }
+                        SearchViewEvent::Dismiss => {
+                            if let Some(editor) = this.open.as_ref().and_then(|o| o.editor.clone()) {
+                                editor.update(cx, |e, cx| e.focus_browse(window, cx));
+                            } else {
+                                this.focus_handle.focus(window, cx);
+                            }
+                        }
+                    });
                 self.open = Some(VaultSession {
                     vault: vault.clone(),
                     tree,
                     editor: None,
-                    _subscriptions: vec![sub],
+                    search,
+                    search_view,
+                    recent: Vec::new(),
+                    _subscriptions: vec![sub, search_sub, view_sub],
                 });
                 self.error = None;
                 self.state.touch_vault(vault.root());
@@ -168,9 +211,12 @@ impl Workspace {
         if open.editor.as_ref().is_some_and(|e| e.read(cx).path() == &path) {
             return;
         }
-        // 切换前把上一篇落盘
+        // 切换前把上一篇落盘，并让索引跟上
         if let Some(prev) = open.editor.clone() {
             let result = prev.update(cx, |e, _| e.flush_sync());
+            if result.is_ok() {
+                self.index_editor(&prev, cx);
+            }
             self.report_flush(result, window, cx);
         }
         let Some(open) = self.open.as_mut() else { return };
@@ -178,8 +224,12 @@ impl Workspace {
             Ok((doc, stamp)) => {
                 let vault = open.vault.clone();
                 let editor = cx.new(|cx| Editor::new(vault, path.clone(), doc, stamp, cx));
-                let sub = cx.subscribe_in(&editor, window, |this, _, event, window, cx| match event {
-                    EditorEvent::Changed | EditorEvent::Reloaded => cx.notify(),
+                let sub = cx.subscribe_in(&editor, window, |this, editor, event, window, cx| match event {
+                    EditorEvent::Changed => cx.notify(),
+                    EditorEvent::Saved | EditorEvent::Reloaded => {
+                        this.index_editor(editor, cx);
+                        cx.notify();
+                    }
                     EditorEvent::SaveFailed(msg) => {
                         window.push_notification(
                             Notification::error(format!("保存失败：{msg}")).title("Aero"),
@@ -189,9 +239,12 @@ impl Workspace {
                     EditorEvent::Conflict(copy) => this.notify_conflict(copy, window, cx),
                     EditorEvent::RenameRequested(name) => this.rename_current(name.clone(), window, cx),
                 });
-                open._subscriptions.truncate(1);
+                open._subscriptions.truncate(3);
                 open._subscriptions.push(sub);
                 open.editor = Some(editor.clone());
+                open.recent.retain(|p| p != &path);
+                open.recent.insert(0, path.clone());
+                open.recent.truncate(20);
                 open.tree.update(cx, |t, cx| t.select(Some(path), cx));
                 editor.update(cx, |e, cx| e.focus_browse(window, cx));
             }
@@ -199,6 +252,104 @@ impl Workspace {
                 window
                     .push_notification(Notification::error(format!("无法打开 {}：{err}", path.as_str())), cx);
             }
+        }
+        cx.notify();
+    }
+
+    /// 搜索命中：打开笔记（已打开则复用）并定位到块。不抢焦点——↑↓ 预览时焦点留在搜索框。
+    fn open_hit(&mut self, path: VaultPath, block_ord: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let already =
+            self.open.as_ref().and_then(|o| o.editor.as_ref()).is_some_and(|e| e.read(cx).path() == &path);
+        if !already {
+            let focused = window.focused(cx);
+            self.open_note(path, window, cx);
+            if let Some(f) = focused {
+                window.focus(&f, cx);
+            }
+        }
+        if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
+            editor.update(cx, |e, cx| e.reveal_indexed_block(block_ord, cx));
+        }
+    }
+
+    fn on_quick_open(&mut self, _: &QuickOpen_, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        if self.quick_open.is_some() {
+            self.close_quick_open(window, cx);
+            return;
+        }
+        let (vault, service, recent) = (open.vault.clone(), open.search.clone(), open.recent.clone());
+        let picker = cx.new(|cx| QuickOpen::new(vault, service, recent, window, cx));
+        let sub = cx.subscribe_in(&picker, window, |this, _, event, window, cx| match event {
+            QuickOpenEvent::Open(path) => {
+                this.close_quick_open(window, cx);
+                this.open_note(path.clone(), window, cx);
+            }
+            QuickOpenEvent::Create(name) => {
+                this.close_quick_open(window, cx);
+                this.create_note_named(name, window, cx);
+            }
+            QuickOpenEvent::Dismiss => this.close_quick_open(window, cx),
+        });
+        self.quick_open = Some((picker, sub));
+        cx.notify();
+    }
+
+    fn close_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quick_open.take().is_some() {
+            match self.open.as_ref().and_then(|o| o.editor.clone()) {
+                Some(editor) => editor.update(cx, |e, cx| e.focus_browse(window, cx)),
+                None => self.focus_handle.focus(window, cx),
+            }
+            cx.notify();
+        }
+    }
+
+    /// 快速打开里"新建 X"：在 vault 根（3.5 的默认位置）新建并进入编辑。
+    fn create_note_named(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        let path = match note_path_in("", name) {
+            Ok(p) => p,
+            Err(msg) => {
+                window.push_notification(Notification::error(msg).title("新建笔记"), cx);
+                return;
+            }
+        };
+        if !open.vault.exists(&path) {
+            let doc = aero_core::Document::from_text(&format!("# {}\n\n", name.trim()));
+            if let Err(err) = open.vault.write(&path, &doc) {
+                window.push_notification(Notification::error(format!("无法新建笔记：{err}")), cx);
+                return;
+            }
+            open.tree.update(cx, |t, cx| {
+                t.rescan();
+                cx.notify();
+            });
+        }
+        self.open_note(path, window, cx);
+        if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
+            editor.update(cx, |e, cx| e.start_writing(window, cx));
+        }
+    }
+
+    fn on_open_search(&mut self, _: &OpenSearch, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        self.sidebar_tab = SidebarTab::Search;
+        if !self.sidebar_visible {
+            self.sidebar_visible = true;
+            self.state.sidebar_visible = Some(true);
+            self.state.save();
+        }
+        open.search_view.update(cx, |v, cx| v.focus(window, cx));
+        cx.notify();
+    }
+
+    fn on_open_files(&mut self, _: &OpenFiles, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_tab = SidebarTab::Files;
+        if !self.sidebar_visible {
+            self.sidebar_visible = true;
+            self.state.sidebar_visible = Some(true);
+            self.state.save();
         }
         cx.notify();
     }
@@ -287,7 +438,7 @@ impl Workspace {
         let was_open = open.editor.as_ref().is_some_and(|e| e.read(cx).path() == path);
         if was_open {
             open.editor = None;
-            open._subscriptions.truncate(1);
+            open._subscriptions.truncate(3);
         }
         let fs_path = open.vault.fs_path(path);
         match crate::trash::move_to_trash(&fs_path) {
@@ -303,6 +454,8 @@ impl Workspace {
                     Notification::info(format!("已移到废纸篓：{}", path.as_str())).title("Aero"),
                     cx,
                 );
+                let p = path.clone();
+                open.search.update(cx, |s, cx| s.note_removed(p, cx));
                 if was_open {
                     self.focus_handle.focus(window, cx);
                 }
@@ -360,8 +513,9 @@ impl Workspace {
                 editor.update(cx, |e, cx| e.set_path(target.clone(), cx));
                 open.tree.update(cx, |t, cx| {
                     t.rescan();
-                    t.select(Some(target), cx);
+                    t.select(Some(target.clone()), cx);
                 });
+                open.search.update(cx, |s, cx| s.note_renamed(old, target, cx));
                 cx.notify();
             }
             Err(err) => window
@@ -369,7 +523,7 @@ impl Workspace {
         }
     }
 
-    /// 退出前落盘。这里没有窗口可以提示，冲突副本只进日志。
+    /// 退出前落盘。这里没有窗口可以提示，冲突副本只进日志。索引也同步 flush 一次。
     fn flush_all(&mut self, cx: &mut Context<Self>) {
         if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
             match editor.update(cx, |e, _| e.flush_sync()) {
@@ -378,6 +532,16 @@ impl Workspace {
                 Err(err) => log::error!("flush: {err}"),
             }
         }
+        if let Some(open) = self.open.as_ref() {
+            open.search.read(cx).flush_blocking();
+        }
+    }
+
+    /// 编辑器刚落盘（或重载）：把它的内容送进索引。
+    fn index_editor(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        let (path, text, stamp) = editor.read(cx).index_snapshot();
+        open.search.update(cx, |s, cx| s.note_saved(path, text, stamp, cx));
     }
 
     fn report_flush(
@@ -402,6 +566,8 @@ impl Workspace {
                 t.rescan();
                 cx.notify();
             });
+            let copy = copy.clone();
+            open.search.update(cx, |s, cx| s.note_changed(copy, cx));
         }
         window.push_notification(
             Notification::warning(format!(
@@ -507,6 +673,11 @@ impl Workspace {
     fn render_sidebar(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let name = open.vault.root().file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let tab = self.sidebar_tab;
+        let body: AnyElement = match tab {
+            SidebarTab::Files => open.tree.clone().into_any_element(),
+            SidebarTab::Search => open.search_view.clone().into_any_element(),
+        };
         v_flex()
             .size_full()
             .bg(theme.sidebar)
@@ -528,7 +699,25 @@ impl Workspace {
                             .on_click(|_, window, cx| window.dispatch_action(Box::new(NewNote), cx)),
                     ),
             )
-            .child(div().flex_1().min_h(px(0.)).child(open.tree.clone()))
+            .child(
+                div().px_2().pb_2().child(
+                    TabBar::new("sidebar-tabs")
+                        .segmented()
+                        .w_full()
+                        .xsmall()
+                        .selected_index(match tab {
+                            SidebarTab::Files => 0,
+                            SidebarTab::Search => 1,
+                        })
+                        .children(["文件", "搜索"])
+                        .on_click(|ix, window, cx| {
+                            let action: Box<dyn Action> =
+                                if *ix == 0 { Box::new(OpenFiles) } else { Box::new(OpenSearch) };
+                            window.dispatch_action(action, cx);
+                        }),
+                ),
+            )
+            .child(div().flex_1().min_h(px(0.)).child(body))
     }
 
     fn render_outline(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
@@ -636,6 +825,23 @@ impl Workspace {
             }
             None => (display_path(open.vault.root()), vec![]),
         };
+        let index_item: Option<AnyElement> = match open.search.read(cx).phase() {
+            Phase::Opening => Some(div().child("索引：打开中…").into_any_element()),
+            Phase::Syncing { done, total } => {
+                Some(div().child(format!("索引中 {done}/{total}")).into_any_element())
+            }
+            Phase::Failed(msg) => Some(
+                div()
+                    .id("index-failed")
+                    .text_color(theme.danger)
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(msg.clone()).build(window, cx)
+                    })
+                    .child("索引不可用")
+                    .into_any_element(),
+            ),
+            Phase::Idle => None,
+        };
         h_flex()
             .h(px(24.))
             .w_full()
@@ -665,7 +871,7 @@ impl Workspace {
                     .child(div().truncate().child(left)),
             )
             .child(
-                h_flex().gap_3().items_center().children(right).child(
+                h_flex().gap_3().items_center().children(index_item).children(right).child(
                     Button::new("toggle-panel")
                         .ghost()
                         .xsmall()
@@ -735,6 +941,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_reveal_in_finder))
             .on_action(cx.listener(Self::on_copy_note_path))
             .on_action(cx.listener(Self::on_save_now))
+            .on_action(cx.listener(Self::on_open_search))
+            .on_action(cx.listener(Self::on_open_files))
+            .on_action(cx.listener(Self::on_quick_open))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_panel))
             .size_full()
@@ -742,6 +951,28 @@ impl Render for Workspace {
             .text_color(foreground)
             .child(TitleBar::new().child(div().text_sm().text_color(muted).child(title)))
             .child(body)
+            .when_some(self.quick_open.as_ref().map(|(p, _)| p.clone()), |el, picker| {
+                // 遮罩 + 居中弹层（3.2）；点遮罩关闭
+                el.child(deferred(
+                    div()
+                        .id("quick-open-overlay")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .justify_center()
+                        .items_start()
+                        .pt(px(120.))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| this.close_quick_open(window, cx)),
+                        )
+                        .child(
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(picker),
+                        ),
+                ))
+            })
     }
 }
 

@@ -1,13 +1,16 @@
 //! 索引引擎的 trait 抽象（方案 10.3 / 10.4）。
 //!
 //! `aero-core` 只依赖这里的 trait；zvec 实现放在 `aero-index`。索引文档 = Block，
-//! 主键 `pk = "{note_id}:{block_ord}"`。保存路径按 ADR 0003 的约束：`upsert(新块)` + `delete(旧有而新无的 pk)`，
+//! 主键 `pk = "{note_id}#{block_ord}"`（zvec 的主键不接受 `:`）。保存路径按 ADR 0003 的约束：`upsert(新块)` + `delete(旧有而新无的 pk)`，
 //! 引擎实现不得暴露 `delete_by_filter` 之类的按条件删除。
 //!
 //! 本模块还提供两个内存实现（[`MemoryFullTextIndex`] / [`MemoryVectorIndex`]），
 //! 供 headless 测试与没有引擎时的 CLI 使用；它们不追求性能。
 
 use std::collections::HashMap;
+
+use crate::block::{Block, BlockKind};
+use crate::document::Document;
 
 /// 一个待索引的块。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,7 +29,7 @@ pub struct IndexBlock {
 
 impl IndexBlock {
     pub fn pk_of(note_id: &str, block_ord: u32) -> String {
-        format!("{note_id}:{block_ord}")
+        format!("{note_id}#{block_ord}")
     }
 }
 
@@ -71,6 +74,8 @@ pub trait FullTextIndex: Send + Sync {
     /// 按主键删除；不存在的 pk 静默忽略
     fn delete(&mut self, pks: &[String]) -> Result<(), IndexError>;
     fn search(&self, query: &FtsQuery) -> Result<Vec<Hit>, IndexError>;
+    /// 按主键取回索引文档（搜索结果要显示正文与标题）；不存在的 pk 跳过，顺序不保证
+    fn fetch(&self, pks: &[String]) -> Result<Vec<IndexBlock>, IndexError>;
     /// 持久化缓冲（空闲时调用；保存路径上不需要）
     fn flush(&mut self) -> Result<(), IndexError>;
     /// 段合并等整理
@@ -105,6 +110,186 @@ pub trait VectorIndex: Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+// ---------------------------------------------------------------------------
+// 文档 → 索引文档
+// ---------------------------------------------------------------------------
+
+/// 要进索引的叶子块：跳过 front matter、`^id` / 属性标记行、分割线，以及去掉标记后为空的块。
+/// 返回顺序即 `block_ord`——搜索结果用 ord 回到这里定位块。
+pub fn indexable_leaves(doc: &Document) -> Vec<&Block> {
+    doc.blocks()
+        .leaves()
+        .filter(|b| !matches!(b.kind, BlockKind::FrontMatter | BlockKind::Marker | BlockKind::ThematicBreak))
+        .filter(|b| !plain_text(&doc.slice(doc.content_range(b)).to_string(), &b.kind).trim().is_empty())
+        .collect()
+}
+
+/// 把一篇文档拆成索引文档（10.3：索引粒度到块）。`ord` 连续，删除旧块时只需知道旧的块数。
+pub fn blocks_for_note(doc: &Document, note_id: &str, path: &str, title: &str) -> Vec<IndexBlock> {
+    indexable_leaves(doc)
+        .into_iter()
+        .enumerate()
+        .map(|(ord, b)| {
+            let src = doc.slice(doc.content_range(b)).to_string();
+            let body = plain_text(&src, &b.kind);
+            let tags = body
+                .split_whitespace()
+                .filter_map(|w| w.strip_prefix('#'))
+                .filter(|t| !t.is_empty() && !t.starts_with('#'))
+                .map(|t| t.trim_end_matches(['，', '。', ',', '.', ';', '；', ')', '）']).to_owned())
+                .filter(|t| !t.is_empty())
+                .collect();
+            IndexBlock {
+                pk: IndexBlock::pk_of(note_id, ord as u32),
+                note_id: note_id.to_owned(),
+                block_ord: ord as u32,
+                path: path.to_owned(),
+                title: title.to_owned(),
+                body,
+                tags,
+            }
+        })
+        .collect()
+}
+
+/// 块源码去掉 Markdown 标记后的正文，供全文索引与结果摘要用。
+/// 不追求完备：去标题 `#`、代码围栏、表格竖线、强调 / 代码 / 高亮 / 删除线记号、链接语法、`{.attr}` 与 HTML 标签；
+/// `[[a|b]]` 留别名 `b`，`[t](url)` 留 `t`，`#tag` 原样保留。
+pub fn plain_text(src: &str, kind: &BlockKind) -> String {
+    let src = match kind {
+        BlockKind::Heading { .. } => src.trim_start_matches('#').trim_start(),
+        BlockKind::CodeFence { .. } => strip_fence(src),
+        BlockKind::CodeBlock => {
+            return src.lines().map(|l| l.strip_prefix("    ").unwrap_or(l)).collect::<Vec<_>>().join("\n");
+        }
+        BlockKind::Table => {
+            return src
+                .lines()
+                .filter(|l| {
+                    !l.trim().trim_matches(['|', ' ']).chars().all(|c| matches!(c, '-' | ':' | '|' | ' '))
+                })
+                .map(|l| {
+                    l.trim()
+                        .trim_matches('|')
+                        .split('|')
+                        .map(|c| strip_inline(c.trim()))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        _ => src,
+    };
+    if matches!(kind, BlockKind::CodeFence { .. }) {
+        return src.to_owned();
+    }
+    // 引用 / callout 整体是一个叶子时去掉每行的 `> `
+    let lines: Vec<String> = src
+        .lines()
+        .map(|l| {
+            let mut l = l;
+            while let Some(rest) = l.trim_start().strip_prefix('>') {
+                l = rest.strip_prefix(' ').unwrap_or(rest);
+            }
+            strip_inline(l)
+        })
+        .collect();
+    lines.join("\n")
+}
+
+fn strip_fence(src: &str) -> &str {
+    let Some(first_nl) = src.find('\n') else { return "" };
+    let body = &src[first_nl + 1..];
+    let trimmed = body.trim_end_matches('\n');
+    match trimmed.rfind('\n') {
+        Some(i)
+            if trimmed[i + 1..].trim_start().starts_with("```")
+                || trimmed[i + 1..].trim_start().starts_with("~~~") =>
+        {
+            &trimmed[..i]
+        }
+        _ if trimmed.trim_start().starts_with("```") || trimmed.trim_start().starts_with("~~~") => "",
+        _ => trimmed,
+    }
+}
+
+/// 行内标记清理（单行）。
+fn strip_inline(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let rest = &line[i..];
+        // 嵌入 / wikilink：![[x]] / [[a|b]] / [[a#h]]
+        if let Some(after) = rest.strip_prefix("![[").or_else(|| rest.strip_prefix("[["))
+            && let Some(end) = after.find("]]")
+        {
+            let inner = &after[..end];
+            // 链接 `|` 后是别名；嵌入 `|` 后是宽度之类的参数，留目标名
+            let shown = match inner.rsplit_once('|') {
+                Some((target, alias)) => {
+                    if rest.starts_with('!') {
+                        target
+                    } else {
+                        alias
+                    }
+                }
+                None => inner,
+            };
+            out.push_str(shown);
+            i += rest.len() - after.len() + end + 2;
+            continue;
+        }
+        // 图片 / 链接：![alt](url) / [text](url)
+        if (rest.starts_with("![") || rest.starts_with('['))
+            && let Some(close) = rest.find("](")
+            && let Some(paren_end) = rest[close + 2..].find(')')
+        {
+            let text_start = if rest.starts_with("![") { 2 } else { 1 };
+            out.push_str(&strip_inline(&rest[text_start..close]));
+            i += close + 2 + paren_end + 1;
+            continue;
+        }
+        // 自动链接 <http://…> 留 URL；其他 <tag> 丢掉
+        if rest.starts_with('<')
+            && let Some(end) = rest.find('>')
+        {
+            let inner = &rest[1..end];
+            if inner.starts_with("http://") || inner.starts_with("https://") {
+                out.push_str(inner);
+            }
+            i += end + 1;
+            continue;
+        }
+        // 属性列表 {.red key=v}
+        if rest.starts_with('{')
+            && let Some(end) = rest.find('}')
+            && rest[1..end].trim_start().starts_with(['.', '#'])
+        {
+            i += end + 1;
+            continue;
+        }
+        let c = rest.chars().next().unwrap();
+        match c {
+            // 强调 / 行内代码记号本身跳过；`~~` / `==` 只在成对记号形态下去掉，单个 `~` `=` 是正文
+            '*' | '`' => i += 1,
+            '~' | '=' if rest.starts_with("~~") || rest.starts_with("==") => i += 2,
+            '\\' if rest.len() > 1 => {
+                // 转义：保留被转义字符
+                let next = rest[1..].chars().next().unwrap();
+                out.push(next);
+                i += 1 + next.len_utf8();
+            }
+            _ => {
+                out.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +355,10 @@ impl FullTextIndex for MemoryFullTextIndex {
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.pk.cmp(&b.pk)));
         hits.truncate(q.limit.max(1));
         Ok(hits)
+    }
+
+    fn fetch(&self, pks: &[String]) -> Result<Vec<IndexBlock>, IndexError> {
+        Ok(pks.iter().filter_map(|pk| self.docs.get(pk).cloned()).collect())
     }
 
     fn flush(&mut self) -> Result<(), IndexError> {
@@ -303,7 +492,7 @@ mod tests {
 
         let mut q = FtsQuery::new("anchor");
         q.note_id = Some("b".into());
-        assert_eq!(idx.search(&q).unwrap()[0].pk, "b:0");
+        assert_eq!(idx.search(&q).unwrap()[0].pk, "b#0");
 
         let mut q = FtsQuery::new("索引");
         q.tags = vec!["INDEX".into()];
@@ -313,23 +502,72 @@ mod tests {
         idx.upsert(&[block("a", 0, "改写后没有那个词了", &[])]).unwrap();
         assert_eq!(idx.search(&FtsQuery::new("anchor")).unwrap().len(), 1);
 
-        idx.delete(&["b:0".into(), "not-exist".into()]).unwrap();
+        idx.delete(&["b#0".into(), "not-exist".into()]).unwrap();
         assert!(idx.search(&FtsQuery::new("anchor")).unwrap().is_empty());
         assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn plain_text_strips_markup() {
+        let p = BlockKind::Paragraph;
+        assert_eq!(
+            plain_text("**粗体** 与 *斜体*、`code`、==高亮==、~~删除~~", &p),
+            "粗体 与 斜体、code、高亮、删除"
+        );
+        assert_eq!(
+            plain_text("见 [[rust/ripgrep|rg]] 和 [[tokio#运行时]] 与 ![[img.png|400]]", &p),
+            "见 rg 和 tokio#运行时 与 img.png"
+        );
+        assert_eq!(
+            plain_text("[文档](https://x.y) ![图](a.png) <https://z.w> <b>x</b>", &p),
+            "文档 图 https://z.w x"
+        );
+        assert_eq!(
+            plain_text("段落 {.red} 结束 #tag snake_case 1 = 2 ~ 3", &p),
+            "段落  结束 #tag snake_case 1 = 2 ~ 3"
+        );
+        assert_eq!(plain_text("\\*literal\\*", &p), "*literal*");
+        assert_eq!(plain_text("## 标题 **x**", &BlockKind::Heading { level: 2 }), "标题 x");
+        assert_eq!(
+            plain_text("```rust\nlet a = 1;\n```", &BlockKind::CodeFence { info: String::new() }),
+            "let a = 1;"
+        );
+        assert_eq!(plain_text("    x\n    y", &BlockKind::CodeBlock), "x\ny");
+        assert_eq!(plain_text("| a | **b** |\n| --- | --- |\n| 1 | 2 |", &BlockKind::Table), "a  b\n1  2");
+        assert_eq!(plain_text("> 引用\n> > 嵌套", &BlockKind::BlockQuote), "引用\n嵌套");
+    }
+
+    #[test]
+    fn blocks_for_note_numbers_indexable_leaves() {
+        let doc = Document::from_text(
+            "---\ntitle: T\n---\n\n# 标题\n\n第一段 #rust #cli。\n\n---\n\n- 列表项一\n- 列表项二\n\n```\ncode\n```\n\n\n",
+        );
+        let blocks = blocks_for_note(&doc, "n1", "a.md", "T");
+        let bodies: Vec<&str> = blocks.iter().map(|b| b.body.as_str()).collect();
+        assert_eq!(bodies, ["标题", "第一段 #rust #cli。", "列表项一", "列表项二", "code"]);
+        assert_eq!(blocks.iter().map(|b| b.block_ord).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+        assert_eq!(blocks[1].pk, "n1#1");
+        assert_eq!(blocks[1].tags, ["rust", "cli"]);
+        assert_eq!(blocks[0].title, "T");
+        assert_eq!(blocks[0].path, "a.md");
+        // ord 与 indexable_leaves 下标一致，能回到块
+        let leaves = indexable_leaves(&doc);
+        assert_eq!(leaves.len(), 5);
+        assert_eq!(doc.slice(doc.content_range(leaves[4])).to_string(), "```\ncode\n```");
     }
 
     #[test]
     fn vector_search_orders_by_cosine() {
         let mut idx = MemoryVectorIndex::new(2);
         idx.upsert(&[
-            VectorItem { pk: "a:0".into(), note_id: "a".into(), block_ord: 0, vector: vec![1.0, 0.0] },
-            VectorItem { pk: "a:1".into(), note_id: "a".into(), block_ord: 1, vector: vec![0.0, 1.0] },
-            VectorItem { pk: "b:0".into(), note_id: "b".into(), block_ord: 0, vector: vec![0.7, 0.7] },
+            VectorItem { pk: "a#0".into(), note_id: "a".into(), block_ord: 0, vector: vec![1.0, 0.0] },
+            VectorItem { pk: "a#1".into(), note_id: "a".into(), block_ord: 1, vector: vec![0.0, 1.0] },
+            VectorItem { pk: "b#0".into(), note_id: "b".into(), block_ord: 0, vector: vec![0.7, 0.7] },
         ])
         .unwrap();
         let hits = idx.search(&[1.0, 0.1], 2, None).unwrap();
-        assert_eq!(hits[0].pk, "a:0");
-        assert_eq!(hits[1].pk, "b:0");
+        assert_eq!(hits[0].pk, "a#0");
+        assert_eq!(hits[1].pk, "b#0");
         let hits = idx.search(&[1.0, 0.1], 5, Some("b")).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(matches!(idx.search(&[1.0], 1, None), Err(IndexError::Dimension { expected: 2, got: 1 })));

@@ -12,7 +12,7 @@ use std::fmt;
 use std::ops::Range;
 
 use crate::anchors::MarkerTable;
-use crate::block::{Block, BlockId, BlockTree};
+use crate::block::{Block, BlockId, BlockKind, BlockTree};
 use crate::parse::{self, ParseOutput, ParseReport, ParsedBlock};
 use crate::text::{self, Edit, EditError, LineEnding, Rope, RopeSlice, SourceText};
 
@@ -135,6 +135,21 @@ impl Document {
 
     pub fn block_text(&self, b: &Block) -> String {
         self.text.slice(self.range_of(b)).to_string()
+    }
+
+    /// front matter 里 `title:` 的值：在文档中的字节区间（不含引号）与去引号后的文本。
+    /// 只认最常见的写法（顶层 `title: xxx`，可带单 / 双引号）；别的形式当作没有 title。
+    pub fn front_matter_title(&self) -> Option<(Range<usize>, String)> {
+        let fm = self.blocks.roots.first().filter(|b| b.kind == BlockKind::FrontMatter)?;
+        let range = self.content_range(fm);
+        let src = self.slice(range.clone()).to_string();
+        let (r, text) = front_matter_title(&src)?;
+        Some((range.start + r.start..range.start + r.end, text))
+    }
+
+    /// 笔记标题：front matter `title`，没有则 `fallback`（通常是文件名）。
+    pub fn title_or(&self, fallback: &str) -> String {
+        self.front_matter_title().map(|(_, t)| t).unwrap_or_else(|| fallback.to_owned())
     }
 
     /// 包含 `offset` 的最深块（区间按闭区间判断，光标停在块尾也算在块内）。
@@ -434,10 +449,54 @@ impl fmt::Display for Document {
     }
 }
 
+/// front matter 源码里 `title:` 一行的值：值在 `src` 内的字节区间（不含引号）与去引号后的文本。
+pub fn front_matter_title(src: &str) -> Option<(Range<usize>, String)> {
+    let mut at = 0;
+    for line in src.split_inclusive('\n') {
+        let start = at;
+        at += line.len();
+        let body = line.trim_end_matches(['\n', '\r']);
+        let Some(rest) = body.strip_prefix("title:") else { continue };
+        let value_start = start + "title:".len() + (rest.len() - rest.trim_start().len());
+        let value = rest.trim();
+        let value_end = value_start + value.len();
+        let (range, text) = match value.as_bytes() {
+            [q @ (b'"' | b'\''), .., last] if *last == *q && value.len() >= 2 => {
+                (value_start + 1..value_end - 1, value[1..value.len() - 1].to_owned())
+            }
+            _ => (value_start..value_end, value.to_owned()),
+        };
+        return Some((range, text));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::BlockKind;
+
+    #[test]
+    fn front_matter_title_value_range() {
+        let src = "---\ntags: [a]\ntitle: 我的标题\n---";
+        let (r, t) = front_matter_title(src).unwrap();
+        assert_eq!(t, "我的标题");
+        assert_eq!(&src[r], "我的标题");
+        let src = "---\ntitle:   \"quoted: yes\"  \n---";
+        let (r, t) = front_matter_title(src).unwrap();
+        assert_eq!(t, "quoted: yes");
+        assert_eq!(&src[r], "quoted: yes");
+        assert!(front_matter_title("---\nsubtitle: x\n---").is_none());
+        let (r, t) = front_matter_title("---\ntitle:\n---").unwrap();
+        assert_eq!(t, "");
+        assert!(r.is_empty());
+
+        let doc = Document::from_text("---\ntitle: T\n---\n\nbody\n");
+        let (r, t) = doc.front_matter_title().unwrap();
+        assert_eq!(t, "T");
+        assert_eq!(doc.slice(r).to_string(), "T");
+        assert_eq!(doc.title_or("file"), "T");
+        assert_eq!(Document::from_text("plain\n").title_or("file"), "file");
+    }
 
     const DOC: &str = "# 标题\n\n第一段。\n\n- a\n- b\n\n第三段。\n";
 

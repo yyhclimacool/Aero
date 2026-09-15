@@ -56,6 +56,8 @@ pub enum EditorEvent {
     Conflict(VaultPath),
     /// 用户在标题处输入了新文件名（不含 `.md`）：真正的重命名由工作区做，文件树与路径要一起变
     RenameRequested(String),
+    /// 异步保存成功落盘；工作区据此增量更新索引
+    Saved,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -110,6 +112,11 @@ pub struct Editor {
     slash: Option<SlashMenu>,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
+    /// 搜索命中定位：下一帧把这个块滚到视口上三分之一处
+    reveal: Option<BlockId>,
+    /// 短暂高亮的块（定位后 1.5 s）
+    highlight: Option<BlockId>,
+    highlight_task: Option<Task<()>>,
     dirty: bool,
     save_state: SaveState,
     save_task: Option<Task<()>>,
@@ -152,6 +159,9 @@ impl Editor {
             slash: None,
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            reveal: None,
+            highlight: None,
+            highlight_task: None,
             dirty: false,
             save_state: SaveState::Clean,
             save_task: None,
@@ -179,11 +189,7 @@ impl Editor {
 
     /// front matter 里 `title:` 值在文档中的区间与文本。
     fn front_matter_title(&self) -> Option<(Range<usize>, String)> {
-        let fm = self.doc.blocks().roots.first().filter(|b| b.kind == BlockKind::FrontMatter)?;
-        let range = self.doc.content_range(fm);
-        let src = self.doc.slice(range.clone()).to_string();
-        let (r, text) = front_matter_title(&src)?;
-        Some((range.start + r.start..range.start + r.end, text))
+        self.doc.front_matter_title()
     }
 
     // ---- 标题编辑（5.1） ----
@@ -273,6 +279,63 @@ impl Editor {
     /// 浏览态聚焦（键盘可用，但没有光标）。
     pub fn focus_browse(&self, window: &mut Window, cx: &mut App) {
         self.focus_handle.focus(window, cx);
+    }
+
+    /// 给索引用的快照：路径、源文本、磁盘指纹。
+    pub fn index_snapshot(&self) -> (VaultPath, String, FileStamp) {
+        (self.path.clone(), self.doc.to_string(), self.stamp)
+    }
+
+    /// 搜索命中定位：第 `ord` 个可索引块（`aero_core::index::indexable_leaves` 的下标）滚到可见位置并短暂高亮。
+    /// 索引可能落后于文档，`ord` 越界时定位到最后一个块。
+    pub fn reveal_indexed_block(&mut self, ord: u32, cx: &mut Context<Self>) {
+        let leaves = aero_core::index::indexable_leaves(&self.doc);
+        let Some(id) = leaves.get(ord as usize).or(leaves.last()).map(|b| b.id) else { return };
+        self.reveal = Some(id);
+        self.highlight = Some(id);
+        self.highlight_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1500)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.highlight == Some(id) {
+                    this.highlight = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn highlighted_block(&self) -> Option<BlockId> {
+        self.highlight
+    }
+
+    /// 定位块的滚动：在块的子元素布局完成后算出它相对滚动容器的位置，把它放到视口上 1/3 处。
+    /// 改 offset 在本帧已经来不及生效，所以顺手 `notify` 再画一帧。
+    fn reveal_listener(
+        &self,
+        id: BlockId,
+        cx: &Context<Self>,
+    ) -> impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static {
+        let scroll = self.scroll.clone();
+        let this = cx.weak_entity();
+        move |bounds, _window, cx| {
+            let Some(target) = bounds.first() else { return };
+            let container = scroll.bounds();
+            if container.size.height <= px(0.) {
+                return;
+            }
+            let desired_top = container.origin.y + container.size.height / 3.;
+            let delta = target.origin.y - desired_top;
+            let offset = scroll.offset();
+            scroll.set_offset(point(offset.x, (offset.y - delta).min(px(0.))));
+            let _ = this.update(cx, |this, cx| {
+                if this.reveal == Some(id) {
+                    this.reveal = None;
+                    cx.notify();
+                }
+            });
+        }
     }
 
     /// 标题树（右侧大纲面板）：`(level, 文本, 块 id)`。
@@ -833,6 +896,7 @@ impl Editor {
                         if this.doc.version() == version {
                             this.dirty = false;
                             this.save_state = SaveState::Saved(Instant::now());
+                            cx.emit(EditorEvent::Saved);
                         } else {
                             // 写盘期间又有编辑，交给它自己的定时器
                             this.save_state = SaveState::Dirty;
@@ -1249,6 +1313,14 @@ impl Editor {
             }
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });
+        let highlighted = self.highlight == Some(id);
+        let accent = theme.accent;
+        // 定位中的块：多套一层拿子元素布局（`on_children_prepainted` 只在无状态 div 上有）
+        let body: AnyElement = if self.reveal == Some(id) {
+            div().w_full().on_children_prepainted(self.reveal_listener(id, cx)).child(body).into_any_element()
+        } else {
+            body
+        };
         Some(
             div()
                 .id(("unit", id.0))
@@ -1257,6 +1329,7 @@ impl Editor {
                 .min_h(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT))
                 .when(is_heading, |el| el.pt_2())
                 .cursor_text()
+                .when(highlighted, |el| el.bg(accent).rounded(px(6.)).mx(px(-8.)).px(px(8.)))
                 .on_mouse_down(MouseButton::Left, focus)
                 .child(body)
                 .into_any_element(),

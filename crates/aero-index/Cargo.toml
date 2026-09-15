@@ -1,0 +1,19 @@
+[package]
+name = "aero-index"
+description = "Index pipeline: zvec full-text index (ADR 0003) + SQLite metadata + incremental indexer over a vault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aero-core.workspace = true
+# 全文 + 向量引擎（ADR 0003）。C 库经 ZVEC_LIB_DIR 提供，见 .cargo/config.toml
+zvec-rust.workspace = true
+# 元数据库（方案 10.2）：每篇笔记的指纹与块数，是索引状态的权威（10.5）
+rusqlite = { version = "0.37", features = ["bundled"] }
+log = "0.4"
+thiserror = "2"
+ulid = "3"
+
+[dev-dependencies]
+tempfile = "3"

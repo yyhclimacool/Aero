@@ -25,6 +25,23 @@ actions!(
         SaveNow,
         /// 把文件树里选中的笔记（没有则是打开中的笔记）移到废纸篓
         DeleteNote,
+        /// ⌘⇧F：左侧栏切到搜索视图并聚焦输入框（`ui_design.md` 4.2）
+        OpenSearch,
+        /// ⌘⇧E：左侧栏切回文件视图
+        OpenFiles,
+        /// ⌘P：快速打开（3.2）
+        QuickOpen,
+    ]
+);
+
+actions!(
+    picker,
+    [
+        /// 搜索视图 / 快速打开里 ↑↓ 移动选中项
+        SelectPrev,
+        SelectNext,
+        /// Esc：关闭快速打开 / 从搜索框回到编辑器
+        Dismiss,
     ]
 );
 
@@ -75,6 +92,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-d", OpenDaily, None),
         KeyBinding::new("cmd-s", SaveNow, None),
         KeyBinding::new("cmd-backspace", DeleteNote, Some("FileTree")),
+        KeyBinding::new("cmd-shift-f", OpenSearch, None),
+        KeyBinding::new("cmd-shift-e", OpenFiles, None),
+        KeyBinding::new("cmd-p", QuickOpen, None),
+        // 搜索框 / 快速打开里的 ↑↓ / Esc：谓词写成 "Picker > Input"，匹配深度与 Input 自己的绑定相同、
+        // 注册更晚，所以先于它们（以及下面编辑器的 up / down）匹配
+        KeyBinding::new("up", SelectPrev, Some("Picker > Input")),
+        KeyBinding::new("down", SelectNext, Some("Picker > Input")),
+        KeyBinding::new("escape", Dismiss, Some("Picker > Input")),
         KeyBinding::new("cmd-\\", ToggleSidebar, None),
         KeyBinding::new("cmd-shift-\\", TogglePanel, None),
         KeyBinding::new("cmd-|", TogglePanel, None),
@@ -117,6 +142,10 @@ pub fn init(cx: &mut App) {
             MenuItem::action("全选", gpui_kit::base::input::SelectAll),
         ]),
         Menu::new("视图").items(vec![
+            MenuItem::action("文件", OpenFiles),
+            MenuItem::action("搜索", OpenSearch),
+            MenuItem::action("快速打开…", QuickOpen),
+            MenuItem::separator(),
             MenuItem::action("折叠 / 展开左侧栏", ToggleSidebar),
             MenuItem::action("折叠 / 展开右侧面板", TogglePanel),
         ]),
