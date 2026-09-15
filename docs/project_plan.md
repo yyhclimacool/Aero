@@ -1,6 +1,6 @@
 # Aero · Local-First AI Knowledge Workspace 技术方案
 
-> 状态：草案 v0.8（2026-09-15）
+> 状态：草案 v0.9（2026-09-15）
 > 投入假设：单人、业余时间（约每周 10 小时）。排期见第 18 节。
 > 本文是后续所有架构决策的依据。产品与范围层面的决定已全部拍板，见第 22 节；剩余待定项均为由 M0 spike 数据决定的技术选型。
 > UI 与交互设计见 `docs/ui_design.md`。
@@ -614,8 +614,8 @@ brew upgrade ripgrep
 
 Block 与 CommonMark 的块级节点一一对应，分两类：
 
-- **Leaf Block（编辑单位）**：Paragraph、Heading、CodeFence、MathBlock、Table、ThematicBreak、HtmlBlock、FrontMatter、Raw、DataBlock（6.4.3）。
-- **Container Block（结构单位）**：ListItem（每个列表项是一个 block，与 Notion 一致；List 本身只是容器）、BlockQuote / Callout、Directive。
+- **Leaf Block（编辑单位）**：Paragraph、Heading、CodeFence（围栏；DataBlock 6.4.3 只是特定 info 的 CodeFence）、CodeBlock（缩进）、MathBlock、Table、ThematicBreak、HtmlBlock、FrontMatter、Raw、Marker（独占行的 `^id` / 属性列表，见 7.2）。
+- **Container Block（结构单位）**：List、ListItem（每个列表项是一个 block，与 Notion 一致；List 本身只是容器）、BlockQuote / Callout、FootnoteDefinition、Directive。
 
 编辑器的光标永远位于某个 Leaf Block 内；拖拽、多选、缩进操作作用于 Leaf 或 ListItem。
 
@@ -632,13 +632,17 @@ struct Document {
 
 struct Block {
     id: BlockId,                   // 会话内稳定的内部 id
-    kind: BlockKind,
-    range: Range<Anchor>,          // 随编辑自动漂移的锚点
+    kind: BlockKind,               // callout 类型 / 折叠、directive 名、围栏 info、任务勾选等都在 kind 的参数里
+    range: Range<Anchor>,          // 随编辑自动漂移的锚点，覆盖块的全部源文本
+    suffix_len: u32,               // 尾部 ` {.red} ^id` 标记占的字节数，编辑器显示正文时去掉
     persisted_id: Option<Arc<str>>,// 文件中的 ^id（如有）
-    attrs: Attrs,                  // callout 类型、directive 属性、语言、块属性列表（颜色等）
+    attrs: Attrs,                  // 属性列表（颜色等）
+    hash: u64,                     // 块源文本的 xxh3，供 7.3 身份匹配与索引增量
     children: Vec<Block>,
 }
 ```
+
+独占一行的 `^id` / `{属性列表}` 在树里是一个 `Marker` 块：区间照实覆盖那一行（往返、间隙校验都不用特判），语义（id、属性）已挂到前一个兄弟块上，UI 不渲染它。
 
 Inline 树节点同样带 `attrs`，承载 6.3.10 的行内属性列表。
 
@@ -651,7 +655,12 @@ Inline 树节点同样带 `attrs`，承载 6.3.10 的行内属性列表。
 ### 7.3 Block 身份
 
 - 内部 `BlockId` 在会话内稳定，供 UI 状态（折叠、选中）与索引增量更新使用。
-- 重新解析后按 `(kind, 内容 hash)` 精确匹配，其次按位置就近匹配，匹配上的沿用旧 id，否则分配新 id。
+- 重新解析后沿用旧 id 的匹配分四级（`aero-core::document`，随机编辑序列的属性测试保证：未被触碰、仍在原位的块 id 不变，且撤销后仍不变）：
+  1. `(kind, 内容 hash)` 相同且起点重合——旧块的起点取已漂移的 anchor，与新区间同一坐标系；
+  2. `(kind, 内容 hash)` 相同、起点最近——同内容的"孪生块"必须先做第 1 级，否则一个被改动后其余会在先序贪心里被错位认领；
+  3. 同 kind、起点最近——内容被改过的块；
+  4. 不限 kind、起点相差 ≤ 2 字节——段落 ↔ 标题 ↔ 列表项这类改前缀的类型转换保住身份，`/` 菜单切换块类型不丢焦点与折叠状态。
+  其余分配新 id。
 - 持久化身份只有 `^id` 与 front matter `id`，规则见 6.3.3 / 6.3.4。未被引用的块身份允许漂移。
 
 ### 7.4 编辑管线
@@ -689,14 +698,19 @@ Inline 树节点同样带 `attrs`，承载 6.3.10 的行内属性列表。
 
 ```text
 原文
- → 预扫描：front matter、数据块、链接引用定义（Raw）、独占行 ^id 与 {属性列表}
- → comrak（strikethrough / table / tasklist / footnotes / math / wikilinks / alerts /
-           highlight / block_directive / attributes / cjk_friendly_emphasis）
- → 后处理：顶层块按区间排序 → 位置校验（越界节点标记不可信，父区间内重扫）
-          → embed / #tag / %% / 段尾 ^id 与 {属性列表} / [文本]{属性} / 行内 directive
-          → 仅含 display Math 的段落提升为数学块
- → Block 树 + Inline 树（均带字节区间）
+ → comrak（front matter / strikethrough / table / tasklist / footnotes / math / wikilinks /
+           highlight / block_directive / attributes / cjk_friendly_emphasis；alerts 关闭）
+ → 转换：sourcepos → 字节区间；越出父区间 / 非 char 边界的夹回并计入报告
+ → 后处理（aero-core::parse）：
+      兄弟块按区间排序（FootnoteDefinition 归位）→ 兄弟重叠时截断前者（块起点比终点可靠）
+      → 仅含 display Math 的段落 → MathBlock
+      → 段尾 / 独占行的 ^id 与 {属性列表}（独占行成为 Marker，语义挂到前一个兄弟）
+      → 引用块首行 [!type]± 标题 → Callout（Aero 的 8 种类型与 GitHub 的 5 种走同一条路）
+      → 顶层块之间含非空白内容的间隙 → Raw（链接引用定义等 comrak 不产节点的内容）
+ → Block 树（带字节区间）；Inline 树（embed / #tag / %% / [文本]{属性} / 行内 directive）为 M1a 事项
 ```
+
+后处理带一份 `ParseReport`（夹回 / 丢弃 / 补 Raw 的计数与明细）。CommonMark spec 655 例、样本文件与合成文档上要求块级零夹回；真实笔记里目前只见过"列表项内段落末尾多算一个空格"这一种 1 字节夹回。
 
 ### 8.3 无损往返规则
 
@@ -977,7 +991,7 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
 - ~~comrak vs markdown-rs：在测试语料上测 inline 位置精度与往返，限时一周定型。~~ **已完成（2026-09-15，ADR 0002）**：comrak。
 - ~~Rope 选型：anchor 漂移、10 MB 文件的编辑延迟。~~ **已完成（2026-09-15，ADR 0004）**：`ropey =2.0.0-beta.1`（与 gpui-base 同型，字节索引）+ aero-core 自建 marker 表做 Anchor；10 MB 上编辑 0.4 µs、快照 O(1)、marker 平移 49 µs，1 万次随机编辑后锚点零错误。M0 四个 spike 全部关闭。
 - ~~zvec-rust 专项：`bench-10k` 查询延迟、高频小 upsert 的写后可见延迟、macOS dylib 进 `Contents/Frameworks` 并签名公证的完整链路、`ZVEC_LIB_DIR` 离线构建、是否可静态链接。~~ **已完成（2026-09-15，ADR 0003）**：zvec 定为唯一索引引擎。查询 p95 ≤ 3 ms、写后 2 ms 可见、bundle 与离线构建跑通；静态链接放弃；发现 `delete_by_filter` 僵尸主键 bug 与 jieba 全词典 200 MB 内存两项，均有绕过方案（10.3）。
-- 产出：`aero-core` 骨架、`FullTextIndex` / `VectorIndex` trait、往返测试框架、`docs/decisions/` 记录。
+- ~~产出：`aero-core` 骨架、`FullTextIndex` / `VectorIndex` trait、往返测试框架、`docs/decisions/` 记录。~~ **已完成（2026-09-15）**：`crates/aero-core` 含 `text`（Rope + Edit）、`anchors`（marker 表）、`block`、`parse`（comrak + 后处理，8.2）、`document`（两段式编辑管线、undo、7.3 身份匹配）、`index`（trait + 内存实现）、`vault`（路径、枚举、原子写）；`tests/roundtrip.rs` 覆盖 CommonMark spec 655 例、样本、合成文档、随机编辑序列（proptest）与可选的真实笔记目录（`AERO_CORPUS_DIR`）。spikes 目录保留到 M1a 开始前再删。
 
 ### M1a · 能打开、能编辑、能保存（约 160 小时，2026-11 中 → 2027-03）
 

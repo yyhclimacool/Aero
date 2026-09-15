@@ -6,3 +6,20 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# 文本模型（ADR 0004），版本随 workspace / gpui-base
+ropey.workspace = true
+# Markdown 解析（ADR 0002）。关掉 cli / syntect，只要解析器与 {.class} 属性支持
+comrak = { version = "0.55", default-features = false, features = ["attributes"] }
+# 非加密哈希：块内容 hash（BlockId 匹配）、文件 hash（变更检测）
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# vault 遍历，尊重 .gitignore 与 .aero/ignore
+ignore = "0.4"
+# .aero/vault.toml
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+ulid = "3"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

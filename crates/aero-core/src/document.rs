@@ -1,0 +1,507 @@
+//! Document：一份 Rope（唯一文本真相）+ marker 表 + Block 树（方案 7.2 / 7.4，ADR 0004）。
+//!
+//! 编辑管线分两段：
+//! - 同步段：[`Document::edit`] 改 Rope、平移 anchor、记 undo。块树保持旧结构，但区间已跟着漂移，
+//!   UI 可以立刻按新区间重绘聚焦块。
+//! - 异步段：[`Document::snapshot`] 拿一个 O(1) 快照，在任意线程 [`Snapshot::parse`]，
+//!   再用 [`Document::apply_parse`] 把结果装回；若期间又有编辑（version 不符）则结果作废，
+//!   由调用方重新快照。小文档直接 [`Document::reparse`] 同步完成。
+
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::ops::Range;
+
+use crate::anchors::MarkerTable;
+use crate::block::{Block, BlockId, BlockTree};
+use crate::parse::{self, ParseOutput, ParseReport, ParsedBlock};
+use crate::text::{self, Edit, EditError, LineEnding, Rope, RopeSlice, SourceText};
+
+/// 文本快照，可跨线程解析。
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    text: Rope,
+    version: u64,
+}
+
+impl Snapshot {
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn text(&self) -> &Rope {
+        &self.text
+    }
+
+    /// 物化 + 解析。10 MB 文档物化 ≈ 0.7 ms，解析按 ~18 ms/MB 估（ADR 0002 / 0004）。
+    pub fn parse(&self) -> ParseOutput {
+        parse::parse(&String::from(&self.text))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Document {
+    text: Rope,
+    anchors: MarkerTable,
+    blocks: BlockTree,
+    /// 每次编辑 +1
+    version: u64,
+    /// 当前块树对应的文本版本
+    parsed_version: u64,
+    next_id: u64,
+    /// 逆编辑组；每组按顺序应用即可撤销一次操作
+    undo: Vec<Vec<Edit>>,
+    redo: Vec<Vec<Edit>>,
+    pub bom: bool,
+    pub line_ending: LineEnding,
+    /// 最近一次解析的后处理统计
+    pub report: ParseReport,
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Self::from_source(SourceText::fresh(""))
+    }
+}
+
+impl Document {
+    pub fn from_text(text: &str) -> Self {
+        Self::from_source(SourceText::fresh(text))
+    }
+
+    /// 从文件字节构造：去 BOM、CRLF → LF，写回时还原。
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, std::str::Utf8Error> {
+        SourceText::decode(bytes).map(Self::from_source)
+    }
+
+    pub fn from_source(src: SourceText) -> Self {
+        let mut doc = Document {
+            text: Rope::from_str(&src.text),
+            anchors: MarkerTable::new(),
+            blocks: BlockTree::default(),
+            version: 0,
+            parsed_version: u64::MAX,
+            next_id: 1,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            bom: src.bom,
+            line_ending: src.line_ending,
+            report: ParseReport::default(),
+        };
+        doc.reparse();
+        doc
+    }
+
+    // ---- 读 ----
+
+    pub fn text(&self) -> &Rope {
+        &self.text
+    }
+
+    pub fn len(&self) -> usize {
+        self.text.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.len() == 0
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn blocks(&self) -> &BlockTree {
+        &self.blocks
+    }
+
+    /// 块树是否落后于文本（有编辑尚未解析）。
+    pub fn is_parse_stale(&self) -> bool {
+        self.parsed_version != self.version
+    }
+
+    pub fn slice(&self, r: Range<usize>) -> RopeSlice<'_> {
+        self.text.slice(r)
+    }
+
+    /// 块的当前字节区间（随编辑漂移后）。
+    pub fn range_of(&self, b: &Block) -> Range<usize> {
+        self.anchors.resolve_range(&b.range)
+    }
+
+    /// 去掉尾部 `^id` / 属性标记后的正文区间。
+    pub fn content_range(&self, b: &Block) -> Range<usize> {
+        let r = self.range_of(b);
+        r.start..r.end.saturating_sub(b.suffix_len as usize).max(r.start)
+    }
+
+    pub fn block_text(&self, b: &Block) -> String {
+        self.text.slice(self.range_of(b)).to_string()
+    }
+
+    /// 包含 `offset` 的最深块（区间按闭区间判断，光标停在块尾也算在块内）。
+    pub fn block_at(&self, offset: usize) -> Option<&Block> {
+        let mut level = &self.blocks.roots;
+        let mut found = None;
+        loop {
+            let hit = level.iter().find(|b| {
+                let r = self.range_of(b);
+                r.start <= offset && offset <= r.end
+            });
+            match hit {
+                Some(b) => {
+                    found = Some(b);
+                    if b.children.is_empty() {
+                        return found;
+                    }
+                    level = &b.children;
+                }
+                None => return found,
+            }
+        }
+    }
+
+    /// 写回文件用的字节（还原 BOM 与行尾）。
+    pub fn to_bytes(&self) -> Vec<u8> {
+        SourceText::encode(&self.to_string(), self.bom, self.line_ending)
+    }
+
+    // ---- 写 ----
+
+    /// 应用一次编辑，作为独立的 undo 组。
+    pub fn edit(&mut self, edit: Edit) -> Result<(), EditError> {
+        self.edit_group(vec![edit])
+    }
+
+    /// 顺序应用一组编辑（后一个的坐标基于前一个应用之后的文本），作为一个 undo 组。
+    /// 任一编辑非法时整组回滚，文档不变。
+    pub fn edit_group(&mut self, edits: Vec<Edit>) -> Result<(), EditError> {
+        let mut inverses = Vec::with_capacity(edits.len());
+        for e in &edits {
+            if let Err(err) = text::check_edit(&self.text, e) {
+                for inv in inverses.iter().rev() {
+                    self.apply_raw(inv);
+                }
+                return Err(err);
+            }
+            inverses.push(self.apply_raw(e));
+        }
+        if !inverses.is_empty() {
+            inverses.reverse();
+            self.undo.push(inverses);
+            self.redo.clear();
+        }
+        Ok(())
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(group) = self.undo.pop() else { return false };
+        let redo_group = self.apply_group(&group);
+        self.redo.push(redo_group);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(group) = self.redo.pop() else { return false };
+        let undo_group = self.apply_group(&group);
+        self.undo.push(undo_group);
+        true
+    }
+
+    fn apply_group(&mut self, group: &[Edit]) -> Vec<Edit> {
+        let mut inverses: Vec<Edit> = group.iter().map(|e| self.apply_raw(e)).collect();
+        inverses.reverse();
+        inverses
+    }
+
+    /// 改 Rope + 平移 anchor + 版本号。调用方保证编辑合法。
+    fn apply_raw(&mut self, edit: &Edit) -> Edit {
+        let inverse = text::apply_edit(&mut self.text, edit);
+        self.anchors.apply(edit);
+        self.version += 1;
+        inverse
+    }
+
+    // ---- 解析 ----
+
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot { text: self.text.clone(), version: self.version }
+    }
+
+    /// 同步重解析。
+    pub fn reparse(&mut self) {
+        let snap = self.snapshot();
+        let out = snap.parse();
+        self.apply_parse(snap.version(), out);
+    }
+
+    /// 装回一次解析结果。`version` 是解析所用快照的版本；与当前不符则丢弃并返回 `false`。
+    pub fn apply_parse(&mut self, version: u64, out: ParseOutput) -> bool {
+        if version != self.version {
+            return false;
+        }
+        self.report = out.report;
+        self.rebuild(out.blocks);
+        self.parsed_version = version;
+        true
+    }
+
+    /// 用新的解析结果重建 anchor 表与块树，按 7.3 沿用旧 BlockId：
+    /// 先按 (kind, hash) 精确匹配（同内容的多个候选取位置最近的），再对剩余块按同类型位置就近匹配。
+    /// 旧块的位置取已漂移的 anchor，与新区间在同一坐标系里。
+    fn rebuild(&mut self, parsed: Vec<ParsedBlock>) {
+        let mut exact: HashMap<(&'static str, u64), Candidates> = HashMap::new();
+        for (_, b) in self.blocks.iter() {
+            let start = self.anchors.resolve(b.range.start);
+            exact.entry((b.kind.tag(), b.hash)).or_default().insert(start, b.id);
+        }
+
+        let flat: Vec<(&'static str, u64, usize)> =
+            ParsedBlock::iter(&parsed).map(|(_, b)| (b.kind.tag(), b.hash, b.range.start)).collect();
+        let mut ids: Vec<Option<BlockId>> = vec![None; flat.len()];
+
+        // 第一遍：精确匹配。先取起点完全重合的，再取最近的——否则内容相同的"孪生块"里，
+        // 一个被改动后其余的会在先序贪心里被错位认领，撤销后 id 整体串位。
+        for max_dist in [0, usize::MAX] {
+            for (i, (tag, hash, start)) in flat.iter().enumerate() {
+                if ids[i].is_none() {
+                    ids[i] = exact.get_mut(&(*tag, *hash)).and_then(|c| c.take_nearest(*start, max_dist));
+                }
+            }
+        }
+
+        // 第二遍：同类型按位置就近（内容被改过的块）
+        let mut by_tag: HashMap<&'static str, Candidates> = HashMap::new();
+        for ((tag, _), c) in exact {
+            by_tag.entry(tag).or_default().extend(c);
+        }
+        for (i, (tag, _, start)) in flat.iter().enumerate() {
+            if ids[i].is_none() {
+                ids[i] = by_tag.get_mut(tag).and_then(|c| c.take_nearest(*start, usize::MAX));
+            }
+        }
+
+        // 第三遍：不限类型、但起点必须几乎重合（段落 ↔ 标题 ↔ 列表项这类改前缀的类型转换
+        // 要保住身份，否则 `/` 菜单切换块类型会丢焦点与折叠状态；远处消失的块不能把 id 传给无关的新块）
+        let mut any = Candidates::default();
+        for (_, c) in by_tag {
+            any.extend(c);
+        }
+        for (i, (_, _, start)) in flat.iter().enumerate() {
+            if ids[i].is_none() {
+                ids[i] = any.take_nearest(*start, 2);
+            }
+        }
+
+        let mut anchors = MarkerTable::successor(&self.anchors);
+        let mut ids = ids.into_iter();
+        let roots = self.build_blocks(parsed, &mut anchors, &mut ids);
+        self.anchors = anchors;
+        self.blocks = BlockTree { roots };
+    }
+
+    fn build_blocks(
+        &mut self,
+        parsed: Vec<ParsedBlock>,
+        anchors: &mut MarkerTable,
+        ids: &mut impl Iterator<Item = Option<BlockId>>,
+    ) -> Vec<Block> {
+        parsed
+            .into_iter()
+            .map(|p| {
+                let id = ids.next().flatten().unwrap_or_else(|| {
+                    let id = BlockId(self.next_id);
+                    self.next_id += 1;
+                    id
+                });
+                let range = anchors.anchor_range(p.range);
+                let children = self.build_blocks(p.children, anchors, ids);
+                Block {
+                    id,
+                    kind: p.kind,
+                    range,
+                    suffix_len: p.suffix_len,
+                    persisted_id: p.persisted_id,
+                    attrs: p.attrs,
+                    hash: p.hash,
+                    children,
+                }
+            })
+            .collect()
+    }
+}
+
+/// 按起点排好序的候选旧块，支持取出离某位置最近的一个。
+#[derive(Default)]
+struct Candidates {
+    by_start: BTreeMap<usize, Vec<BlockId>>,
+    len: usize,
+}
+
+impl Candidates {
+    fn insert(&mut self, start: usize, id: BlockId) {
+        self.by_start.entry(start).or_default().push(id);
+        self.len += 1;
+    }
+
+    fn extend(&mut self, other: Candidates) {
+        for (start, ids) in other.by_start {
+            for id in ids {
+                self.insert(start, id);
+            }
+        }
+    }
+
+    /// 取出起点离 `start` 最近、且距离不超过 `max_dist` 的候选。
+    fn take_nearest(&mut self, start: usize, max_dist: usize) -> Option<BlockId> {
+        if self.len == 0 {
+            return None;
+        }
+        let below = self.by_start.range(..=start).next_back().map(|(k, _)| *k);
+        let above = self.by_start.range(start..).next().map(|(k, _)| *k);
+        let key = match (below, above) {
+            (Some(b), Some(a)) => {
+                if start - b <= a - start {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Some(b), None) => b,
+            (None, Some(a)) => a,
+            (None, None) => return None,
+        };
+        if key.abs_diff(start) > max_dist {
+            return None;
+        }
+        let ids = self.by_start.get_mut(&key)?;
+        let id = ids.pop();
+        if ids.is_empty() {
+            self.by_start.remove(&key);
+        }
+        self.len -= 1;
+        id
+    }
+}
+
+impl fmt::Display for Document {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for chunk in self.text.chunks() {
+            f.write_str(chunk)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::BlockKind;
+
+    const DOC: &str = "# 标题\n\n第一段。\n\n- a\n- b\n\n第三段。\n";
+
+    #[test]
+    fn parse_on_construct_and_ranges_follow_edits() {
+        let mut d = Document::from_text(DOC);
+        assert_eq!(d.blocks.roots.len(), 4);
+        let para = d.blocks.roots[1].clone();
+        assert_eq!(d.block_text(&para), "第一段。");
+
+        // 在标题里插字：段落区间整体后移，块树未重解析但区间已正确
+        d.edit(Edit::insert("# 标题".len(), "！")).unwrap();
+        assert!(d.is_parse_stale());
+        assert_eq!(d.block_text(&para), "第一段。");
+        assert_eq!(d.to_string(), "# 标题！\n\n第一段。\n\n- a\n- b\n\n第三段。\n");
+    }
+
+    #[test]
+    fn block_ids_survive_reparse() {
+        let mut d = Document::from_text(DOC);
+        let before: Vec<(BlockId, BlockKind)> =
+            d.blocks.iter().map(|(_, b)| (b.id, b.kind.clone())).collect();
+        // 改第一段的内容
+        let r = d.range_of(&d.blocks.roots[1]);
+        d.edit(Edit::insert(r.end, "更多。")).unwrap();
+        d.reparse();
+        let after: Vec<(BlockId, BlockKind)> = d.blocks.iter().map(|(_, b)| (b.id, b.kind.clone())).collect();
+        assert_eq!(before.len(), after.len());
+        // 未改动的块 id 不变（精确匹配）；改动的段落靠位置匹配也沿用了 id
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn new_block_gets_new_id_and_others_keep_theirs() {
+        let mut d = Document::from_text(DOC);
+        let ids_before: Vec<BlockId> = d.blocks.roots.iter().map(|b| b.id).collect();
+        d.edit(Edit::insert(d.len(), "\n新段落。\n")).unwrap();
+        d.reparse();
+        let ids_after: Vec<BlockId> = d.blocks.roots.iter().map(|b| b.id).collect();
+        assert_eq!(ids_after.len(), 5);
+        assert_eq!(&ids_after[..4], &ids_before[..]);
+        assert!(!ids_before.contains(&ids_after[4]));
+    }
+
+    #[test]
+    fn undo_redo_roundtrip() {
+        let mut d = Document::from_text("abc");
+        d.edit(Edit::insert(3, "d")).unwrap();
+        d.edit_group(vec![Edit::delete(0..1), Edit::insert(0, "X")]).unwrap();
+        assert_eq!(d.to_string(), "Xbcd");
+        assert!(d.undo());
+        assert_eq!(d.to_string(), "abcd");
+        assert!(d.undo());
+        assert_eq!(d.to_string(), "abc");
+        assert!(!d.undo());
+        assert!(d.redo());
+        assert!(d.redo());
+        assert_eq!(d.to_string(), "Xbcd");
+        assert!(!d.redo());
+    }
+
+    #[test]
+    fn invalid_group_is_rolled_back() {
+        let mut d = Document::from_text("abc");
+        let err = d.edit_group(vec![Edit::insert(0, "x"), Edit::delete(0..99)]).unwrap_err();
+        assert!(matches!(err, EditError::OutOfBounds { .. }));
+        assert_eq!(d.to_string(), "abc");
+        assert!(!d.can_undo());
+    }
+
+    #[test]
+    fn stale_parse_is_rejected() {
+        let mut d = Document::from_text(DOC);
+        let snap = d.snapshot();
+        d.edit(Edit::insert(0, "x")).unwrap();
+        let out = snap.parse();
+        assert!(!d.apply_parse(snap.version(), out));
+        assert!(d.is_parse_stale());
+        d.reparse();
+        assert!(!d.is_parse_stale());
+    }
+
+    #[test]
+    fn block_at_finds_deepest() {
+        let d = Document::from_text(DOC);
+        let off = DOC.find("- b").unwrap() + 2;
+        let b = d.block_at(off).unwrap();
+        assert_eq!(b.kind, BlockKind::Paragraph);
+        assert_eq!(d.block_text(b), "b");
+        // 块尾（闭区间）
+        let heading = &d.blocks.roots[0];
+        assert_eq!(d.block_at(d.range_of(heading).end).unwrap().id, heading.id);
+    }
+
+    #[test]
+    fn bytes_roundtrip_preserves_crlf_and_bom() {
+        let bytes = b"\xEF\xBB\xBF# a\r\n\r\nb\r\n";
+        let d = Document::from_bytes(bytes).unwrap();
+        assert_eq!(d.to_bytes(), bytes);
+        assert_eq!(d.blocks.roots.len(), 2);
+    }
+}
