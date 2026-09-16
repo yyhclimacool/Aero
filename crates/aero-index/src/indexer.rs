@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use aero_core::index::blocks_for_note;
+use aero_core::index::blocks_and_links_for_note;
+use aero_core::links::{Resolution, Resolver};
 use aero_core::{
     Document, FileStamp, FtsQuery, FullTextIndex, IndexBlock, IndexError, Vault, VaultError, VaultPath,
 };
@@ -70,11 +71,95 @@ const FLUSH_EVERY_BLOCKS: usize = 10_000;
 /// 块 / 过滤字段的布局版本；变了就整体重建。3：`tags_filter` 连祖先标签一起写（父标签查询）。
 const FTS_VERSION: i64 = 3;
 
+/// wikilink 解析用的笔记表：路径 / 文件名 / 标题 → 路径，以及路径 → `note_id`。
+/// 从 `notes` 表建一次，之后随每次入库 / 删除 / 改名增量维护，单篇保存不再全表重读、不再走 vault。
+///
+/// 全量同步开始时（[`Indexer::plan_sync`]）磁盘上的全部路径就登记进来，新文件预分配 `note_id`：
+/// 这样逐篇入库时按路径 / 文件名的解析已经是最终结果（不会把还没轮到的同名笔记漏成"唯一"），
+/// 收尾只需补挂靠标题解析的少数行——而不是把上百万行读出来再逐行 UPDATE。
+struct LinkUniverse {
+    resolver: Resolver,
+    id_by_path: HashMap<String, String>,
+}
+
+impl LinkUniverse {
+    fn from_rows(rows: Vec<NoteRow>) -> Self {
+        let mut u =
+            LinkUniverse { resolver: Resolver::new(), id_by_path: HashMap::with_capacity(rows.len()) };
+        for row in rows {
+            if let Ok(path) = VaultPath::new(&row.path) {
+                u.insert(path, &row.note_id, Some(&row.title));
+            }
+        }
+        u
+    }
+
+    /// `title` 为 None：只登记路径（预分配阶段，标题要等读了文件才知道）。
+    fn insert(&mut self, path: VaultPath, note_id: &str, title: Option<&str>) {
+        self.id_by_path.insert(path.as_str().to_owned(), note_id.to_owned());
+        self.resolver.insert(path, title);
+    }
+
+    fn remove(&mut self, path: &VaultPath) {
+        self.id_by_path.remove(path.as_str());
+        self.resolver.remove(path);
+    }
+
+    /// 解析到的目标的 `note_id`；歧义 / 不存在都是 None。
+    fn resolve_id(&self, target: &str, fragment: Option<&str>, note_dir: &str) -> Option<&str> {
+        match self.resolver.resolve(target, fragment, note_dir) {
+            Resolution::Resolved { path, .. } => self.id_by_path.get(path.as_str()).map(String::as_str),
+            Resolution::Ambiguous { .. } | Resolution::Unresolved => None,
+        }
+    }
+
+    fn ids_of(&self, paths: &[VaultPath]) -> Vec<String> {
+        paths.iter().filter_map(|p| self.id_by_path.get(p.as_str()).cloned()).collect()
+    }
+}
+
+/// 一次 [`Indexer::reconcile_links`] 之前改动过的笔记：只重判它们邻域里的行（见 [`Resolver::neighbors`]）；
+/// 改动太多（全量同步）就退化为重判全部名字有竞争的行。
+#[derive(Default)]
+struct Touched {
+    /// `(路径, 改动前的标题)`
+    notes: Vec<(VaultPath, Option<String>)>,
+    /// 超过这么多篇就不逐篇算邻域了
+    overflow: bool,
+}
+
+const TOUCHED_LIMIT: usize = 64;
+
+impl Touched {
+    fn push(&mut self, path: VaultPath, old_title: Option<String>) {
+        if self.notes.len() >= TOUCHED_LIMIT {
+            self.overflow = true;
+        } else {
+            self.notes.push((path, old_title));
+        }
+    }
+}
+
 pub struct Indexer {
     vault: Arc<Vault>,
     meta: Meta,
     fts: Box<dyn FullTextIndex>,
+    /// 懒建；`rebuild` 清库时丢掉。
+    links: Option<LinkUniverse>,
+    /// 全量同步为还没入库的新文件预分配的 `note_id`（路径 → id），入库时领走。
+    preassigned: HashMap<String, String>,
+    touched: Touched,
+    /// 全量同步进行中（`plan_sync` 到 `finish_sync`）：链接行攒批写。
+    bulk: bool,
+    /// 攒着还没写进 links 表的 `(note_id, 行)`；读表前必须先 [`Self::flush_link_batch`]。
+    link_batch: Vec<(String, Vec<LinkRow>)>,
 }
+
+/// 一篇里的一条 wikilink 及其解析到的 `note_id`（`None` = 未解析）。
+type LinkRow = (aero_core::links::LinkSpan, Option<String>);
+
+/// 全量同步时每攒多少篇的链接行写一个事务。
+const LINK_BATCH_NOTES: usize = 256;
 
 impl Indexer {
     /// 打开 `data_dir/<vault_id>/` 下的索引（`meta.sqlite` + `fts/`），没有则建。
@@ -97,7 +182,16 @@ impl Indexer {
 
     /// 用给定的元数据库与引擎组装（测试用内存引擎）。
     pub fn with_parts(vault: Arc<Vault>, meta: Meta, fts: Box<dyn FullTextIndex>) -> Self {
-        Indexer { vault, meta, fts }
+        Indexer {
+            vault,
+            meta,
+            fts,
+            links: None,
+            preassigned: HashMap::new(),
+            touched: Touched::default(),
+            bulk: false,
+            link_batch: Vec::new(),
+        }
     }
 
     pub fn vault(&self) -> &Arc<Vault> {
@@ -127,28 +221,57 @@ impl Indexer {
         for row in &plan.removed {
             self.remove_step(row, &mut report);
         }
+        if let Err(e) = self.finish_sync() {
+            report.errors.push(e.to_string());
+        }
         if let Err(e) = self.fts.flush() {
             report.errors.push(e.to_string());
         }
         report
     }
 
+    /// 全量同步收尾（`plan_sync` + 若干 `sync_step` / `remove_step` 之后调）：写完攒批的链接行，
+    /// 补挂靠标题解析的行、重判名字有竞争的行（路径 / 文件名解析在 `plan_sync` 预登记后已是最终结果）。
+    pub fn finish_sync(&mut self) -> Result<usize, IndexerError> {
+        self.bulk = false;
+        self.reconcile_links()
+    }
+
     /// 全量同步的计划：磁盘上每篇笔记与其已知元数据，以及元数据里有、磁盘上没有的。
-    pub fn plan_sync(&self) -> Result<SyncPlan, IndexerError> {
+    /// 同时把磁盘上的全部路径登记进链接解析表（新文件预分配 `note_id`），见 [`LinkUniverse`]。
+    pub fn plan_sync(&mut self) -> Result<SyncPlan, IndexerError> {
         let notes = self.vault.notes()?;
         let mut known: HashMap<String, NoteRow> =
             self.meta.all_notes()?.into_iter().map(|r| (r.path.clone(), r)).collect();
-        let notes = notes
+        let notes: Vec<(VaultPath, Option<NoteRow>)> = notes
             .into_iter()
             .map(|p| {
                 let row = known.remove(p.as_str());
                 (p, row)
             })
             .collect();
+        // 上次同步中途取消可能留下指向预分配 id 的行；先清掉，别让它们冒充已解析
+        self.flush_link_batch()?;
+        self.meta.clear_dangling_targets()?;
+        self.bulk = true;
+        self.universe()?;
+        let universe = self.links.as_mut().expect("universe built above");
+        for (path, row) in &notes {
+            if row.is_none() {
+                let id = self
+                    .preassigned
+                    .entry(path.as_str().to_owned())
+                    .or_insert_with(|| ulid::Ulid::generate().to_string());
+                if !universe.resolver.contains(path) {
+                    universe.insert(path.clone(), id, None);
+                }
+            }
+        }
         Ok(SyncPlan { notes, removed: known.into_values().collect() })
     }
 
     /// 同步一篇（`plan_sync` 的一项），结果计入 `report`。每写满 [`FLUSH_EVERY_BLOCKS`] 块 flush 一次。
+    /// 全部步骤走完后调一次 [`Self::reconcile_links`]。
     pub fn sync_step(&mut self, path: &VaultPath, row: Option<&NoteRow>, report: &mut SyncReport) {
         match self.sync_one(path, row) {
             Ok(Some(n)) => {
@@ -162,8 +285,38 @@ impl Indexer {
                 }
             }
             Ok(None) => report.unchanged += 1,
-            Err(e) => report.errors.push(format!("{}: {e}", path.as_str())),
+            Err(e) => {
+                report.errors.push(format!("{}: {e}", path.as_str()));
+                if row.is_none() {
+                    // 新文件没入库成功：撤掉预登记，指向它的行退回未解析
+                    if let Err(e) = self.forget_preassigned(path) {
+                        report.errors.push(format!("{}: {e}", path.as_str()));
+                    }
+                }
+            }
         }
+    }
+
+    fn forget_preassigned(&mut self, path: &VaultPath) -> Result<(), IndexerError> {
+        if let Some(id) = self.preassigned.remove(path.as_str()) {
+            self.touched.push(path.clone(), None);
+            if let Some(u) = self.links.as_mut() {
+                u.remove(path);
+            }
+            self.flush_link_batch()?;
+            self.meta.unresolve_incoming(&id)?;
+        }
+        Ok(())
+    }
+
+    /// 把攒批的链接行写进表（一个事务）。
+    fn flush_link_batch(&mut self) -> Result<(), IndexerError> {
+        if self.link_batch.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut self.link_batch);
+        self.meta.replace_links_many(batch.iter().map(|(id, rows)| (id.as_str(), rows.as_slice())))?;
+        Ok(())
     }
 
     /// 删掉磁盘上已不存在的一篇（`plan_sync().removed` 的一项）。
@@ -196,7 +349,9 @@ impl Indexer {
     /// 从磁盘读一篇并索引（外部修改 / 新建后调用）。
     pub fn index_note(&mut self, path: &VaultPath) -> Result<usize, IndexerError> {
         let (doc, stamp) = self.vault.read(path)?;
-        self.index_document(path, &doc, stamp)
+        let n = self.index_document(path, &doc, stamp)?;
+        self.reconcile_links()?;
+        Ok(n)
     }
 
     /// 文件监听报告某个路径有动静：与磁盘对齐这一篇——不存在则从索引里删掉，指纹没变则什么都不做
@@ -207,13 +362,19 @@ impl Indexer {
             return Ok(match row {
                 Some(row) => {
                     self.remove_row(&row)?;
+                    // 它走了，之前因与它同名而歧义的行可能又能挂上了
+                    self.reconcile_links()?;
                     Refresh::Removed
                 }
                 None => Refresh::Unchanged,
             });
         }
         Ok(match self.sync_one(path, row.as_ref())? {
-            Some(blocks) => Refresh::Indexed(blocks),
+            Some(blocks) => {
+                // 这篇可能刚入库：它自己的链接行，以及别的笔记指向它的行，现在能挂上了
+                self.reconcile_links()?;
+                Refresh::Indexed(blocks)
+            }
             None => Refresh::Unchanged,
         })
     }
@@ -225,10 +386,15 @@ impl Indexer {
         text: &str,
         stamp: FileStamp,
     ) -> Result<usize, IndexerError> {
-        self.index_document(path, &Document::from_text(text), stamp)
+        let n = self.index_document(path, &Document::from_text(text), stamp)?;
+        self.reconcile_links()?;
+        Ok(n)
     }
 
     /// 用内存里的文档索引。返回写入的块数。
+    ///
+    /// 这篇的链接行整体重建并按当前解析表解析；标题变了则指向它的行退回未解析。
+    /// 调用方随后用 [`Self::reconcile_links`] 补挂别的笔记里等着这篇的行、重判名字有竞争的行。
     pub fn index_document(
         &mut self,
         path: &VaultPath,
@@ -236,11 +402,15 @@ impl Indexer {
         stamp: FileStamp,
     ) -> Result<usize, IndexerError> {
         let existing = self.meta.note_by_path(path.as_str())?;
-        let note_id =
-            existing.as_ref().map_or_else(|| ulid::Ulid::generate().to_string(), |r| r.note_id.clone());
+        let note_id = match &existing {
+            Some(r) => r.note_id.clone(),
+            None => {
+                self.preassigned.remove(path.as_str()).unwrap_or_else(|| ulid::Ulid::generate().to_string())
+            }
+        };
         let old_count = existing.as_ref().map_or(0, |r| r.block_count);
         let title = doc.title_or(path.stem());
-        let blocks: Vec<IndexBlock> = blocks_for_note(doc, &note_id, path.as_str(), &title);
+        let (blocks, spans) = blocks_and_links_for_note(doc, &note_id, path.as_str(), &title);
         self.fts.upsert(&blocks)?;
         let new_count = blocks.len() as u32;
         if old_count > new_count {
@@ -249,12 +419,42 @@ impl Indexer {
             self.fts.delete(&gone)?;
         }
         self.meta.upsert_note(&NoteRow {
-            note_id,
+            note_id: note_id.clone(),
             path: path.as_str().to_owned(),
-            title,
+            title: title.clone(),
             stamp,
             block_count: new_count,
         })?;
+        let old_title = existing.as_ref().map(|r| r.title.clone()).filter(|t| *t != title);
+        if old_title.is_some() {
+            // 靠旧标题解析到这篇的行不再成立；补挂时能按新标题 / 文件名解析上的会挂回来
+            self.meta.unresolve_incoming(&note_id)?;
+        }
+        // 只有"这篇是新的"或"标题变了"才会影响别人指向它的行；正文改动不用重判入链
+        // （被大量引用的笔记每次保存都重判几千行，保存后可搜索的延迟会跟着涨）
+        if existing.is_none() || old_title.is_some() {
+            self.touched.push(path.clone(), old_title);
+        }
+        self.universe()?.insert(path.clone(), &note_id, Some(&title));
+        // 同篇锚点 `[[#h]]` 不是笔记间关系，不进表
+        let universe = self.links.as_ref().expect("universe built above");
+        let rows: Vec<LinkRow> = spans
+            .into_iter()
+            .filter(|s| !s.target.is_empty())
+            .map(|s| {
+                let id =
+                    universe.resolve_id(&s.target, s.fragment.as_deref(), path.parent()).map(str::to_owned);
+                (s, id)
+            })
+            .collect();
+        if self.bulk {
+            self.link_batch.push((note_id, rows));
+            if self.link_batch.len() >= LINK_BATCH_NOTES {
+                self.flush_link_batch()?;
+            }
+        } else {
+            self.meta.replace_links_many([(note_id.as_str(), rows.as_slice())])?;
+        }
         Ok(blocks.len())
     }
 
@@ -262,6 +462,7 @@ impl Indexer {
     pub fn remove_note(&mut self, path: &VaultPath) -> Result<(), IndexerError> {
         if let Some(row) = self.meta.note_by_path(path.as_str())? {
             self.remove_row(&row)?;
+            self.reconcile_links()?;
         }
         Ok(())
     }
@@ -269,11 +470,24 @@ impl Indexer {
     fn remove_row(&mut self, row: &NoteRow) -> Result<(), IndexerError> {
         let pks: Vec<String> = (0..row.block_count).map(|ord| IndexBlock::pk_of(&row.note_id, ord)).collect();
         self.fts.delete(&pks)?;
+        // 攒批里可能还有这篇的行，先落表再删
+        self.flush_link_batch()?;
         self.meta.remove_note(&row.note_id)?;
+        self.meta.remove_links(&row.note_id)?;
+        // 指向它的行退回未解析：目标重建后会重新挂上，而不是留着一个悬空 id
+        self.meta.unresolve_incoming(&row.note_id)?;
+        if let Ok(path) = VaultPath::new(&row.path) {
+            // 先记邻域再移除：它的标题组要从 title_of 里查
+            self.touched.push(path.clone(), Some(row.title.clone()));
+            if let Some(u) = self.links.as_mut() {
+                u.remove(&path);
+            }
+        }
         Ok(())
     }
 
     /// 重命名 / 移动：`note_id` 不变；块里存的 `path` / `title` 要跟着改，所以重写这些块。
+    /// 按旧名字解析到它的链接行退回未解析（与预览点击时的解析结果保持一致；M2 的改名同步会改写链接文本）。
     pub fn rename_note(&mut self, old: &VaultPath, new: &VaultPath) -> Result<(), IndexerError> {
         let Some(row) = self.meta.note_by_path(old.as_str())? else {
             // 之前没索引过：当新文件处理
@@ -282,9 +496,75 @@ impl Indexer {
         let (doc, stamp) = self.vault.read(new)?;
         let title = doc.title_or(new.stem());
         self.meta.rename_note(&row.note_id, new.as_str(), &title)?;
+        self.flush_link_batch()?;
+        self.meta.unresolve_incoming(&row.note_id)?;
+        self.touched.push(old.clone(), Some(row.title.clone()));
+        if let Some(u) = self.links.as_mut() {
+            u.remove(old);
+        }
         // 直接按新路径走一遍保存路径（note_id 已通过 rename 绑定到新路径）
         self.index_document(new, &doc, stamp)?;
+        self.reconcile_links()?;
         Ok(())
+    }
+
+    /// 重判两类链接行（哈希查找，不遍历笔记）：还没解析到目标的（目标可能刚入库），
+    /// 以及指向"判定可能受本次改动影响"的笔记的（唯一可能变歧义、标题可能让位给文件名）——
+    /// 单篇场景是改动笔记的邻域，全量同步收尾是全部名字有竞争的笔记。返回改写的行数。
+    pub fn reconcile_links(&mut self) -> Result<usize, IndexerError> {
+        self.flush_link_batch()?;
+        self.universe()?;
+        let touched = std::mem::take(&mut self.touched);
+        let universe = self.links.as_ref().expect("universe built above");
+        // (当前 resolved_note_id, 行)：结果没变的行不写
+        let mut rows: Vec<(Option<String>, crate::meta::PendingLink)> =
+            self.meta.pending_links()?.into_iter().map(|row| (None, row)).collect();
+        let affected: Vec<VaultPath> = if touched.overflow {
+            universe.resolver.contested()
+        } else {
+            let mut v: Vec<VaultPath> = touched
+                .notes
+                .iter()
+                .flat_map(|(p, old_title)| universe.resolver.neighbors(p, old_title.as_deref()))
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let affected = universe.ids_of(&affected);
+        if !affected.is_empty() {
+            rows.extend(self.meta.links_resolved_to(&affected)?.into_iter().map(|(id, row)| (Some(id), row)));
+        }
+        let mut updates = Vec::new();
+        for (current, (note_id, path, target, fragment, byte_start)) in &rows {
+            let Ok(path) = VaultPath::new(path) else { continue };
+            let resolved = universe.resolve_id(target, fragment.as_deref(), path.parent());
+            if resolved != current.as_deref() {
+                updates.push((note_id.as_str(), *byte_start, resolved));
+            }
+        }
+        if !updates.is_empty() {
+            self.meta.set_links_resolved(updates.iter().copied())?;
+        }
+        Ok(updates.len())
+    }
+
+    /// 给预览点击用的解析表：已索引的笔记（带标题）加上磁盘上还没索引到的（刚新建、全量同步进行中）。
+    pub fn link_resolver(&mut self) -> Result<Resolver, IndexerError> {
+        let mut resolver = self.universe()?.resolver.clone();
+        for path in self.vault.notes()? {
+            if !resolver.contains(&path) {
+                resolver.insert(path, None);
+            }
+        }
+        Ok(resolver)
+    }
+
+    fn universe(&mut self) -> Result<&mut LinkUniverse, IndexerError> {
+        if self.links.is_none() {
+            self.links = Some(LinkUniverse::from_rows(self.meta.all_notes()?));
+        }
+        Ok(self.links.as_mut().expect("just built"))
     }
 
     /// 全文搜索，结果带正文与标题，按分数降序。
@@ -343,6 +623,11 @@ impl Indexer {
     /// 清空并全量重建。
     pub fn rebuild(&mut self, progress: impl FnMut(usize, usize)) -> Result<SyncReport, IndexerError> {
         self.meta.reset()?;
+        self.links = None;
+        self.preassigned.clear();
+        self.touched = Touched::default();
+        self.bulk = false;
+        self.link_batch.clear();
         self.fts.clear()?;
         self.meta.set_fts_version(FTS_VERSION)?;
         Ok(self.sync_all(progress))
@@ -368,6 +653,183 @@ mod tests {
 
     fn paths(hits: &[SearchHit]) -> Vec<(String, u32)> {
         hits.iter().map(|h| (h.path.as_str().to_owned(), h.block_ord)).collect()
+    }
+
+    #[test]
+    fn indexing_records_links_and_removal_clears_them() {
+        let (dir, mut ix) =
+            setup(&[("a.md", "见 [[b]] 与 [[missing]]，还有 [[b#标题]]。\n"), ("b.md", "# B\n")]);
+        let r = ix.sync_all(|_, _| {});
+        assert!(r.errors.is_empty(), "{r:?}");
+
+        let b_id: String = ix.meta.note_by_path("b.md").unwrap().unwrap().note_id;
+        let rows = ix.meta.links_rows().unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("b".to_owned(), Some(b_id.clone()), None),
+                ("missing".to_owned(), None, None),
+                ("b".to_owned(), Some(b_id.clone()), Some("标题".to_owned())),
+            ]
+        );
+
+        // 重新保存 a：行随内容更新；[[c]] 的目标还不存在，落库为未解析
+        std::fs::write(dir.path().join("a.md"), "见 [[c]]\n").unwrap();
+        ix.index_note(&VaultPath::new("a.md").unwrap()).unwrap();
+        let rows = ix.meta.links_rows().unwrap();
+        assert_eq!(rows, [("c".to_owned(), None, None)]);
+
+        // c 被创建并索引：之前没解析上的行补挂到 c
+        std::fs::write(dir.path().join("c.md"), "# C\n").unwrap();
+        assert_eq!(ix.refresh_note(&VaultPath::new("c.md").unwrap()).unwrap(), Refresh::Indexed(1));
+        let c_id = ix.meta.note_by_path("c.md").unwrap().unwrap().note_id;
+        assert_eq!(ix.meta.links_rows().unwrap(), [("c".to_owned(), Some(c_id), None)]);
+
+        // a 被删：它的链接行清掉
+        std::fs::remove_file(dir.path().join("a.md")).unwrap();
+        assert_eq!(ix.refresh_note(&VaultPath::new("a.md").unwrap()).unwrap(), Refresh::Removed);
+        assert!(ix.meta.links_rows().unwrap().is_empty());
+    }
+
+    /// 目标被删 / 重建 / 改名 / 改标题时，指向它的行不能留着悬空的旧 id。
+    #[test]
+    fn incoming_links_follow_target_deletion_recreation_rename_and_retitle() {
+        let (dir, mut ix) = setup(&[
+            ("a.md", "[[b]] 与 [[乙标题]]\n"),
+            ("b.md", "# 乙标题\n"),
+            ("t.md", "---\ntitle: 乙标题\n---\n"),
+        ]);
+        // 标题 "乙标题" 有两篇（b 的一级标题不算 front matter 标题；t 的是）——先确认基本挂接
+        let r = ix.sync_all(|_, _| {});
+        assert!(r.errors.is_empty(), "{r:?}");
+        let b_id = ix.meta.note_by_path("b.md").unwrap().unwrap().note_id;
+        let t_id = ix.meta.note_by_path("t.md").unwrap().unwrap().note_id;
+        assert_eq!(
+            ix.meta.links_rows().unwrap(),
+            [("b".to_owned(), Some(b_id.clone()), None), ("乙标题".to_owned(), Some(t_id.clone()), None)]
+        );
+
+        // 删 b：[[b]] 退回未解析（不是悬空 id）
+        std::fs::remove_file(dir.path().join("b.md")).unwrap();
+        assert_eq!(ix.refresh_note(&VaultPath::new("b.md").unwrap()).unwrap(), Refresh::Removed);
+        assert_eq!(ix.meta.links_rows().unwrap()[0], ("b".to_owned(), None, None));
+
+        // 重建 b（新 note_id）：[[b]] 挂到新 id
+        std::fs::write(dir.path().join("b.md"), "# B2\n").unwrap();
+        ix.refresh_note(&VaultPath::new("b.md").unwrap()).unwrap();
+        let b2_id = ix.meta.note_by_path("b.md").unwrap().unwrap().note_id;
+        assert_ne!(b2_id, b_id);
+        assert_eq!(ix.meta.links_rows().unwrap()[0], ("b".to_owned(), Some(b2_id.clone()), None));
+
+        // b 改名为 c：[[b]] 不再解析（与预览点击的判定一致）
+        std::fs::rename(dir.path().join("b.md"), dir.path().join("c.md")).unwrap();
+        ix.rename_note(&VaultPath::new("b.md").unwrap(), &VaultPath::new("c.md").unwrap()).unwrap();
+        assert_eq!(ix.meta.links_rows().unwrap()[0], ("b".to_owned(), None, None));
+
+        // t 改标题：靠标题解析的行退回未解析；改回来又挂上
+        std::fs::write(dir.path().join("t.md"), "---\ntitle: 别的\n---\n").unwrap();
+        ix.index_note(&VaultPath::new("t.md").unwrap()).unwrap();
+        assert_eq!(ix.meta.links_rows().unwrap()[1], ("乙标题".to_owned(), None, None));
+        std::fs::write(dir.path().join("t.md"), "---\ntitle: 乙标题\n---\n").unwrap();
+        ix.index_note(&VaultPath::new("t.md").unwrap()).unwrap();
+        assert_eq!(ix.meta.links_rows().unwrap()[1], ("乙标题".to_owned(), Some(t_id), None));
+    }
+
+    /// 名字有竞争的目标：另一篇拿了同样的标题 → 靠标题挂上的行变歧义；同名文件出现 → 标题让位给文件名；
+    /// 竞争者消失 → 挂回来。
+    #[test]
+    fn contested_names_are_rejudged_after_each_save() {
+        let (dir, mut ix) = setup(&[("src.md", "[[甲]]\n"), ("x.md", "---\ntitle: 甲\n---\n")]);
+        let r = ix.sync_all(|_, _| {});
+        assert!(r.errors.is_empty(), "{r:?}");
+        let x_id = ix.meta.note_by_path("x.md").unwrap().unwrap().note_id;
+        assert_eq!(ix.meta.links_rows().unwrap(), [("甲".to_owned(), Some(x_id.clone()), None)]);
+
+        // y 也叫"甲"：歧义，行退回未解析
+        std::fs::write(dir.path().join("y.md"), "---\ntitle: 甲\n---\n").unwrap();
+        ix.refresh_note(&VaultPath::new("y.md").unwrap()).unwrap();
+        assert_eq!(ix.meta.links_rows().unwrap(), [("甲".to_owned(), None, None)]);
+
+        // y 删掉：又只剩 x，挂回去
+        std::fs::remove_file(dir.path().join("y.md")).unwrap();
+        ix.refresh_note(&VaultPath::new("y.md").unwrap()).unwrap();
+        assert_eq!(ix.meta.links_rows().unwrap(), [("甲".to_owned(), Some(x_id.clone()), None)]);
+
+        // 出现文件 甲.md：文件名优先于标题
+        std::fs::write(dir.path().join("甲.md"), "z\n").unwrap();
+        ix.refresh_note(&VaultPath::new("甲.md").unwrap()).unwrap();
+        let file_id = ix.meta.note_by_path("甲.md").unwrap().unwrap().note_id;
+        assert_ne!(file_id, x_id);
+        assert_eq!(ix.meta.links_rows().unwrap(), [("甲".to_owned(), Some(file_id), None)]);
+    }
+
+    /// 只改正文的保存不重判指向这篇的行（被大量引用的笔记否则每次保存都重判几千行）；
+    /// 新建、改标题、重命名、删除才算"动了名字"。
+    #[test]
+    fn content_only_saves_do_not_rejudge_incoming_links() {
+        let (_dir, mut ix) = setup(&[("a.md", "[[b]]\n"), ("b.md", "---\ntitle: B\n---\nold\n")]);
+        let r = ix.sync_all(|_, _| {});
+        assert!(r.errors.is_empty(), "{r:?}");
+        let b = VaultPath::new("b.md").unwrap();
+        let stamp = FileStamp { mtime: std::time::UNIX_EPOCH, size: 0, hash: 0 };
+
+        ix.index_document(&b, &Document::from_text("---\ntitle: B\n---\nnew\n"), stamp).unwrap();
+        assert!(ix.touched.notes.is_empty(), "正文改动：{:?}", ix.touched.notes);
+
+        ix.index_document(&b, &Document::from_text("---\ntitle: B2\n---\nnew\n"), stamp).unwrap();
+        assert_eq!(ix.touched.notes, [(b.clone(), Some("B".to_owned()))], "改标题要重判");
+        ix.reconcile_links().unwrap();
+
+        let c = VaultPath::new("c.md").unwrap();
+        ix.index_document(&c, &Document::from_text("c\n"), stamp).unwrap();
+        assert_eq!(ix.touched.notes, [(c, None)], "新笔记要重判");
+    }
+
+    /// 全量同步中途取消（新文件预分配了 id 却没入库）再重来：不留悬空 id，最终照样挂对。
+    #[test]
+    fn interrupted_sync_leaves_no_dangling_preassigned_ids() {
+        let (_dir, mut ix) = setup(&[("a.md", "[[b]]\n"), ("b.md", "b\n")]);
+        let plan = ix.plan_sync().unwrap();
+        let mut report = SyncReport::default();
+        // 只处理 a：它的 [[b]] 挂到 b 预分配的 id 上，然后"取消"
+        let (a_path, a_row) = plan.notes.iter().find(|(p, _)| p.as_str() == "a.md").unwrap();
+        ix.sync_step(a_path, a_row.as_ref(), &mut report);
+        ix.flush_link_batch().unwrap();
+        let rows = ix.meta.links_rows().unwrap();
+        let ghost = rows[0].1.clone().expect("挂在预分配 id 上");
+        assert!(ix.meta.note_by_path("b.md").unwrap().is_none());
+
+        // 模拟重启：丢掉进程内状态，再来一次完整同步
+        ix.links = None;
+        ix.preassigned.clear();
+        let r = ix.sync_all(|_, _| {});
+        assert!(r.errors.is_empty(), "{r:?}");
+        let b_id = ix.meta.note_by_path("b.md").unwrap().unwrap().note_id;
+        assert_ne!(b_id, ghost, "重启后是新 id");
+        assert_eq!(ix.meta.links_rows().unwrap(), [("b".to_owned(), Some(b_id), None)]);
+    }
+
+    /// 全量同步顺序无关：同名两篇即使一篇先入库，也不会被当成"唯一"挂上；大小写不敏感。
+    #[test]
+    fn full_sync_resolves_links_order_independently_and_case_insensitively() {
+        let (_dir, mut ix) = setup(&[
+            ("0-first.md", "[[cargo]] [[Notes]]\n"),
+            ("a/cargo.md", "x\n"),
+            ("z/cargo.md", "y\n"),
+            ("notes.md", "n\n"),
+        ]);
+        let r = ix.sync_all(|_, _| {});
+        assert!(r.errors.is_empty(), "{r:?}");
+        let notes_id = ix.meta.note_by_path("notes.md").unwrap().unwrap().note_id;
+        assert_eq!(
+            ix.meta.links_rows().unwrap(),
+            [("cargo".to_owned(), None, None), ("Notes".to_owned(), Some(notes_id), None)]
+        );
+        // 点击用的解析表：歧义照样报出来，并带上磁盘上刚出现、还没索引的文件
+        std::fs::write(_dir.path().join("fresh.md"), "").unwrap();
+        let resolver = ix.link_resolver().unwrap();
+        assert!(matches!(resolver.resolve("cargo", None, ""), Resolution::Ambiguous { .. }));
+        assert!(matches!(resolver.resolve("FRESH", None, ""), Resolution::Resolved { .. }));
     }
 
     #[test]

@@ -232,8 +232,20 @@ pub fn indexable_leaves(doc: &Document) -> Vec<&Block> {
 
 /// 把一篇文档拆成索引文档（10.3：索引粒度到块）。`ord` 连续，删除旧块时只需知道旧的块数。
 pub fn blocks_for_note(doc: &Document, note_id: &str, path: &str, title: &str) -> Vec<IndexBlock> {
-    let tags = note_tags(doc);
-    indexable_leaves(doc)
+    blocks_and_links_for_note(doc, note_id, path, title).0
+}
+
+/// [`blocks_for_note`] 外加这篇的全部 wikilink 区间（`links::scan` 的结果）——标签与链接共用一次行内解析。
+pub fn blocks_and_links_for_note(
+    doc: &Document,
+    note_id: &str,
+    path: &str,
+    title: &str,
+) -> (Vec<IndexBlock>, Vec<crate::links::LinkSpan>) {
+    let text = doc.to_string();
+    let (tag_sources, links) = crate::parse::inline_scan(&text);
+    let tags = note_tags(doc, &tag_sources);
+    let blocks = indexable_leaves(doc)
         .into_iter()
         .enumerate()
         .map(|(ord, b)| {
@@ -249,7 +261,8 @@ pub fn blocks_for_note(doc: &Document, note_id: &str, path: &str, title: &str) -
                 tags: tags.clone(),
             }
         })
-        .collect()
+        .collect();
+    (blocks, links)
 }
 
 /// front matter 里的 `tags:` / `tag:`（Obsidian 两个键都认）。
@@ -361,7 +374,8 @@ impl<'de> serde::Deserialize<'de> for TagItem {
     }
 }
 
-fn note_tags(doc: &Document) -> Vec<String> {
+/// `tag_sources` 是 [`crate::parse::inline_scan`] 给出的正文片段（调用方已解析过一次，这里不再解析）。
+fn note_tags(doc: &Document, tag_sources: &[&str]) -> Vec<String> {
     let mut tags = Vec::new();
     let mut add = |tag: &str| {
         if let Some(tag) = normalize_tag(tag)
@@ -377,7 +391,7 @@ fn note_tags(doc: &Document) -> Vec<String> {
             add(tag.strip_prefix('#').unwrap_or(&tag));
         }
     }
-    for source in crate::parse::tag_sources(&doc.to_string()) {
+    for source in tag_sources {
         let mut chars = source.char_indices().peekable();
         let mut previous = None;
         while let Some((i, c)) = chars.next() {

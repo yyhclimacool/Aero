@@ -16,6 +16,7 @@ pub mod anchors;
 pub mod block;
 pub mod document;
 pub mod index;
+pub mod links;
 pub mod parse;
 pub mod text;
 pub mod vault;

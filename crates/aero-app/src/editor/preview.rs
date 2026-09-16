@@ -44,7 +44,9 @@ pub(super) fn markdown(
     style: TextViewStyle,
     reveal: u64,
     state: Entity<PreviewState>,
+    editor: Entity<super::Editor>,
 ) -> TextView {
+    let block_editor = editor.clone();
     TextView::markdown(id.clone(), text)
         .style(style.clone())
         .selectable(false)
@@ -62,9 +64,46 @@ pub(super) fn markdown(
         .markdown_block_renderer("callout", move |node, _, cx| {
             let callout = node.data::<Callout>().expect("callout parser data");
             let id: SharedString = format!("{id}-callout-{}", callout.offset).into();
-            render_callout(id, callout, style.clone(), reveal, &state, cx)
+            render_callout(id, callout, style.clone(), reveal, &state, &block_editor, cx)
+        })
+        .on_link_click(move |url, event, _window, cx| match link_click(url, event) {
+            LinkClick::Ignore => {}
+            // 外部链接保持默认行为：系统浏览器打开
+            LinkClick::External => cx.open_url(url),
+            LinkClick::Note { target, fragment } => editor.update(cx, |_, cx| {
+                cx.emit(super::EditorEvent::LinkClicked { target, fragment });
+            }),
         })
         .w_full()
+}
+
+/// 预览里一次链接点击该怎么处理。
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LinkClick {
+    /// 右键 / 长按等不算"打开"
+    Ignore,
+    /// 不是 `aero://note/`：交给系统
+    External,
+    /// wikilink：已解码的目标与片段，发给工作区解析
+    Note { target: String, fragment: Option<String> },
+}
+
+/// 与 TextView 无 handler 时的默认判定一致：左键 / 中键 / 键盘 / 非长按触摸才算点击。
+/// `aero://note/` 在这里就解码——工作区拿到的是目标与片段，不再二次解析 URL。
+pub(super) fn link_click(url: &str, event: &ClickEvent) -> LinkClick {
+    let actionable = match event {
+        ClickEvent::Mouse(click) => matches!(click.up.button, MouseButton::Left | MouseButton::Middle),
+        ClickEvent::Keyboard(_) => true,
+        ClickEvent::Touch(click) => !click.long_press,
+    };
+    if !actionable {
+        return LinkClick::Ignore;
+    }
+    match aero_core::links::decode_note_url(url) {
+        Some((target, fragment)) => LinkClick::Note { target, fragment },
+        None if url.starts_with(aero_core::links::NOTE_URL_PREFIX) => LinkClick::Ignore,
+        None => LinkClick::External,
+    }
 }
 
 fn appearance(kind: &CalloutKind, cx: &App) -> (&'static str, IconName, Hsla) {
@@ -98,6 +137,7 @@ fn render_callout(
     style: TextViewStyle,
     reveal: u64,
     state: &Entity<PreviewState>,
+    editor: &Entity<super::Editor>,
     cx: &mut App,
 ) -> AnyElement {
     let (label, icon, color) = appearance(&callout.kind, cx);
@@ -185,10 +225,11 @@ fn render_callout(
             el.child(div().debug_selector(move || format!("callout-body-{title}")).w_full().min_w_0().child(
                 markdown(
                     format!("{id}-body").into(),
-                    callout.body.clone().into(),
+                    aero_core::links::to_markdown(&callout.body).into(),
                     style,
                     reveal,
                     state.clone(),
+                    editor.clone(),
                 ),
             ))
         })
@@ -197,8 +238,11 @@ fn render_callout(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_callout;
+    use super::{LinkClick, link_click, parse_callout};
     use aero_core::{BlockKind, CalloutKind, Fold};
+    use gpui_kit::{
+        ClickEvent, Modifiers, MouseButton, MouseClickEvent, MouseDownEvent, MouseUpEvent, point, px,
+    };
 
     #[test]
     fn callout_body_preserves_markdown_structure_and_lazy_lines() {
@@ -234,6 +278,38 @@ mod tests {
         assert_eq!(callout.body, "body\n\n    code\n> ordinary quote");
         for source in ["> quote", "> [!note]x", "> [!]", "> [!note2]", "> > [!note]", "> \\[!note]"] {
             assert!(parse_callout(source, 0, 0).is_none(), "{source}");
+        }
+    }
+
+    fn mouse_click(button: MouseButton) -> ClickEvent {
+        let position = point(px(0.), px(0.));
+        let modifiers = Modifiers::default();
+        ClickEvent::Mouse(MouseClickEvent {
+            down: MouseDownEvent { button, position, modifiers, click_count: 1, first_mouse: false },
+            up: MouseUpEvent { button, position, modifiers, click_count: 1 },
+        })
+    }
+
+    /// 预览发给工作区的必须是 `to_markdown` 生成的 URL 解码后的目标与片段（两端共用 links 模块，不能各解析一套）。
+    #[test]
+    fn link_click_decodes_note_urls_and_passes_external_ones_through() {
+        let url = aero_core::links::encode_note_url("rust/cargo", Some("安装"));
+        assert_eq!(
+            link_click(&url, &mouse_click(MouseButton::Left)),
+            LinkClick::Note { target: "rust/cargo".into(), fragment: Some("安装".into()) }
+        );
+        assert_eq!(
+            link_click(&aero_core::links::encode_note_url("", Some("h")), &mouse_click(MouseButton::Middle)),
+            LinkClick::Note { target: String::new(), fragment: Some("h".into()) }
+        );
+        assert_eq!(link_click("https://example.com", &mouse_click(MouseButton::Left)), LinkClick::External);
+        assert_eq!(link_click(&url, &mouse_click(MouseButton::Right)), LinkClick::Ignore);
+        assert_eq!(link_click("aero://note/%zz", &mouse_click(MouseButton::Left)), LinkClick::Ignore);
+        // 预览渲染出的每个链接都能被原样解回
+        let rendered = aero_core::links::to_markdown("见 [[a b|别名]] 与 [[c#d]]");
+        for url in ["aero://note/a%20b", "aero://note/c#d"] {
+            assert!(rendered.contains(&format!("]({url})")), "{rendered}");
+            assert!(matches!(link_click(url, &mouse_click(MouseButton::Left)), LinkClick::Note { .. }));
         }
     }
 }

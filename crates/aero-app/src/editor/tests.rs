@@ -1261,3 +1261,25 @@ fn shift_arrows_upgrade_to_block_selection_at_block_edges(cx: &mut TestAppContex
     assert_eq!(selected(&editor, cx), Some(2..3));
     assert_eq!(text(&editor, cx), "first\n\nline a\nline b\n\nthird\n");
 }
+
+/// wikilink 标题片段跳转：滚到对应标题并高亮；找不到的标题什么都不动。
+#[gpui_kit::test]
+fn reveal_heading_jumps_and_ignores_missing(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) =
+        open(cx, "# 甲\n\n段落\n\n## 乙\n\n段落二\n\n## **粗** `码` [[链接|别名]]  Case\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let ids =
+        cx.update(|_, cx| editor.read(cx).headings().into_iter().map(|(_, _, id)| id).collect::<Vec<_>>());
+    assert_eq!(ids.len(), 3, "语料里要有三个标题");
+    assert!(cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_heading("乙", cx))));
+    assert_eq!(cx.update(|_, cx| editor.read(cx).highlighted_block()), Some(ids[1]));
+    // 找不到：返回 false，高亮与定位保持不变
+    assert!(!cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_heading("不存在", cx))));
+    assert_eq!(cx.update(|_, cx| editor.read(cx).highlighted_block()), Some(ids[1]));
+    // 片段写的是渲染后的文字（无行内标记、大小写 / 空白不同）也能命中
+    for fragment in ["粗 码 别名 case", "  粗 码 别名 CASE ", "**粗** `码` [[链接|别名]]  Case"]
+    {
+        assert!(cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_heading(fragment, cx))), "{fragment:?}");
+        assert_eq!(cx.update(|_, cx| editor.read(cx).highlighted_block()), Some(ids[2]));
+    }
+}

@@ -30,3 +30,6 @@ target
 
 # scripts/release-macos.sh 的默认输出目录（.dmg）
 /dist/
+
+# macOS Finder 元数据
+.DS_Store

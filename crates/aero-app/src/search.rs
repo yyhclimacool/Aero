@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aero_core::links::Resolver;
 use aero_core::{FileStamp, Vault, VaultPath};
 use aero_index::{Indexer, Refresh, SearchHit, SyncReport};
 use gpui_kit::*;
@@ -56,6 +57,8 @@ const PHASE_FAILED: u8 = 3;
 pub struct SearchService {
     indexer: Arc<Mutex<Option<Indexer>>>,
     shared: Arc<Shared>,
+    /// 打开 + 全量对齐的专用线程；[`Self::close_blocking`] 会等它停下
+    sync_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     _poll: Option<Task<()>>,
     flush_task: Option<Task<()>>,
     /// 上次 optimize 之后的增量写入次数
@@ -68,7 +71,7 @@ impl SearchService {
     pub fn new(vault: Arc<Vault>, data_dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let indexer: Arc<Mutex<Option<Indexer>>> = Arc::default();
         let shared = Arc::new(Shared::default());
-        spawn_sync(vault, data_dir, indexer.clone(), shared.clone());
+        let sync_thread = spawn_sync(vault, data_dir, indexer.clone(), shared.clone());
 
         // 前台轮询进度，直到进入稳定状态
         let poll = cx.spawn(async move |this, cx| {
@@ -88,6 +91,7 @@ impl SearchService {
         SearchService {
             indexer,
             shared,
+            sync_thread: Mutex::new(sync_thread),
             _poll: Some(poll),
             flush_task: None,
             writes_since_optimize: 0,
@@ -131,6 +135,19 @@ impl SearchService {
         cx.background_spawn(async move {
             let guard = indexer.lock().unwrap();
             guard.as_ref().and_then(|ix| ix.note_titles().ok()).unwrap_or_default()
+        })
+    }
+
+    /// 预览点 wikilink 用的解析表：已索引笔记（含 front matter 标题）加磁盘上还没索引到的文件。
+    /// 引擎还没打开时退化为只按磁盘文件列表解析（没有标题匹配）。
+    pub fn link_resolver(&self, vault: Arc<Vault>, cx: &App) -> Task<Resolver> {
+        let indexer = self.indexer.clone();
+        cx.background_spawn(async move {
+            let mut guard = indexer.lock().unwrap();
+            match guard.as_mut().map(|ix| ix.link_resolver()) {
+                Some(Ok(resolver)) => resolver,
+                _ => Resolver::from_notes(vault.notes().unwrap_or_default()),
+            }
         })
     }
 
@@ -183,14 +200,30 @@ impl SearchService {
         });
     }
 
-    /// 退出前同步落盘。
-    pub fn flush_blocking(&self) {
-        if let Ok(mut g) = self.indexer.lock()
-            && let Some(ix) = g.as_mut()
-            && let Err(e) = ix.flush()
+    /// 退出 / 切换 vault 前：停掉同步线程，flush，并在**当前线程**上释放引擎句柄。
+    /// 之后还在飞的后台任务拿到锁只会看到 `None`，什么都不做。
+    ///
+    /// 必须同步做：引擎句柄若留给最后一个持有 `Arc` 的后台任务顺手释放，可能正好撞上 `exit()`
+    /// 在跑 C++ 静态析构（销毁引擎的全局线程池），2026-09-16 的三份崩溃报告都是这一条
+    /// （`zvec_collection_close` 在 GCD 线程上 vs 主线程 `__cxa_finalize_ranges`）。
+    /// 同理，切换到同一个 vault 时新句柄必须在旧句柄关掉之后再开，否则锁不上。
+    pub fn close_blocking(&self) {
+        self.shared.cancelled.store(true, Ordering::Release);
+        // 等同步线程停下（它每篇检查一次 cancelled；还在打开索引时会在存进锁之前看到 cancelled）
+        if let Some(handle) = self.sync_thread.lock().unwrap_or_else(|p| p.into_inner()).take()
+            && let Err(e) = handle.join()
         {
-            log::warn!("index flush: {e}");
+            log::error!("index sync thread panicked: {e:?}");
         }
+        let mut guard = self.indexer.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ix) = guard.as_mut() {
+            if let Err(e) = ix.flush() {
+                log::warn!("index flush: {e}");
+            }
+            log::debug!("index closed on {:?}", std::thread::current().name());
+        }
+        // 引擎句柄在这里关掉
+        *guard = None;
     }
 
     /// 上次 optimize 后累计的增量写入数（测试观察 optimize 策略用）。
@@ -278,25 +311,34 @@ impl SearchService {
 }
 
 impl Drop for SearchService {
+    /// 实体在主线程上释放；引擎句柄也跟着在这里关，不留给后台任务。
     fn drop(&mut self) {
-        self.shared.cancelled.store(true, Ordering::Release);
+        self.close_blocking();
     }
 }
 
 /// 专用线程：打开索引，然后逐篇对齐。每篇单独拿锁，保存 / 搜索可以插队。
+/// 返回线程句柄；起不来时置 `Failed` 并返回 `None`。
 fn spawn_sync(
     vault: Arc<Vault>,
     data_dir: PathBuf,
     indexer: Arc<Mutex<Option<Indexer>>>,
     shared: Arc<Shared>,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     let shared_outer = shared.clone();
     let spawned = std::thread::Builder::new().name("aero-index-sync".into()).spawn(move || {
         let opened = Indexer::open(vault, &data_dir);
         let plan = match opened {
-            Ok(ix) => {
+            Ok(mut ix) => {
                 let plan = ix.plan_sync();
-                *indexer.lock().unwrap() = Some(ix);
+                let mut slot = indexer.lock().unwrap();
+                if shared.cancelled.load(Ordering::Acquire) {
+                    // 服务已经关了：句柄就地释放（关闭方正 join 着本线程，不会同时在 exit）
+                    drop(slot);
+                    drop(ix);
+                    return;
+                }
+                *slot = Some(ix);
                 plan
             }
             Err(e) => {
@@ -327,15 +369,23 @@ fn spawn_sync(
             }
             shared.done.store(i + 1, Ordering::Relaxed);
         }
+        if shared.cancelled.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(ix) = indexer.lock().unwrap().as_mut() {
             for row in &plan.removed {
                 ix.remove_step(row, &mut report);
             }
+            if let Err(e) = ix.finish_sync() {
+                report.errors.push(e.to_string());
+            }
             if let Err(e) = ix.flush() {
                 report.errors.push(e.to_string());
             }
-            // 首次建库 / 大量改动之后合并一次段文件；小改动留给空闲策略
-            if report.indexed + report.removed >= OPTIMIZE_AFTER_SYNC_NOTES {
+            // 首次建库 / 大量改动之后合并一次段文件；小改动留给空闲策略。关闭方在等锁时不做（可能要几秒）
+            if report.indexed + report.removed >= OPTIMIZE_AFTER_SYNC_NOTES
+                && !shared.cancelled.load(Ordering::Acquire)
+            {
                 let started = Instant::now();
                 match ix.optimize() {
                     Ok(()) => log::info!("index optimize after sync: {:?}", started.elapsed()),
@@ -356,10 +406,14 @@ fn spawn_sync(
         *shared.report.lock().unwrap() = Some(report);
         shared.phase.store(PHASE_IDLE, Ordering::Release);
     });
-    if let Err(e) = spawned {
-        log::error!("cannot spawn index thread: {e}");
-        *shared_outer.error.lock().unwrap() = Some(e.to_string());
-        shared_outer.phase.store(PHASE_FAILED, Ordering::Release);
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::error!("cannot spawn index thread: {e}");
+            *shared_outer.error.lock().unwrap() = Some(e.to_string());
+            shared_outer.phase.store(PHASE_FAILED, Ordering::Release);
+            None
+        }
     }
 }
 
@@ -378,12 +432,82 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             cx.run_until_parked();
-            if cx.update(|cx| service.read(cx).phase()) == Phase::Idle {
+            let phase = cx.update(|cx| service.read(cx).phase());
+            if phase == Phase::Idle {
                 return;
             }
-            assert!(std::time::Instant::now() < deadline, "index never became idle");
+            assert!(std::time::Instant::now() < deadline, "index never became idle: {phase:?}");
             std::thread::sleep(Duration::from_millis(30));
         }
+    }
+
+    /// 关掉之后引擎句柄已释放：同一份索引能立刻再打开（锁拿得到，不是删掉重建）；
+    /// 旧服务上还在飞的操作看到 `None`，静默返回。
+    #[gpui_kit::test]
+    fn close_blocking_releases_the_engine_for_reopen(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "hello world\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let first = cx.new(|cx| SearchService::new(vault.clone(), data.path().to_path_buf(), cx));
+        idle(cx, &first);
+        let hits = cx.update(|cx| first.read(cx).search("hello".into(), 10, cx));
+        assert_eq!(cx.foreground_executor().block_on(hits).unwrap().len(), 1);
+
+        cx.update(|cx| first.read(cx).close_blocking());
+        let hits = cx.update(|cx| first.read(cx).search("hello".into(), 10, cx));
+        assert!(
+            cx.foreground_executor().block_on(hits).unwrap().is_empty(),
+            "closed service answers nothing"
+        );
+        // 关掉后的写操作也不能 panic
+        let a = VaultPath::new("a.md").unwrap();
+        let (_, stamp) = vault.read(&a).unwrap();
+        first.update(cx, |s, cx| s.note_saved(a.clone(), "changed\n".into(), stamp, cx));
+        cx.run_until_parked();
+
+        // 旧句柄还没 drop（实体仍活着），第二个服务照样能打开同一目录并沿用已有索引
+        let second = cx.new(|cx| SearchService::new(vault.clone(), data.path().to_path_buf(), cx));
+        idle(cx, &second);
+        let report = cx.update(|cx| second.read(cx).last_report()).unwrap();
+        assert_eq!((report.indexed, report.unchanged), (0, 1), "index reused, not rebuilt: {report:?}");
+        let hits = cx.update(|cx| second.read(cx).search("hello".into(), 10, cx));
+        assert_eq!(cx.foreground_executor().block_on(hits).unwrap().len(), 1);
+        // 临时目录先于实体销毁；显式关掉，别让引擎在被删掉的目录上收尾
+        cx.update(|cx| second.read(cx).close_blocking());
+    }
+
+    /// 全量对齐还没跑完就丢掉服务：同步线程被等停、句柄就地释放，接着再开同一份索引不会撞锁。
+    #[gpui_kit::test]
+    fn dropping_mid_sync_stops_the_thread_and_frees_the_lock(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..400 {
+            std::fs::write(dir.path().join(format!("n{i}.md")), format!("# note {i}\n\nbody {i}\n")).unwrap();
+        }
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        for _ in 0..3 {
+            // 还在打开 / 对齐途中就关：返回时同步线程已经 join、句柄已释放
+            let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().to_path_buf(), cx));
+            cx.update(|cx| {
+                let s = service.read(cx);
+                s.close_blocking();
+                assert!(s.sync_thread.lock().unwrap().is_none(), "sync thread joined");
+                assert!(s.indexer.lock().unwrap().is_none(), "engine handle released");
+            });
+        }
+        // 不等 Idle 直接丢实体：Drop 走同一条路（实体在下一次 update 冲刷效果时释放）
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().to_path_buf(), cx));
+        drop(service);
+        cx.update(|_| {});
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().to_path_buf(), cx));
+        idle(cx, &service);
+        let report = cx.update(|cx| service.read(cx).last_report()).unwrap();
+        assert_eq!(report.indexed + report.unchanged, 400, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        let hits = cx.update(|cx| service.read(cx).search("body".into(), 10, cx));
+        assert_eq!(cx.foreground_executor().block_on(hits).unwrap().len(), 10);
+        cx.update(|cx| service.read(cx).close_blocking());
     }
 
     /// 增量写入计数；空闲 flush 时只有"累计够多且距上次够久"才 optimize，optimize 后计数清零。

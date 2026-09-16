@@ -70,12 +70,21 @@ pub struct ZvecFts {
 
 impl ZvecFts {
     /// 打开 `dir` 下的索引；不存在则创建。打开失败（格式变了、损坏）时删掉重建——索引随时可以从文件重建（10.1）。
+    ///
+    /// 例外：引擎报"锁不上"说明这份索引正被另一个进程（或本进程里还没关掉的旧句柄）打开着，
+    /// 此时**不能**删目录——会把别人正在用的段文件抽掉，对方的后台线程随即段错误。原样报错，搜索不可用、编辑照常。
     pub fn open(dir: &Path) -> Result<Self, IndexError> {
         ensure_initialized()?;
         let (col, recreated) =
             if dir.is_dir() && dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
                 match Collection::open(&dir.to_string_lossy(), Some(&options()?)) {
                     Ok(c) => (c, false),
+                    Err(e) if is_lock_error(&e) => {
+                        return Err(IndexError::Engine(format!(
+                            "index at {} is open elsewhere (another Aero instance?): {e}",
+                            dir.display()
+                        )));
+                    }
                     Err(e) => {
                         log::warn!("cannot open fts index at {}: {e}; rebuilding", dir.display());
                         std::fs::remove_dir_all(dir).map_err(|e| IndexError::Engine(e.to_string()))?;
@@ -214,6 +223,12 @@ fn is_boolean(text: &str) -> bool {
 
 fn options() -> Result<CollectionOptions, IndexError> {
     CollectionOptions::new().map_err(engine)
+}
+
+/// 引擎只给 `InternalError`，锁冲突要看文案：`Can't lock read-write collection: …/LOCK`。
+/// 注意 `Can't open lock file` 是另一回事（目录里根本没有 LOCK，不是合法索引），那种要走重建。
+fn is_lock_error(e: &zvec_rust::Error) -> bool {
+    e.to_string().to_ascii_lowercase().contains("can't lock")
 }
 
 fn create(dir: &Path) -> Result<Collection, IndexError> {
@@ -398,6 +413,30 @@ mod tests {
         let mut pks: Vec<_> = idx.search(q).unwrap().into_iter().map(|hit| hit.pk).collect();
         pks.sort();
         pks
+    }
+
+    /// 同一份索引被另一个句柄打开着时，第二次打开只能报错，不能把目录删了重建（对方正在用）。
+    #[test]
+    fn opening_a_locked_index_fails_without_wiping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fts_dir = dir.path().join("fts");
+        let mut first = ZvecFts::open(&fts_dir).unwrap();
+        first.upsert(&[block("a", 0, "hello world")]).unwrap();
+        first.flush().unwrap();
+
+        let second = ZvecFts::open(&fts_dir);
+        match second {
+            Err(IndexError::Engine(msg)) => assert!(msg.contains("open elsewhere"), "{msg}"),
+            Err(other) => panic!("unexpected error: {other:?}"),
+            // 引擎实现若允许同进程重复打开，也不能是重建出来的空索引
+            Ok(second) => assert!(!second.was_recreated()),
+        }
+        // 第一个句柄仍然完好
+        assert_eq!(hit_pks(&first, &FtsQuery::new("hello")), ["a#0"]);
+        drop(first);
+        let reopened = ZvecFts::open(&fts_dir).unwrap();
+        assert!(!reopened.was_recreated());
+        assert_eq!(hit_pks(&reopened, &FtsQuery::new("hello")), ["a#0"]);
     }
 
     #[test]

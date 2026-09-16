@@ -73,6 +73,11 @@ pub enum EditorEvent {
     RenameRequested(String),
     /// 横幅上的"打开副本"
     OpenRequested(VaultPath),
+    /// 预览里点了 wikilink：已解码的目标与可选片段（`target` 为空 = 同篇锚点 `[[#h]]`），工作区负责解析与打开
+    LinkClicked {
+        target: String,
+        fragment: Option<String>,
+    },
     /// 横幅上的"关闭"：工作区丢掉这个编辑器
     CloseRequested,
     /// 异步保存成功落盘；工作区据此增量更新索引
@@ -422,6 +427,27 @@ impl Editor {
             .iter()
             .find(|unit| unit.range.start <= range.start && range.end <= unit.range.end)
             .map_or(block.id, |unit| unit.id);
+        self.reveal_block(id, cx);
+    }
+
+    /// wikilink 标题片段跳转：按标题文本定位（与右侧大纲同源），找不到返回 false、什么都不动。
+    /// 比对去掉行内标记（`**`、`` ` ``、`[[ ]]` 等）、忽略大小写与首尾空白；先找完全相等的，再退到去标记后相等的。
+    pub fn reveal_heading(&mut self, heading: &str, cx: &mut Context<Self>) -> bool {
+        let headings = self.headings();
+        let wanted = heading.trim();
+        let wanted_key = heading_key(wanted);
+        let exact = headings.iter().find(|(_, text, _)| text == wanted);
+        let Some((_, _, id)) =
+            exact.or_else(|| headings.iter().find(|(_, text, _)| heading_key(text) == wanted_key))
+        else {
+            return false;
+        };
+        self.reveal_block(*id, cx);
+        true
+    }
+
+    /// 滚到块可见位置（视口上 1/3）并短暂高亮。
+    fn reveal_block(&mut self, id: BlockId, cx: &mut Context<Self>) {
         self.reveal_generation += 1;
         self.reveal = Some(id);
         self.reveal_mode = RevealMode::Center;
@@ -1696,6 +1722,12 @@ impl Editor {
         self.focused.as_ref().is_some_and(|f| f.id == Some(id))
     }
 
+    /// 有块处于编辑态（源码文本框可见）。
+    #[cfg(test)]
+    pub fn is_editing(&self) -> bool {
+        self.focused.is_some()
+    }
+
     /// 这个块（作为编辑单位）在块选区里。
     fn is_selected_block(&self, id: BlockId) -> bool {
         let Some(sel) = self.selection else { return false };
@@ -1996,8 +2028,13 @@ impl Editor {
         let theme = cx.theme();
         let text: SharedString = self.doc.slice(range).to_string().into();
         let id = b.id;
-        let focus = cx.listener(move |this: &mut Self, ev: &MouseDownEvent, window, cx| {
-            this.focus_block_at(id, ev.position, window, cx)
+        // 用 click 而不是 mouse down 进编辑态：预览里的链接在 mouse up 时才触发并 stop_propagation，
+        // 若 mouse down 就把块换成文本框，链接的 mouse up 落不到 TextView 上，点 wikilink 只会进编辑态。
+        let focus = cx.listener(move |this: &mut Self, ev: &ClickEvent, window, cx| {
+            if ev.is_right_click() {
+                return;
+            }
+            this.focus_block_at(id, ev.position(), window, cx)
         });
 
         let body: AnyElement = match &b.kind {
@@ -2016,11 +2053,20 @@ impl Editor {
                 .into_any_element(),
             _ => {
                 let text = if text.is_empty() { SharedString::from("\u{200b}") } else { text };
+                // wikilink 在预览里渲染成标准 Markdown 链接（aero://note/…），点击经 on_link_click 回编辑器
+                let rendered: SharedString = aero_core::links::to_markdown(&text).into();
                 // TextView 的解析状态按元素 id 缓存；带上编辑器实体 id，切换笔记后不会复用上一篇的状态
                 let view_id = SharedString::from(format!("blk-{}-{}", cx.entity_id(), id.0));
                 let reveal = if self.highlight == Some(id) { self.reveal_generation } else { 0 };
-                preview::markdown(view_id, text, self.text_view_style(cx), reveal, self.preview.clone())
-                    .into_any_element()
+                preview::markdown(
+                    view_id,
+                    rendered,
+                    self.text_view_style(cx),
+                    reveal,
+                    self.preview.clone(),
+                    cx.entity(),
+                )
+                .into_any_element()
             }
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });
@@ -2042,7 +2088,7 @@ impl Editor {
             .cursor_text()
             .when(highlighted, |el| el.bg(accent).rounded(px(6.)).mx(px(-8.)).px(px(8.)))
             .when(selected && !highlighted, |el| Self::selected_style(el, selection))
-            .on_mouse_down(MouseButton::Left, focus)
+            .on_click(focus)
             .child(body)
             .into_any_element();
         Some(self.with_gutter(id, depth, unit, cx))
@@ -2118,6 +2164,12 @@ impl Render for Editor {
             )
             .vertical_scrollbar(&self.scroll)
     }
+}
+
+/// 标题比对用的键：去行内标记与 wikilink 括号、压掉多余空白、小写。
+fn heading_key(text: &str) -> String {
+    let plain = aero_core::index::plain_text(text, &BlockKind::Paragraph);
+    plain.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 fn heading_size(level: u8) -> Pixels {

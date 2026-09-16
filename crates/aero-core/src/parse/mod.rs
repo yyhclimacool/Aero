@@ -105,9 +105,12 @@ pub fn parse(text: &str) -> ParseOutput {
     ParseOutput { blocks: roots, report: cx.report }
 }
 
-pub(crate) fn tag_sources(text: &str) -> Vec<&str> {
+/// 一次 comrak 解析同时得到：可能含 `#tag` 的文本片段（标题、图片 alt、链接 URL、wikilink 目标、
+/// 代码、`{...}` 属性都排除）与全部 wikilink 区间。索引每篇笔记时两者都要，合在一起省一次解析。
+pub(crate) fn inline_scan(text: &str) -> (Vec<&str>, Vec<crate::links::LinkSpan>) {
     let arena = Arena::new();
     let root = parse_document(&arena, text, &comrak_options());
+    let links = crate::links::scan_tree(root, text);
     let cx = Cx { text, line_starts: line_starts(text), report: ParseReport::default() };
     // 属性值中的 Markdown 会把一段属性拆成多个 Text 节点，须按原文区间排除。
     let attributes: Vec<Range<usize>> = text
@@ -149,7 +152,7 @@ pub(crate) fn tag_sources(text: &str) -> Vec<&str> {
             sources.push(source);
         }
     }
-    sources
+    (sources, links)
 }
 
 fn line_starts(text: &str) -> Vec<usize> {

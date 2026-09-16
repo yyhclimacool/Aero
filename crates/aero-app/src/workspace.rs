@@ -73,6 +73,14 @@ pub struct Workspace {
     _activation_subscription: Subscription,
 }
 
+/// 预览里点 wikilink 后的动作：打开已存在的笔记，或提示同名候选，或新建（路径 + 初始内容），或失败原因。
+enum LinkAction {
+    Open { path: VaultPath, fragment: Option<String> },
+    Ambiguous { target: String, candidates: Vec<VaultPath> },
+    Created { path: VaultPath, body: String },
+    Failed(String),
+}
+
 impl Workspace {
     pub fn new(initial_vault: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = PersistedState::load();
@@ -122,7 +130,6 @@ impl Workspace {
         if !self.flush_before_leaving(window, cx) {
             return;
         }
-        self.flush_all(cx);
         match Vault::open(root) {
             Ok(vault) => {
                 let vault = Arc::new(vault);
@@ -130,7 +137,9 @@ impl Workspace {
                 let sub = cx.subscribe_in(&tree, window, |this, _, event, window, cx| match event {
                     FileTreeEvent::Open(path) => this.open_note(path.clone(), window, cx),
                 });
-                // 先丢掉上一个 vault 的索引服务（它的同步线程看到 cancelled 会停）
+                // 新 vault 打得开才离开旧的：落盘并同步关掉旧索引句柄（再打开同一个 vault 时锁才能拿到），
+                // 然后丢掉上一个会话
+                self.flush_all(cx);
                 self.open = None;
                 let search = cx.new(|cx| SearchService::new(vault.clone(), app_data_dir().join("index"), cx));
                 let search_sub = cx.observe(&search, |_, _, cx| cx.notify());
@@ -290,8 +299,191 @@ impl Workspace {
             EditorEvent::Deleted => this.on_editor_deleted(editor, cx),
             EditorEvent::RenameRequested(name) => this.rename_current(name.clone(), window, cx),
             EditorEvent::OpenRequested(path) => this.open_note(path.clone(), window, cx),
+            EditorEvent::LinkClicked { target, fragment } => {
+                this.on_link_clicked(target.clone(), fragment.clone(), window, cx)
+            }
             EditorEvent::CloseRequested => this.close_editor(window, cx),
         })
+    }
+
+    /// 预览里点 wikilink：后台解析（已索引笔记 + 磁盘文件，见 `SearchService::link_resolver`）→ 打开目标；
+    /// 带标题片段则定位到对应标题。同名多篇是歧义：提示候选、不猜也不创建。
+    /// 未解析的目标在链接所在目录创建 `<target>.md` 并打开，toast 提供撤销（见 [`Self::undo_created_note`]）。
+    fn on_link_clicked(
+        &mut self,
+        target: String,
+        fragment: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.open.as_ref() else { return };
+        let editor = open.editor.clone();
+        if target.trim().is_empty() {
+            // `[[#标题]]`：同篇锚点
+            if let (Some(fragment), Some(editor)) = (fragment, editor) {
+                editor.update(cx, |e, cx| {
+                    e.reveal_heading(&fragment, cx);
+                });
+            }
+            return;
+        }
+        // 相对路径按链接所在笔记的目录解析；撤销时回到来源笔记
+        let source_dir = editor.as_ref().map(|e| e.read(cx).path().parent().to_owned()).unwrap_or_default();
+        let source_path = editor.as_ref().map(|e| e.read(cx).path().clone());
+        let vault = open.vault.clone();
+        let resolver = open.search.read(cx).link_resolver(vault.clone(), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let action = cx
+                .background_spawn(async move {
+                    match resolver.await.resolve(&target, fragment.as_deref(), &source_dir) {
+                        aero_core::links::Resolution::Resolved { path, fragment } => {
+                            LinkAction::Open { path, fragment }
+                        }
+                        aero_core::links::Resolution::Ambiguous { candidates } => {
+                            LinkAction::Ambiguous { target, candidates }
+                        }
+                        aero_core::links::Resolution::Unresolved => {
+                            let Some(path) = aero_core::links::creation_path(&source_dir, &target) else {
+                                return LinkAction::Failed(format!("无效的链接目标：{target}"));
+                            };
+                            if vault.exists(&path) {
+                                // 解析后、创建前被并发新建：直接打开
+                                return LinkAction::Open { path, fragment: None };
+                            }
+                            let body = format!("# {}\n\n", path.stem());
+                            match vault.create_bytes(&path, body.as_bytes()) {
+                                Ok(_) => LinkAction::Created { path, body },
+                                Err(err) => LinkAction::Failed(format!("无法新建笔记：{err}")),
+                            }
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match action {
+                LinkAction::Open { path, fragment } => {
+                    this.open_note(path.clone(), window, cx);
+                    // 打开可能被否决（上一篇保存失败）或失败：只在真的切到目标后才定位标题
+                    let editor = this.open.as_ref().and_then(|o| o.editor.clone());
+                    if let (Some(fragment), Some(editor)) = (fragment, editor)
+                        && editor.read(cx).path() == &path
+                        && !editor.update(cx, |e, cx| e.reveal_heading(&fragment, cx))
+                    {
+                        window.push_notification(
+                            Notification::info(format!("{} 里没有标题「{fragment}」", path.as_str()))
+                                .title("Aero"),
+                            cx,
+                        );
+                    }
+                }
+                LinkAction::Ambiguous { target, candidates } => {
+                    let list = candidates.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("、");
+                    window.push_notification(
+                        Notification::warning(format!(
+                            "「{target}」有 {} 篇同名笔记：{list}。请在链接里写明路径。",
+                            candidates.len()
+                        ))
+                        .title("Aero"),
+                        cx,
+                    );
+                }
+                LinkAction::Created { path, body } => {
+                    this.open_created_note(path, source_path, body, window, cx)
+                }
+                LinkAction::Failed(msg) => {
+                    window.push_notification(Notification::error(msg).title("Aero"), cx)
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 打开刚创建（或并发已存在）的笔记：刷新树、进入编辑态，toast 提供撤销。
+    fn open_created_note(
+        &mut self,
+        path: VaultPath,
+        source: Option<VaultPath>,
+        body: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(open) = self.open.as_ref() {
+            open.tree.update(cx, |t, cx| {
+                t.rescan();
+                cx.notify();
+            });
+        }
+        self.open_note(path.clone(), window, cx);
+        if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
+            editor.update(cx, |e, cx| e.start_writing(window, cx));
+        }
+        let this = cx.weak_entity();
+        window.push_notification(
+            Notification::info(format!("已创建：{}", path.as_str())).title("Aero").action(move |_, _, _| {
+                let this = this.clone();
+                let path = path.clone();
+                let source = source.clone();
+                let body = body.clone();
+                Button::new("wikilink-undo").label("撤销").on_click(move |_, window, cx| {
+                    let Some(this) = this.upgrade() else { return };
+                    this.update(cx, |w, cx| w.undo_created_note(&path, &body, source.as_ref(), window, cx));
+                })
+            }),
+            cx,
+        );
+    }
+
+    /// 撤销刚创建的笔记：内容未被编辑才移入废纸篓并回到来源笔记；已编辑则拒绝。
+    fn undo_created_note(
+        &mut self,
+        path: &VaultPath,
+        original: &str,
+        source: Option<&VaultPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.open.as_mut() else { return };
+        let showing = open.editor.as_ref().is_some_and(|e| e.read(cx).path() == path);
+        let untouched = match open.editor.as_ref().filter(|_| showing) {
+            Some(editor) => {
+                // 文本没变还不够：有未落盘 / 正在落盘的改动时，移走文件后保存会把它写回来
+                let e = editor.read(cx);
+                e.index_snapshot().1 == original
+                    && !matches!(e.save_state(), SaveState::Dirty | SaveState::Saving)
+            }
+            None => open.vault.read(path).is_ok_and(|(doc, _)| doc.to_string() == original),
+        };
+        if !untouched {
+            window.push_notification(Notification::warning("笔记已被编辑，撤销已取消。").title("Aero"), cx);
+            return;
+        }
+        // 先移文件、成功了再收编辑器：废纸篓失败时文件还在，编辑器不能先没了
+        let fs_path = open.vault.fs_path(path);
+        if let Err(err) = crate::trash::move_to_trash(&fs_path) {
+            window.push_notification(Notification::error(format!("无法撤销：{err}")).title("Aero"), cx);
+            return;
+        }
+        if showing {
+            open.editor = None;
+            open.editor_sub = None;
+        }
+        open.tree.update(cx, |t, cx| {
+            t.rescan();
+            if t.selected() == Some(path) {
+                t.select(None, cx);
+            }
+            cx.notify();
+        });
+        let p = path.clone();
+        open.search.update(cx, |s, cx| s.note_removed(p, cx));
+        window.push_notification(
+            Notification::info(format!("已撤销：{} 移入废纸篓", path.as_str())).title("Aero"),
+            cx,
+        );
+        match source {
+            Some(source) => self.open_note(source.clone(), window, cx),
+            None => self.focus_handle.focus(window, cx),
+        }
+        cx.notify();
     }
 
     /// 搜索命中：打开笔记（已打开则复用）并定位到块。不抢焦点——↑↓ 预览时焦点留在搜索框。
@@ -639,7 +831,8 @@ impl Workspace {
         }
     }
 
-    /// 退出前落盘。这里没有窗口可以提示，冲突副本只进日志。索引也同步 flush 一次。
+    /// 离开当前 vault（退出 / 关闭 / 切换）前落盘。这里没有窗口可以提示，冲突副本只进日志。
+    /// 索引同步 flush 并**关掉**：引擎句柄不能留给后台任务在退出途中释放（见 `SearchService::close_blocking`）。
     fn flush_all(&mut self, cx: &mut Context<Self>) {
         if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
             match editor.update(cx, |e, _| e.flush_sync()) {
@@ -649,7 +842,7 @@ impl Workspace {
             }
         }
         if let Some(open) = self.open.as_ref() {
-            open.search.read(cx).flush_blocking();
+            open.search.read(cx).close_blocking();
         }
     }
 
@@ -1099,7 +1292,7 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (background, foreground, muted) =
             (cx.theme().background, cx.theme().foreground, cx.theme().muted_foreground);
         let title = match &self.open {
@@ -1164,6 +1357,7 @@ impl Render for Workspace {
             .text_color(foreground)
             .child(TitleBar::new().child(div().text_sm().text_color(muted).child(title)))
             .child(body)
+            .children(gpui_kit::component::Root::render_notification_layer(window, cx))
             .when_some(self.quick_open.as_ref().map(|(p, _)| p.clone()), |el, picker| {
                 // 遮罩 + 居中弹层（3.2）；点遮罩关闭
                 el.child(deferred(
@@ -1250,6 +1444,7 @@ mod tests {
     use std::sync::Arc;
 
     use aero_core::{Vault, VaultPath};
+    use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 
     use super::{SidebarTab, VaultSession, Workspace};
@@ -1640,6 +1835,168 @@ mod tests {
                 "most recent available command is undo"
             );
             assert_eq!(workspace.read(cx).recent_commands, ["undo", "redo", "heading-2"]);
+        });
+    }
+
+    /// 真实点击预览里的 wikilink（mouse down、一帧、mouse up——真机上两者之间必有重绘）：
+    /// 不能被"点块进编辑态"吃掉，要经 TextView → 编辑器事件 → 工作区解析，打开目标并按标题片段定位。
+    #[gpui_kit::test]
+    fn clicking_a_wikilink_in_the_preview_opens_target_and_reveals_heading(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("[[B#**标题**]] 见\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        std::fs::write(dir.path().join("b.md"), "# 甲\n\n正文\n\n## 标题\n\n更多\n").unwrap();
+        let search = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.clone());
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        let source = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor.clone().unwrap());
+
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let block = cx.debug_bounds("unit-1").expect("段落已渲染");
+        let at = block.origin + gpui_kit::point(gpui_kit::px(6.), gpui_kit::px(10.));
+        cx.simulate_mouse_down(at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_up(at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let open = workspace.read(cx).open.as_ref().unwrap();
+                let Some(editor) = open.editor.as_ref() else { return false };
+                let e = editor.read(cx);
+                e.path().as_str() == "b.md" && e.highlighted_block().is_some()
+            })
+        });
+        cx.update(|_, cx| {
+            assert!(!source.read(cx).is_editing(), "点链接不该把来源块切进编辑态");
+            let e = workspace.read(cx).open.as_ref().unwrap().editor.as_ref().unwrap().read(cx);
+            // 目标大小写不同（[[B]] → b.md）、片段带行内标记（**标题** → ## 标题）也要命中
+            let second = e.headings().get(1).map(|(_, _, id)| *id);
+            assert_eq!(e.highlighted_block(), second, "带标题片段的链接应定位到该标题块");
+        });
+    }
+
+    /// 同名多篇（歧义）：不猜、不创建，编辑器留在原地。
+    #[gpui_kit::test]
+    fn wikilink_click_on_ambiguous_target_creates_nothing(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("见 [[cargo]]\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        for dir_name in ["x", "y"] {
+            std::fs::create_dir_all(dir.path().join(dir_name)).unwrap();
+            std::fs::write(dir.path().join(dir_name).join("cargo.md"), "c\n").unwrap();
+        }
+        let search = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.clone());
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        let editor = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor.clone().unwrap());
+        cx.update(|_, cx| {
+            editor.update(cx, |_, cx| {
+                cx.emit(crate::editor::EditorEvent::LinkClicked { target: "cargo".into(), fragment: None })
+            });
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!dir.path().join("cargo.md").exists(), "歧义目标不能在源目录新建同名文件");
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            assert_eq!(open.editor.as_ref().unwrap().read(cx).path().as_str(), "a.md");
+        });
+    }
+
+    /// 未解析链接点击 → 在链接所在目录创建 `<target>.md`（`# 名字` 约定）并打开；
+    /// toast 撤销按钮把未改动的文件移入废纸篓并回到来源笔记。
+    #[gpui_kit::test]
+    fn wikilink_click_creates_missing_note_and_undo_trashes_it(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("见 [[新笔记]]\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let editor = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor.clone().unwrap());
+        cx.update(|_, cx| {
+            editor.update(cx, |_, cx| {
+                cx.emit(crate::editor::EditorEvent::LinkClicked {
+                    target: "新笔记".into(), fragment: None
+                })
+            });
+        });
+        let created = dir.path().join("新笔记.md");
+        wait_until(cx, |cx| {
+            created.exists()
+                && cx.update(|_, cx| {
+                    let open = workspace.read(cx).open.as_ref().unwrap();
+                    let Some(editor) = open.editor.as_ref() else { return false };
+                    let e = editor.read(cx);
+                    e.path().as_str() == "新笔记.md" && e.index_snapshot().1 == "# 新笔记\n\n"
+                })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        // toast 入场动画是 400ms 墙钟动画：等它结束再点撤销
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        cx.update(|window, cx| window.click("wikilink-undo", cx));
+        wait_until(cx, |cx| {
+            !created.exists()
+                && cx.update(|_, cx| {
+                    workspace
+                        .read(cx)
+                        .open
+                        .as_ref()
+                        .and_then(|o| o.editor.as_ref())
+                        .is_some_and(|e| e.read(cx).path().as_str() == "a.md")
+                })
+        });
+    }
+
+    /// 新建笔记被编辑过后点撤销：拒绝移动，文件保留、编辑器不动。
+    #[gpui_kit::test]
+    fn wikilink_undo_refuses_when_created_note_was_edited(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("见 [[新笔记]]\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let editor = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor.clone().unwrap());
+        cx.update(|_, cx| {
+            editor.update(cx, |_, cx| {
+                cx.emit(crate::editor::EditorEvent::LinkClicked {
+                    target: "新笔记".into(), fragment: None
+                })
+            });
+        });
+        let created = dir.path().join("新笔记.md");
+        wait_until(cx, |cx| {
+            created.exists()
+                && cx.update(|_, cx| {
+                    workspace
+                        .read(cx)
+                        .open
+                        .as_ref()
+                        .and_then(|o| o.editor.as_ref())
+                        .is_some_and(|e| e.read(cx).path().as_str() == "新笔记.md")
+                })
+        });
+        cx.simulate_input("X");
+        cx.executor().advance_clock(std::time::Duration::from_millis(600));
+        wait_until(cx, |_| std::fs::read_to_string(&created).is_ok_and(|s| s.contains('X')));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        // toast 入场动画是 400ms 墙钟动画：等它结束再点撤销
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        cx.update(|window, cx| window.click("wikilink-undo", cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(created.exists(), "编辑过的笔记不应被撤销删除");
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            let e = open.editor.as_ref().unwrap().read(cx);
+            assert_eq!(e.path().as_str(), "新笔记.md", "拒绝撤销后应留在新建笔记上");
         });
     }
 }
