@@ -40,6 +40,24 @@ fn open(cx: &mut TestAppContext, body: &str) -> (tempfile::TempDir, Arc<Vault>, 
 }
 
 #[gpui_kit::test]
+fn command_availability_excludes_noop_and_unsupported_conversions(cx: &mut TestAppContext) {
+    let source = "# Title\n\n> quote\n\n| A | B |\n| --- | --- |\n| x | y |\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        assert!(!editor.command_available(&crate::actions::ConvertBlock(1)));
+        assert!(editor.command_available(&crate::actions::ConvertBlock(2)));
+        assert!(!editor.command_available(&crate::actions::DocUndo));
+    });
+    for ix in [1, 2] {
+        focus_unit(&editor, ix, cx);
+        cx.update(|_, cx| assert!(!editor.read(cx).command_available(&crate::actions::ConvertBlock(2))));
+    }
+}
+
+#[gpui_kit::test]
 fn callout_preview_folds_without_editing_source(cx: &mut TestAppContext) {
     let source =
         "> [!warning]- Caution\n> **Body**\n>\n> - first\n> - second\n\n> [!mystery] Unknown\n> kept\n";

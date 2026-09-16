@@ -31,6 +31,7 @@ actions!(
         OpenFiles,
         /// ⌘P：快速打开（3.2）
         QuickOpen,
+        CommandPalette,
     ]
 );
 
@@ -84,6 +85,74 @@ actions!(
 #[action(namespace = editor, no_json)]
 pub struct ConvertBlock(pub u8);
 
+#[derive(Clone, Copy)]
+pub enum CommandScope {
+    Global,
+    Vault,
+    Note,
+    NoteTarget,
+    Editor,
+}
+
+pub struct Command {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub keywords: &'static str,
+    pub scope: CommandScope,
+    pub action: Box<dyn Action>,
+    pub shortcut: String,
+}
+
+impl Command {
+    fn new(
+        id: &'static str,
+        label: &'static str,
+        keywords: &'static str,
+        scope: CommandScope,
+        action: impl Action,
+    ) -> Self {
+        Self { id, label, keywords, scope, action: Box::new(action), shortcut: String::new() }
+    }
+}
+
+pub fn commands() -> Vec<Command> {
+    use CommandScope::*;
+    let mut commands = vec![
+        Command::new("open-vault", "打开 Vault…", "open folder dkwjk", Global, OpenVault),
+        Command::new("new-vault", "新建 Vault…", "new vault xj", Global, NewVault),
+        Command::new("close-vault", "关闭 Vault", "close vault gb", Vault, CloseVault),
+        Command::new("new-note", "新建笔记", "new note xjbj", Vault, NewNote),
+        Command::new("open-daily", "今日日记", "daily journal jrrj", Vault, OpenDaily),
+        Command::new("save", "保存笔记", "save note bcbj", Note, SaveNow),
+        Command::new("delete-note", "移到废纸篓", "delete trash ydfzl", NoteTarget, DeleteNote),
+        Command::new("quick-open", "快速打开笔记…", "quick open ksdk", Vault, QuickOpen),
+        Command::new("search", "全文搜索", "search find qwss", Vault, OpenSearch),
+        Command::new("files", "显示文件树", "files explorer xswjs", Vault, OpenFiles),
+        Command::new("sidebar", "折叠 / 展开左侧栏", "toggle sidebar zcl", Vault, ToggleSidebar),
+        Command::new("panel", "折叠 / 展开右侧面板", "toggle panel ycmb", Vault, TogglePanel),
+        Command::new("undo", "撤销", "undo cx", Editor, DocUndo),
+        Command::new("redo", "重做", "redo cz", Editor, DocRedo),
+        Command::new("quit", "退出 Aero", "quit exit tc", Global, Quit),
+    ];
+    for (n, (id, label, keywords)) in [
+        ("text", "转换为正文", "text paragraph zw"),
+        ("heading-1", "转换为标题 1", "heading 1 bt1"),
+        ("heading-2", "转换为标题 2", "heading 2 bt2"),
+        ("heading-3", "转换为标题 3", "heading 3 bt3"),
+        ("bullet-list", "转换为无序列表", "bullet list wxlb"),
+        ("ordered-list", "转换为有序列表", "ordered list yxlb"),
+        ("task-list", "转换为任务列表", "task list rwlb"),
+        ("quote", "转换为引用", "quote yy"),
+        ("code", "转换为代码块", "code dmk"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        commands.push(Command::new(id, label, keywords, Editor, ConvertBlock(n as u8)));
+    }
+    commands
+}
+
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
@@ -95,6 +164,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-f", OpenSearch, None),
         KeyBinding::new("cmd-shift-e", OpenFiles, None),
         KeyBinding::new("cmd-p", QuickOpen, None),
+        KeyBinding::new("cmd-shift-p", CommandPalette, None),
         // 搜索框 / 快速打开里的 ↑↓ / Esc：谓词写成 "Picker > Input"，匹配深度与 Input 自己的绑定相同、
         // 注册更晚，所以先于它们（以及下面编辑器的 up / down）匹配
         KeyBinding::new("up", SelectPrev, Some("Picker > Input")),
@@ -145,6 +215,7 @@ pub fn init(cx: &mut App) {
             MenuItem::action("文件", OpenFiles),
             MenuItem::action("搜索", OpenSearch),
             MenuItem::action("快速打开…", QuickOpen),
+            MenuItem::action("命令面板…", CommandPalette),
             MenuItem::separator(),
             MenuItem::action("折叠 / 展开左侧栏", ToggleSidebar),
             MenuItem::action("折叠 / 展开右侧面板", TogglePanel),

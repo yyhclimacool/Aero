@@ -111,6 +111,7 @@ pub struct Editor {
     preview: Entity<preview::PreviewState>,
     _preview_subscription: Subscription,
     focused: Option<Focused>,
+    picker_open: bool,
     title_edit: Option<TitleEdit>,
     slash: Option<SlashMenu>,
     focus_handle: FocusHandle,
@@ -163,6 +164,7 @@ impl Editor {
             preview,
             _preview_subscription: preview_subscription,
             focused: None,
+            picker_open: false,
             title_edit: None,
             slash: None,
             focus_handle: cx.focus_handle(),
@@ -182,6 +184,42 @@ impl Editor {
 
     pub fn path(&self) -> &VaultPath {
         &self.path
+    }
+
+    pub fn set_picker_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker_open = open;
+        if open {
+            self.slash = None;
+        } else {
+            // 同帧恢复再转移焦点可能不触发 Blur，下一帧按命令执行后的实际焦点收尾。
+            cx.on_next_frame(window, |this, window, cx| {
+                if !this.picker_open
+                    && this
+                        .focused
+                        .as_ref()
+                        .is_some_and(|focused| !focused.textarea.focus_handle(cx).is_focused(window))
+                {
+                    this.exit_edit(cx);
+                }
+            });
+        }
+    }
+
+    pub fn command_available(&self, action: &dyn Action) -> bool {
+        if action.as_any().is::<DocUndo>() {
+            self.doc.can_undo()
+        } else if action.as_any().is::<DocRedo>() {
+            self.doc.can_redo()
+        } else if let Some(action) = action.as_any().downcast_ref::<ConvertBlock>() {
+            let Some(focused) = &self.focused else { return false };
+            let Some(target) = BlockType::from_shortcut(action.0) else { return false };
+            unit_at(&self.units, focused.range.start).is_none_or(|ix| {
+                ops::block_type(&self.units[ix])
+                    .is_some_and(|current| current != BlockType::Quote && current != target)
+            })
+        } else {
+            false
+        }
     }
 
     /// 文件已被工作区重命名 / 移动：换掉路径，内容与脏状态不变。
@@ -528,6 +566,8 @@ impl Editor {
             InputEvent::Change => self.on_change(cx),
             // ⏎ 由 SplitBlock 动作截获（见 actions.rs）；⇧⏎ 软换行由控件自己插入，随后的 Change 已经写回
             InputEvent::PressEnter { .. } | InputEvent::Focus => {}
+            // 弹层暂借焦点，保留控件和选区供命令执行，但仍按失焦规则保存。
+            InputEvent::Blur if self.picker_open => self.save_now(cx),
             InputEvent::Blur => self.exit_edit(cx),
         }
     }

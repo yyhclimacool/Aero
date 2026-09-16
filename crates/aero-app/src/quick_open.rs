@@ -14,7 +14,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::actions::{Dismiss, SelectNext, SelectPrev};
+use crate::actions::{Command, Dismiss, SelectNext, SelectPrev};
 use crate::search::SearchService;
 
 const MAX_SHOWN: usize = 12;
@@ -24,6 +24,10 @@ pub enum QuickOpenEvent {
     Open(VaultPath),
     /// 新建名为该串的笔记
     Create(String),
+    Execute {
+        id: &'static str,
+        action: Box<dyn Action>,
+    },
     Dismiss,
 }
 
@@ -38,8 +42,12 @@ pub struct Candidate {
 pub struct QuickOpen {
     input: Entity<InputState>,
     candidates: Vec<Candidate>,
+    has_vault: bool,
     /// 最近打开的在前
     recent: Vec<VaultPath>,
+    commands: Vec<Command>,
+    recent_commands: Vec<&'static str>,
+    command_mode: bool,
     /// 当前显示的候选下标（已排序）
     shown: Vec<usize>,
     /// 输入非空：列表末尾多一行"新建"
@@ -51,21 +59,49 @@ pub struct QuickOpen {
 
 impl QuickOpen {
     pub fn new(
-        vault: Arc<Vault>,
-        service: Entity<SearchService>,
-        recent: Vec<VaultPath>,
+        commands: Vec<Command>,
+        recent_commands: Vec<&'static str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索笔记标题或路径…"));
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索笔记标题或路径，输入 > 搜索命令…"));
         let sub = cx.subscribe_in(&input, window, Self::on_input_event);
-        // 先用文件名；索引里的标题到了再换
-        let candidates: Vec<Candidate> = vault
+        let mut this = QuickOpen {
+            input,
+            candidates: Vec::new(),
+            has_vault: false,
+            recent: Vec::new(),
+            commands,
+            recent_commands,
+            command_mode: false,
+            shown: Vec::new(),
+            has_query: false,
+            selected: 0,
+            scroll: ScrollHandle::new(),
+            _subscriptions: vec![sub],
+        };
+        this.refilter(cx);
+        this.input.update(cx, |s, cx| s.focus(window, cx));
+        this
+    }
+
+    pub fn set_notes(
+        &mut self,
+        vault: Arc<Vault>,
+        service: Entity<SearchService>,
+        recent: Vec<VaultPath>,
+        cx: &mut Context<Self>,
+    ) {
+        self.candidates = vault
             .notes()
             .unwrap_or_default()
             .into_iter()
             .map(|p| Candidate { title: p.stem().to_owned(), path: p })
             .collect();
+        self.recent = recent;
+        self.has_vault = true;
+        self.refilter(cx);
         let titles = service.read(cx).note_titles(cx);
         cx.spawn(async move |this, cx| {
             let titles = titles.await;
@@ -78,23 +114,21 @@ impl QuickOpen {
                         c.title = title;
                     }
                 }
-                this.refilter(cx);
+                if !this.command_mode {
+                    this.refilter(cx);
+                }
             });
         })
         .detach();
-        let mut this = QuickOpen {
-            input,
-            candidates,
-            recent,
-            shown: Vec::new(),
-            has_query: false,
-            selected: 0,
-            scroll: ScrollHandle::new(),
-            _subscriptions: vec![sub],
-        };
-        this.refilter(cx);
-        this.input.update(cx, |s, cx| s.focus(window, cx));
-        this
+    }
+
+    pub fn show_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |s, cx| {
+            s.set_value("> ", window, cx);
+            s.set_selected_range(2..2, cx);
+            s.focus(window, cx);
+        });
+        self.refilter(cx);
     }
 
     #[cfg(test)]
@@ -129,8 +163,25 @@ impl QuickOpen {
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let q = self.query(cx);
-        self.has_query = !q.is_empty();
-        self.shown = if q.is_empty() {
+        self.command_mode = q.starts_with('>');
+        self.has_query = self.has_vault && !self.command_mode && !q.is_empty();
+        self.shown = if let Some(query) = q.strip_prefix('>') {
+            let query = query.trim();
+            let mut scored: Vec<_> = self
+                .commands
+                .iter()
+                .enumerate()
+                .filter_map(|(i, command)| {
+                    let score =
+                        fuzzy_score(query, command.label).max(fuzzy_score(query, command.keywords))?;
+                    let recent =
+                        self.recent_commands.iter().position(|id| *id == command.id).unwrap_or(usize::MAX);
+                    Some((i, score, recent))
+                })
+                .collect();
+            scored.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.cmp(&a.1)).then_with(|| a.0.cmp(&b.0)));
+            scored.into_iter().map(|(i, _, _)| i).collect()
+        } else if q.is_empty() {
             // 最近打开优先，不足的按路径补
             let mut out: Vec<usize> = self
                 .recent
@@ -166,6 +217,7 @@ impl QuickOpen {
             scored.into_iter().take(MAX_SHOWN).map(|(_, i)| i).collect()
         };
         self.selected = 0;
+        self.scroll.scroll_to_item(0);
         cx.notify();
     }
 
@@ -173,6 +225,7 @@ impl QuickOpen {
         let n = self.rows();
         if n > 0 {
             self.selected = (self.selected + n - 1) % n;
+            self.scroll.scroll_to_item(self.selected);
             cx.notify();
         }
     }
@@ -181,6 +234,7 @@ impl QuickOpen {
         let n = self.rows();
         if n > 0 {
             self.selected = (self.selected + 1) % n;
+            self.scroll.scroll_to_item(self.selected);
             cx.notify();
         }
     }
@@ -195,6 +249,16 @@ impl QuickOpen {
     }
 
     fn confirm(&mut self, create: bool, cx: &mut Context<Self>) {
+        if self.command_mode {
+            if let Some(&i) = self.shown.get(self.selected) {
+                let command = &self.commands[i];
+                cx.emit(QuickOpenEvent::Execute { id: command.id, action: command.action.boxed_clone() });
+            }
+            return;
+        }
+        if !self.has_vault {
+            return;
+        }
         let q = self.query(cx);
         if create || self.shown.is_empty() || self.selected >= self.shown.len() {
             if !q.is_empty() {
@@ -245,9 +309,14 @@ impl Render for QuickOpen {
             .iter()
             .enumerate()
             .map(|(row, &i)| {
-                let c = &self.candidates[i];
-                let dir = c.path.parent();
-                let dir_label = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+                let (title, detail) = if self.command_mode {
+                    let command = &self.commands[i];
+                    (command.label.to_owned(), command.shortcut.clone())
+                } else {
+                    let c = &self.candidates[i];
+                    let dir = c.path.parent();
+                    (c.title.clone(), if dir.is_empty() { String::new() } else { format!("{dir}/") })
+                };
                 let selected = row == self.selected;
                 h_flex()
                     .id(("qo-row", row))
@@ -260,8 +329,9 @@ impl Render for QuickOpen {
                     .cursor_pointer()
                     .when(selected, |el| el.bg(active))
                     .when(!selected, |el| el.hover(move |s| s.bg(hover)))
-                    .child(div().flex_1().min_w_0().truncate().text_sm().child(c.title.clone()))
-                    .child(div().flex_none().text_xs().text_color(muted).child(dir_label))
+                    .debug_selector(move || format!("picker-row-{row}"))
+                    .child(div().flex_1().min_w_0().truncate().text_sm().child(title))
+                    .child(div().flex_none().text_xs().text_color(muted).child(detail))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected = row;
                         this.confirm(false, cx);
@@ -269,7 +339,7 @@ impl Render for QuickOpen {
                     .into_any_element()
             })
             .collect();
-        let create_row: Option<AnyElement> = (!q.is_empty()).then(|| {
+        let create_row: Option<AnyElement> = self.has_query.then(|| {
             let row = self.shown.len();
             let selected = self.selected == row;
             h_flex()
@@ -324,14 +394,15 @@ impl Render for QuickOpen {
                     .track_scroll(&self.scroll)
                     .children(rows)
                     .when(empty, |el| {
-                        el.child(
-                            div()
-                                .px_3()
-                                .py_2()
-                                .text_sm()
-                                .text_color(muted)
-                                .child("这个 vault 里还没有笔记。"),
-                        )
+                        el.child(div().px_3().py_2().text_sm().text_color(muted).child(
+                            if self.command_mode {
+                                "没有匹配的可用命令。"
+                            } else if !self.has_vault {
+                                "请先打开 Vault，或输入 > 搜索命令。"
+                            } else {
+                                "这个 vault 里还没有笔记。"
+                            },
+                        ))
                     })
                     .children(create_row)
                     .vertical_scrollbar(&self.scroll),
@@ -365,6 +436,141 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn commands_filter_rank_and_confirm_without_creating(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut picker =
+                QuickOpen::new(crate::actions::commands(), vec!["open-daily", "new-note"], window, cx);
+            picker.show_commands(window, cx);
+            picker
+        });
+        let executed = Rc::new(RefCell::new(Vec::new()));
+        let sink = executed.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&picker, move |_, event, _| {
+                if let QuickOpenEvent::Execute { id, .. } = event {
+                    sink.borrow_mut().push(*id);
+                }
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let p = picker.read(cx);
+            assert!(p.command_mode);
+            assert!(!p.has_query);
+            assert_eq!(p.commands[p.shown[0]].id, "open-daily");
+            assert_eq!(p.commands[p.shown[1]].id, "new-note");
+        });
+        cx.simulate_input("新建笔记");
+        cx.update(|_, cx| {
+            let p = picker.read(cx);
+            assert_eq!(p.shown.len(), 1);
+            assert_eq!(p.commands[p.shown[0]].id, "new-note");
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(*executed.borrow(), ["new-note"]);
+        picker.update_in(cx, |p, window, cx| {
+            p.input.update(cx, |s, cx| s.set_value("> DAILY", window, cx));
+            p.refilter(cx);
+        });
+        cx.simulate_keystrokes("cmd-enter");
+        assert_eq!(*executed.borrow(), ["new-note", "open-daily"]);
+        picker.update_in(cx, |p, window, cx| {
+            p.input.update(cx, |s, cx| s.set_value("", window, cx));
+            p.refilter(cx);
+        });
+        cx.update(|_, cx| {
+            let p = picker.read(cx);
+            assert!(!p.command_mode);
+            assert_eq!(p.rows(), 0);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn palette_without_vault_cannot_create_notes_after_removing_prefix(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(crate::actions::commands(), vec![], window, cx);
+            picker.show_commands(window, cx);
+            picker
+        });
+        let events: Rc<RefCell<usize>> = Rc::default();
+        let sink = events.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&picker, move |_, _, _| *sink.borrow_mut() += 1).detach();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("new note name");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(picker.read(cx).rows(), 0));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("cmd-enter");
+        assert_eq!(*events.borrow(), 0);
+    }
+
+    #[gpui_kit::test]
+    fn command_keyboard_navigation_scrolls_and_wraps(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(crate::actions::commands(), vec![], window, cx);
+            picker.show_commands(window, cx);
+            picker
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let count = cx.update(|_, cx| picker.read(cx).rows());
+        assert!(count > 12, "all commands remain reachable");
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let p = picker.read(cx);
+            assert_eq!(p.selected, count - 1);
+            assert!(p.scroll.offset().y < gpui_kit::px(0.));
+        });
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let p = picker.read(cx);
+            assert_eq!(p.selected, 0);
+            assert!(p.scroll.offset().y >= gpui_kit::px(-4.), "first row is visible below the 4px padding");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn command_prefix_never_creates_notes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let (picker, cx) =
+            cx.add_window_view(|window, cx| QuickOpen::new(crate::actions::commands(), vec![], window, cx));
+        let events: Rc<RefCell<usize>> = Rc::default();
+        let sink = events.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&picker, move |_, _, _| *sink.borrow_mut() += 1).detach();
+        });
+        cx.run_until_parked();
+        cx.simulate_input("> definitely-no-command");
+        cx.update(|_, cx| assert_eq!(picker.read(cx).rows(), 0, "command mode has no create row"));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("cmd-enter");
+        assert_eq!(*events.borrow(), 0);
+    }
+
+    #[gpui_kit::test]
     fn quick_open_lists_recent_filters_and_creates(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -384,8 +590,11 @@ mod tests {
         let service =
             cx.update(|cx| cx.new(|cx| SearchService::new(vault.clone(), data.path().to_path_buf(), cx)));
         let recent = vec![VaultPath::new("todo.md").unwrap()];
-        let (picker, cx) =
-            cx.add_window_view(|window, cx| QuickOpen::new(vault, service, recent, window, cx));
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(vec![], vec![], window, cx);
+            picker.set_notes(vault, service, recent, cx);
+            picker
+        });
         let events: Rc<RefCell<Vec<String>>> = Rc::default();
         let sink = events.clone();
         cx.update(|_, cx| {
@@ -393,6 +602,7 @@ mod tests {
                 sink.borrow_mut().push(match ev {
                     QuickOpenEvent::Open(p) => format!("open {}", p.as_str()),
                     QuickOpenEvent::Create(n) => format!("create {n}"),
+                    QuickOpenEvent::Execute { id, .. } => format!("execute {id}"),
                     QuickOpenEvent::Dismiss => "dismiss".into(),
                 });
             })

@@ -55,6 +55,8 @@ pub struct Workspace {
     open: Option<VaultSession>,
     /// ⌘P 弹层
     quick_open: Option<(Entity<QuickOpen>, Subscription)>,
+    picker_focus: Option<FocusHandle>,
+    recent_commands: Vec<&'static str>,
     sidebar_tab: SidebarTab,
     sidebar_visible: bool,
     panel_visible: bool,
@@ -83,6 +85,8 @@ impl Workspace {
         });
         let mut this = Workspace {
             quick_open: None,
+            picker_focus: None,
+            recent_commands: Vec::new(),
             sidebar_tab: SidebarTab::Files,
             sidebar_visible: state.sidebar_visible.unwrap_or(true),
             panel_visible: state.panel_visible.unwrap_or(true),
@@ -273,13 +277,74 @@ impl Workspace {
     }
 
     fn on_quick_open(&mut self, _: &QuickOpen_, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(open) = self.open.as_ref() else { return };
+        if self.open.is_none() {
+            return;
+        }
         if self.quick_open.is_some() {
             self.close_quick_open(window, cx);
             return;
         }
-        let (vault, service, recent) = (open.vault.clone(), open.search.clone(), open.recent.clone());
-        let picker = cx.new(|cx| QuickOpen::new(vault, service, recent, window, cx));
+        self.open_picker(false, window, cx);
+    }
+
+    fn on_command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((picker, _)) = &self.quick_open {
+            picker.update(cx, |picker, cx| picker.show_commands(window, cx));
+        } else {
+            self.open_picker(true, window, cx);
+        }
+    }
+
+    fn available_commands(&self, window: &Window, cx: &App) -> Vec<Command> {
+        let editor = self.open.as_ref().and_then(|o| o.editor.as_ref());
+        let target =
+            self.open.as_ref().is_some_and(|o| o.tree.read(cx).selected().is_some() || editor.is_some());
+        let mut commands = commands();
+        commands.retain(|command| match command.scope {
+            CommandScope::Global => true,
+            CommandScope::Vault => self.open.is_some(),
+            CommandScope::Note => editor.is_some(),
+            CommandScope::NoteTarget => target,
+            CommandScope::Editor => editor.is_some_and(|e| {
+                e.read(cx).command_available(command.action.as_ref())
+                    && window.is_action_available(command.action.as_ref(), cx)
+            }),
+        });
+        if let Some(focus) = window.focused(cx) {
+            for command in &mut commands {
+                if let Some(binding) =
+                    window.highest_precedence_binding_for_action_in(command.action.as_ref(), &focus)
+                {
+                    command.shortcut = binding
+                        .keystrokes()
+                        .iter()
+                        .map(|key| gpui_kit::component::kbd::Kbd::format(key.as_keystroke()))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                }
+            }
+        }
+        commands
+    }
+
+    fn open_picker(&mut self, command_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let commands = self.available_commands(window, cx);
+        self.picker_focus = window.focused(cx);
+        if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
+            editor.update(cx, |e, cx| e.set_picker_open(true, window, cx));
+        }
+        let notes =
+            self.open.as_ref().map(|open| (open.vault.clone(), open.search.clone(), open.recent.clone()));
+        let picker = cx.new(|cx| {
+            let mut picker = QuickOpen::new(commands, self.recent_commands.clone(), window, cx);
+            if let Some((vault, service, recent)) = notes {
+                picker.set_notes(vault, service, recent, cx);
+            }
+            if command_mode {
+                picker.show_commands(window, cx);
+            }
+            picker
+        });
         let sub = cx.subscribe_in(&picker, window, |this, _, event, window, cx| match event {
             QuickOpenEvent::Open(path) => {
                 this.close_quick_open(window, cx);
@@ -289,6 +354,15 @@ impl Workspace {
                 this.close_quick_open(window, cx);
                 this.create_note_named(name, window, cx);
             }
+            QuickOpenEvent::Execute { id, action } => {
+                this.close_quick_open(window, cx);
+                if this.available_commands(window, cx).iter().any(|command| command.id == *id) {
+                    this.recent_commands.retain(|recent| recent != id);
+                    this.recent_commands.insert(0, id);
+                    this.recent_commands.truncate(20);
+                    window.dispatch_action(action.boxed_clone(), cx);
+                }
+            }
             QuickOpenEvent::Dismiss => this.close_quick_open(window, cx),
         });
         self.quick_open = Some((picker, sub));
@@ -297,9 +371,17 @@ impl Workspace {
 
     fn close_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.quick_open.take().is_some() {
-            match self.open.as_ref().and_then(|o| o.editor.clone()) {
-                Some(editor) => editor.update(cx, |e, cx| e.focus_browse(window, cx)),
-                None => self.focus_handle.focus(window, cx),
+            if let Some(focus) =
+                self.picker_focus.take().filter(|focus| self.focus_handle.contains(focus, window))
+            {
+                window.focus(&focus, cx);
+            } else if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
+                editor.update(cx, |e, cx| e.focus_browse(window, cx));
+            } else {
+                self.focus_handle.focus(window, cx);
+            }
+            if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
+                editor.update(cx, |e, cx| e.set_picker_open(false, window, cx));
             }
             cx.notify();
         }
@@ -944,6 +1026,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_search))
             .on_action(cx.listener(Self::on_open_files))
             .on_action(cx.listener(Self::on_quick_open))
+            .on_action(cx.listener(Self::on_command_palette))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_toggle_panel))
             .size_full()
@@ -1029,5 +1112,268 @@ fn ago(at: Instant) -> String {
         format!("{secs} 秒前")
     } else {
         format!("{} 分钟前", secs / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aero_core::{Vault, VaultPath};
+    use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+
+    use super::{SidebarTab, VaultSession, Workspace};
+    use crate::editor::Editor;
+    use crate::file_tree::FileTree;
+    use crate::paths::PersistedState;
+    use crate::search::SearchService;
+    use crate::search_view::SearchView;
+
+    fn open(
+        cx: &mut TestAppContext,
+        source: Option<&str>,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Entity<Workspace>) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = source.map(|source| {
+            std::fs::write(dir.path().join("a.md"), source).unwrap();
+            Arc::new(Vault::open(dir.path()).unwrap())
+        });
+        let (workspace, _) = cx.add_window_view(|window, cx| {
+            let open = vault.map(|vault| {
+                let path = VaultPath::new("a.md").unwrap();
+                let (doc, stamp) = Editor::load(vault.clone(), path.clone()).unwrap();
+                let editor = cx.new(|cx| Editor::new(vault.clone(), path, doc, stamp, cx));
+                let tree = cx.new(|cx| FileTree::new(vault.clone(), cx));
+                let search = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+                let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
+                VaultSession {
+                    vault,
+                    tree,
+                    editor: Some(editor),
+                    search,
+                    search_view,
+                    recent: vec![],
+                    _subscriptions: vec![],
+                }
+            });
+            let focus_handle = cx.focus_handle();
+            focus_handle.focus(window, cx);
+            Workspace {
+                state: PersistedState::default(),
+                open,
+                quick_open: None,
+                picker_focus: None,
+                recent_commands: vec![],
+                sidebar_tab: SidebarTab::Files,
+                sidebar_visible: true,
+                panel_visible: true,
+                resizable: cx.new(|_| Default::default()),
+                focus_handle,
+                error: None,
+                _quit_subscription: cx.on_app_quit(|_, _| async {}),
+                _activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
+            }
+        });
+        (dir, data, workspace)
+    }
+
+    #[gpui_kit::test]
+    fn command_palette_shortcut_works_without_vault(cx: &mut TestAppContext) {
+        let (_dir, _data, workspace) = open(cx, None);
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let commands = workspace.read(cx).available_commands(window, cx);
+            assert_eq!(
+                commands.iter().map(|command| command.id).collect::<Vec<_>>(),
+                ["open-vault", "new-vault", "quit"]
+            );
+            assert!(commands[0].shortcut.contains('O'));
+        });
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(workspace.read(cx).quick_open.is_some()));
+        cx.simulate_input("new note");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("picker-row-0").is_none(), "note commands need a vault");
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| assert!(workspace.read(cx).quick_open.is_some()));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(workspace.read(cx).quick_open.is_none());
+            assert_eq!(window.focused(cx), Some(workspace.read(cx).focus_handle.clone()));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn command_palette_returns_to_search_without_editor_commands(cx: &mut TestAppContext) {
+        let (_dir, _data, workspace) = open(cx, Some("# Heading\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.run_until_parked();
+        let (editor, heading) = cx.update(|window, cx| {
+            let editor = workspace.read(cx).open.as_ref().unwrap().editor.clone().unwrap();
+            let heading = editor.read(cx).headings()[0].2;
+            editor.update(cx, |e, cx| e.focus_block(heading, window, cx));
+            (editor, heading)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+        cx.simulate_input("全文搜索");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let search_focus = cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+            let workspace = workspace.read(cx);
+            assert_eq!(workspace.sidebar_tab, SidebarTab::Search);
+            assert!(workspace.quick_open.is_none());
+            assert!(
+                workspace
+                    .available_commands(window, cx)
+                    .iter()
+                    .all(|command| !matches!(command.scope, crate::actions::CommandScope::Editor))
+            );
+            assert!(
+                !editor.read(cx).command_available(&crate::actions::ConvertBlock(2)),
+                "leaving the editor through a palette command must exit source editing"
+            );
+            window.focused(cx).unwrap()
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_hit(VaultPath::new("a.md").unwrap(), 0, window, cx);
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(editor.read(cx).highlighted_block(), Some(heading));
+            assert_eq!(window.focused(cx), Some(search_focus.clone()));
+            assert_eq!(editor.read(cx).index_snapshot().1, "# Heading\n");
+        });
+        assert!(cx.debug_bounds("unit-1").is_some(), "hit renders its preview");
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| assert_eq!(window.focused(cx), Some(search_focus)));
+    }
+
+    #[gpui_kit::test]
+    fn command_palette_can_open_note_picker_without_losing_caret(cx: &mut TestAppContext) {
+        let (_dir, _data, workspace) = open(cx, Some("# Heading\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.run_until_parked();
+        let editor = cx.update(|window, cx| {
+            let editor = workspace.read(cx).open.as_ref().unwrap().editor.clone().unwrap();
+            editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx));
+            editor
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-left");
+        let original = cx.update(|window, cx| window.focused(cx).unwrap());
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+        cx.simulate_input("快速打开笔记");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            assert!(workspace.read(cx).quick_open.is_some());
+            assert!(editor.read(cx).command_available(&crate::actions::ConvertBlock(2)));
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            assert!(workspace.read(cx).quick_open.is_none());
+            assert_eq!(window.focused(cx), Some(original));
+        });
+        cx.simulate_input("X");
+        cx.update(|_, cx| assert_eq!(editor.read(cx).index_snapshot().1, "X# Heading\n"));
+    }
+
+    #[gpui_kit::test]
+    fn command_palette_restores_caret_and_executes_editor_action(cx: &mut TestAppContext) {
+        let (_dir, _data, workspace) = open(cx, Some("# Heading\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.run_until_parked();
+        let editor = cx.update(|window, cx| {
+            let editor = workspace.read(cx).open.as_ref().unwrap().editor.clone().unwrap();
+            editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx));
+            editor
+        });
+        cx.run_until_parked();
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("cmd-left");
+        let original = cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            window.focused(cx).unwrap()
+        });
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            assert_eq!(window.focused(cx), Some(original));
+        });
+        cx.simulate_input("X");
+        cx.update(|_, cx| assert_eq!(editor.read(cx).index_snapshot().1, "X# Heading!\n"));
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+        cx.simulate_input("heading 2");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            assert!(workspace.read(cx).quick_open.is_none());
+            assert_eq!(editor.read(cx).index_snapshot().1, "## X# Heading!\n");
+            assert!(editor.read(cx).command_available(&crate::actions::ConvertBlock(1)));
+        });
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+        cx.simulate_input("undo");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            assert_eq!(editor.read(cx).index_snapshot().1, "X# Heading!\n");
+            assert!(editor.read(cx).command_available(&crate::actions::ConvertBlock(2)));
+            assert_eq!(workspace.read(cx).recent_commands, ["undo", "heading-2"]);
+        });
+        cx.simulate_keystrokes("cmd-p");
+        cx.run_until_parked();
+        cx.simulate_input("> redo");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            assert_eq!(editor.read(cx).index_snapshot().1, "## X# Heading!\n");
+            assert!(editor.read(cx).command_available(&crate::actions::ConvertBlock(1)));
+            assert_eq!(workspace.read(cx).recent_commands, ["redo", "undo", "heading-2"]);
+        });
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let first = cx.debug_bounds("picker-row-0").unwrap();
+        cx.simulate_click(first.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(workspace.read(cx).quick_open.is_none());
+            assert_eq!(
+                editor.read(cx).index_snapshot().1,
+                "X# Heading!\n",
+                "most recent available command is undo"
+            );
+            assert_eq!(workspace.read(cx).recent_commands, ["undo", "redo", "heading-2"]);
+        });
     }
 }
