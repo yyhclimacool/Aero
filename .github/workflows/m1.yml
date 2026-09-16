@@ -1,0 +1,56 @@
+name: M1 acceptance
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      performance:
+        description: Run the 100k-note index performance gate
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m1-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    # ARM64: the repository currently pins only the Apple Silicon zvec checksum.
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust and Metal toolchains
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+          rustup override set 1.98.1
+          if ! xcrun --find metal; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun --kill-cache
+          fi
+          xcrun --find metal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: m1-${{ runner.os }}-${{ runner.arch }}-rust-1.98.1-${{ hashFiles('Cargo.lock') }}
+      - name: Fetch verified native library
+        run: bash scripts/fetch-zvec.sh
+      - name: Tests and local distribution checks
+        run: bash scripts/check-m1.sh --bundle
+      - name: 100k-note performance gate
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.performance }}
+        run: |
+          cargo build --locked --release -p aero-index --example m1_bench
+          /usr/bin/time -l target/release/examples/m1_bench 100000 > target/m1-qa/bench-100k.jsonl 2> target/m1-qa/bench-100k.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m1-acceptance-${{ github.run_id }}
+          path: target/m1-qa/

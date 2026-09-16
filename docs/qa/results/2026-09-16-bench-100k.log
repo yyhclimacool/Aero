@@ -1,0 +1,29 @@
+generated 100000 notes, 2868 bytes/note
+indexed 10000/100000
+indexed 20000/100000
+indexed 30000/100000
+indexed 40000/100000
+indexed 50000/100000
+indexed 60000/100000
+indexed 70000/100000
+indexed 80000/100000
+indexed 90000/100000
+indexed 100000/100000
+      196.61 real       308.98 user        52.73 sys
+           904790016  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              151360  page reclaims
+                  71  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+              135540  voluntary context switches
+             2154782  involuntary context switches
+       6895237366701  instructions retired
+       1497021928821  cycles elapsed
+           581026944  peak memory footprint

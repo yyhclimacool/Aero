@@ -724,6 +724,158 @@ fn conflict_copies(dir: &std::path::Path) -> Vec<String> {
     v
 }
 
+#[gpui_kit::test]
+fn repeated_conflicts_keep_every_disk_version(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "base\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let first = editor.update(cx, |e, _| e.backup_disk(b"first").unwrap());
+    let second = editor.update(cx, |e, _| e.backup_disk(b"second").unwrap());
+    assert_ne!(first, second);
+    assert_eq!(std::fs::read(dir.path().join(first.as_str())).unwrap(), b"first");
+    assert_eq!(std::fs::read(dir.path().join(second.as_str())).unwrap(), b"second");
+}
+
+#[gpui_kit::test]
+fn unreadable_disk_state_stops_saving(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "base\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("!");
+    let file = dir.path().join("a.md");
+    std::fs::rename(&file, dir.path().join("original.md")).unwrap();
+    // 目录不能作为笔记读取：这不是“未修改”或“已删除”。
+    std::fs::create_dir(&file).unwrap();
+    assert!(editor.update(cx, |e, _| e.disk_state()).is_err());
+    editor.update(cx, |e, cx| e.save_now(cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.dirty);
+        assert!(matches!(e.save_state(), super::SaveState::Failed(_)));
+        assert!(!e.is_deleted());
+    });
+    assert!(editor.update(cx, |e, _| e.flush_sync()).is_err());
+    assert!(file.is_dir());
+    assert_eq!(text(&editor, cx), "base!\n");
+}
+
+/// 通过真实控件的 IME 协议验证：预编辑不保存，提交后才进入 Document / undo。
+#[gpui_kit::test]
+fn ime_preedit_commit_and_undo_preserve_markdown(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let source = "前😀 **ab** 后\n";
+    let (dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for (preedit, committed) in [("nihao", "你好"), ("にほんご", "日本語")] {
+        focus_unit(&editor, 0, cx);
+        let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                let at = "前😀 **".len();
+                s.set_selected_range(at..at, cx);
+                s.replace_and_mark_text_in_range(None, preedit, None, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(text(&editor, cx), source, "preedit must not become a document edit");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.replace_text_in_range(None, committed, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(text(&editor, cx), format!("前😀 **{committed}ab** 后\n"));
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), source, "one undo removes the complete composition");
+    }
+}
+
+#[gpui_kit::test]
+fn ime_cancel_does_not_change_document_or_disk(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let source = "[[目标]]\n";
+    let (dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            s.set_selected_range(2..2, cx);
+            s.replace_and_mark_text_in_range(None, "quxiao", None, window, cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            s.replace_and_mark_text_in_range(None, "", None, window, cx);
+            s.unmark_text(window, cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_secs(3));
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), source);
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+    cx.update(|_, cx| assert!(!editor.read(cx).doc.can_undo()));
+}
+
+/// 原笔记可写，但冲突副本名称超过文件系统限制：备份失败绝不能继续覆盖原文。
+#[gpui_kit::test]
+fn failed_conflict_backup_preserves_both_versions_and_can_retry(cx: &mut TestAppContext) {
+    use super::{EditorEvent, SaveState};
+    let (dir, vault, path, editor) = open(cx, "base\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let long_path = VaultPath::new(&format!("{}.md", "a".repeat(190))).unwrap();
+    vault.rename(&path, &long_path).unwrap();
+    editor.update(cx, |e, cx| e.set_path(long_path.clone(), cx));
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("!");
+    let file = vault.fs_path(&long_path);
+    std::fs::write(&file, "theirs from disk\n").unwrap();
+    let failures = std::rc::Rc::new(std::cell::Cell::new(0));
+    let sink = failures.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&editor, move |_, event: &EditorEvent, _| {
+            if matches!(event, EditorEvent::SaveFailed(_)) {
+                sink.set(sink.get() + 1);
+            }
+        })
+        .detach();
+    });
+    let original_stamp = cx.update(|_, cx| editor.read(cx).stamp);
+    // 自动保存与监听触发保存都必须停止；失败不能更新已知磁盘指纹。
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    editor.update(cx, |e, cx| e.check_external(cx));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs from disk\n");
+    assert_eq!(text(&editor, cx), "base!\n");
+    assert!(failures.get() > 0);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.dirty);
+        assert!(matches!(e.save_state(), SaveState::Failed(_)));
+        assert_eq!(e.stamp, original_stamp);
+        assert!(e.banner().is_none());
+    });
+    assert!(editor.update(cx, |e, _| e.flush_sync()).is_err());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs from disk\n");
+    // 去掉失败原因后重试，仍需先备份磁盘版本。
+    vault.rename(&long_path, &path).unwrap();
+    editor.update(cx, |e, cx| {
+        e.set_path(path, cx);
+        e.save_now(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "base!\n");
+    let copies = conflict_copies(dir.path());
+    assert_eq!(copies.len(), 1);
+    assert_eq!(std::fs::read_to_string(dir.path().join(&copies[0])).unwrap(), "theirs from disk\n");
+}
+
 /// 10.2 的横幅：重载 → 蓝色并 10 s 自动消失；冲突 → 黄色，"使用磁盘版本"把副本换进来并删掉副本。
 #[gpui_kit::test]
 fn banners_for_reload_and_conflict(cx: &mut TestAppContext) {

@@ -150,7 +150,7 @@ impl Vault {
             let cfg = VaultToml { vault_id: ulid::Ulid::generate().to_string(), format: VAULT_FORMAT };
             fs::create_dir_all(cfg_path.parent().unwrap()).map_err(io_err(&cfg_path))?;
             let body = toml::to_string(&cfg).map_err(|e| VaultError::Config(e.to_string()))?;
-            atomic_write(&cfg_path, body.as_bytes())?;
+            atomic_write(&cfg_path, body.as_bytes(), true)?;
             cfg.vault_id
         };
         Ok(Vault { root, id })
@@ -225,11 +225,25 @@ impl Vault {
 
     /// 原子写入（临时文件 + rename），保留原文件权限。父目录不存在时创建。
     pub fn write_bytes(&self, p: &VaultPath, bytes: &[u8]) -> Result<FileStamp, VaultError> {
+        self.write_bytes_impl(p, bytes, true)
+    }
+
+    /// 原子创建新文件；目标存在（含符号链接）时失败，绝不覆盖已有冲突副本。
+    pub fn create_bytes(&self, p: &VaultPath, bytes: &[u8]) -> Result<FileStamp, VaultError> {
+        self.write_bytes_impl(p, bytes, false)
+    }
+
+    fn write_bytes_impl(
+        &self,
+        p: &VaultPath,
+        bytes: &[u8],
+        overwrite: bool,
+    ) -> Result<FileStamp, VaultError> {
         let path = self.fs_path(p);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(io_err(dir))?;
         }
-        atomic_write(&path, bytes)?;
+        atomic_write(&path, bytes, overwrite)?;
         let meta = fs::metadata(&path).map_err(io_err(&path))?;
         Ok(FileStamp {
             mtime: meta.modified().map_err(io_err(&path))?,
@@ -272,7 +286,7 @@ impl Vault {
 }
 
 /// 写临时文件、fsync、rename 覆盖。目标已存在时沿用其权限位。
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+fn atomic_write(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), VaultError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(".{name}.aero-tmp-{}-{}", std::process::id(), ulid::Ulid::generate()));
@@ -283,9 +297,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
         if let Ok(meta) = fs::metadata(path) {
             let _ = fs::set_permissions(&tmp, meta.permissions());
         }
-        fs::rename(&tmp, path).map_err(io_err(path))
+        if overwrite {
+            fs::rename(&tmp, path).map_err(io_err(path))
+        } else {
+            // 同目录硬链接原子发布已 fsync 的完整文件；存在的目标不会被替换。
+            fs::hard_link(&tmp, path).map_err(io_err(path))
+        }
     })();
-    if result.is_err() {
+    if result.is_err() || !overwrite {
         let _ = fs::remove_file(&tmp);
     }
     result
@@ -294,6 +313,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_bytes_never_overwrites_existing_file_or_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let path = VaultPath::new("backup.md").unwrap();
+        vault.create_bytes(&path, b"first complete version").unwrap();
+        assert!(vault.create_bytes(&path, b"second").is_err());
+        assert_eq!(fs::read(vault.fs_path(&path)).unwrap(), b"first complete version");
+        let folder = VaultPath::new("folder.md").unwrap();
+        fs::create_dir(vault.fs_path(&folder)).unwrap();
+        assert!(vault.create_bytes(&folder, b"text").is_err());
+        assert!(vault.fs_path(&folder).is_dir());
+        assert!(
+            !fs::read_dir(dir.path())
+                .unwrap()
+                .any(|entry| { entry.unwrap().file_name().to_string_lossy().contains("aero-tmp") })
+        );
+    }
 
     #[test]
     fn vault_path_rules() {

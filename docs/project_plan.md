@@ -4,6 +4,7 @@
 > 投入假设：单人、业余时间（约每周 10 小时）。排期见第 18 节。
 > 本文是后续所有架构决策的依据。产品与范围层面的决定已全部拍板，见第 22 节；剩余待定项均为由 M0 spike 数据决定的技术选型。
 > UI 与交互设计见 `docs/ui_design.md`。
+> 当前验收状态（2026-09-16）：M1 编辑/搜索主流程已实现，完整验收尚未关闭。保存保护修复、自动化测试、性能实测及待验项目见 [M1 验收记录](qa/m1.md)。
 
 ---
 
@@ -1045,7 +1046,8 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
   `optimize()` 策略（10.3）：全量同步后若索引 / 删除的笔记 ≥ 50 篇合并一次段文件；平时计增量写入，空闲 flush 时"累计 ≥ 200 次且距上次 ≥ 10 分钟"才 optimize，之后计数清零。
   标签查询小项：`-#tag` / `-tag:x` 排除（zvec 的过滤表达式没有 `NOT LIKE`，用多取一批再在 Rust 侧剔除实现）、`tag:rust` 不带 `#` 也算包含、`#rust` 匹配子标签 `rust/cli`（索引侧 `tags_filter` 写入全部祖先，`FTS_VERSION` 升到 3 触发重建；内存实现用 `tag_matches`）、`#rust,` 之类的尾标点剥掉。
   分发链路（第 15 节）：`scripts/bundle-macos.sh` 设了 `AERO_SIGN_IDENTITY` 就用 Developer ID 正式签名（`--options runtime` + `resources/macos/entitlements.plist`，zvec dylib 一并签），否则 ad-hoc；`scripts/dmg-macos.sh` 用 `hdiutil` 出 UDZO 镜像（内含 Aero.app 与 `/Applications` 快捷方式，有身份时也签 .dmg）；`scripts/notarize-macos.sh` 用 `xcrun notarytool submit --wait` 公证并 `stapler staple`，凭据来自 `AERO_NOTARY_PROFILE`（钥匙串配置）或 `AERO_NOTARY_APPLE_ID / TEAM_ID / PASSWORD`，提交前先拦下 ad-hoc 签名（注意别用 `| grep -q`：pipefail 下 grep 提前退出会让 codesign 吃 SIGPIPE，判定不稳定）；`scripts/release-macos.sh [--notarize] [dist/]` 串起来。`scripts/test_bundle_macos.py` 覆盖 bundle 结构、签名、dmg 内容与挂载后签名、公证脚本的预检（缺凭据 / ad-hoc / `--notarize` 不触发构建）。**自动更新按砍单清单砍掉**：M1 的发布 = 上传 `.dmg`。
-  M1 至此收口；剩下的都是有意推后的项（见 M1a 第三刀末尾与第 18 节）。
+  M1 的功能主流程至此收口；这不等于 IME、性能与正式分发已全部验收，当前状态以 [M1 验收记录](qa/m1.md) 为准。
+- **验收补充（2026-09-16）**：修复冲突副本写入失败后仍覆盖原笔记的问题，磁盘校验失败时停止保存；冲突副本以原子 create-only 方式创建，同名时另取名称。保存失败阻止切换笔记、切换/关闭 vault，普通 Quit 与窗口关闭也检查保存结果。新增保存失败/重试、连续冲突、IME 预编辑/提交/取消及文档撤销回归测试；新增 `scripts/check-m1.sh`、GitHub Actions 工作流和 `aero-index/examples/m1_bench.rs`。本机自动化通过情况、原生 IME 人工清单、性能结果与正式公证待验项分别记录在 `docs/qa/`，不将未验项目标为通过。
 
 ### M2 · 知识互联（约 155 小时，2027-05 → 2027-09 初）
 

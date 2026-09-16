@@ -76,6 +76,10 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(initial_vault: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = PersistedState::load();
+        let workspace = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            workspace.update(cx, |this, cx| this.flush_before_leaving(window, cx)).unwrap_or(true)
+        });
         let quit = cx.on_app_quit(|this, cx| {
             this.flush_all(cx);
             async {}
@@ -115,6 +119,9 @@ impl Workspace {
     // ---- vault ----
 
     fn open_vault(&mut self, root: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.flush_before_leaving(window, cx) {
+            return;
+        }
         self.flush_all(cx);
         match Vault::open(root) {
             Ok(vault) => {
@@ -216,6 +223,9 @@ impl Workspace {
     }
 
     fn on_close_vault(&mut self, _: &CloseVault, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.flush_before_leaving(window, cx) {
+            return;
+        }
         self.flush_all(cx);
         self.open = None;
         self.focus_handle.focus(window, cx);
@@ -233,13 +243,9 @@ impl Workspace {
         if open.editor.as_ref().is_some_and(|e| e.read(cx).path() == &path) {
             return;
         }
-        // 切换前把上一篇落盘，并让索引跟上
-        if let Some(prev) = open.editor.clone() {
-            let result = prev.update(cx, |e, _| e.flush_sync());
-            if result.is_ok() {
-                self.index_editor(&prev, cx);
-            }
-            self.report_flush(result, window, cx);
+        // 保存失败时保留当前编辑器，不能只弹通知后丢掉未保存内容。
+        if !self.flush_before_leaving(window, cx) {
+            return;
         }
         let Some(open) = self.open.as_mut() else { return };
         match Editor::load(open.vault.clone(), path.clone()) {
@@ -644,6 +650,27 @@ impl Workspace {
         }
         if let Some(open) = self.open.as_ref() {
             open.search.read(cx).flush_blocking();
+        }
+    }
+
+    fn flush_before_leaving(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) else { return true };
+        if editor.read(cx).save_state() == &SaveState::Saving {
+            window.push_notification(Notification::warning("正在保存，请稍后再试。").title("Aero"), cx);
+            return false;
+        }
+        let result = editor.update(cx, |e, _| e.flush_sync());
+        let saved = result.is_ok();
+        if saved {
+            self.index_editor(&editor, cx);
+        }
+        self.report_flush(result, window, cx);
+        saved
+    }
+
+    fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.flush_before_leaving(window, cx) {
+            cx.quit();
         }
     }
 
@@ -1115,6 +1142,7 @@ impl Render for Workspace {
             .id("workspace")
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_open_vault))
             .on_action(cx.listener(Self::on_new_vault))
             .on_action(cx.listener(Self::on_close_vault))
@@ -1307,6 +1335,46 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "condition not met within 20 s");
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
+    }
+
+    #[gpui_kit::test]
+    fn failed_save_blocks_note_and_vault_switching(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("base\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let (editor, vault) = cx.update(|_, cx| {
+            let session = workspace.read(cx).open.as_ref().unwrap();
+            (session.editor.clone().unwrap(), session.vault.clone())
+        });
+        let long_path = VaultPath::new(&format!("{}.md", "a".repeat(190))).unwrap();
+        vault.rename(&VaultPath::new("a.md").unwrap(), &long_path).unwrap();
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                e.set_path(long_path.clone(), cx);
+                e.start_writing(window, cx);
+            })
+        });
+        cx.simulate_input("!");
+        let local_text = cx.update(|_, cx| editor.read(cx).index_snapshot().1);
+        std::fs::write(vault.fs_path(&long_path), "theirs from disk\n").unwrap();
+        std::fs::write(dir.path().join("b.md"), "other\n").unwrap();
+        let other_vault = tempfile::tempdir().unwrap();
+        cx.update(|window, cx| {
+            workspace.update(cx, |w, cx| {
+                w.open_note(VaultPath::new("b.md").unwrap(), window, cx);
+                assert_eq!(w.open.as_ref().unwrap().editor.as_ref(), Some(&editor));
+                w.on_close_vault(&crate::actions::CloseVault, window, cx);
+                assert!(w.open.is_some());
+                w.open_vault(other_vault.path(), window, cx);
+                assert_eq!(w.open.as_ref().unwrap().vault.root(), vault.root());
+                assert!(!w.flush_before_leaving(window, cx), "close/quit must be vetoed");
+            })
+        });
+        assert_eq!(std::fs::read_to_string(vault.fs_path(&long_path)).unwrap(), "theirs from disk\n");
+        cx.update(|_, cx| assert_eq!(editor.read(cx).index_snapshot().1, local_text));
     }
 
     fn hit_paths(cx: &mut VisualTestContext, search: &Entity<SearchService>, query: &str) -> Vec<String> {

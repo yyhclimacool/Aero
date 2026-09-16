@@ -17,7 +17,12 @@ AERO_LOG=debug cargo run -p aero-app -- ~/Knowledge
 
 # 测试：aero-core 往返测试、aero-index 索引往返（含真 zvec 引擎）、aero-app 的纯函数与无头 GPUI 交互测试
 cargo test -p aero-core -p aero-index -p aero-app
+
+# M1 自动验收（格式、测试、从当前源码打包及 DMG 检查）
+bash scripts/check-m1.sh --bundle
 ```
+
+M1 验收状态及复跑说明见 [docs/qa/m1.md](docs/qa/m1.md)，包含保存失败回归、输入法清单和真实性能基准；自动化通过不代表原生 IME、GUI 性能与正式公证全部通过。
 
 全文索引存放在 `~/Library/Application Support/Aero/index/<vault-id>/`，是可随时删除重建的缓存；首次打开 vault 时后台建索引，状态栏显示进度。
 

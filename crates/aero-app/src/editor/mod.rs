@@ -1240,12 +1240,20 @@ impl Editor {
         }
         self.save_task = None;
         match self.disk_state() {
-            Disk::Changed(disk, stamp) => self.write_conflict_copy(&disk, stamp, cx),
-            Disk::Missing => {
+            Ok(Disk::Changed(disk, stamp)) => {
+                if !self.write_conflict_copy(&disk, stamp, cx) {
+                    return;
+                }
+            }
+            Ok(Disk::Missing) => {
                 self.mark_deleted(cx);
                 return;
             }
-            Disk::Unchanged => {}
+            Ok(Disk::Unchanged) => {}
+            Err(err) => {
+                self.save_failed(format!("无法校验磁盘版本，已停止保存：{err}"), cx);
+                return;
+            }
         }
         self.start_write(cx);
     }
@@ -1297,10 +1305,8 @@ impl Editor {
             return Ok(None);
         }
         self.save_task = None;
-        let conflict = match self.disk_state() {
-            Disk::Changed(disk, _) => {
-                Some(self.vault.write_bytes(&self.conflict_path(), &disk).map(|_| self.conflict_path())?)
-            }
+        let conflict = match self.disk_state()? {
+            Disk::Changed(disk, _) => Some(self.backup_disk(&disk)?),
             Disk::Missing => {
                 log::warn!("{}: deleted on disk; unsaved changes dropped", self.path.as_str());
                 return Ok(None);
@@ -1317,20 +1323,24 @@ impl Editor {
     // ---- 外部修改（方案 12：vault 监听 + 2 s 轮询兜底 + 写前校验；不做三方合并） ----
 
     /// 磁盘文件相对编辑器所知指纹的状态：先比 mtime/size（不读内容），变了再比内容 hash。
-    fn disk_state(&mut self) -> Disk {
-        let Ok((mtime, size)) = self.vault.stat(&self.path) else {
-            return if self.vault.exists(&self.path) { Disk::Unchanged } else { Disk::Missing };
+    fn disk_state(&mut self) -> Result<Disk, VaultError> {
+        let (mtime, size) = match self.vault.stat(&self.path) {
+            Ok(stamp) => stamp,
+            Err(VaultError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Disk::Missing);
+            }
+            Err(err) => return Err(err),
         };
         if mtime == self.stamp.mtime && size == self.stamp.size {
-            return Disk::Unchanged;
+            return Ok(Disk::Unchanged);
         }
-        let Ok((bytes, stamp)) = self.vault.read_bytes(&self.path) else { return Disk::Unchanged };
+        let (bytes, stamp) = self.vault.read_bytes(&self.path)?;
         if stamp.hash == self.stamp.hash {
             // 只是被 touch 了一下（或同步工具写回同样的内容）
             self.stamp = stamp;
-            return Disk::Unchanged;
+            return Ok(Disk::Unchanged);
         }
-        Disk::Changed(bytes, stamp)
+        Ok(Disk::Changed(bytes, stamp))
     }
 
     /// 监听 / 轮询 / 窗口激活时调用：无未保存修改则重载，有则留冲突副本并立即落盘本地版本；
@@ -1340,8 +1350,8 @@ impl Editor {
             return;
         }
         match self.disk_state() {
-            Disk::Missing => self.mark_deleted(cx),
-            Disk::Unchanged => {
+            Ok(Disk::Missing) => self.mark_deleted(cx),
+            Ok(Disk::Unchanged) => {
                 if self.is_deleted() {
                     self.set_banner(None, cx);
                     if self.dirty {
@@ -1349,18 +1359,19 @@ impl Editor {
                     }
                 }
             }
-            Disk::Changed(disk, stamp) => {
+            Ok(Disk::Changed(disk, stamp)) => {
                 if self.is_deleted() {
                     self.set_banner(None, cx);
                 }
                 if self.dirty {
-                    self.write_conflict_copy(&disk, stamp, cx);
+                    // 统一经过写前校验与备份；失败时不能继续保存。
                     self.save_now(cx);
                 } else {
                     self.reload(&disk, stamp, cx);
                     self.set_banner(Some(Banner::Reloaded), cx);
                 }
             }
+            Err(err) => self.save_failed(format!("无法读取磁盘版本，已停止保存：{err}"), cx),
         }
     }
 
@@ -1514,10 +1525,38 @@ impl Editor {
     }
 
     /// 把磁盘版本另存为冲突副本，然后本地版本继续走正常保存（绝不静默覆盖外部修改）。
-    fn write_conflict_copy(&mut self, disk: &[u8], stamp: FileStamp, cx: &mut Context<Self>) {
-        let conflict = self.conflict_path();
-        match self.vault.write_bytes(&conflict, disk) {
-            Ok(_) => {
+    fn backup_disk(&self, disk: &[u8]) -> Result<VaultPath, VaultError> {
+        let base = self.conflict_path();
+        // 一秒内可能收到多次外部保存；同名时换名字，不能覆盖上一份副本。
+        for attempt in 0..1000 {
+            let path = if attempt == 0 {
+                base.clone()
+            } else {
+                VaultPath::new(&format!("{}-{attempt}.md", base.as_str().trim_end_matches(".md")))?
+            };
+            match self.vault.create_bytes(&path, disk) {
+                Ok(_) => return Ok(path),
+                Err(VaultError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Err(VaultError::AlreadyExists(base.to_string()))
+    }
+
+    fn save_failed(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.save_task = None;
+        if self.save_state != SaveState::Failed(msg.clone()) {
+            log::error!("{msg}");
+            self.save_state = SaveState::Failed(msg.clone());
+            cx.emit(EditorEvent::SaveFailed(msg));
+            cx.emit(EditorEvent::Changed);
+            cx.notify();
+        }
+    }
+
+    fn write_conflict_copy(&mut self, disk: &[u8], stamp: FileStamp, cx: &mut Context<Self>) -> bool {
+        match self.backup_disk(disk) {
+            Ok(conflict) => {
                 log::warn!(
                     "{}: changed on disk while dirty; disk version saved as {}",
                     self.path.as_str(),
@@ -1527,11 +1566,11 @@ impl Editor {
                 self.stamp = stamp;
                 self.set_banner(Some(Banner::Conflict { copy: conflict.clone() }), cx);
                 cx.emit(EditorEvent::PathsTouched(vec![conflict]));
+                true
             }
             Err(err) => {
-                let msg = format!("无法保存冲突副本 {}：{err}", conflict.as_str());
-                log::error!("{msg}");
-                cx.emit(EditorEvent::SaveFailed(msg));
+                self.save_failed(format!("无法保存冲突副本，已停止保存：{err}"), cx);
+                false
             }
         }
     }
