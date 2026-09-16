@@ -26,6 +26,7 @@ use crate::paths::{PersistedState, app_data_dir, display_path};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::search::{Phase, SearchService};
 use crate::search_view::{SearchView, SearchViewEvent};
+use crate::watch::{Batch, VaultWatcher, WatchEvent};
 
 const SIDEBAR_WIDTH: f32 = 260.;
 const PANEL_WIDTH: f32 = 300.;
@@ -35,9 +36,13 @@ struct VaultSession {
     vault: Arc<Vault>,
     tree: Entity<FileTree>,
     editor: Option<Entity<Editor>>,
+    /// 当前编辑器的事件订阅；换 / 关编辑器时一起丢
+    editor_sub: Option<Subscription>,
     /// 全文索引（后台）；状态栏显示进度，搜索视图查询它
     search: Entity<SearchService>,
     search_view: Entity<SearchView>,
+    /// vault 目录的文件监听；起不来时编辑器退回轮询、索引只在启动时对齐
+    _watcher: Entity<VaultWatcher>,
     /// 本次会话里打开过的笔记，最近的在前（快速打开的"最近优先"）
     recent: Vec<VaultPath>,
     _subscriptions: Vec<Subscription>,
@@ -136,14 +141,27 @@ impl Workspace {
                             }
                         }
                     });
+                let watcher = cx.new(|cx| VaultWatcher::new(vault.clone(), cx));
+                if let Some(err) = watcher.read(cx).error.clone() {
+                    // 监听起不来时编辑器退回 2 s 轮询、索引只在启动时对齐；告诉用户一声，别静默变慢
+                    window.push_notification(
+                        Notification::warning(format!("无法监听文件变化，改为定时检查：{err}")).title("Aero"),
+                        cx,
+                    );
+                }
+                let watch_sub = cx.subscribe_in(&watcher, window, |this, _, event, window, cx| match event {
+                    WatchEvent::Changed(batch) => this.on_vault_changed(batch, window, cx),
+                });
                 self.open = Some(VaultSession {
                     vault: vault.clone(),
                     tree,
                     editor: None,
+                    editor_sub: None,
                     search,
                     search_view,
+                    _watcher: watcher,
                     recent: Vec::new(),
-                    _subscriptions: vec![sub, search_sub, view_sub],
+                    _subscriptions: vec![sub, search_sub, view_sub, watch_sub],
                 });
                 self.error = None;
                 self.state.touch_vault(vault.root());
@@ -228,23 +246,9 @@ impl Workspace {
             Ok((doc, stamp)) => {
                 let vault = open.vault.clone();
                 let editor = cx.new(|cx| Editor::new(vault, path.clone(), doc, stamp, cx));
-                let sub = cx.subscribe_in(&editor, window, |this, editor, event, window, cx| match event {
-                    EditorEvent::Changed => cx.notify(),
-                    EditorEvent::Saved | EditorEvent::Reloaded => {
-                        this.index_editor(editor, cx);
-                        cx.notify();
-                    }
-                    EditorEvent::SaveFailed(msg) => {
-                        window.push_notification(
-                            Notification::error(format!("保存失败：{msg}")).title("Aero"),
-                            cx,
-                        );
-                    }
-                    EditorEvent::Conflict(copy) => this.notify_conflict(copy, window, cx),
-                    EditorEvent::RenameRequested(name) => this.rename_current(name.clone(), window, cx),
-                });
-                open._subscriptions.truncate(3);
-                open._subscriptions.push(sub);
+                let sub = self.subscribe_editor(&editor, window, cx);
+                let Some(open) = self.open.as_mut() else { return };
+                open.editor_sub = Some(sub);
                 open.editor = Some(editor.clone());
                 open.recent.retain(|p| p != &path);
                 open.recent.insert(0, path.clone());
@@ -258,6 +262,30 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    /// 编辑器事件 → 工作区动作（索引、文件树、横幅上的请求）。
+    fn subscribe_editor(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(editor, window, |this, editor, event, window, cx| match event {
+            EditorEvent::Changed => cx.notify(),
+            EditorEvent::Saved | EditorEvent::Reloaded => {
+                this.index_editor(editor, cx);
+                cx.notify();
+            }
+            EditorEvent::SaveFailed(msg) => {
+                window.push_notification(Notification::error(format!("保存失败：{msg}")).title("Aero"), cx);
+            }
+            EditorEvent::PathsTouched(paths) => this.on_editor_touched_paths(editor, paths.clone(), cx),
+            EditorEvent::Deleted => this.on_editor_deleted(editor, cx),
+            EditorEvent::RenameRequested(name) => this.rename_current(name.clone(), window, cx),
+            EditorEvent::OpenRequested(path) => this.open_note(path.clone(), window, cx),
+            EditorEvent::CloseRequested => this.close_editor(window, cx),
+        })
     }
 
     /// 搜索命中：打开笔记（已打开则复用）并定位到块。不抢焦点——↑↓ 预览时焦点留在搜索框。
@@ -520,7 +548,7 @@ impl Workspace {
         let was_open = open.editor.as_ref().is_some_and(|e| e.read(cx).path() == path);
         if was_open {
             open.editor = None;
-            open._subscriptions.truncate(3);
+            open.editor_sub = None;
         }
         let fs_path = open.vault.fs_path(path);
         match crate::trash::move_to_trash(&fs_path) {
@@ -641,7 +669,7 @@ impl Workspace {
         }
     }
 
-    /// 磁盘版本已另存为冲突副本：提示，并让文件树显示出这个新文件。
+    /// 切换笔记时上一篇落盘留下了冲突副本：那个编辑器已经不在了，横幅没处显示，用通知代替。
     fn notify_conflict(&mut self, copy: &VaultPath, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(open) = self.open.as_ref() {
             open.tree.update(cx, |t, cx| {
@@ -659,6 +687,80 @@ impl Workspace {
             .title("外部修改"),
             cx,
         );
+    }
+
+    /// 编辑器在自己路径之外动了文件（冲突副本、另存为）：文件树重扫并跟住编辑器当前路径，索引对齐。
+    fn on_editor_touched_paths(
+        &mut self,
+        editor: &Entity<Editor>,
+        paths: Vec<VaultPath>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.open.as_mut() else { return };
+        let current = editor.read(cx).path().clone();
+        open.tree.update(cx, |t, cx| {
+            t.rescan();
+            if t.selected() != Some(&current) {
+                t.select(Some(current.clone()), cx);
+            }
+            cx.notify();
+        });
+        open.recent.retain(|p| p != &current);
+        open.recent.insert(0, current);
+        open.search.update(cx, |s, cx| s.notes_touched(paths, cx));
+        cx.notify();
+    }
+
+    /// 打开中的笔记在外部被删：编辑器已显示横幅并停止保存；这里让文件树与索引跟上。
+    fn on_editor_deleted(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        let path = editor.read(cx).path().clone();
+        open.tree.update(cx, |t, cx| {
+            t.rescan();
+            if t.selected() == Some(&path) {
+                t.select(None, cx);
+            }
+            cx.notify();
+        });
+        open.search.update(cx, |s, cx| s.note_removed(path, cx));
+        cx.notify();
+    }
+
+    /// 横幅"关闭"：丢掉编辑器，回到空编辑区。不落盘（文件已删除时正是为了不把它变回来）。
+    fn close_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_mut() else { return };
+        open.editor = None;
+        open.editor_sub = None;
+        open.tree.update(cx, |t, cx| t.select(None, cx));
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// vault 目录有动静（文件监听）：文件树重扫；打开中的那篇立刻检查外部修改；其余按指纹对齐索引。
+    fn on_vault_changed(&mut self, batch: &Batch, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        let editor = open.editor.clone();
+        let current = editor.as_ref().map(|e| e.read(cx).path().clone());
+        open.tree.update(cx, |t, cx| {
+            t.rescan();
+            cx.notify();
+        });
+        let mine = |p: &VaultPath| current.as_ref() == Some(p);
+        if let Some(editor) = &editor
+            && (batch.changed.iter().any(mine) || batch.removed.iter().any(mine))
+        {
+            // 编辑器自己处理：重载 / 冲突副本 / 已删除，并通过事件把索引带上
+            editor.update(cx, |e, cx| e.check_external(cx));
+        }
+        let touched: Vec<VaultPath> =
+            batch.changed.iter().chain(&batch.removed).filter(|p| !mine(p)).cloned().collect();
+        open.search.update(cx, |s, cx| {
+            s.notes_touched(touched, cx);
+            if batch.rescan {
+                s.resync(cx);
+            }
+        });
+        cx.notify();
     }
 
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1128,6 +1230,7 @@ mod tests {
     use crate::paths::PersistedState;
     use crate::search::SearchService;
     use crate::search_view::SearchView;
+    use crate::watch::VaultWatcher;
 
     fn open(
         cx: &mut TestAppContext,
@@ -1143,7 +1246,7 @@ mod tests {
             std::fs::write(dir.path().join("a.md"), source).unwrap();
             Arc::new(Vault::open(dir.path()).unwrap())
         });
-        let (workspace, _) = cx.add_window_view(|window, cx| {
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
             let open = vault.map(|vault| {
                 let path = VaultPath::new("a.md").unwrap();
                 let (doc, stamp) = Editor::load(vault.clone(), path.clone()).unwrap();
@@ -1151,12 +1254,15 @@ mod tests {
                 let tree = cx.new(|cx| FileTree::new(vault.clone(), cx));
                 let search = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
                 let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
+                let watcher = cx.new(|cx| VaultWatcher::new(vault.clone(), cx));
                 VaultSession {
                     vault,
                     tree,
                     editor: Some(editor),
+                    editor_sub: None,
                     search,
                     search_view,
+                    _watcher: watcher,
                     recent: vec![],
                     _subscriptions: vec![],
                 }
@@ -1179,7 +1285,99 @@ mod tests {
                 _activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
             }
         });
+        // 编辑器事件订阅与 `open_note` 一致
+        workspace.update_in(cx, |w, window, cx| {
+            let editor = w.open.as_ref().and_then(|o| o.editor.clone());
+            if let Some(editor) = editor {
+                let sub = w.subscribe_editor(&editor, window, cx);
+                w.open.as_mut().unwrap().editor_sub = Some(sub);
+            }
+        });
         (dir, data, workspace)
+    }
+
+    /// 索引线程是真线程：真实等待直到条件成立（最多 20 s）。
+    fn wait_until(cx: &mut VisualTestContext, mut ok: impl FnMut(&mut VisualTestContext) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            cx.run_until_parked();
+            if ok(cx) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "condition not met within 20 s");
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+
+    fn hit_paths(cx: &mut VisualTestContext, search: &Entity<SearchService>, query: &str) -> Vec<String> {
+        let result: std::rc::Rc<std::cell::RefCell<Option<Vec<String>>>> = Default::default();
+        let sink = result.clone();
+        cx.update(|_, cx| {
+            let task = search.read(cx).search(query.to_owned(), 20, cx);
+            cx.spawn(async move |_| {
+                let hits = task.await.unwrap();
+                *sink.borrow_mut() = Some(hits.iter().map(|h| h.path.as_str().to_owned()).collect());
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        result.borrow().clone().expect("search task finished")
+    }
+
+    /// 文件监听的一批变化：文件树重扫、打开中的那篇立刻重载 / 进入已删除态、其余按指纹对齐索引。
+    #[gpui_kit::test]
+    fn vault_changes_refresh_tree_editor_and_index(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("alpha anchor\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let (tree, editor, search) = cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.tree.clone(), open.editor.clone().unwrap(), open.search.clone())
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        assert_eq!(hit_paths(cx, &search, "anchor"), ["a.md"]);
+
+        // 外部新建 b.md
+        std::fs::write(dir.path().join("b.md"), "bravo anchor\n").unwrap();
+        let b = VaultPath::new("b.md").unwrap();
+        let batch = crate::watch::Batch { changed: vec![b.clone()], removed: vec![], rescan: false };
+        workspace.update_in(cx, |w, window, cx| w.on_vault_changed(&batch, window, cx));
+        cx.update(|_, cx| assert!(tree.read(cx).contains(&b)));
+        wait_until(cx, |cx| hit_paths(cx, &search, "anchor").len() == 2);
+
+        // 外部改了打开中的 a.md（干净）：立刻重载，不用等 2 s 轮询
+        let a = VaultPath::new("a.md").unwrap();
+        let file = dir.path().join("a.md");
+        std::fs::write(&file, "alpha rewritten\n").unwrap();
+        std::fs::File::open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(5))
+            .unwrap();
+        let batch = crate::watch::Batch { changed: vec![a.clone()], removed: vec![], rescan: false };
+        workspace.update_in(cx, |w, window, cx| w.on_vault_changed(&batch, window, cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(editor.read(cx).index_snapshot().1, "alpha rewritten\n");
+            assert_eq!(editor.read(cx).banner(), Some(&crate::editor::Banner::Reloaded));
+        });
+        // 重载事件让索引跟上
+        wait_until(cx, |cx| hit_paths(cx, &search, "rewritten") == ["a.md"]);
+
+        // 外部删了打开中的 a.md：编辑器进入已删除态，树里没了，索引里也没了
+        std::fs::remove_file(&file).unwrap();
+        let batch = crate::watch::Batch { changed: vec![], removed: vec![a.clone()], rescan: false };
+        workspace.update_in(cx, |w, window, cx| w.on_vault_changed(&batch, window, cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(editor.read(cx).is_deleted());
+            assert!(!tree.read(cx).contains(&a));
+            assert_eq!(tree.read(cx).selected(), None);
+        });
+        wait_until(cx, |cx| hit_paths(cx, &search, "anchor") == ["b.md"]);
+
+        // 横幅"关闭"：编辑器被丢掉
+        editor.update(cx, |_, cx| cx.emit(crate::editor::EditorEvent::CloseRequested));
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(workspace.read(cx).open.as_ref().unwrap().editor.is_none()));
     }
 
     #[gpui_kit::test]

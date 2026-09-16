@@ -2,7 +2,7 @@
 //!
 //! 输入 150 ms 防抖后查全文索引，结果按笔记分组、块级命中、关键词高亮；
 //! `↑↓` 在命中间移动并让编辑区定位到该块，`⏎` 打开，`Esc` 回到编辑器。
-//! `#tag` / `tag:#tag` 按笔记级标签过滤；语义开关、`path:` 与搜索历史随后续里程碑加入。
+//! `#tag` / `tag:tag` 按笔记级标签过滤（父标签含子标签），`-#tag` 排除；语义开关、`path:` 与搜索历史随后续里程碑加入。
 
 use std::ops::Range;
 use std::time::Duration;
@@ -62,7 +62,7 @@ pub struct SearchView {
 
 impl SearchView {
     pub fn new(service: Entity<SearchService>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索全文…  #标签 tag:#标签"));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("搜索全文…  #标签 -#排除"));
         let input_sub = cx.subscribe_in(&input, window, Self::on_input_event);
         // 索引刚建好时把当前查询再跑一遍——用户可能在索引完成前就开始输入了
         let service_sub = cx.observe(&service, |this, service, cx| {
@@ -418,7 +418,7 @@ impl Render for SearchView {
             Some("没有匹配的块。")
         } else if self.query.is_empty() {
             Some(
-                "输入关键词、\"短语\"、+必含 -排除；用 #标签 或 tag:#标签 筛选笔记，多标签须全部匹配，点击结果定位到块。",
+                "输入关键词、\"短语\"、+必含 -排除；#标签 / tag:标签 筛选笔记（父标签含子标签，多标签须全部匹配），-#标签 排除；点击结果定位到块。",
             )
         } else {
             None
@@ -590,14 +590,19 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(200));
         cx.run_until_parked();
         cx.update(|_, cx| assert_eq!(view.read(cx).hits().len(), 2));
-        for (query, count, path) in [
-            ("anchor #RUST tag:#cli", 2, "a.md"),
-            // 纯标签：标签是笔记级的，一篇只列一条
-            ("#rust", 1, "a.md"),
-            ("tag:#rust/cli", 1, "sub/b.md"),
-            ("#rust #rust/cli", 0, ""),
-            ("anchor #missing", 0, ""),
-        ] {
+        let cases: [(&str, usize, &[&str]); 8] = [
+            // `cli` 不命中 b.md 的 `rust/cli`（层级只向下）
+            ("anchor #RUST tag:#cli", 2, &["a.md"]),
+            // 纯标签：标签是笔记级的，一篇只列一条；父标签 `rust` 命中 b.md 的 `rust/cli`
+            ("#rust", 2, &["a.md", "sub/b.md"]),
+            ("tag:#rust/cli", 1, &["sub/b.md"]),
+            ("#rust #rust/cli", 1, &["sub/b.md"]),
+            ("anchor -#cli", 1, &["sub/b.md"]),
+            ("anchor -#rust", 0, &[]),
+            ("-#rust", 0, &[]),
+            ("anchor #missing", 0, &[]),
+        ];
+        for (query, count, paths) in cases {
             view.update_in(cx, |v, window, cx| v.input.update(cx, |s, cx| s.set_value(query, window, cx)));
             view.update_in(cx, |v, _, cx| v.schedule(cx));
             cx.executor().advance_clock(Duration::from_millis(200));
@@ -606,11 +611,12 @@ mod tests {
                 let v = view.read(cx);
                 assert!(v.error.is_none(), "{:?}", v.error);
                 assert_eq!(v.hits().len(), count, "{query}");
-                assert!(v.hits().iter().all(|hit| hit.path.as_str() == path), "{query}");
+                assert!(v.hits().iter().all(|hit| paths.contains(&hit.path.as_str())), "{query}");
             });
             if count > 0 {
                 view.update_in(cx, |v, _, cx| v.open_selected(cx));
-                assert!(events.borrow().last().unwrap().starts_with(&format!("open {path}#")));
+                let last = events.borrow().last().cloned().unwrap();
+                assert!(paths.iter().any(|p| last.starts_with(&format!("open {p}#"))), "{query}: {last}");
             }
         }
         view.update_in(cx, |v, window, cx| {

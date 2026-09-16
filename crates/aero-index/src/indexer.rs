@@ -45,6 +45,17 @@ pub struct SyncReport {
     written: usize,
 }
 
+/// [`Indexer::refresh_note`] 的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refresh {
+    /// 重新索引了这么多块
+    Indexed(usize),
+    /// 文件已不存在，索引里的块已删
+    Removed,
+    /// 指纹没变（或本来就没索引过也不存在）
+    Unchanged,
+}
+
 /// [`Indexer::plan_sync`] 的结果。
 #[derive(Debug)]
 pub struct SyncPlan {
@@ -56,7 +67,8 @@ pub struct SyncPlan {
 
 /// 全量重建时每写多少块 `flush()` 一次（ADR 0003：不分批峰值内存 900 MB，分批 ≈ 280 MB）。
 const FLUSH_EVERY_BLOCKS: usize = 10_000;
-const FTS_VERSION: i64 = 2;
+/// 块 / 过滤字段的布局版本；变了就整体重建。3：`tags_filter` 连祖先标签一起写（父标签查询）。
+const FTS_VERSION: i64 = 3;
 
 pub struct Indexer {
     vault: Arc<Vault>,
@@ -185,6 +197,25 @@ impl Indexer {
     pub fn index_note(&mut self, path: &VaultPath) -> Result<usize, IndexerError> {
         let (doc, stamp) = self.vault.read(path)?;
         self.index_document(path, &doc, stamp)
+    }
+
+    /// 文件监听报告某个路径有动静：与磁盘对齐这一篇——不存在则从索引里删掉，指纹没变则什么都不做
+    /// （自己刚保存的文件也会触发监听，这里靠指纹把它筛掉），变了才重新索引。
+    pub fn refresh_note(&mut self, path: &VaultPath) -> Result<Refresh, IndexerError> {
+        let row = self.meta.note_by_path(path.as_str())?;
+        if !self.vault.exists(path) {
+            return Ok(match row {
+                Some(row) => {
+                    self.remove_row(&row)?;
+                    Refresh::Removed
+                }
+                None => Refresh::Unchanged,
+            });
+        }
+        Ok(match self.sync_one(path, row.as_ref())? {
+            Some(blocks) => Refresh::Indexed(blocks),
+            None => Refresh::Unchanged,
+        })
     }
 
     /// 用刚落盘的源文本索引（编辑器保存后调用，省一次读盘；解析在这里做）。
@@ -371,6 +402,32 @@ mod tests {
         assert!(ix.search("第二段", 10).unwrap().is_empty());
     }
 
+    /// 文件监听的入口：新文件索引、指纹没变跳过、内容变了重索引、文件消失删除。
+    #[test]
+    fn refresh_note_follows_disk() {
+        let (dir, mut ix) = setup(&[("a.md", "anchor one\n")]);
+        let a = VaultPath::new("a.md").unwrap();
+        let b = VaultPath::new("b.md").unwrap();
+        assert_eq!(ix.refresh_note(&a).unwrap(), Refresh::Indexed(1));
+        assert_eq!(ix.refresh_note(&a).unwrap(), Refresh::Unchanged);
+        // 不存在也没索引过：无事发生
+        assert_eq!(ix.refresh_note(&b).unwrap(), Refresh::Unchanged);
+
+        std::fs::write(dir.path().join("b.md"), "anchor two\n\nmore\n").unwrap();
+        assert_eq!(ix.refresh_note(&b).unwrap(), Refresh::Indexed(2));
+        assert_eq!(ix.stats(), (2, 3));
+
+        // 内容变了（长度不同保证指纹不同）
+        std::fs::write(dir.path().join("a.md"), "anchor one changed\n").unwrap();
+        assert_eq!(ix.refresh_note(&a).unwrap(), Refresh::Indexed(1));
+        assert_eq!(ix.search("changed", 10).unwrap().len(), 1);
+
+        std::fs::remove_file(dir.path().join("b.md")).unwrap();
+        assert_eq!(ix.refresh_note(&b).unwrap(), Refresh::Removed);
+        assert_eq!(ix.stats(), (1, 1));
+        assert_eq!(paths(&ix.search("anchor", 10).unwrap()), [("a.md".into(), 0)]);
+    }
+
     #[test]
     fn search_parses_note_wide_tag_filters() {
         let (_dir, mut ix) = setup(&[
@@ -380,10 +437,12 @@ mod tests {
         let report = ix.sync_all(|_, _| {});
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(paths(&ix.search("anchor #RUST tag:#cli", 1).unwrap()), [("a.md".into(), 0)]);
-        // 带文本：a.md 的两块都命中；纯标签：每篇只回第一块
-        assert_eq!(paths(&ix.search("anchor #rust", 10).unwrap()), [("a.md".into(), 0)]);
+        // 父标签 `rust` 也命中 b.md 的 `rust/cli`；`cli` 不命中 `rust/cli`（层级只向下）
+        assert_eq!(paths(&ix.search("anchor #rust", 10).unwrap()), [("a.md".into(), 0), ("b.md".into(), 0)]);
+        assert_eq!(paths(&ix.search("anchor #cli", 10).unwrap()), [("a.md".into(), 0)]);
         assert_eq!(ix.search("second #rust", 10).unwrap().len(), 1);
-        assert_eq!(paths(&ix.search("#rust", 10).unwrap()), [("a.md".into(), 0)]);
+        // 纯标签：每篇只回第一块
+        assert_eq!(paths(&ix.search("#rust", 10).unwrap()), [("a.md".into(), 0), ("b.md".into(), 0)]);
         assert_eq!(paths(&ix.search("#rust/cli", 10).unwrap()), [("b.md".into(), 0)]);
         assert!(ix.search("#rust #missing", 10).unwrap().is_empty());
     }
@@ -528,6 +587,38 @@ mod tests {
         let r = ix.rebuild(|_, _| {}).unwrap();
         assert_eq!(r.indexed, 2);
         assert_eq!(ix.stats(), (2, 3));
+    }
+
+    /// zvec 引擎：父标签命中子标签（过滤字段里带祖先）、`-#tag` 排除（取回后筛）、尾标点与 `tag:x`。
+    #[test]
+    fn zvec_matches_parent_tags_and_excludes() {
+        let (dir, _) = setup(&[
+            ("a.md", "needle #rust/cli\n"),
+            ("b.md", "---\ntags: [rust, draft]\n---\n\nneedle\n"),
+            ("c.md", "needle #rusty\n"),
+            ("d.md", "needle\n"),
+        ]);
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let mut ix = Indexer::open(vault, data.path()).unwrap();
+        let report = ix.sync_all(|_, _| {});
+        assert!(report.errors.is_empty(), "{report:?}");
+        let notes = |ix: &Indexer, q: &str| {
+            let mut v: Vec<String> =
+                ix.search(q, 10).unwrap().into_iter().map(|h| h.path.as_str().to_owned()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(notes(&ix, "#rust"), ["a.md", "b.md"]);
+        assert_eq!(notes(&ix, "needle tag:rust"), ["a.md", "b.md"]);
+        assert_eq!(notes(&ix, "needle #rust,"), ["a.md", "b.md"]);
+        assert_eq!(notes(&ix, "#rust/cli"), ["a.md"]);
+        assert_eq!(notes(&ix, "needle -#rust"), ["c.md", "d.md"]);
+        assert_eq!(notes(&ix, "#rust -#draft"), ["a.md"]);
+        assert_eq!(notes(&ix, "needle -#rust/cli -tag:rusty"), ["b.md", "d.md"]);
+        assert!(notes(&ix, "-#draft").is_empty());
+        // 排除也按层级：`-#rust` 连 `rust/cli` 一起排除；`rusty` 不受影响
+        assert_eq!(notes(&ix, "needle -#rust -#rusty"), ["d.md"]);
     }
 
     #[test]

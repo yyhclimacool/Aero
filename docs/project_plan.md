@@ -1014,14 +1014,19 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
   删除（4.1）：文件树右键"移到废纸篓 / 在 Finder 中显示 / 复制路径"，树内 `⌘⌫`，文件菜单同项；用 `NSFileManager trashItemAtURL:` 进系统废纸篓（可放回）。删打开中的笔记时先丢掉编辑器——它排队中的自动保存会把文件写回来。`.assets/` 的询问对话框（10.5）留到 M2 有附件时。
   教训：`/` 菜单的 ⏎ / ↑↓ / Tab 都得先于块操作检查菜单是否开着，Tab 还要单独绑一个 `MenuConfirm` 动作，因为 gpui-base 把 Tab 用于缩进；带数据的动作（`ConvertBlock(u8)`、`TrashNote(String)`）用 `#[action(no_json)]` 免掉 serde / schemars 依赖。
   尚未做：单一 undo 与控件内选区的联动、块级选区、块 gutter（`⠿` / `+`）、冲突 / 删除横幅（现在是通知）、外部删除的"已删除"状态、设置页。
+- **进展（2026-09-16，第三刀，M1a 收尾）**：块选中态、块 gutter、横幅、"已删除"状态都做了；设置页按 1.7"少设置"原则留到有第二个值得反复调的项再说。
+  块选中态（`ui_design.md` 6）：选区以**编辑单位下标**记 `anchor / head`，与 `focused` 互斥。编辑态 Esc → 选中当前块（空位上直接回浏览态），再 Esc → 浏览态；↑↓ 收成一块并移动、⇧↑↓ 扩展、到头停住；编辑态里光标已在首 / 末行时 ⇧↑↓ 把字符选区升级为块选区（否则 propagate 给控件）；⏎ 编辑 `head` 那块（光标在块末）；⌫ / ⌦ 删除（`ops::delete_units`：整行删、连带之后的空行、删到文末时收掉前面多出的空行，一个撤销组，选区落到原位置的下一块，文档空了回浏览态）；⌘C / ⌘X 以 Markdown 源码复制 / 剪切（`ops::units_span`：列表项按整项含嵌套子项）；撤销 / 重做在块选中态下重新选中受影响处的块。键位绑定在 `Editor` 上下文：这些绑定在控件聚焦时也匹配但深度更浅，只在 `Input` 层全部 propagate 之后才轮到，处理器在没有块选区时一律 propagate，所以不会抢控件的 ⌫ / ⌘C。选中块画成 `theme.selection` 底色；`head` 那块超出视口时最小滚动进来（搜索定位仍放视口 1/3）。
+  块 gutter（5.3）：每个编辑单位左侧悬停出现 `⠿ +`。`⠿` 进入块选中态；`+` 在块下方新开一个内容为 `/` 的段落并把焦点放在 `/` 后，随后按 `/` 菜单的常规逻辑开菜单（Esc 关菜单时 `/` 留在文档里，与手敲一致；列表项后插会把列表断开，菜单里选列表类型即续上）。布局上把正文列左内边距多留 48 px，每个单位行 `ml(-reach) pl(reach)` 向左伸出去画按钮（嵌套列表 `reach` 再加标记列宽，各层级按钮左对齐），这样鼠标从块移到按钮上仍在同一个 `group_hover` 内、按钮不会半路消失；正文仍是 720 宽。块菜单、拖拽重排、`⌘D` 复制块、`⌘A` 两次全选留到 M2 之后。
+  无头测试：`block_selection_keyboard_flow`（Esc 两段、↑↓ / ⇧↑↓、⏎、⌘C / ⌫ / ⌘Z / ⌘X、删空）、`shift_arrows_upgrade_to_block_selection_at_block_edges`、`gutter_inserts_below_and_selects`（布局对齐 + 720 宽 + 点击行为）；`ops` 层的 `units_span` / `delete_units` / `insert_slash_below` 单测。
+  尚未做（有意留下）：单一 undo 与控件内选区的联动、软换行时首 / 末行按视觉行判断、块选中态下直接输入字符进入编辑态（IME 组合键下 key_char 不可靠，等有源码位置映射再做）。
 
 ### M1b · 能搜（约 60 小时，2027-03 → 2027-04）
 
 - 全文搜索（zvec FTS + jieba，含内存 overlay）、搜索结果定位到块、命令面板。
 - callout 渲染、表格只读渲染。
-- 分发链路：签名、公证、`.dmg`、自动更新。
+- 分发链路：签名、公证、`.dmg`、~~自动更新~~（已砍，见下）。
 - **M1b 结束时公开仓库。**
-- 砍单清单：自动更新 → 表格只读渲染 → 命令面板。
+- 砍单清单：自动更新 → 表格只读渲染 → 命令面板。（实际只砍了自动更新。）
 - **进展（2026-09-15，第一刀，提前动工）**：全文搜索这条垂直切片先做了，因为它决定 `aero-core` 的块抽取形态。
   `aero-core::index`：`blocks_for_note` 把文档的叶子块变成 `IndexBlock`（front matter / 空块不进索引），`plain_text` 去掉标题 `#`、列表标记、围栏、行内标记与 `[[a|b]]` 的别名侧（`![[img|400]]` 取目标侧），`{...}` 属性整段丢弃。主键 `note_id#ord`——zvec 的 pk 不允许 `:`。
   `crates/aero-index`（新）：`ZvecFts` 实现 `FullTextIndex`（jieba + lowercase，`+term -term "phrase"` 走布尔表达式，其余按自然语言、相邻词 AND；集合损坏时删掉重建）；`Meta`（SQLite，`notes` 表记 `mtime/size/hash` 与块数，带 `index_state` 版本号，版本不符就重建）；`Indexer` 串起 Vault / Meta / FTS：`plan_sync` 列出变化与消失的笔记，`sync_step` 逐篇处理，保存路径严格是 `upsert` + `delete(旧 pk)`（10.3），每 1 万块 flush 一次。索引在 `~/Library/Application Support/Aero/index/<vault-id>/{meta.sqlite,fts/}`。
@@ -1034,6 +1039,13 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
   标签是**笔记级**的：front matter `tags:` / `tag:`（标量、列表、逗号分隔的老写法都认，单项不合规只丢那一项）+ 正文行内 `#tag`（comrak 树上只看 Text 节点：标题、图片 alt、链接 URL、`[[#heading]]` 一类 wikilink 锚点、代码、`{...}` 属性都不算），归一成小写；同一篇的每个 `IndexBlock` 带同一组。查询语法 `#tag` / `tag:#tag`，多个标签 AND；`FtsQuery::parse` 把它们从查询文本里摘出来，引号内的 `#` 保留字面。zvec 侧多一个 `tags_filter` 字段，存 `|<hex(tag)>|` 串，用 `LIKE '%|hex|%'` 做精确匹配（hex 里没有通配符，也不会被 SQL 注入）；`FTS_VERSION` 记在 `meta.sqlite`，不符或 `fts/` 被重建时整体重索引。**纯标签查询每篇笔记只返回 `block_ord == 0`**——标签是笔记级的，否则一篇长笔记的几百个块会吃满 `limit`、挤掉别的笔记；带文本仍是块级。
   callout（`editor/preview.rs`）：借 `TextView::markdown_block_parser` 把 Blockquote 节点识别成 `[!kind]±`，自绘标题栏（图标 / 颜色 / 折叠按钮），正文再起一个 TextView 递归渲染（嵌套 callout 天然支持）；折叠状态放 `PreviewState`（按 视图 id + 块内偏移 存），不写回源码，外部重载时清空；搜索定位到折叠 callout 里的块会把它展开。表格：`TextViewStyle.table` 加横向 overflow scroll，表头半粗，横向滚动手势不冒泡到文档。
   尚未做：`-#tag` 排除与 `tag:rust`（不带 `#`）语法、`#rust` 匹配子标签 `rust/cli`（现在是精确匹配）、查询里 `#rust,` 这类带尾标点的标签不识别。
+- **进展（2026-09-16，第三刀，M1b 收尾）**：上面两段"尚未做"里除自动更新之外的全部。
+  `notify` 监听（第 12 节，`aero-app/src/watch.rs`）：`RecommendedWatcher`（macOS 上是 FSEvents）递归监听 vault 根；事件进专用线程，按 300 ms 静默窗口合并、单批最多攒 2 s，一批分成 `changed`（现在存在的笔记）/ `removed`（已不在的笔记）/ `rescan`（目录级变化或事件溢出）；隐藏路径、`*.assets/` 内的东西直接忽略。前台**定时取批**而不是被线程唤醒——GPUI 的测试调度器不允许外部线程唤醒任务（索引服务同款做法）。FSEvents 报的是解析过符号链接的真实路径（`/var` → `/private/var`），所以按用户给的根与 canonicalize 后的根各试一次 strip_prefix。工作区收到一批：打开中的编辑器立刻 `check_external`、文件树重扫、索引对 `changed ∪ removed` 逐篇 `refresh_note`（按元数据指纹筛掉自己刚保存的那些），`rescan` 时再做一次增量 `sync_all`。监听起不来（权限、fd 耗尽）时退回原来的 2 s 轮询并弹一条警告。监听只回答"哪些路径动过"，不判断是谁动的：编辑器自己的保存也会触发事件，下游按指纹筛。
+  横幅（`ui_design.md` 10.2，替代之前的通知）：文档顶部非模态一条。蓝"已重新载入"10 s 自动消失；黄"冲突"（磁盘版本已另存为副本，本地已照常落盘）有"保留我的 / 使用磁盘版本 / 打开副本"；红"已删除"（文件在外部被删）停止自动保存、内容留在编辑器里，有"恢复 / 另存为… / 关闭"。`save_now` 写前的 `disk_state()` 统一给出 `Unchanged / Changed / Missing` 三态；文件消失时**不写**——自动保存不该把用户刚删的文件变回来，"恢复"走越过校验的 `start_write`。副本、另存、恢复触碰的路径以 `PathsTouched` 事件告知工作区，文件树与索引跟上。
+  `optimize()` 策略（10.3）：全量同步后若索引 / 删除的笔记 ≥ 50 篇合并一次段文件；平时计增量写入，空闲 flush 时"累计 ≥ 200 次且距上次 ≥ 10 分钟"才 optimize，之后计数清零。
+  标签查询小项：`-#tag` / `-tag:x` 排除（zvec 的过滤表达式没有 `NOT LIKE`，用多取一批再在 Rust 侧剔除实现）、`tag:rust` 不带 `#` 也算包含、`#rust` 匹配子标签 `rust/cli`（索引侧 `tags_filter` 写入全部祖先，`FTS_VERSION` 升到 3 触发重建；内存实现用 `tag_matches`）、`#rust,` 之类的尾标点剥掉。
+  分发链路（第 15 节）：`scripts/bundle-macos.sh` 设了 `AERO_SIGN_IDENTITY` 就用 Developer ID 正式签名（`--options runtime` + `resources/macos/entitlements.plist`，zvec dylib 一并签），否则 ad-hoc；`scripts/dmg-macos.sh` 用 `hdiutil` 出 UDZO 镜像（内含 Aero.app 与 `/Applications` 快捷方式，有身份时也签 .dmg）；`scripts/notarize-macos.sh` 用 `xcrun notarytool submit --wait` 公证并 `stapler staple`，凭据来自 `AERO_NOTARY_PROFILE`（钥匙串配置）或 `AERO_NOTARY_APPLE_ID / TEAM_ID / PASSWORD`，提交前先拦下 ad-hoc 签名（注意别用 `| grep -q`：pipefail 下 grep 提前退出会让 codesign 吃 SIGPIPE，判定不稳定）；`scripts/release-macos.sh [--notarize] [dist/]` 串起来。`scripts/test_bundle_macos.py` 覆盖 bundle 结构、签名、dmg 内容与挂载后签名、公证脚本的预检（缺凭据 / ad-hoc / `--notarize` 不触发构建）。**自动更新按砍单清单砍掉**：M1 的发布 = 上传 `.dmg`。
+  M1 至此收口；剩下的都是有意推后的项（见 M1a 第三刀末尾与第 18 节）。
 
 ### M2 · 知识互联（约 155 小时，2027-05 → 2027-09 初）
 

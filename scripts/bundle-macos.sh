@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# 构建带 Finder / Dock 图标的本地 Aero.app。需要 macOS、Rust、Python 3 和 Xcode 命令行工具。
+# 构建带 Finder / Dock 图标的 Aero.app。需要 macOS、Rust、Python 3 和 Xcode 命令行工具。
 # 用法：scripts/bundle-macos.sh [debug|release]（默认 debug）
+#
+# 签名：
+# - 默认 ad-hoc 签名（本机运行）；
+# - 设 AERO_SIGN_IDENTITY="Developer ID Application: Name (TEAMID)" 则用该证书正式签名，
+#   带 hardened runtime、安全时间戳与 resources/macos/entitlements.plist（公证的前提）。
+# 公证与 .dmg 见 scripts/release-macos.sh。
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -81,7 +87,14 @@ for path in paths:
 PY
 
 # 嵌套代码先签名，外层签名才能封存完整资源。
-codesign --force --sign - --timestamp=none "$aero_app/Contents/Frameworks/libzvec_c_api.dylib"
-codesign --force --sign - --timestamp=none "$aero_app"
+if [[ -n "${AERO_SIGN_IDENTITY:-}" ]]; then
+  # 正式签名：hardened runtime + 安全时间戳；动态库与可执行文件同一证书，库校验才能通过
+  sign_flags=(--force --sign "$AERO_SIGN_IDENTITY" --timestamp --options runtime)
+  codesign "${sign_flags[@]}" "$aero_app/Contents/Frameworks/libzvec_c_api.dylib"
+  codesign "${sign_flags[@]}" --entitlements crates/aero-app/resources/macos/entitlements.plist "$aero_app"
+else
+  codesign --force --sign - --timestamp=none "$aero_app/Contents/Frameworks/libzvec_c_api.dylib"
+  codesign --force --sign - --timestamp=none "$aero_app"
+fi
 codesign --verify --deep --strict "$aero_app"
 printf 'Built: %s\n' "$aero_app"

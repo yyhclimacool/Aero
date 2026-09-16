@@ -73,10 +73,23 @@ actions!(
         /// 文档级撤销（文本控件自己的撤销栈被绕过，见 9.5）
         DocUndo,
         DocRedo,
-        /// 编辑态 → 浏览态
+        /// Esc：块选中态 → 浏览态（编辑态里的 Esc 由文本控件的 `Escape` 动作冒泡到编辑器，先进块选中态）
         BlurEditor,
         /// `/` 菜单开着时 Tab 确认；否则交给文本控件
         MenuConfirm,
+        /// 块选中态（`ui_design.md` 6）：↑↓ 移动选中
+        SelectBlockUp,
+        SelectBlockDown,
+        /// ⇧↑↓：扩展块选区；编辑态里光标在首 / 末行时把选区升级为块选中
+        ExtendBlockUp,
+        ExtendBlockDown,
+        /// ⏎：编辑选中的块（光标在块末）
+        EditSelectedBlock,
+        /// ⌫ / ⌦：删除选中的块（可撤销）
+        DeleteSelectedBlocks,
+        /// ⌘C / ⌘X：把选中的块作为 Markdown 源码复制 / 剪切
+        CopySelectedBlocks,
+        CutSelectedBlocks,
     ]
 );
 
@@ -180,9 +193,23 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("tab", MenuConfirm, Some("Input")),
         KeyBinding::new("cmd-z", DocUndo, Some("Input")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Input")),
-        // 浏览态（编辑器容器持有焦点）下的撤销 / 重做
+        // 编辑态里 ⇧↑↓ 越过块边界时升级为块选中；否则 propagate 给控件扩展字符选区
+        KeyBinding::new("shift-up", ExtendBlockUp, Some("Input")),
+        KeyBinding::new("shift-down", ExtendBlockDown, Some("Input")),
+        // 浏览态 / 块选中态（编辑器容器持有焦点）。这些绑定在 Input 聚焦时也匹配，但深度更浅，
+        // 只在控件那一层的绑定都 propagate 之后才轮到；处理器在没有块选区时 propagate。
         KeyBinding::new("cmd-z", DocUndo, Some("Editor")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Editor")),
+        KeyBinding::new("escape", BlurEditor, Some("Editor")),
+        KeyBinding::new("up", SelectBlockUp, Some("Editor")),
+        KeyBinding::new("down", SelectBlockDown, Some("Editor")),
+        KeyBinding::new("shift-up", ExtendBlockUp, Some("Editor")),
+        KeyBinding::new("shift-down", ExtendBlockDown, Some("Editor")),
+        KeyBinding::new("enter", EditSelectedBlock, Some("Editor")),
+        KeyBinding::new("backspace", DeleteSelectedBlocks, Some("Editor")),
+        KeyBinding::new("delete", DeleteSelectedBlocks, Some("Editor")),
+        KeyBinding::new("cmd-c", CopySelectedBlocks, Some("Editor")),
+        KeyBinding::new("cmd-x", CutSelectedBlocks, Some("Editor")),
     ]);
     cx.bind_keys((0..=8u8).map(|n| KeyBinding::new(&format!("cmd-alt-{n}"), ConvertBlock(n), Some("Input"))));
 

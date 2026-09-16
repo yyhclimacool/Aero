@@ -146,6 +146,56 @@ pub fn down_target(
     Some((ix, col.min(first_len)))
 }
 
+/// 连续几个单位（下标闭区间 `first..=last`）在源码里占的整行区间：首个单位所在行的行首到最后一个单位
+/// 末行的行尾（不含那个换行）。列表项按整项算（含嵌套子项）；`^id` 等尾标记与正文同行，自然包含。
+/// 这就是块选中态里 ⌘C 复制、⌫ 删除的对象（`ui_design.md` 6）。
+pub fn units_span(doc: &Document, units: &[Unit], first: usize, last: usize) -> Range<usize> {
+    let text = doc.to_string();
+    let mut start = usize::MAX;
+    let mut end = 0;
+    for unit in &units[first..=last] {
+        let (s, e) = match &unit.list {
+            Some(ctx) => (ctx.item_range.start, ctx.item_range.end),
+            None => (unit.range.start, unit.range.end),
+        };
+        // 区间末尾若已含换行，退回到行内再找行尾，免得跑到下一行
+        let e = if e > s && text[..e].ends_with('\n') { e - 1 } else { e };
+        start = start.min(s);
+        end = end.max(e);
+    }
+    let start = line_start(&text, start.min(text.len()));
+    let end = text[end.min(text.len())..].find('\n').map_or(text.len(), |i| end + i);
+    start..end
+}
+
+/// 删除连续几个单位：整行删掉，连同它们之后的空行；删到文末时也收掉前面多出来的空行，
+/// 文档结尾仍是单个换行。
+pub fn delete_units(doc: &Document, units: &[Unit], first: usize, last: usize) -> Edit {
+    let text = doc.to_string();
+    let Range { mut start, mut end } = units_span(doc, units, first, last);
+    while end < text.len() && text.as_bytes()[end] == b'\n' {
+        end += 1;
+    }
+    if end == text.len() {
+        while start >= 2 && &text[start - 2..start] == "\n\n" {
+            start -= 1;
+        }
+    }
+    Edit::delete(start..end)
+}
+
+/// 块 gutter 的 `+`（`ui_design.md` 5.3）：在单位 `ix` 下方新开一个段落，内容是一个 `/`，
+/// 焦点放在 `/` 之后——编辑器随后按 `/` 菜单的常规逻辑把菜单打开；Esc 关菜单时 `/` 留在文档里，
+/// 与手敲 `/` 一致。列表项按整项算，新段落落在项之后（把列表断开；菜单里选列表类型即可续上）。
+pub fn insert_slash_below(doc: &Document, units: &[Unit], ix: usize) -> Plan {
+    let text = doc.to_string();
+    let at = units_span(doc, units, ix, ix).end;
+    let rest = &text[at..];
+    // 后面已经是空行或文末：两个换行把新段落隔开就够；紧跟着别的内容时再补一个，免得 `/` 并进它的段落
+    let insert = if rest.is_empty() || rest.starts_with("\n\n") { "\n\n/" } else { "\n\n/\n" };
+    Plan { focus_offset: at + "\n\n/".len(), edit: Edit::insert(at, insert) }
+}
+
 /// 在文末新建空段落：需要补的换行与新段落的偏移；不需要编辑时 `edit` 为 `None`。
 pub fn append_paragraph(doc: &Document) -> (Option<Edit>, usize) {
     let text = doc.to_string();
@@ -598,6 +648,86 @@ mod tests {
         let (ix, cursor) = down_target(&doc, &us, &us[0].range, 4).unwrap();
         assert_eq!((ix, cursor), (1, 4));
         assert_eq!(down_target(&doc, &us, &us[1].range, 0), None);
+    }
+
+    #[test]
+    fn unit_spans_cover_whole_lines_and_list_items() {
+        let doc = Document::from_text("# T\n\n- a\n  - b\n- c\n\n```rs\nx\n```\n\npara ^p1\n");
+        let us = units(&doc);
+        let text = doc.to_string();
+        let kinds: Vec<&str> = us.iter().map(|u| u.kind.tag()).collect();
+        assert_eq!(kinds, ["heading", "paragraph", "paragraph", "paragraph", "code_fence", "paragraph"]);
+        assert_eq!(&text[units_span(&doc, &us, 0, 0)], "# T");
+        // 列表项按整项：a 带着嵌套的 b
+        assert_eq!(&text[units_span(&doc, &us, 1, 1)], "- a\n  - b");
+        assert_eq!(&text[units_span(&doc, &us, 2, 2)], "  - b");
+        assert_eq!(&text[units_span(&doc, &us, 1, 3)], "- a\n  - b\n- c");
+        assert_eq!(&text[units_span(&doc, &us, 4, 4)], "```rs\nx\n```");
+        // 尾标记同行，一起算
+        assert_eq!(&text[units_span(&doc, &us, 5, 5)], "para ^p1");
+        assert_eq!(&text[units_span(&doc, &us, 0, 5)], text.trim_end());
+    }
+
+    #[test]
+    fn delete_units_removes_lines_and_surrounding_blank_lines() {
+        let mut doc = Document::from_text("aaa\n\nbbb\n\nccc\n");
+        let us = units(&doc);
+        doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+        assert_eq!(doc.to_string(), "aaa\n\nccc\n");
+        // 删最后一块：前面的空行也收掉
+        doc.reparse();
+        let us = units(&doc);
+        doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+        assert_eq!(doc.to_string(), "aaa\n");
+        // 删第一块
+        let mut doc = Document::from_text("aaa\n\nbbb\n");
+        let us = units(&doc);
+        doc.edit(delete_units(&doc, &us, 0, 0)).unwrap();
+        assert_eq!(doc.to_string(), "bbb\n");
+        // 全删：空文档
+        let mut doc = Document::from_text("aaa\n\nbbb\n");
+        let us = units(&doc);
+        doc.edit(delete_units(&doc, &us, 0, 1)).unwrap();
+        assert_eq!(doc.to_string(), "");
+        // 列表项：整行；紧邻的项不需要空行
+        let mut doc = Document::from_text("- a\n- b\n- c\n");
+        let us = units(&doc);
+        doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+        assert_eq!(doc.to_string(), "- a\n- c\n");
+        // 标题与紧跟的段落之间没有空行
+        let mut doc = Document::from_text("# T\npara\n");
+        let us = units(&doc);
+        doc.edit(delete_units(&doc, &us, 0, 0)).unwrap();
+        assert_eq!(doc.to_string(), "para\n");
+    }
+
+    #[test]
+    fn insert_slash_below_opens_a_separate_paragraph() {
+        // 后面隔着空行
+        let mut doc = Document::from_text("aaa\n\nbbb\n");
+        let us = units(&doc);
+        let plan = insert_slash_below(&doc, &us, 0);
+        let (text, focused) = apply(&mut doc, plan);
+        assert_eq!(text, "aaa\n\n/\n\nbbb\n");
+        assert_eq!(focused.as_deref(), Some("/"));
+        // 紧跟内容（标题后的段落）：多补一个换行，`/` 不并进下一段
+        let mut doc = Document::from_text("# T\npara\n");
+        let us = units(&doc);
+        let plan = insert_slash_below(&doc, &us, 0);
+        let (text, focused) = apply(&mut doc, plan);
+        assert_eq!(text, "# T\n\n/\n\npara\n");
+        assert_eq!(focused.as_deref(), Some("/"));
+        // 最后一块 / 列表项之后
+        let mut doc = Document::from_text("- a\n  - b\n- c");
+        let us = units(&doc);
+        let plan = insert_slash_below(&doc, &us, 0);
+        let (text, _) = apply(&mut doc, plan);
+        assert_eq!(text, "- a\n  - b\n\n/\n\n- c");
+        let us = units(&doc);
+        let plan = insert_slash_below(&doc, &us, us.len() - 1);
+        let (text, focused) = apply(&mut doc, plan);
+        assert_eq!(text, "- a\n  - b\n\n/\n\n- c\n\n/");
+        assert_eq!(focused.as_deref(), Some("/"));
     }
 
     #[test]

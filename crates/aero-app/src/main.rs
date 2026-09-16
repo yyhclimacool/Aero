@@ -16,6 +16,7 @@ mod quick_open;
 mod search;
 mod search_view;
 mod trash;
+mod watch;
 mod workspace;
 
 use std::path::PathBuf;

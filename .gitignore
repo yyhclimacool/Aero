@@ -27,3 +27,6 @@ target
 
 # zvec 预编译 C 库，由 scripts/fetch-zvec.sh 下载并校验
 /vendor/
+
+# scripts/release-macos.sh 的默认输出目录（.dmg）
+/dist/

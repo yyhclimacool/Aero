@@ -18,19 +18,23 @@ mod text_ops;
 mod units;
 
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aero_core::{Block, BlockId, BlockKind, Document, Edit, FileStamp, Vault, VaultError, VaultPath};
 use gpui_kit::base::input::{Backspace, Escape, Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::text::TextViewStyle;
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::actions::{
-    BlockDown, BlockUp, BlurEditor, ConvertBlock, DocRedo, DocUndo, MenuConfirm, SplitBlock,
+    BlockDown, BlockUp, BlurEditor, ConvertBlock, CopySelectedBlocks, CutSelectedBlocks,
+    DeleteSelectedBlocks, DocRedo, DocUndo, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp, MenuConfirm,
+    SelectBlockDown, SelectBlockUp, SplitBlock,
 };
 use ops::{BlockType, Plan};
 use slash::SlashAction;
@@ -41,27 +45,62 @@ use units::{Unit, unit_at};
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// 相邻输入并入同一个 undo 组的时间窗口（方案 9.5）。
 const COALESCE_WINDOW: Duration = Duration::from_millis(600);
-/// 轮询磁盘文件 mtime/size 的间隔（方案 12 的 `notify` 监听是 M1b 事项；轮询只做一次 stat，够便宜）。
+/// 轮询磁盘文件 mtime/size 的兜底间隔（主要靠 vault 监听推着 `check_external`；轮询只做一次 stat，够便宜）。
 const EXTERNAL_POLL: Duration = Duration::from_secs(2);
+/// "已重新载入"横幅自动消失的时间（`ui_design.md` 10.2）
+const RELOADED_BANNER: Duration = Duration::from_secs(10);
 
 pub const BODY_FONT_SIZE: f32 = 16.;
 pub const BODY_LINE_HEIGHT: f32 = 1.7;
+/// 正文列宽（`ui_design.md` 2.1）
+const COLUMN_WIDTH: f32 = 720.;
+/// 块 gutter（`⠿ +`，5.3）占的宽度，留在正文列左侧的内边距里
+const GUTTER: f32 = 48.;
+/// 列表标记列（24）+ 间距（4）：嵌套一层，正文右移这么多
+const LIST_INDENT: f32 = 28.;
 
 pub enum EditorEvent {
     /// 内容、光标或保存状态变化，状态栏据此刷新
     Changed,
     SaveFailed(String),
-    /// 磁盘内容被别的程序改了，而这里没有未保存修改：已静默重载（方案 12）
+    /// 磁盘内容被别的程序改了，而这里没有未保存修改：已重载（方案 12）
     Reloaded,
-    /// 磁盘内容与未保存修改冲突：磁盘版本已另存到该路径，本地版本照常落盘
-    Conflict(VaultPath),
+    /// 编辑器在自己的路径之外还动了这些文件（冲突副本、删掉的副本、另存为）：文件树重扫、索引对齐
+    PathsTouched(Vec<VaultPath>),
+    /// 文件已在外部被删除：编辑器停止自动保存并显示横幅；工作区让文件树与索引跟上
+    Deleted,
     /// 用户在标题处输入了新文件名（不含 `.md`）：真正的重命名由工作区做，文件树与路径要一起变
     RenameRequested(String),
+    /// 横幅上的"打开副本"
+    OpenRequested(VaultPath),
+    /// 横幅上的"关闭"：工作区丢掉这个编辑器
+    CloseRequested,
     /// 异步保存成功落盘；工作区据此增量更新索引
     Saved,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
+
+/// 文档顶部的非模态横幅（`ui_design.md` 10.2）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Banner {
+    /// 蓝：磁盘版本已重新载入（无未保存修改时不做合并，直接换），10 s 自动消失
+    Reloaded,
+    /// 黄：外部修改与未保存修改冲突，磁盘版本已另存为副本；本地版本已照常落盘
+    Conflict { copy: VaultPath },
+    /// 红：文件已在外部被删除；自动保存停止，内容保留
+    Deleted,
+}
+
+/// 横幅上的一个按钮：元素 id、文字、点击时做的事。
+type BannerAction = (&'static str, &'static str, Box<dyn Fn(&mut Editor, &mut Window, &mut Context<Editor>)>);
+
+/// 磁盘上这篇文件相对编辑器所知指纹的状态。
+enum Disk {
+    Unchanged,
+    Changed(Vec<u8>, FileStamp),
+    Missing,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SaveState {
@@ -90,6 +129,35 @@ struct TitleEdit {
     _subscription: Subscription,
 }
 
+/// 块选中态（`ui_design.md` 6）：连续几个编辑单位被整块选中，没有文本光标。
+/// 以单位下标记：`anchor` 是起点，`head` 随 ↑↓ 移动（⇧↑↓ 只动 `head`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockSelection {
+    anchor: usize,
+    head: usize,
+}
+
+impl BlockSelection {
+    fn first(&self) -> usize {
+        self.anchor.min(self.head)
+    }
+
+    fn last(&self) -> usize {
+        self.anchor.max(self.head)
+    }
+
+    fn contains(&self, ix: usize) -> bool {
+        (self.first()..=self.last()).contains(&ix)
+    }
+}
+
+/// 定位某个块之后怎么滚：搜索命中放到视口上 1/3；键盘移动块选区只保证看得见。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RevealMode {
+    Center,
+    Visible,
+}
+
 struct Focused {
     /// 控件文本对应的文档区间，随编辑漂移
     range: Range<usize>,
@@ -111,17 +179,22 @@ pub struct Editor {
     preview: Entity<preview::PreviewState>,
     _preview_subscription: Subscription,
     focused: Option<Focused>,
+    /// 块选中态；与 `focused` 互斥
+    selection: Option<BlockSelection>,
     picker_open: bool,
     title_edit: Option<TitleEdit>,
     slash: Option<SlashMenu>,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
-    /// 搜索命中定位：下一帧把这个块滚到视口上三分之一处
+    /// 下一帧把这个块滚到合适位置（搜索命中定位、块选区移动）
     reveal: Option<BlockId>,
+    reveal_mode: RevealMode,
     reveal_generation: u64,
     /// 短暂高亮的块（定位后 1.5 s）
     highlight: Option<BlockId>,
     highlight_task: Option<Task<()>>,
+    banner: Option<Banner>,
+    banner_task: Option<Task<()>>,
     dirty: bool,
     save_state: SaveState,
     save_task: Option<Task<()>>,
@@ -164,15 +237,19 @@ impl Editor {
             preview,
             _preview_subscription: preview_subscription,
             focused: None,
+            selection: None,
             picker_open: false,
             title_edit: None,
             slash: None,
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             reveal: None,
+            reveal_mode: RevealMode::Center,
             reveal_generation: 0,
             highlight: None,
             highlight_task: None,
+            banner: None,
+            banner_task: None,
             dirty: false,
             save_state: SaveState::Clean,
             save_task: None,
@@ -244,6 +321,7 @@ impl Editor {
     /// 点击标题：换成单行输入框，全选当前标题。
     fn start_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.exit_edit(cx);
+        self.selection = None;
         let title = self.title();
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("未命名"));
         let subscription = cx.subscribe_in(&input, window, Self::on_title_input_event);
@@ -346,6 +424,7 @@ impl Editor {
             .map_or(block.id, |unit| unit.id);
         self.reveal_generation += 1;
         self.reveal = Some(id);
+        self.reveal_mode = RevealMode::Center;
         self.highlight = Some(id);
         self.highlight_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(1500)).await;
@@ -364,14 +443,15 @@ impl Editor {
         self.highlight
     }
 
-    /// 定位块的滚动：在块的子元素布局完成后算出它相对滚动容器的位置，把它放到视口上 1/3 处。
-    /// 改 offset 在本帧已经来不及生效，所以顺手 `notify` 再画一帧。
+    /// 定位块的滚动：在块的子元素布局完成后算出它相对滚动容器的位置——`Center` 放到视口上 1/3 处，
+    /// `Visible` 只在块超出视口时把它挪进来。改 offset 在本帧已经来不及生效，所以顺手 `notify` 再画一帧。
     fn reveal_listener(
         &self,
         id: BlockId,
         cx: &Context<Self>,
     ) -> impl Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static {
         let scroll = self.scroll.clone();
+        let mode = self.reveal_mode;
         let this = cx.weak_entity();
         move |bounds, _window, cx| {
             let Some(target) = bounds.first() else { return };
@@ -379,8 +459,20 @@ impl Editor {
             if container.size.height <= px(0.) {
                 return;
             }
-            let desired_top = container.origin.y + container.size.height / 3.;
-            let delta = target.origin.y - desired_top;
+            let delta = match mode {
+                RevealMode::Center => target.origin.y - (container.origin.y + container.size.height / 3.),
+                RevealMode::Visible => {
+                    let margin = px(16.);
+                    if target.origin.y < container.origin.y + margin {
+                        target.origin.y - (container.origin.y + margin)
+                    } else if target.bottom_right().y > container.bottom_right().y - margin {
+                        (target.bottom_right().y - (container.bottom_right().y - margin))
+                            .min(target.origin.y - (container.origin.y + margin))
+                    } else {
+                        px(0.)
+                    }
+                }
+            };
             let offset = scroll.offset();
             scroll.set_offset(point(offset.x, (offset.y - delta).min(px(0.))));
             let _ = this.update(cx, |this, cx| {
@@ -521,6 +613,7 @@ impl Editor {
         });
         self.last_edit_at = None;
         log::debug!("focus {:?} id={:?} cursor={cursor}", range, id);
+        self.selection = None;
         self.focused = Some(Focused { range, id, enter_newline, textarea, _subscription: subscription });
         cx.notify();
     }
@@ -536,6 +629,36 @@ impl Editor {
         }
     }
 
+    /// 编辑态里的 Esc（文本控件的 `Escape` 冒泡到这里）：先关菜单 / 标题编辑；否则退出编辑并选中刚才的块
+    /// （`ui_design.md` 6："Esc 两段式退出"）。光标在没有块的空位上时直接回浏览态。
+    fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            self.cancel_title_edit(true, window, cx);
+            return;
+        }
+        if self.slash.take().is_some() {
+            cx.notify();
+            return;
+        }
+        match self.focused_unit() {
+            Some(ix) => self.select_blocks(ix, ix, window, cx),
+            None => self.blur_to_browse(window, cx),
+        }
+    }
+
+    /// 块选中态里的 Esc（或程序化的 `BlurEditor`）：回浏览态。没什么可退的就 propagate。
+    fn on_blur_editor(&mut self, _: &BlurEditor, window: &mut Window, cx: &mut Context<Self>) {
+        let busy = self.title_edit.is_some()
+            || self.slash.is_some()
+            || self.focused.is_some()
+            || self.selection.is_some();
+        if busy {
+            self.blur_to_browse(window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
     fn blur_to_browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.title_edit.is_some() {
             self.cancel_title_edit(true, window, cx);
@@ -546,7 +669,167 @@ impl Editor {
             return;
         }
         self.exit_edit(cx);
+        if self.selection.take().is_some() {
+            cx.notify();
+        }
         self.focus_handle.focus(window, cx);
+    }
+
+    // ---- 块选中态（`ui_design.md` 6） ----
+
+    #[cfg(test)]
+    pub fn selected_blocks(&self) -> Option<Range<usize>> {
+        self.selection.map(|s| s.first()..s.last() + 1)
+    }
+
+    /// 选中 `anchor..=head` 这些单位：退出编辑态（落盘），焦点回容器，`head` 那块滚到可见处。
+    fn select_blocks(&mut self, anchor: usize, head: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.units.is_empty() {
+            self.blur_to_browse(window, cx);
+            return;
+        }
+        let last = self.units.len() - 1;
+        let (anchor, head) = (anchor.min(last), head.min(last));
+        self.slash = None;
+        self.exit_edit(cx);
+        self.selection = Some(BlockSelection { anchor, head });
+        self.reveal = Some(self.units[head].id);
+        self.reveal_mode = RevealMode::Visible;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// ↑↓：选区收成一块并移动；⇧↑↓：只动 `head`。到头了就停。没有选区时 propagate。
+    fn move_selection(&mut self, delta: isize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sel) = self.selection else {
+            cx.propagate();
+            return;
+        };
+        let last = self.units.len().saturating_sub(1) as isize;
+        let head = (sel.head as isize + delta).clamp(0, last) as usize;
+        let anchor = if extend { sel.anchor } else { head };
+        self.select_blocks(anchor, head, window, cx);
+    }
+
+    fn on_select_up(&mut self, _: &SelectBlockUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(-1, false, window, cx);
+    }
+
+    fn on_select_down(&mut self, _: &SelectBlockDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(1, false, window, cx);
+    }
+
+    /// ⇧↑ / ⇧↓：块选中态里扩展选区；编辑态里光标已在首 / 末行时，字符选区升级为块选区（当前块 + 相邻块）。
+    fn extend_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_some() {
+            self.move_selection(delta, true, window, cx);
+            return;
+        }
+        let Some((text, cursor)) = self.textarea_text_and_cursor(cx) else {
+            cx.propagate();
+            return;
+        };
+        let (line, _) = line_col(&text, cursor);
+        let at_edge = if delta < 0 { line == 0 } else { line + 1 == line_count(&text) };
+        let Some(ix) = self.focused_unit().filter(|_| at_edge) else {
+            cx.propagate();
+            return;
+        };
+        let last = self.units.len().saturating_sub(1) as isize;
+        let head = (ix as isize + delta).clamp(0, last) as usize;
+        self.select_blocks(ix, head, window, cx);
+    }
+
+    fn on_extend_up(&mut self, _: &ExtendBlockUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.extend_selection(-1, window, cx);
+    }
+
+    fn on_extend_down(&mut self, _: &ExtendBlockDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.extend_selection(1, window, cx);
+    }
+
+    /// ⏎：编辑 `head` 那块，光标在块末。
+    fn on_edit_selected(&mut self, _: &EditSelectedBlock, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sel) = self.selection else {
+            cx.propagate();
+            return;
+        };
+        let Some(unit) = self.units.get(sel.head) else { return };
+        let len = unit.range.len();
+        self.focus_unit(sel.head, len, window, cx);
+    }
+
+    /// 选中块的 Markdown 源码（整行，列表项含标记与嵌套子项）。
+    fn selected_source(&self) -> Option<String> {
+        let sel = self.selection?;
+        let span = ops::units_span(&self.doc, &self.units, sel.first(), sel.last());
+        Some(self.doc.slice(span).to_string())
+    }
+
+    /// ⌫ / ⌦：删掉选中的块，一个撤销组；选区落到原位置上的下一块（没有就上一块；文档空了回浏览态）。
+    fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sel) = self.selection else { return };
+        let edit = ops::delete_units(&self.doc, &self.units, sel.first(), sel.last());
+        if let Err(err) = self.doc.edit(edit) {
+            log::error!("edit rejected: {err}");
+            return;
+        }
+        let first = sel.first();
+        self.last_edit_at = None;
+        self.after_doc_change(cx);
+        if self.units.is_empty() {
+            self.selection = None;
+            self.focus_handle.focus(window, cx);
+        } else {
+            let ix = first.min(self.units.len() - 1);
+            self.select_blocks(ix, ix, window, cx);
+        }
+    }
+
+    fn on_delete_selected(&mut self, _: &DeleteSelectedBlocks, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_some() {
+            self.delete_selected(window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
+    // ---- 块 gutter（`ui_design.md` 5.3） ----
+
+    fn unit_index(&self, id: BlockId) -> Option<usize> {
+        self.units.iter().position(|u| u.id == id)
+    }
+
+    /// gutter 的 `⠿`：进入块选中态（块菜单与拖拽重排不在 M1）。
+    fn select_block_by_id(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.unit_index(id) {
+            self.select_blocks(ix, ix, window, cx);
+        }
+    }
+
+    /// gutter 的 `+`：在块下方新开段落并打开 `/` 菜单。
+    fn insert_block_below(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.unit_index(id) else { return };
+        let plan = ops::insert_slash_below(&self.doc, &self.units, ix);
+        self.apply_plan(plan, window, cx);
+        self.update_slash(cx);
+    }
+
+    fn on_copy_selected(&mut self, _: &CopySelectedBlocks, _: &mut Window, cx: &mut Context<Self>) {
+        match self.selected_source() {
+            Some(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            None => cx.propagate(),
+        }
+    }
+
+    fn on_cut_selected(&mut self, _: &CutSelectedBlocks, window: &mut Window, cx: &mut Context<Self>) {
+        match self.selected_source() {
+            Some(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.delete_selected(window, cx);
+            }
+            None => cx.propagate(),
+        }
     }
 
     // ---- 控件事件 ----
@@ -721,6 +1004,7 @@ impl Editor {
                 .filter(|&ix| self.units[ix].range.start == f.range.start)
                 .map(|ix| self.units[ix].id);
         }
+        self.clamp_selection();
         self.dirty = true;
         self.save_state = SaveState::Dirty;
         self.schedule_save(cx);
@@ -909,13 +1193,33 @@ impl Editor {
         }
     }
 
-    /// 撤销 / 重做之后：光标放到受影响区间的末尾（编辑态下），像所有编辑器那样"跟着变化走"。
+    /// 撤销 / 重做之后：光标放到受影响区间的末尾（编辑态下），像所有编辑器那样"跟着变化走"；
+    /// 块选中态下改为选中受影响处的块（撤销一次块删除，被恢复的块就是选中的那块）。
     fn after_history(&mut self, affected: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
         self.last_edit_at = None;
         let was_editing = self.focused.take().is_some();
+        let was_selecting = self.selection.is_some();
         self.after_doc_change(cx);
         if was_editing {
             self.focus_at(affected.end, None, window, cx);
+        } else if was_selecting {
+            let ix = unit_at(&self.units, affected.start)
+                .or_else(|| self.units.iter().position(|u| u.range.start >= affected.start))
+                .unwrap_or(self.units.len().saturating_sub(1));
+            self.select_blocks(ix, ix, window, cx);
+        }
+    }
+
+    /// 单位变了（编辑、重载）之后让选区仍然落在合法下标上；没有单位就退出块选中态。
+    fn clamp_selection(&mut self) {
+        if let Some(sel) = self.selection.as_mut() {
+            if self.units.is_empty() {
+                self.selection = None;
+            } else {
+                let last = self.units.len() - 1;
+                sel.anchor = sel.anchor.min(last);
+                sel.head = sel.head.min(last);
+            }
         }
     }
 
@@ -929,14 +1233,25 @@ impl Editor {
     }
 
     /// 立即（异步）写盘。写前先看磁盘有没有被别人改过（5.5 写前校验）。
+    /// 文件已在外部被删时不写：自动保存不该把用户刚删掉的文件变回来（横幅上有"恢复"）。
     pub fn save_now(&mut self, cx: &mut Context<Self>) {
-        if !self.dirty || self.save_state == SaveState::Saving {
+        if !self.dirty || self.save_state == SaveState::Saving || self.is_deleted() {
             return;
         }
         self.save_task = None;
-        if let Some((disk, stamp)) = self.external_change() {
-            self.write_conflict_copy(&disk, stamp, cx);
+        match self.disk_state() {
+            Disk::Changed(disk, stamp) => self.write_conflict_copy(&disk, stamp, cx),
+            Disk::Missing => {
+                self.mark_deleted(cx);
+                return;
+            }
+            Disk::Unchanged => {}
         }
+        self.start_write(cx);
+    }
+
+    /// 真正的异步写盘，不看磁盘状态（校验在 [`Self::save_now`]；"恢复"要越过"文件不存在"直接写）。
+    fn start_write(&mut self, cx: &mut Context<Self>) {
         let bytes = self.doc.to_bytes();
         let version = self.doc.version();
         let (vault, path) = (self.vault.clone(), self.path.clone());
@@ -976,16 +1291,21 @@ impl Editor {
     }
 
     /// 同步落盘（切换笔记、退出前）。有外部修改时同样先留冲突副本，返回其路径。
+    /// 文件已在外部被删时不写回（与 [`Self::save_now`] 一致），未保存内容随编辑器丢弃。
     pub fn flush_sync(&mut self) -> Result<Option<VaultPath>, VaultError> {
-        if !self.dirty {
+        if !self.dirty || self.is_deleted() {
             return Ok(None);
         }
         self.save_task = None;
-        let conflict = match self.external_change() {
-            Some((disk, _)) => {
+        let conflict = match self.disk_state() {
+            Disk::Changed(disk, _) => {
                 Some(self.vault.write_bytes(&self.conflict_path(), &disk).map(|_| self.conflict_path())?)
             }
-            None => None,
+            Disk::Missing => {
+                log::warn!("{}: deleted on disk; unsaved changes dropped", self.path.as_str());
+                return Ok(None);
+            }
+            Disk::Unchanged => None,
         };
         let stamp = self.vault.write_bytes(&self.path, &self.doc.to_bytes())?;
         self.stamp = stamp;
@@ -994,35 +1314,53 @@ impl Editor {
         Ok(conflict)
     }
 
-    // ---- 外部修改（方案 12，M1a 子集：轮询 + 写前校验；`notify` 监听与三方合并留给 M1b） ----
+    // ---- 外部修改（方案 12：vault 监听 + 2 s 轮询兜底 + 写前校验；不做三方合并） ----
 
-    /// 磁盘文件是否被别的程序改过：先比 mtime/size（不读内容），变了再比内容 hash。
-    /// 返回磁盘上的新内容与指纹。文件不存在时视为"没变"——下次保存会重建它。
-    fn external_change(&mut self) -> Option<(Vec<u8>, FileStamp)> {
-        let (mtime, size) = self.vault.stat(&self.path).ok()?;
+    /// 磁盘文件相对编辑器所知指纹的状态：先比 mtime/size（不读内容），变了再比内容 hash。
+    fn disk_state(&mut self) -> Disk {
+        let Ok((mtime, size)) = self.vault.stat(&self.path) else {
+            return if self.vault.exists(&self.path) { Disk::Unchanged } else { Disk::Missing };
+        };
         if mtime == self.stamp.mtime && size == self.stamp.size {
-            return None;
+            return Disk::Unchanged;
         }
-        let (bytes, stamp) = self.vault.read_bytes(&self.path).ok()?;
+        let Ok((bytes, stamp)) = self.vault.read_bytes(&self.path) else { return Disk::Unchanged };
         if stamp.hash == self.stamp.hash {
             // 只是被 touch 了一下（或同步工具写回同样的内容）
             self.stamp = stamp;
-            return None;
+            return Disk::Unchanged;
         }
-        Some((bytes, stamp))
+        Disk::Changed(bytes, stamp)
     }
 
-    /// 轮询 / 窗口激活时调用：无未保存修改则静默重载，有则留冲突副本并立即落盘本地版本。
+    /// 监听 / 轮询 / 窗口激活时调用：无未保存修改则重载，有则留冲突副本并立即落盘本地版本；
+    /// 文件不见了进入"已删除"态，又出现了（比如从废纸篓放回）则解除。
     pub fn check_external(&mut self, cx: &mut Context<Self>) {
         if self.save_state == SaveState::Saving {
             return;
         }
-        let Some((disk, stamp)) = self.external_change() else { return };
-        if self.dirty {
-            self.write_conflict_copy(&disk, stamp, cx);
-            self.save_now(cx);
-        } else {
-            self.reload(&disk, stamp, cx);
+        match self.disk_state() {
+            Disk::Missing => self.mark_deleted(cx),
+            Disk::Unchanged => {
+                if self.is_deleted() {
+                    self.set_banner(None, cx);
+                    if self.dirty {
+                        self.schedule_save(cx);
+                    }
+                }
+            }
+            Disk::Changed(disk, stamp) => {
+                if self.is_deleted() {
+                    self.set_banner(None, cx);
+                }
+                if self.dirty {
+                    self.write_conflict_copy(&disk, stamp, cx);
+                    self.save_now(cx);
+                } else {
+                    self.reload(&disk, stamp, cx);
+                    self.set_banner(Some(Banner::Reloaded), cx);
+                }
+            }
         }
     }
 
@@ -1038,6 +1376,7 @@ impl Editor {
         self.doc = doc;
         self.stamp = stamp;
         self.units = units::units(&self.doc);
+        self.clamp_selection();
         self.preview.update(cx, |state, _| *state = preview::PreviewState::default());
         self.dirty = false;
         self.save_task = None;
@@ -1046,6 +1385,123 @@ impl Editor {
         cx.emit(EditorEvent::Reloaded);
         cx.emit(EditorEvent::Changed);
         cx.notify();
+    }
+
+    // ---- 横幅（10.2） ----
+
+    #[cfg(test)]
+    pub fn banner(&self) -> Option<&Banner> {
+        self.banner.as_ref()
+    }
+
+    /// 文件已在外部被删除：不再自动保存，内容留在编辑器里。
+    pub fn is_deleted(&self) -> bool {
+        matches!(self.banner, Some(Banner::Deleted))
+    }
+
+    fn set_banner(&mut self, banner: Option<Banner>, cx: &mut Context<Self>) {
+        self.banner_task = None;
+        if banner == Some(Banner::Reloaded) {
+            self.banner_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(RELOADED_BANNER).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.banner == Some(Banner::Reloaded) {
+                        this.banner = None;
+                        cx.notify();
+                    }
+                });
+            }));
+        }
+        self.banner = banner;
+        cx.notify();
+    }
+
+    fn mark_deleted(&mut self, cx: &mut Context<Self>) {
+        if self.is_deleted() {
+            return;
+        }
+        log::warn!("{}: deleted on disk", self.path.as_str());
+        self.save_task = None;
+        self.set_banner(Some(Banner::Deleted), cx);
+        cx.emit(EditorEvent::Deleted);
+        cx.emit(EditorEvent::Changed);
+    }
+
+    /// 横幅"保留我的"：副本留在 vault 里，横幅消失。
+    pub fn dismiss_banner(&mut self, cx: &mut Context<Self>) {
+        self.set_banner(None, cx);
+    }
+
+    /// 横幅"使用磁盘版本"：把冲突副本的内容换进来并落盘到本笔记，副本删掉（内容已在这里，不会丢）。
+    pub fn take_disk_version(&mut self, cx: &mut Context<Self>) {
+        let Some(Banner::Conflict { copy }) = self.banner.clone() else { return };
+        let (bytes, _) = match self.vault.read_bytes(&copy) {
+            Ok(v) => v,
+            Err(err) => {
+                cx.emit(EditorEvent::SaveFailed(format!("无法读取冲突副本 {}：{err}", copy.as_str())));
+                return;
+            }
+        };
+        self.reload(&bytes, self.stamp, cx);
+        self.dirty = true;
+        self.save_state = SaveState::Dirty;
+        self.set_banner(None, cx);
+        self.save_now(cx);
+        if let Err(err) = std::fs::remove_file(self.vault.fs_path(&copy)) {
+            log::warn!("remove conflict copy {}: {err}", copy.as_str());
+        }
+        cx.emit(EditorEvent::PathsTouched(vec![copy]));
+    }
+
+    /// 横幅"恢复"：把编辑器里的内容写回原路径。
+    pub fn restore_deleted(&mut self, cx: &mut Context<Self>) {
+        if !self.is_deleted() || self.save_state == SaveState::Saving {
+            return;
+        }
+        self.set_banner(None, cx);
+        self.save_task = None;
+        self.dirty = true;
+        self.start_write(cx);
+    }
+
+    /// 横幅"另存为…"：写到 vault 内的另一条路径并改跟它。
+    pub fn save_as(&mut self, path: VaultPath, cx: &mut Context<Self>) -> Result<(), VaultError> {
+        let stamp = self.vault.write_bytes(&path, &self.doc.to_bytes())?;
+        let old = std::mem::replace(&mut self.path, path.clone());
+        self.stamp = stamp;
+        self.dirty = false;
+        self.save_task = None;
+        self.save_state = SaveState::Saved(Instant::now());
+        self.set_banner(None, cx);
+        cx.emit(EditorEvent::PathsTouched(vec![old, path]));
+        cx.emit(EditorEvent::Saved);
+        cx.emit(EditorEvent::Changed);
+        Ok(())
+    }
+
+    /// "另存为…"的系统对话框：默认放在同目录，名字带 `-恢复`。
+    fn prompt_save_as(&mut self, cx: &mut Context<Self>) {
+        let dir = self.vault.fs_path(&self.path);
+        let dir = dir.parent().map(Path::to_path_buf).unwrap_or_else(|| self.vault.root().to_path_buf());
+        let suggested = format!("{}-恢复.md", self.path.stem());
+        let root = self.vault.root().to_path_buf();
+        let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(target))) = rx.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                let mut target = target;
+                if target.extension().is_none() {
+                    target.set_extension("md");
+                }
+                let result = VaultPath::from_fs(&root, &target)
+                    .map_err(|_| format!("{} 不在当前 vault 里", target.display()))
+                    .and_then(|p| this.save_as(p, cx).map_err(|e| e.to_string()));
+                if let Err(msg) = result {
+                    cx.emit(EditorEvent::SaveFailed(format!("无法另存为：{msg}")));
+                }
+            });
+        })
+        .detach();
     }
 
     /// `<name>.conflict-<本地时间>.md`，与原文件同目录。
@@ -1069,7 +1525,8 @@ impl Editor {
                 );
                 // 记下磁盘当前指纹：接下来的写盘不该再把同一份外部修改当成新冲突
                 self.stamp = stamp;
-                cx.emit(EditorEvent::Conflict(conflict));
+                self.set_banner(Some(Banner::Conflict { copy: conflict.clone() }), cx);
+                cx.emit(EditorEvent::PathsTouched(vec![conflict]));
             }
             Err(err) => {
                 let msg = format!("无法保存冲突副本 {}：{err}", conflict.as_str());
@@ -1080,6 +1537,77 @@ impl Editor {
     }
 
     // ---- 渲染 ----
+
+    /// 文档顶部横幅（10.2）：一行说明 + 几个动作按钮。
+    fn render_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let banner = self.banner.as_ref()?;
+        let theme = cx.theme();
+        let (color, text, actions): (Hsla, String, Vec<BannerAction>) = match banner {
+            Banner::Reloaded => (
+                theme.info,
+                "此文件在外部被修改，已重新载入。".to_owned(),
+                vec![("banner-ok", "好", Box::new(|this, _, cx| this.dismiss_banner(cx)))],
+            ),
+            Banner::Conflict { copy } => {
+                let copy_open = copy.clone();
+                (
+                    theme.warning,
+                    format!(
+                        "此文件在外部被修改，且你有未保存的改动。磁盘版本已另存为 {}，当前内容已照常保存。",
+                        copy.as_str()
+                    ),
+                    vec![
+                        ("banner-keep", "保留我的", Box::new(|this, _, cx| this.dismiss_banner(cx))),
+                        ("banner-disk", "使用磁盘版本", Box::new(|this, _, cx| this.take_disk_version(cx))),
+                        (
+                            "banner-open-copy",
+                            "打开副本",
+                            Box::new(move |_, _, cx| cx.emit(EditorEvent::OpenRequested(copy_open.clone()))),
+                        ),
+                    ],
+                )
+            }
+            Banner::Deleted => (
+                theme.danger,
+                "此文件已在外部被删除。内容保留在这里，不会再自动保存。".to_owned(),
+                vec![
+                    ("banner-restore", "恢复", Box::new(|this, _, cx| this.restore_deleted(cx))),
+                    ("banner-save-as", "另存为…", Box::new(|this, _, cx| this.prompt_save_as(cx))),
+                    ("banner-close", "关闭", Box::new(|_, _, cx| cx.emit(EditorEvent::CloseRequested))),
+                ],
+            ),
+        };
+        let buttons: Vec<AnyElement> = actions
+            .into_iter()
+            .map(|(id, label, action)| {
+                Button::new(id)
+                    .outline()
+                    .xsmall()
+                    .label(label)
+                    .on_click(cx.listener(move |this, _, window, cx| action(this, window, cx)))
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            h_flex()
+                .id("banner")
+                .w_full()
+                .mb_4()
+                .px_3()
+                .py_2()
+                .gap_3()
+                .items_center()
+                .rounded(px(6.))
+                .border_l(px(3.))
+                .border_color(color)
+                .bg(color.opacity(0.12))
+                .text_size(px(13.))
+                .line_height(relative(1.4))
+                .child(div().flex_1().min_w_0().child(text))
+                .child(h_flex().flex_none().gap_1().children(buttons))
+                .into_any_element(),
+        )
+    }
 
     /// 文档标题（5.1）：浏览时是大字，点击变成单行输入框。
     fn render_title(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1127,6 +1655,17 @@ impl Editor {
 
     fn is_focused_block(&self, id: BlockId) -> bool {
         self.focused.as_ref().is_some_and(|f| f.id == Some(id))
+    }
+
+    /// 这个块（作为编辑单位）在块选区里。
+    fn is_selected_block(&self, id: BlockId) -> bool {
+        let Some(sel) = self.selection else { return false };
+        self.units.iter().position(|u| u.id == id).is_some_and(|ix| sel.contains(ix))
+    }
+
+    /// 块选中态的高亮：整块淡底色，与搜索定位的 `accent` 高亮区分。
+    fn selected_style<E: Styled>(el: E, selection: Hsla) -> E {
+        el.bg(selection).rounded(px(6.)).mx(px(-8.)).px(px(8.))
     }
 
     /// 块整体落在聚焦区间内但不是聚焦块（粘贴出多块时），渲染时跳过。
@@ -1266,7 +1805,7 @@ impl Editor {
                 Some(v_flex().w_full().gap(px(4.)).children(els).into_any_element())
             }
             BlockKind::ListItem { .. } => Some(self.render_list_item(b, None, depth, cx)),
-            k if units::is_atomic(k) => self.render_unit(b, cx),
+            k if units::is_atomic(k) => self.render_unit(b, depth, cx),
             _ => {
                 let els: Vec<AnyElement> =
                     b.children.iter().filter_map(|c| self.render_block(c, depth, cx)).collect();
@@ -1307,21 +1846,26 @@ impl Editor {
         };
 
         let body: AnyElement = if content.is_empty() {
-            if self.is_focused_block(item.id) {
+            let id = item.id;
+            let body = if self.is_focused_block(id) {
                 self.render_textarea(None, cx)
             } else {
-                let id = item.id;
+                let selected = self.is_selected_block(id);
+                let selection = theme.selection;
                 div()
                     .id(("empty-item", id.0))
+                    .debug_selector(|| format!("unit-{}", id.0))
                     .w_full()
                     .h(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT))
                     .cursor_text()
+                    .when(selected, |el| Self::selected_style(el, selection))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| this.focus_block(id, window, cx)),
                     )
                     .into_any_element()
-            }
+            };
+            self.with_gutter(id, depth + 1, body, cx)
         } else {
             let els: Vec<AnyElement> =
                 content.iter().filter_map(|c| self.render_block(c, depth + 1, cx)).collect();
@@ -1337,11 +1881,75 @@ impl Editor {
             .into_any_element()
     }
 
+    /// 悬停出现的块 gutter（5.3）：`⠿` 进入块选中态，`+` 在下方插入块并打开 `/` 菜单。
+    /// 行向左伸出 gutter 的宽度（嵌套列表再加上标记列），按钮画在伸出去的那段里：
+    /// 鼠标从块移到按钮上仍在同一个悬停组内，按钮不会在半路消失；各层级的按钮左对齐。
+    fn with_gutter(&self, id: BlockId, depth: usize, content: AnyElement, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let reach = px(GUTTER + LIST_INDENT * depth as f32);
+        let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+        let button = |name: &'static str, glyph: &'static str, title: &'static str| {
+            div()
+                .id((name, id.0))
+                .debug_selector(move || format!("{name}-{}", id.0))
+                .flex_none()
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .text_size(px(14.))
+                .text_color(muted)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(title).build(window, cx)
+                })
+                .child(glyph)
+        };
+        let handle = button("gutter-handle", "⠿", "选中块").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.select_block_by_id(id, window, cx);
+            }),
+        );
+        let plus = button("gutter-plus", "+", "在下方插入块").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.insert_block_below(id, window, cx);
+            }),
+        );
+        h_flex()
+            .w_full()
+            .items_start()
+            .relative()
+            .group("unit")
+            .ml(-reach)
+            .pl(reach)
+            .child(
+                h_flex()
+                    .absolute()
+                    .left_0()
+                    .top(px(4.))
+                    .w(px(GUTTER))
+                    .gap(px(4.))
+                    .opacity(0.)
+                    .group_hover("unit", |s| s.opacity(1.))
+                    .child(handle)
+                    .child(plus),
+            )
+            .child(div().flex_1().min_w_0().child(content))
+            .into_any_element()
+    }
+
     /// 一个编辑单位：聚焦则画控件，否则渲染。
-    fn render_unit(&self, b: &Block, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_unit(&self, b: &Block, depth: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
         let range = self.doc.content_range(b);
         if self.is_focused_block(b.id) {
-            return Some(self.render_textarea(Some(&b.kind), cx));
+            let textarea = self.render_textarea(Some(&b.kind), cx);
+            return Some(self.with_gutter(b.id, depth, textarea, cx));
         }
         if self.is_covered(&range) {
             return None;
@@ -1378,26 +1986,27 @@ impl Editor {
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });
         let highlighted = self.highlight == Some(id);
-        let accent = theme.accent;
+        let selected = self.is_selected_block(id);
+        let (accent, selection) = (theme.accent, theme.selection);
         // 定位中的块：多套一层拿子元素布局（`on_children_prepainted` 只在无状态 div 上有）
         let body: AnyElement = if self.reveal == Some(id) {
             div().w_full().on_children_prepainted(self.reveal_listener(id, cx)).child(body).into_any_element()
         } else {
             body
         };
-        Some(
-            div()
-                .id(("unit", id.0))
-                .debug_selector(|| format!("unit-{}", id.0))
-                .w_full()
-                .min_h(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT))
-                .when(is_heading, |el| el.pt_2())
-                .cursor_text()
-                .when(highlighted, |el| el.bg(accent).rounded(px(6.)).mx(px(-8.)).px(px(8.)))
-                .on_mouse_down(MouseButton::Left, focus)
-                .child(body)
-                .into_any_element(),
-        )
+        let unit = div()
+            .id(("unit", id.0))
+            .debug_selector(|| format!("unit-{}", id.0))
+            .w_full()
+            .min_h(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT))
+            .when(is_heading, |el| el.pt_2())
+            .cursor_text()
+            .when(highlighted, |el| el.bg(accent).rounded(px(6.)).mx(px(-8.)).px(px(8.)))
+            .when(selected && !highlighted, |el| Self::selected_style(el, selection))
+            .on_mouse_down(MouseButton::Left, focus)
+            .child(body)
+            .into_any_element();
+        Some(self.with_gutter(id, depth, unit, cx))
     }
 }
 
@@ -1426,21 +2035,32 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_convert_block))
             .on_action(cx.listener(Self::on_menu_confirm))
-            .on_action(cx.listener(|this, _: &Escape, window, cx| this.blur_to_browse(window, cx)))
-            .on_action(cx.listener(|this, _: &BlurEditor, window, cx| this.blur_to_browse(window, cx)))
+            .on_action(cx.listener(Self::on_escape))
+            .on_action(cx.listener(Self::on_blur_editor))
+            .on_action(cx.listener(Self::on_select_up))
+            .on_action(cx.listener(Self::on_select_down))
+            .on_action(cx.listener(Self::on_extend_up))
+            .on_action(cx.listener(Self::on_extend_down))
+            .on_action(cx.listener(Self::on_edit_selected))
+            .on_action(cx.listener(Self::on_delete_selected))
+            .on_action(cx.listener(Self::on_copy_selected))
+            .on_action(cx.listener(Self::on_cut_selected))
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .child(
+                // 左内边距多留 gutter 的宽度：块行向左伸出去画 `⠿ +`，正文仍是 720 宽
                 v_flex()
                     .w_full()
-                    .max_w(px(720. + 48.))
+                    .max_w(px(COLUMN_WIDTH + GUTTER + 24. + GUTTER + 24.))
                     .mx_auto()
-                    .px_6()
+                    .pl(px(24. + GUTTER))
+                    .pr_6()
                     .pt_10()
                     .text_size(px(BODY_FONT_SIZE))
                     .line_height(relative(BODY_LINE_HEIGHT))
                     .text_color(foreground)
+                    .children(self.render_banner(cx))
                     .child(self.render_title(cx))
                     .child(v_flex().w_full().gap(px(8.)).children(blocks))
                     .when(empty, |el| el.child(div().text_color(muted).child("点击这里开始写，或按 ⏎")))

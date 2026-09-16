@@ -713,6 +713,149 @@ fn external_change_while_dirty_writes_conflict_copy(cx: &mut TestAppContext) {
     assert_eq!(n.count(), 1);
 }
 
+fn conflict_copies(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("a.conflict-") && n.ends_with(".md"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// 10.2 的横幅：重载 → 蓝色并 10 s 自动消失；冲突 → 黄色，"使用磁盘版本"把副本换进来并删掉副本。
+#[gpui_kit::test]
+fn banners_for_reload_and_conflict(cx: &mut TestAppContext) {
+    use super::{Banner, EditorEvent};
+    let (dir, _vault, _path, editor) = open(cx, "base\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let file = dir.path().join("a.md");
+    let touched: std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>> = Default::default();
+    let sink = touched.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&editor, move |_, ev: &EditorEvent, _| {
+            if let EditorEvent::PathsTouched(paths) = ev {
+                sink.borrow_mut().push(paths.iter().map(|p| p.as_str().to_owned()).collect());
+            }
+        })
+        .detach();
+    });
+
+    // 干净时外部修改：重载 + 蓝横幅，10 s 后消失
+    let past = std::time::SystemTime::now() - Duration::from_secs(5);
+    std::fs::write(&file, "theirs\n").unwrap();
+    std::fs::File::open(&file).unwrap().set_modified(past).unwrap();
+    editor.update(cx, |e, cx| e.check_external(cx));
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "theirs\n");
+    cx.update(|_, cx| assert_eq!(editor.read(cx).banner(), Some(&Banner::Reloaded)));
+    cx.executor().advance_clock(Duration::from_secs(11));
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(editor.read(cx).banner(), None));
+
+    // 有未保存修改时外部修改：冲突副本 + 黄横幅
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("!");
+    let past = std::time::SystemTime::now() - Duration::from_secs(10);
+    std::fs::write(&file, "disk wins\n").unwrap();
+    std::fs::File::open(&file).unwrap().set_modified(past).unwrap();
+    editor.update(cx, |e, cx| e.check_external(cx));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "theirs!\n");
+    let copies = conflict_copies(dir.path());
+    assert_eq!(copies.len(), 1);
+    let copy = VaultPath::new(&copies[0]).unwrap();
+    cx.update(|_, cx| assert_eq!(editor.read(cx).banner(), Some(&Banner::Conflict { copy: copy.clone() })));
+    assert_eq!(touched.borrow().as_slice(), [vec![copies[0].clone()]]);
+
+    // 使用磁盘版本：内容换成副本的、落盘、副本删掉
+    editor.update(cx, |e, cx| e.take_disk_version(cx));
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "disk wins\n");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "disk wins\n");
+    assert!(conflict_copies(dir.path()).is_empty());
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.banner(), None);
+        assert!(matches!(e.save_state(), super::SaveState::Saved(_)));
+    });
+    assert_eq!(touched.borrow().len(), 2);
+    assert_eq!(touched.borrow()[1], vec![copies[0].clone()]);
+}
+
+/// 文件在外部被删：红横幅、自动保存停止（不把文件变回来）；"恢复"写回；"关闭"发事件。
+#[gpui_kit::test]
+fn external_deletion_stops_autosave_until_restored(cx: &mut TestAppContext) {
+    use super::{Banner, EditorEvent};
+    let (dir, _vault, _path, editor) = open(cx, "base\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let file = dir.path().join("a.md");
+    let events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>> = Default::default();
+    let sink = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&editor, move |_, ev: &EditorEvent, _| match ev {
+            EditorEvent::Deleted => sink.borrow_mut().push("deleted"),
+            EditorEvent::CloseRequested => sink.borrow_mut().push("close"),
+            EditorEvent::Saved => sink.borrow_mut().push("saved"),
+            _ => {}
+        })
+        .detach();
+    });
+
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("!");
+    std::fs::remove_file(&file).unwrap();
+    // 2 s 轮询发现文件没了；500 ms 的自动保存不该把它写回来
+    cx.executor().advance_clock(Duration::from_millis(2100));
+    cx.run_until_parked();
+    assert!(!file.exists(), "autosave must not resurrect a deleted file");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.banner(), Some(&Banner::Deleted));
+        assert!(e.is_deleted());
+    });
+    assert_eq!(events.borrow().as_slice(), ["deleted"]);
+    assert_eq!(text(&editor, cx), "base!\n");
+
+    // 继续编辑也不保存
+    cx.simulate_input("?");
+    cx.executor().advance_clock(Duration::from_millis(3000));
+    cx.run_until_parked();
+    assert!(!file.exists());
+    assert_eq!(text(&editor, cx), "base!?\n");
+
+    // 恢复：写回原路径，横幅消失，之后照常自动保存
+    editor.update(cx, |e, cx| e.restore_deleted(cx));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "base!?\n");
+    cx.update(|_, cx| assert_eq!(editor.read(cx).banner(), None));
+    assert_eq!(events.borrow().as_slice(), ["deleted", "saved"]);
+
+    // 再删一次，这回"关闭"
+    std::fs::remove_file(&file).unwrap();
+    editor.update(cx, |e, cx| e.check_external(cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(editor.read(cx).is_deleted()));
+    // flush_sync 也不写回
+    assert_eq!(editor.update(cx, |e, _| e.flush_sync()).unwrap(), None);
+    assert!(!file.exists());
+    editor.update(cx, |_, cx| cx.emit(EditorEvent::CloseRequested));
+    cx.run_until_parked();
+    assert_eq!(events.borrow().as_slice(), ["deleted", "saved", "deleted", "close"]);
+
+    // 另存为：写到新路径并改跟它
+    let target = VaultPath::new("sub/restored.md").unwrap();
+    editor.update(cx, |e, cx| e.save_as(target.clone(), cx)).unwrap();
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(dir.path().join("sub/restored.md")).unwrap(), "base!?\n");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.path(), &target);
+        assert_eq!(e.banner(), None);
+    });
+}
+
 #[gpui_kit::test]
 fn empty_note_starts_writing(cx: &mut TestAppContext) {
     let (_dir, _vault, _path, editor) = open(cx, "");
@@ -774,4 +917,195 @@ fn reveal_indexed_block_scrolls_and_highlights(cx: &mut TestAppContext) {
     cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_indexed_block(999, cx)));
     let last = cx.update(|_, cx| aero_core::index::indexable_leaves(&editor.read(cx).doc).last().unwrap().id);
     cx.update(|_, cx| assert_eq!(editor.read(cx).highlighted_block(), Some(last)));
+}
+
+fn selected(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Option<std::ops::Range<usize>> {
+    cx.update(|_, cx| editor.read(cx).selected_blocks())
+}
+
+/// 块选中态（`ui_design.md` 6）：Esc 两段式退出、↑↓ / ⇧↑↓ 移动与扩展、⏎ 回编辑、⌫ 删除可撤销、⌘C / ⌘X。
+#[gpui_kit::test]
+fn block_selection_keyboard_flow(cx: &mut TestAppContext) {
+    let source = "# Title\n\n- one\n- two\n\nlast\n";
+    let (dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let file = dir.path().join("a.md");
+
+    // 编辑态 Esc → 当前块被选中、控件消失、未保存内容落盘；再 Esc → 浏览态
+    focus_unit(&editor, 1, cx);
+    cx.simulate_input("!");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(selected(&editor, cx), Some(1..2));
+    cx.update(|window, cx| {
+        let e = editor.read(cx);
+        assert!(e.focused.is_none());
+        assert!(e.focus_handle.is_focused(window), "container keeps keyboard focus in block selection");
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "# Title\n\n- one!\n- two\n\nlast\n");
+    cx.simulate_keystrokes("escape");
+    assert_eq!(selected(&editor, cx), None);
+
+    // 浏览态 ↑↓ 不产生选区
+    cx.simulate_keystrokes("down");
+    assert_eq!(selected(&editor, cx), None);
+
+    // ↓ 移动、⇧↓ 扩展、⇧↑ 收回、到头停住
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("escape");
+    assert_eq!(selected(&editor, cx), Some(0..1));
+    cx.simulate_keystrokes("down");
+    assert_eq!(selected(&editor, cx), Some(1..2));
+    cx.simulate_keystrokes("shift-down shift-down");
+    assert_eq!(selected(&editor, cx), Some(1..4));
+    cx.simulate_keystrokes("shift-down");
+    assert_eq!(selected(&editor, cx), Some(1..4), "extending past the last block stays put");
+    cx.simulate_keystrokes("shift-up");
+    assert_eq!(selected(&editor, cx), Some(1..3));
+    cx.simulate_keystrokes("up up up up");
+    assert_eq!(selected(&editor, cx), Some(0..1));
+
+    // 选中块画成高亮的同一批 unit 元素
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let title_id = cx.update(|_, cx| editor.read(cx).units[0].id);
+    let selector: &'static str = Box::leak(format!("unit-{}", title_id.0).into_boxed_str());
+    assert!(cx.debug_bounds(selector).is_some());
+
+    // ⏎：编辑 head 那块，光标在块末
+    cx.simulate_keystrokes("down enter");
+    assert_eq!(selected(&editor, cx), None);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let f = e.focused.as_ref().expect("enter re-enters edit mode");
+        assert_eq!(f.textarea.read(cx).value(), "one!");
+        assert_eq!(f.textarea.read(cx).cursor(), 4);
+    });
+
+    // ⌘C 复制选中块的源码（列表项含标记）；⌫ 删除；选区落到下一块；⌘Z 撤销并重新选中恢复的块
+    cx.simulate_keystrokes("escape shift-down cmd-c");
+    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some("- one!\n- two".to_owned()));
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text(&editor, cx), "# Title\n\nlast\n");
+    assert_eq!(selected(&editor, cx), Some(1..2));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "# Title\n\n- one!\n- two\n\nlast\n");
+    assert_eq!(selected(&editor, cx), Some(1..2), "undo re-selects the restored block");
+
+    // ⌘X 剪切最后一块：前面多出的空行一起收掉，选区退到上一块
+    cx.simulate_keystrokes("down down cmd-x");
+    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some("last".to_owned()));
+    assert_eq!(text(&editor, cx), "# Title\n\n- one!\n- two\n");
+    assert_eq!(selected(&editor, cx), Some(2..3));
+
+    // 删到空文档：回浏览态，文件也随之为空
+    cx.simulate_keystrokes("shift-up shift-up backspace");
+    assert_eq!(text(&editor, cx), "");
+    assert_eq!(selected(&editor, cx), None);
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+}
+
+/// 块 gutter（`ui_design.md` 5.3）：每个单位左侧有 `⠿` / `+`，各层级左对齐、不占正文宽度；
+/// `+` 在下方新开段落并打开 `/` 菜单，`⠿` 进入块选中态；点按钮不会顺带把块置为编辑态。
+#[gpui_kit::test]
+fn gutter_inserts_below_and_selects(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "intro\n\n- item\n\nend\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let draw = |cx: &mut VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+    let selector = |name: &str, id: aero_core::BlockId| -> &'static str {
+        Box::leak(format!("{name}-{}", id.0).into_boxed_str())
+    };
+    let ids: Vec<aero_core::BlockId> =
+        cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    assert_eq!(ids.len(), 3);
+    draw(cx);
+
+    // 布局：gutter 在正文左侧、不同层级左对齐；正文列仍是 720 宽
+    let intro = cx.debug_bounds(selector("unit", ids[0])).unwrap();
+    let plus_intro = cx.debug_bounds(selector("gutter-plus", ids[0])).unwrap();
+    let handle_intro = cx.debug_bounds(selector("gutter-handle", ids[0])).unwrap();
+    let handle_item = cx.debug_bounds(selector("gutter-handle", ids[1])).unwrap();
+    assert!(
+        handle_intro.right() <= plus_intro.origin.x && plus_intro.right() <= intro.origin.x,
+        "gutter sits left of the block"
+    );
+    assert_eq!(handle_item.origin.x, handle_intro.origin.x, "list item gutter aligns with top-level gutter");
+    assert_eq!(intro.size.width, gpui_kit::px(720.));
+
+    // `+`：下方多出 "/" 段落，菜单打开，焦点在 "/" 之后
+    cx.simulate_click(plus_intro.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "intro\n\n/\n\n- item\n\nend\n");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.slash.is_some(), "slash menu opens");
+        let f = e.focused.as_ref().expect("new paragraph is being edited");
+        assert_eq!(f.textarea.read(cx).value(), "/");
+        assert_eq!(f.textarea.read(cx).cursor(), 1);
+    });
+    // 菜单里选标题 2：`/` 被删掉，新块变成 "## "
+    cx.simulate_input("h2");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "intro\n\n## \n\n- item\n\nend\n");
+    cx.simulate_input("New");
+    assert_eq!(text(&editor, cx), "intro\n\n## New\n\n- item\n\nend\n");
+
+    // `⠿`：进入块选中态（而不是编辑态）
+    cx.simulate_keystrokes("escape escape");
+    draw(cx);
+    let ids: Vec<aero_core::BlockId> =
+        cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    let handle_end = cx.debug_bounds(selector("gutter-handle", ids[3])).unwrap();
+    cx.simulate_click(handle_end.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(selected(&editor, cx), Some(3..4));
+    cx.update(|_, cx| assert!(editor.read(cx).focused.is_none()));
+
+    // 列表项的 `+`：段落落在项之后
+    draw(cx);
+    let plus_item = cx.debug_bounds(selector("gutter-plus", ids[2])).unwrap();
+    cx.simulate_click(plus_item.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "intro\n\n## New\n\n- item\n\n/\n\nend\n");
+    assert_eq!(selected(&editor, cx), None);
+    // Esc 关菜单，`/` 留在文档里（与手敲一致）
+    cx.simulate_keystrokes("escape");
+    cx.update(|_, cx| assert!(editor.read(cx).slash.is_none() && editor.read(cx).focused.is_some()));
+    assert_eq!(text(&editor, cx), "intro\n\n## New\n\n- item\n\n/\n\nend\n");
+}
+
+/// 编辑态里 ⇧↑ / ⇧↓ 在首 / 末行升级为块选区；不在边上时仍是控件内的字符选区。
+#[gpui_kit::test]
+fn shift_arrows_upgrade_to_block_selection_at_block_edges(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "first\n\nline a\nline b\n\nthird\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+
+    // 多行段落的末行：⇧↑ 只扩展字符选区
+    focus_unit(&editor, 1, cx);
+    cx.simulate_keystrokes("shift-up");
+    assert_eq!(selected(&editor, cx), None);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let ta = e.focused.as_ref().unwrap().textarea.read(cx);
+        assert_ne!(
+            ta.selected_range().start,
+            ta.selected_range().end,
+            "character selection inside the block"
+        );
+    });
+    // 再一次已在首行：升级为块选区（当前块 + 上一块）
+    cx.simulate_keystrokes("shift-up");
+    assert_eq!(selected(&editor, cx), Some(0..2));
+    cx.update(|_, cx| assert!(editor.read(cx).focused.is_none()));
+
+    // 末行 ⇧↓：当前块 + 下一块
+    focus_unit(&editor, 1, cx);
+    cx.simulate_keystrokes("shift-down");
+    assert_eq!(selected(&editor, cx), Some(1..3));
+    // 最后一块末行 ⇧↓：只选中自己
+    focus_unit(&editor, 2, cx);
+    cx.simulate_keystrokes("shift-down");
+    assert_eq!(selected(&editor, cx), Some(2..3));
+    assert_eq!(text(&editor, cx), "first\n\nline a\nline b\n\nthird\n");
 }

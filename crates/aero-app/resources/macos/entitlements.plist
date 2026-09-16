@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Hardened runtime 下的正式签名用到这份文件（scripts/bundle-macos.sh，AERO_SIGN_IDENTITY）。
+      Aero 不进 App Sandbox，也不需要 JIT / 未签名内存 / 禁用库校验：
+      libzvec_c_api.dylib 与可执行文件用同一证书签名，库校验直接通过。
+      这里刻意留空，将来需要的 entitlement 加在这里并在 project_plan 里说明原因。
+    -->
+</dict>
+</plist>

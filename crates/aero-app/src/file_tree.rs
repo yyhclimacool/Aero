@@ -134,6 +134,19 @@ impl FileTree {
         self.rebuild_rows();
     }
 
+    /// 树里是否有这篇笔记（上次 `rescan` 时磁盘上的、且没被忽略规则过滤掉）。
+    #[cfg(test)]
+    pub fn contains(&self, path: &VaultPath) -> bool {
+        let mut cur = &self.root;
+        for seg in path.parent().split('/').filter(|s| !s.is_empty()) {
+            match cur.folders.iter().find(|f| f.name == seg) {
+                Some(f) => cur = f,
+                None => return false,
+            }
+        }
+        cur.notes.contains(path)
+    }
+
     /// 当前选中的文件夹（选中的是笔记时取其所在目录），用于新建笔记的位置规则（3.5）。
     pub fn selected_dir(&self) -> Option<String> {
         self.selected.as_ref().map(|p| p.parent().to_owned())

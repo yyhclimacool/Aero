@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use aero_core::index::tag_with_ancestors;
 use aero_core::{FtsQuery, FullTextIndex, Hit, IndexBlock, IndexError};
 use zvec_rust::{
     Collection, CollectionOptions, CollectionSchema, DataType, Doc, FieldSchema, Fts, FtsQueryParams,
@@ -95,12 +96,15 @@ impl ZvecFts {
         self.col.as_ref().ok_or(IndexError::Closed)
     }
 
+    /// 执行查询。`tags` 走引擎过滤（`tags_filter` 里连祖先一起写了，父标签查询就是精确子串）；
+    /// `exclude_tags` 引擎不支持 `NOT LIKE`，多取一些再在这里筛掉——排除的是很常见的标签时结果可能不满。
     fn query(&self, q: &FtsQuery, output: &[&str]) -> Result<Vec<Doc>, IndexError> {
         let text = q.text.trim();
         if text.is_empty() && q.tags.is_empty() {
             return Ok(Vec::new());
         }
-        let topk = q.limit.clamp(1, 1000) as i32;
+        let limit = q.limit.clamp(1, 1000);
+        let topk = if q.exclude_tags.is_empty() { limit } else { (limit * 4 + 64).min(1000) } as i32;
         let mut sq = if text.is_empty() {
             scalar_query(topk)?
         } else {
@@ -115,7 +119,11 @@ impl ZvecFts {
             sq.set_fts_params(FtsQueryParams::new(Some("AND")).map_err(engine)?).map_err(engine)?;
             sq
         };
-        sq.set_output_fields(output).map_err(engine)?;
+        let mut output: Vec<&str> = output.to_vec();
+        if !q.exclude_tags.is_empty() && !output.contains(&"tags_filter") {
+            output.push("tags_filter");
+        }
+        sq.set_output_fields(&output).map_err(engine)?;
         let mut filters: Vec<_> =
             q.tags.iter().map(|tag| format!("tags_filter LIKE '%{}%'", encode_tag(tag))).collect();
         if text.is_empty() {
@@ -128,7 +136,16 @@ impl ZvecFts {
         if !filters.is_empty() {
             sq.set_filter(&filters.join(" AND ")).map_err(engine)?;
         }
-        self.col()?.query(&sq).map_err(engine)
+        let mut docs = self.col()?.query(&sq).map_err(engine)?;
+        if !q.exclude_tags.is_empty() {
+            let excluded: Vec<String> = q.exclude_tags.iter().map(|tag| encode_tag(tag)).collect();
+            docs.retain(|d| {
+                let filter = d.get_string("tags_filter").ok().flatten().unwrap_or_default();
+                !excluded.iter().any(|e| filter.contains(e.as_str()))
+            });
+            docs.truncate(limit);
+        }
+        Ok(docs)
     }
 }
 
@@ -225,7 +242,15 @@ fn to_doc(b: &IndexBlock) -> Result<Doc, IndexError> {
     d.add_string("path", &b.path).map_err(engine)?;
     d.add_string("title", &b.title).map_err(engine)?;
     d.add_string("tags", &b.tags.join(" ")).map_err(engine)?;
-    let tags_filter: String = b.tags.iter().map(|tag| encode_tag(tag)).collect();
+    // 过滤字段连祖先一起写：`rust/cli` → `|rust/cli||rust|`，查 `#rust` 就是精确子串，不用前缀匹配
+    let mut seen = std::collections::BTreeSet::new();
+    let tags_filter: String = b
+        .tags
+        .iter()
+        .flat_map(|tag| tag_with_ancestors(&tag.to_lowercase()))
+        .filter(|tag| seen.insert(tag.clone()))
+        .map(|tag| encode_tag(&tag))
+        .collect();
     d.add_string("tags_filter", &tags_filter).map_err(engine)?;
     d.add_string("body", &b.body).map_err(engine)?;
     Ok(d)
@@ -390,10 +415,12 @@ mod tests {
         .unwrap();
 
         for text in ["", "  \t", "needle"] {
-            assert_eq!(hit_pks(&idx, &tag_query(text, &["RUST"])), ["both#0", "rust#0"]);
-            assert_eq!(hit_pks(&idx, &tag_query(text, &["rust", "cLi"])), ["both#0"]);
+            // 父标签命中子标签（`rust` → `rust/web`），但不命中前缀 / 后缀相似的 `rusty` / `trust`
+            assert_eq!(hit_pks(&idx, &tag_query(text, &["RUST"])), ["both#0", "nested#0", "rust#0"]);
+            assert_eq!(hit_pks(&idx, &tag_query(text, &["rust", "cLi"])), ["both#0", "nested#0"]);
             assert_eq!(hit_pks(&idx, &tag_query(text, &["RUST/WEB"])), ["nested#0"]);
             assert_eq!(hit_pks(&idx, &tag_query(text, &["été/学习", "CLI"])), ["both#0"]);
+            assert_eq!(hit_pks(&idx, &tag_query(text, &["ÉTÉ"])), ["both#0"]);
         }
         let mut q = tag_query("", &["rust"]);
         q.limit = 1;

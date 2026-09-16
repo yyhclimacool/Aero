@@ -36,8 +36,11 @@ impl IndexBlock {
 
 /// 全文查询。`text` 的语法由引擎决定（zvec：`+term -term "phrase"`），内存实现按空白切词做 AND。
 ///
-/// `text` 为空而 `tags` 非空是**纯标签查询**：标签是笔记级的（见 [`blocks_for_note`]），
-/// 引擎每篇笔记只返回 `block_ord == 0` 那一块，否则一篇长笔记的几百个块会把 `limit` 吃满、挤掉别的笔记。
+/// 标签是笔记级的（见 [`blocks_for_note`]），按层级匹配：查 `rust` 命中带 `rust` 或 `rust/...` 的笔记
+/// （见 [`tag_matches`]）。`tags` 全部要命中，`exclude_tags` 命中任一即排除。
+///
+/// `text` 为空而 `tags` 非空是**纯标签查询**：引擎每篇笔记只返回 `block_ord == 0` 那一块，
+/// 否则一篇长笔记的几百个块会把 `limit` 吃满、挤掉别的笔记。只有 `exclude_tags` 的查询不成立（返回空）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FtsQuery {
     pub text: String,
@@ -46,13 +49,18 @@ pub struct FtsQuery {
     pub note_id: Option<String>,
     /// 必须全部命中的标签（小写、不带 `#`）
     pub tags: Vec<String>,
+    /// 命中任一就排除的标签（小写、不带 `#`）
+    pub exclude_tags: Vec<String>,
 }
 
 impl FtsQuery {
     pub fn new(text: impl Into<String>) -> Self {
-        FtsQuery { text: text.into(), limit: 50, note_id: None, tags: Vec::new() }
+        FtsQuery { text: text.into(), limit: 50, note_id: None, tags: Vec::new(), exclude_tags: Vec::new() }
     }
 
+    /// 从搜索框文本里拆出标签条件（`ui_design.md` 4.2）：
+    /// `#tag` / `tag:tag` / `tag:#tag` 是要求，前面加 `-` 是排除；标签后面粘着的标点（`#rust,`）忽略；
+    /// 其余原样交给引擎做全文匹配（引号内的空格不拆）。
     pub fn parse(text: &str) -> Self {
         let mut query = Self::new("");
         let mut terms = Vec::new();
@@ -63,13 +71,18 @@ impl FtsQuery {
             if c.is_whitespace() && !quoted && !escaped {
                 let token = &text[start..i];
                 if !token.is_empty() {
-                    let tag = token.strip_prefix("tag:#").or_else(|| token.strip_prefix('#'));
-                    if let Some(tag) = tag.and_then(normalize_tag) {
-                        if !query.tags.contains(&tag) {
-                            query.tags.push(tag);
+                    match tag_token(token) {
+                        Some((tag, false)) => {
+                            if !query.tags.contains(&tag) {
+                                query.tags.push(tag);
+                            }
                         }
-                    } else {
-                        terms.push(token);
+                        Some((tag, true)) => {
+                            if !query.exclude_tags.contains(&tag) {
+                                query.exclude_tags.push(tag);
+                            }
+                        }
+                        None => terms.push(token),
                     }
                 }
                 start = i + c.len_utf8();
@@ -88,6 +101,26 @@ impl FtsQuery {
         query.text = terms.join(" ");
         query
     }
+
+    /// 有没有任何能产生结果的条件。
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.tags.is_empty()
+    }
+}
+
+/// 查询里的一个词是不是标签条件：`(标签, 是否排除)`。
+fn tag_token(token: &str) -> Option<(String, bool)> {
+    let (token, exclude) = match token.strip_prefix('-') {
+        Some(rest) => (rest, true),
+        None => (token, false),
+    };
+    let tag = token
+        .strip_prefix("tag:#")
+        .or_else(|| token.strip_prefix("tag:"))
+        .or_else(|| token.strip_prefix('#'))?;
+    // 粘在后面的标点：`#rust,` `#rust。` `(#rust)`
+    let tag = tag.trim_end_matches(|c: char| !tag_char(c) || c == '/');
+    normalize_tag(tag).map(|tag| (tag, exclude))
 }
 
 fn tag_char(c: char) -> bool {
@@ -97,6 +130,28 @@ fn tag_char(c: char) -> bool {
 fn normalize_tag(tag: &str) -> Option<String> {
     let first = tag.chars().next()?;
     (!first.is_numeric() && tag.chars().all(tag_char)).then(|| tag.to_lowercase())
+}
+
+/// 标签层级匹配：查 `rust` 命中 `rust` 与 `rust/cli`，但不命中 `rusty`；两边都应已小写。
+pub fn tag_matches(query: &str, doc_tag: &str) -> bool {
+    doc_tag == query
+        || (doc_tag.len() > query.len()
+            && doc_tag.starts_with(query)
+            && doc_tag.as_bytes()[query.len()] == b'/')
+}
+
+/// 一个标签自身加上所有祖先：`a/b/c` → `[a/b/c, a/b, a]`。引擎按精确子串过滤时，把它们都写进过滤字段，
+/// 父标签查询就不需要前缀匹配。
+pub fn tag_with_ancestors(tag: &str) -> Vec<String> {
+    let mut out = vec![tag.to_owned()];
+    let mut rest = tag;
+    while let Some((parent, _)) = rest.rsplit_once('/') {
+        if !parent.is_empty() {
+            out.push(parent.to_owned());
+        }
+        rest = parent;
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -530,14 +585,17 @@ impl FullTextIndex for MemoryFullTextIndex {
             return Ok(Vec::new());
         }
         let tags: Vec<String> = q.tags.iter().map(|tag| tag.to_lowercase()).collect();
+        let excluded: Vec<String> = q.exclude_tags.iter().map(|tag| tag.to_lowercase()).collect();
         // 纯标签查询：标签是笔记级的，每篇只回第一块（见 FtsQuery 文档）
         let tag_only = terms.is_empty();
+        let has = |d: &IndexBlock, t: &str| d.tags.iter().any(|dt| tag_matches(t, &dt.to_lowercase()));
         let mut hits: Vec<Hit> = self
             .docs
             .values()
             .filter(|d| !tag_only || d.block_ord == 0)
             .filter(|d| q.note_id.as_ref().is_none_or(|n| *n == d.note_id))
-            .filter(|d| tags.iter().all(|t| d.tags.iter().any(|dt| dt.to_lowercase() == *t)))
+            .filter(|d| tags.iter().all(|t| has(d, t)))
+            .filter(|d| !excluded.iter().any(|t| has(d, t)))
             .filter_map(|d| {
                 let hay = format!("{}\n{}\n{}", d.title, d.body, d.tags.join(" ")).to_lowercase();
                 let mut score = 0usize;
@@ -687,13 +745,62 @@ mod tests {
         assert_eq!(q.tags, ["rust", "cli", "rust/cli"]);
         assert_eq!(FtsQuery::parse("#中文标签").tags, ["中文标签"]);
         assert_eq!(FtsQuery::parse("tag:#rust #cli").text, "");
-        let literal = r##""#rust" \#escaped #123 ##heading tag:# -#omit +#required"##;
+        let literal = r##""#rust" \#escaped #123 ##heading tag:# +#required -# -tag:"##;
         assert_eq!(FtsQuery::parse(literal).text, literal);
         assert!(FtsQuery::parse(literal).tags.is_empty());
+        assert!(FtsQuery::parse(literal).exclude_tags.is_empty());
         let escaped = r##""a \" #literal" #filter"##;
         assert_eq!(FtsQuery::parse(escaped).tags, ["filter"]);
         assert_eq!(FtsQuery::parse(escaped).text, r##""a \" #literal""##);
         assert!(FtsQuery::parse("\"unclosed #literal").tags.is_empty());
+    }
+
+    /// 4.2 的标签语法补全：`-#tag` 排除、`tag:rust` 不带 `#`、尾标点忽略、层级匹配。
+    #[test]
+    fn parses_exclusions_bare_tag_prefix_and_trailing_punctuation() {
+        let q = FtsQuery::parse("anchor -#Draft tag:rust -tag:wip -tag:#Old #cli, (#中文) #a/b/ -#draft");
+        assert_eq!(q.text, "anchor (#中文)");
+        assert_eq!(q.tags, ["rust", "cli", "a/b"]);
+        assert_eq!(q.exclude_tags, ["draft", "wip", "old"]);
+        assert_eq!(FtsQuery::parse("#rust。").tags, ["rust"]);
+        assert_eq!(FtsQuery::parse("#rust:").tags, ["rust"]);
+        // 只有排除条件：不成立
+        assert!(FtsQuery::parse("-#draft").is_empty());
+        assert!(!FtsQuery::parse("#draft").is_empty());
+        assert!(!FtsQuery::parse("x -#draft").is_empty());
+
+        assert!(tag_matches("rust", "rust"));
+        assert!(tag_matches("rust", "rust/cli"));
+        assert!(tag_matches("rust/cli", "rust/cli/x"));
+        assert!(!tag_matches("rust", "rusty"));
+        assert!(!tag_matches("rust/cli", "rust"));
+        assert_eq!(tag_with_ancestors("a/b/c"), ["a/b/c", "a/b", "a"]);
+        assert_eq!(tag_with_ancestors("solo"), ["solo"]);
+    }
+
+    /// 内存实现：层级匹配与排除。
+    #[test]
+    fn memory_index_matches_parent_tags_and_excludes() {
+        let mut idx = MemoryFullTextIndex::new();
+        idx.upsert(&[
+            block("a", 0, "needle", &["rust/cli"]),
+            block("b", 0, "needle", &["rust", "draft"]),
+            block("c", 0, "needle", &["rusty"]),
+            block("d", 0, "needle", &[]),
+        ])
+        .unwrap();
+        let notes = |q: &FtsQuery| {
+            let mut v: Vec<String> = idx.search(q).unwrap().into_iter().map(|h| h.note_id).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(notes(&FtsQuery::parse("#rust")), ["a", "b"]);
+        assert_eq!(notes(&FtsQuery::parse("needle #rust")), ["a", "b"]);
+        assert_eq!(notes(&FtsQuery::parse("#rust/cli")), ["a"]);
+        assert_eq!(notes(&FtsQuery::parse("needle -#rust")), ["c", "d"]);
+        assert_eq!(notes(&FtsQuery::parse("#rust -#draft")), ["a"]);
+        assert_eq!(notes(&FtsQuery::parse("needle -#rust/cli")), ["b", "c", "d"]);
+        assert!(notes(&FtsQuery::parse("-#draft")).is_empty());
     }
 
     #[test]
