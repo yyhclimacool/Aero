@@ -129,6 +129,23 @@ impl SearchService {
         })
     }
 
+    /// 当前笔记的反向链接；磁盘读取与 SQLite 查询都在后台执行。
+    pub fn backlinks(
+        &self,
+        path: VaultPath,
+        limit: usize,
+        cx: &App,
+    ) -> Task<Result<Vec<aero_index::Backlink>, String>> {
+        let indexer = self.indexer.clone();
+        cx.background_spawn(async move {
+            let guard = indexer.lock().unwrap();
+            match guard.as_ref() {
+                Some(ix) => ix.backlinks(&path, limit).map_err(|e| e.to_string()),
+                None => Ok(Vec::new()),
+            }
+        })
+    }
+
     /// 已索引笔记的 `(路径, 标题)`（快速打开用）；引擎还没打开时返回空。
     pub fn note_titles(&self, cx: &App) -> Task<Vec<(VaultPath, String)>> {
         let indexer = self.indexer.clone();
@@ -165,8 +182,47 @@ impl SearchService {
         self.run(cx, move |ix| ix.remove_note(&path).map(|_| true).map_err(|e| e.to_string()));
     }
 
-    pub fn note_renamed(&mut self, old: VaultPath, new: VaultPath, cx: &mut Context<Self>) {
-        self.run(cx, move |ix| ix.rename_note(&old, &new).map(|_| true).map_err(|e| e.to_string()));
+    pub fn notes_renamed(&mut self, report: aero_core::rename::RenameReport, cx: &mut Context<Self>) {
+        // 启动同步可能仍持有旧文件列表；等它结束再应用重命名，否则任务会在引擎尚未打开时丢失。
+        if matches!(self.phase(), Phase::Opening | Phase::Syncing { .. }) {
+            let mut report = Some(report);
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(PROGRESS_POLL).await;
+                    let done = this
+                        .update(cx, |this, cx| {
+                            if this.shared.cancelled.load(Ordering::Acquire) {
+                                return true;
+                            }
+                            if matches!(this.phase(), Phase::Opening | Phase::Syncing { .. }) {
+                                return false;
+                            }
+                            if matches!(this.phase(), Phase::Idle) {
+                                this.notes_renamed(report.take().expect("applied once"), cx);
+                            }
+                            true
+                        })
+                        .unwrap_or(true);
+                    if done {
+                        return;
+                    }
+                }
+            })
+            .detach();
+            return;
+        }
+        self.run(cx, move |ix| {
+            let mut errors = Vec::new();
+            if let Err(e) = ix.rename_note(&report.from, &report.to) {
+                errors.push(e.to_string());
+            }
+            for path in report.updated.iter().filter(|p| **p != report.to) {
+                if let Err(e) = ix.refresh_note(path) {
+                    errors.push(e.to_string());
+                }
+            }
+            if errors.is_empty() { Ok(true) } else { Err(errors.join("; ")) }
+        });
     }
 
     /// 文件监听报告这些路径有动静：逐篇按指纹对齐（新建 / 改动 → 重索引，消失 → 删除，没变 → 跳过）。
@@ -439,6 +495,43 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "index never became idle: {phase:?}");
             std::thread::sleep(Duration::from_millis(30));
         }
+    }
+
+    /// 启动同步的旧文件列表处理完后，重命名更新仍必须执行一次。
+    #[gpui_kit::test]
+    fn rename_index_update_waits_for_initial_sync(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "targetunique\n").unwrap();
+        std::fs::write(dir.path().join("b.md"), "[[a]]\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        let from = VaultPath::new("a.md").unwrap();
+        let to = VaultPath::new("new.md").unwrap();
+        let report = aero_core::rename::RenamePlan::prepare(&vault, from.clone(), to.clone())
+            .unwrap()
+            .execute()
+            .unwrap();
+        // 固定在“同步未完成”这个边界，避免依赖真线程跑得快慢。
+        service.update(cx, |s, cx| {
+            s.shared.phase.store(super::PHASE_SYNCING, std::sync::atomic::Ordering::Release);
+            s.notes_renamed(report, cx);
+        });
+        cx.run_until_parked();
+        let task = cx.update(|cx| service.read(cx).search("targetunique".into(), 10, cx));
+        assert_eq!(cx.foreground_executor().block_on(task).unwrap()[0].path, from);
+        service
+            .update(cx, |s, _| s.shared.phase.store(super::PHASE_IDLE, std::sync::atomic::Ordering::Release));
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        let task = cx.update(|cx| service.read(cx).search("targetunique".into(), 10, cx));
+        assert_eq!(cx.foreground_executor().block_on(task).unwrap()[0].path, to);
+        let task = cx.update(|cx| service.read(cx).backlinks(to, 10, cx));
+        let hits = cx.foreground_executor().block_on(task).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path.as_str(), "b.md");
+        cx.update(|cx| service.read(cx).close_blocking());
     }
 
     /// 关掉之后引擎句柄已释放：同一份索引能立刻再打开（锁拿得到，不是删掉重建）；

@@ -22,6 +22,12 @@ pub struct NoteRow {
     pub block_count: u32,
 }
 
+/// 反链来源及其归一化文档中的 UTF-8 字节区间。
+pub struct BacklinkRow {
+    pub source: NoteRow,
+    pub range: std::ops::Range<usize>,
+}
+
 /// 一条还没解析到目标的链接行：`(源 note_id, 源路径, target, fragment, byte_start)`。
 pub type PendingLink = (String, String, String, Option<String>, i64);
 
@@ -178,6 +184,22 @@ impl Meta {
 
     pub fn note_count(&self) -> rusqlite::Result<u64> {
         self.conn.query_row("SELECT count(*) FROM notes", [], |r| r.get::<_, i64>(0)).map(|n| n as u64)
+    }
+
+    /// 按来源路径、出现顺序列出入链。自身链接不属于笔记间的反链。
+    pub fn backlinks(&self, path: &str, limit: usize) -> rusqlite::Result<Vec<BacklinkRow>> {
+        let mut st = self.conn.prepare(
+            "SELECT n.note_id, n.path, n.title, n.mtime_ns, n.size, n.hash, n.block_count,
+                    l.byte_start, l.byte_end
+             FROM notes dst JOIN links l ON l.resolved_note_id = dst.note_id
+             JOIN notes n ON n.note_id = l.source_note_id
+             WHERE dst.path = ?1 AND n.note_id != dst.note_id
+             ORDER BY n.path, l.byte_start LIMIT ?2",
+        )?;
+        st.query_map(params![path, limit.min(i64::MAX as usize) as i64], |r| {
+            Ok(BacklinkRow { source: row_to_note(r)?, range: r.get(7)?..r.get(8)? })
+        })?
+        .collect()
     }
 
     /// 重建一篇笔记的全部链接行：先删旧行，再按扫描区间插入。解析在调用方（`Indexer`）做，

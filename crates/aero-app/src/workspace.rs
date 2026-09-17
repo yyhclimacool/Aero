@@ -19,6 +19,7 @@ use gpui_kit::*;
 
 use crate::actions::QuickOpen as QuickOpen_;
 use crate::actions::*;
+use crate::backlinks::{BacklinkOpened, BacklinksView};
 use crate::branding;
 use crate::editor::{Editor, EditorEvent, SaveState};
 use crate::file_tree::{FileTree, FileTreeEvent, unique_note_name};
@@ -41,6 +42,7 @@ struct VaultSession {
     /// 全文索引（后台）；状态栏显示进度，搜索视图查询它
     search: Entity<SearchService>,
     search_view: Entity<SearchView>,
+    backlinks: Entity<BacklinksView>,
     /// vault 目录的文件监听；起不来时编辑器退回轮询、索引只在启动时对齐
     _watcher: Entity<VaultWatcher>,
     /// 本次会话里打开过的笔记，最近的在前（快速打开的"最近优先"）
@@ -55,6 +57,12 @@ enum SidebarTab {
     Search,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContextTab {
+    Backlinks,
+    Outline,
+}
+
 pub struct Workspace {
     state: PersistedState,
     open: Option<VaultSession>,
@@ -63,6 +71,8 @@ pub struct Workspace {
     picker_focus: Option<FocusHandle>,
     recent_commands: Vec<&'static str>,
     sidebar_tab: SidebarTab,
+    context_tab: ContextTab,
+    rename_pending: bool,
     sidebar_visible: bool,
     panel_visible: bool,
     resizable: Entity<ResizableState>,
@@ -105,6 +115,8 @@ impl Workspace {
             picker_focus: None,
             recent_commands: Vec::new(),
             sidebar_tab: SidebarTab::Files,
+            context_tab: ContextTab::Backlinks,
+            rename_pending: false,
             sidebar_visible: state.sidebar_visible.unwrap_or(true),
             panel_visible: state.panel_visible.unwrap_or(true),
             state,
@@ -144,6 +156,8 @@ impl Workspace {
                 let search = cx.new(|cx| SearchService::new(vault.clone(), app_data_dir().join("index"), cx));
                 let search_sub = cx.observe(&search, |_, _, cx| cx.notify());
                 let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
+                let backlinks = cx.new(|cx| BacklinksView::new(search.clone(), cx));
+                let backlinks_sub = self.subscribe_backlinks(&backlinks, window, cx);
                 let view_sub =
                     cx.subscribe_in(&search_view, window, |this, _, event, window, cx| match event {
                         SearchViewEvent::Open { path, block_ord } => {
@@ -175,9 +189,10 @@ impl Workspace {
                     editor_sub: None,
                     search,
                     search_view,
+                    backlinks,
                     _watcher: watcher,
                     recent: Vec::new(),
-                    _subscriptions: vec![sub, search_sub, view_sub, watch_sub],
+                    _subscriptions: vec![sub, search_sub, view_sub, watch_sub, backlinks_sub],
                 });
                 self.error = None;
                 self.state.touch_vault(vault.root());
@@ -268,6 +283,7 @@ impl Workspace {
                 open.recent.retain(|p| p != &path);
                 open.recent.insert(0, path.clone());
                 open.recent.truncate(20);
+                open.backlinks.update(cx, |v, cx| v.set_note(Some(path.clone()), cx));
                 open.tree.update(cx, |t, cx| t.select(Some(path), cx));
                 editor.update(cx, |e, cx| e.focus_browse(window, cx));
             }
@@ -277,6 +293,28 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    /// 反链点击 → 打开来源；切换被保存保护否决时不改动当前编辑器。
+    fn subscribe_backlinks(
+        &mut self,
+        view: &Entity<BacklinksView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(view, window, |this, _, event: &BacklinkOpened, window, cx| {
+            let hit = &event.0;
+            this.open_note(hit.path.clone(), window, cx);
+            if let Some(editor) = this.open.as_ref().and_then(|o| o.editor.clone())
+                && editor.read(cx).path() == &hit.path
+                && !editor.update(cx, |e, cx| e.reveal_backlink(hit, cx))
+            {
+                window.push_notification(
+                    Notification::info("来源笔记已变化，已打开笔记；反链将在索引更新后刷新。"),
+                    cx,
+                );
+            }
+        })
     }
 
     /// 编辑器事件 → 工作区动作（索引、文件树、横幅上的请求）。
@@ -465,6 +503,7 @@ impl Workspace {
         if showing {
             open.editor = None;
             open.editor_sub = None;
+            open.backlinks.update(cx, |v, cx| v.set_note(None, cx));
         }
         open.tree.update(cx, |t, cx| {
             t.rescan();
@@ -747,6 +786,7 @@ impl Workspace {
         if was_open {
             open.editor = None;
             open.editor_sub = None;
+            open.backlinks.update(cx, |v, cx| v.set_note(None, cx));
         }
         let fs_path = open.vault.fs_path(path);
         match crate::trash::move_to_trash(&fs_path) {
@@ -797,8 +837,11 @@ impl Workspace {
         }
     }
 
-    /// 标题处改了名字：在同一目录下重命名文件（5.1）。链接同步更新是 M2 的事。
+    /// 后台准备全库链接改写计划；提交时校验当前编辑器仍是保存过的版本。
     fn rename_current(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.flush_before_leaving(window, cx) {
+            return;
+        }
         let Some(open) = self.open.as_ref() else { return };
         let Some(editor) = open.editor.clone() else { return };
         let old = editor.read(cx).path().clone();
@@ -809,26 +852,110 @@ impl Workspace {
                 return;
             }
         };
-        if open.vault.exists(&target) {
-            window.push_notification(
-                Notification::error(format!("已有同名笔记：{}", target.as_str())).title("重命名"),
-                cx,
-            );
+        if target == old {
             return;
         }
-        match open.vault.rename(&old, &target) {
-            Ok(()) => {
-                editor.update(cx, |e, cx| e.set_path(target.clone(), cx));
+        let vault = open.vault.clone();
+        let hash = editor.read(cx).index_snapshot().2.hash;
+        self.rename_pending = true;
+        let (from, to) = (old.clone(), target.clone());
+        let prepare =
+            cx.background_spawn(async move { aero_core::rename::RenamePlan::prepare(&vault, from, to) });
+        cx.spawn_in(window, async move |this, cx| {
+            let plan = match prepare.await {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.rename_pending = false;
+                        window.push_notification(
+                            Notification::error(format!("无法重命名：{error}")).title("重命名"),
+                            cx,
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            // 产品交互约定：超过 20 个其他文件的批量修改先确认实际影响数量。
+            if plan.other_files_changed() > 20 {
+                let Ok(answer) = this.update_in(cx, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        "重命名并更新链接？",
+                        Some(&format!(
+                            "将 {} 重命名为 {}，并更新 {} 个其他文件中的链接。",
+                            old,
+                            target,
+                            plan.other_files_changed()
+                        )),
+                        &["取消", "重命名并更新"],
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                if answer.await.ok() != Some(1) {
+                    let _ = this.update(cx, |this, cx| {
+                        this.rename_pending = false;
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.rename_pending = false;
+                let Some(open) = this.open.as_mut() else { return };
+                if open.editor.as_ref() != Some(&editor)
+                    || editor.read(cx).path() != &old
+                    || editor.read(cx).index_snapshot().2.hash != hash
+                    || !matches!(editor.read(cx).save_state(), SaveState::Clean | SaveState::Saved(_))
+                {
+                    window.push_notification(
+                        Notification::warning("笔记在准备期间已变化，重命名已取消，请保存后重试。"),
+                        cx,
+                    );
+                    return;
+                }
+                // 提交与编辑器换路径在同一次 UI 回调内完成，文件监听/自动保存不会在两者之间插入。
+                match plan.execute() {
+                    Ok(report) => {
+                        let message = format!(
+                            "已重命名为 {}，更新 {} 处链接。",
+                            target.file_name(),
+                            report.links_changed
+                        );
+                        open.search.update(cx, |s, cx| s.notes_renamed(report, cx));
+                        editor.update(cx, |e, cx| {
+                            e.set_path(target.clone(), cx);
+                            e.check_external(cx);
+                        });
+                        for recent in &mut open.recent {
+                            if *recent == old {
+                                *recent = target.clone();
+                            }
+                        }
+                        window.push_notification(Notification::info(message).title("重命名"), cx);
+                    }
+                    Err(error) => {
+                        // 回滚被外部改动阻止时仍跟随存活的文件，错误中带有恢复副本路径。
+                        if !open.vault.exists(&old) && open.vault.exists(&target) {
+                            editor.update(cx, |e, cx| e.set_path(target.clone(), cx));
+                        }
+                        editor.update(cx, |e, cx| e.check_external(cx));
+                        open.search.update(cx, |s, cx| s.resync(cx));
+                        window.push_notification(Notification::error(error.to_string()).title("重命名"), cx);
+                    }
+                }
+                let current = editor.read(cx).path().clone();
+                open.backlinks.update(cx, |v, cx| v.set_note(Some(current.clone()), cx));
                 open.tree.update(cx, |t, cx| {
                     t.rescan();
-                    t.select(Some(target.clone()), cx);
+                    t.select(Some(current), cx);
                 });
-                open.search.update(cx, |s, cx| s.note_renamed(old, target, cx));
                 cx.notify();
-            }
-            Err(err) => window
-                .push_notification(Notification::error(format!("无法重命名：{err}")).title("重命名"), cx),
-        }
+            });
+        })
+        .detach();
     }
 
     /// 离开当前 vault（退出 / 关闭 / 切换）前落盘。这里没有窗口可以提示，冲突副本只进日志。
@@ -847,6 +974,10 @@ impl Workspace {
     }
 
     fn flush_before_leaving(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.rename_pending {
+            window.push_notification(Notification::warning("正在准备重命名，请稍后再试。").title("Aero"), cx);
+            return false;
+        }
         let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) else { return true };
         if editor.read(cx).save_state() == &SaveState::Saving {
             window.push_notification(Notification::warning("正在保存，请稍后再试。").title("Aero"), cx);
@@ -951,6 +1082,7 @@ impl Workspace {
         let Some(open) = self.open.as_mut() else { return };
         open.editor = None;
         open.editor_sub = None;
+        open.backlinks.update(cx, |v, cx| v.set_note(None, cx));
         open.tree.update(cx, |t, cx| t.select(None, cx));
         self.focus_handle.focus(window, cx);
         cx.notify();
@@ -1124,6 +1256,35 @@ impl Workspace {
             .child(div().flex_1().min_h(px(0.)).child(body))
     }
 
+    fn render_context(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
+        let (background, border) = (cx.theme().sidebar, cx.theme().sidebar_border);
+        let body = match self.context_tab {
+            ContextTab::Backlinks => open.backlinks.clone().into_any_element(),
+            ContextTab::Outline => self.render_outline(open, cx).into_any_element(),
+        };
+        v_flex()
+            .size_full()
+            .bg(background)
+            .border_l_1()
+            .border_color(border)
+            .child(
+                div().px_2().py_2().child(
+                    TabBar::new("context-tabs")
+                        .segmented()
+                        .w_full()
+                        .xsmall()
+                        .selected_index(if self.context_tab == ContextTab::Backlinks { 0 } else { 1 })
+                        .children(["反链", "大纲"])
+                        .on_click(cx.listener(|this, ix, _, cx| {
+                            this.context_tab =
+                                if *ix == 0 { ContextTab::Backlinks } else { ContextTab::Outline };
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(div().flex_1().min_h(px(0.)).child(body))
+    }
+
     fn render_outline(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
@@ -1159,32 +1320,18 @@ impl Workspace {
             })
             .collect();
         let empty = rows.is_empty();
-        v_flex()
-            .size_full()
-            .bg(theme.sidebar)
-            .border_l_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                h_flex()
-                    .h(px(40.))
-                    .px_3()
-                    .items_center()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child("大纲"),
-            )
-            .child(
-                v_flex()
-                    .id("outline-rows")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .px_1()
-                    .overflow_y_scroll()
-                    .children(rows)
-                    .when(empty, |el| {
-                        el.child(div().px_3().py_2().text_xs().text_color(muted).child("文档里还没有标题。"))
-                    }),
-            )
+        v_flex().size_full().child(
+            v_flex()
+                .id("outline-rows")
+                .flex_1()
+                .min_h(px(0.))
+                .px_1()
+                .overflow_y_scroll()
+                .children(rows)
+                .when(empty, |el| {
+                    el.child(div().px_3().py_2().text_xs().text_color(muted).child("文档里还没有标题。"))
+                }),
+        )
     }
 
     fn render_editor_area(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1324,7 +1471,7 @@ impl Render for Workspace {
                                 .size(px(PANEL_WIDTH))
                                 .size_range(px(220.)..px(480.))
                                 .visible(self.panel_visible)
-                                .child(self.render_outline(open, cx)),
+                                .child(self.render_context(open, cx)),
                         ),
                 )
                 .child(self.render_status_bar(open, cx))
@@ -1393,6 +1540,9 @@ fn note_path_in(dir: &str, name: &str) -> Result<VaultPath, String> {
     if name.contains(['/', '\\']) {
         return Err("名字里不能有 / 或 \\".into());
     }
+    if name.chars().any(char::is_control) {
+        return Err("名字里不能有换行或控制字符".into());
+    }
     if name.starts_with('.') {
         return Err("名字不能以 . 开头".into());
     }
@@ -1447,7 +1597,8 @@ mod tests {
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 
-    use super::{SidebarTab, VaultSession, Workspace};
+    use super::{ContextTab, SidebarTab, VaultSession, Workspace};
+    use crate::backlinks::BacklinksView;
     use crate::editor::Editor;
     use crate::file_tree::FileTree;
     use crate::paths::PersistedState;
@@ -1477,6 +1628,8 @@ mod tests {
                 let tree = cx.new(|cx| FileTree::new(vault.clone(), cx));
                 let search = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
                 let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
+                let backlinks = cx.new(|cx| BacklinksView::new(search.clone(), cx));
+                backlinks.update(cx, |v, cx| v.set_note(Some(VaultPath::new("a.md").unwrap()), cx));
                 let watcher = cx.new(|cx| VaultWatcher::new(vault.clone(), cx));
                 VaultSession {
                     vault,
@@ -1485,6 +1638,7 @@ mod tests {
                     editor_sub: None,
                     search,
                     search_view,
+                    backlinks,
                     _watcher: watcher,
                     recent: vec![],
                     _subscriptions: vec![],
@@ -1499,6 +1653,8 @@ mod tests {
                 picker_focus: None,
                 recent_commands: vec![],
                 sidebar_tab: SidebarTab::Files,
+                context_tab: ContextTab::Backlinks,
+                rename_pending: false,
                 sidebar_visible: true,
                 panel_visible: true,
                 resizable: cx.new(|_| Default::default()),
@@ -1514,6 +1670,10 @@ mod tests {
             if let Some(editor) = editor {
                 let sub = w.subscribe_editor(&editor, window, cx);
                 w.open.as_mut().unwrap().editor_sub = Some(sub);
+            }
+            if let Some(view) = w.open.as_ref().map(|o| o.backlinks.clone()) {
+                let sub = w.subscribe_backlinks(&view, window, cx);
+                w.open.as_mut().unwrap()._subscriptions.push(sub);
             }
         });
         (dir, data, workspace)
@@ -1561,6 +1721,9 @@ mod tests {
             workspace.update(cx, |w, cx| {
                 w.open_note(VaultPath::new("b.md").unwrap(), window, cx);
                 assert_eq!(w.open.as_ref().unwrap().editor.as_ref(), Some(&editor));
+                w.rename_current("should-not-rename".into(), window, cx);
+                assert_eq!(editor.read(cx).path(), &long_path);
+                assert!(!w.rename_pending, "failed save must prevent rename preparation");
                 w.on_close_vault(&crate::actions::CloseVault, window, cx);
                 assert!(w.open.is_some());
                 w.open_vault(other_vault.path(), window, cx);
@@ -1836,6 +1999,177 @@ mod tests {
             );
             assert_eq!(workspace.read(cx).recent_commands, ["undo", "redo", "heading-2"]);
         });
+    }
+
+    #[gpui_kit::test]
+    fn rename_updates_links_editor_tree_search_and_backlinks(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Target\n\n自己 [[a]]\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let (search, view, editor, tree) = cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.search.clone(), open.backlinks.clone(), open.editor.clone().unwrap(), open.tree.clone())
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        std::fs::write(dir.path().join("b.md"), "引用 [[a#Target|别名]]\n").unwrap();
+        // b 尚未索引；重命名不能依赖索引齐全。
+        workspace.update_in(cx, |w, window, cx| w.rename_current("新名字".into(), window, cx));
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));
+        let new = VaultPath::new("新名字.md").unwrap();
+        cx.update(|_, cx| {
+            assert_eq!(editor.read(cx).path(), &new);
+            assert_eq!(editor.read(cx).index_snapshot().1, "# Target\n\n自己 [[新名字]]\n");
+            assert!(tree.read(cx).contains(&new));
+            assert!(!tree.read(cx).contains(&VaultPath::new("a.md").unwrap()));
+        });
+        assert!(!dir.path().join("a.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.md")).unwrap(),
+            "引用 [[新名字#Target|别名]]\n"
+        );
+        wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).hits().len() == 1));
+        assert_eq!(hit_paths(cx, &search, "Target"), ["新名字.md"]);
+        // 后续输入/保存必须写新路径，不得复活旧文件。
+        editor.update_in(cx, |e, window, cx| e.start_writing(window, cx));
+        cx.simulate_input("追加正文");
+        editor.update_in(cx, |e, _, cx| e.save_now(cx));
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| matches!(editor.read(cx).save_state(), crate::editor::SaveState::Saved(_)))
+        });
+        assert!(!dir.path().join("a.md").exists());
+        assert!(std::fs::read_to_string(dir.path().join("新名字.md")).unwrap().contains("追加正文"));
+        cx.update(|_, cx| search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn rename_cancels_when_editing_continues_during_preparation(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Target\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.rename_current("new".into(), window, cx);
+            let editor = w.open.as_ref().unwrap().editor.clone().unwrap();
+            editor.update(cx, |e, cx| e.start_writing(window, cx));
+        });
+        cx.simulate_input("继续编辑");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));
+        assert!(dir.path().join("a.md").exists());
+        assert!(!dir.path().join("new.md").exists());
+        cx.update(|_, cx| {
+            let e = workspace.read(cx).open.as_ref().unwrap().editor.as_ref().unwrap().read(cx);
+            assert_eq!(e.path().as_str(), "a.md");
+            assert!(e.index_snapshot().1.contains("继续编辑"));
+        });
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn rename_large_batch_can_be_cancelled_before_any_file_changes(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Target\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        for i in 0..21 {
+            std::fs::write(dir.path().join(format!("source-{i}.md")), "[[a]]\n").unwrap();
+        }
+        workspace.update_in(cx, |w, window, cx| w.rename_current("new".into(), window, cx));
+        wait_until(cx, |cx| cx.has_pending_prompt());
+        assert!(cx.pending_prompt().unwrap().1.contains("21"));
+        assert!(dir.path().join("a.md").exists());
+        assert!(!dir.path().join("new.md").exists());
+        cx.simulate_prompt_answer("取消");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));
+        for i in 0..21 {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(format!("source-{i}.md"))).unwrap(),
+                "[[a]]\n"
+            );
+        }
+        assert!(dir.path().join("a.md").exists());
+        assert!(!dir.path().join("new.md").exists());
+        // 再次发起并接受，同一批引用全部更新。
+        workspace.update_in(cx, |w, window, cx| w.rename_current("new".into(), window, cx));
+        wait_until(cx, |cx| cx.has_pending_prompt());
+        cx.simulate_prompt_answer("重命名并更新");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));
+        assert!(!dir.path().join("a.md").exists());
+        assert!(dir.path().join("new.md").exists());
+        for i in 0..21 {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(format!("source-{i}.md"))).unwrap(),
+                "[[new]]\n"
+            );
+        }
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn backlinks_refresh_navigate_and_reject_stale_positions(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Target\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let (search, view) = cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.search.clone(), open.backlinks.clone())
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        let b = VaultPath::new("b.md").unwrap();
+        std::fs::write(dir.path().join("b.md"), "# 引用 [[a]]\n\n> 再次 [[a|目标]]\n").unwrap();
+        cx.update(|_, cx| search.update(cx, |s, cx| s.note_changed(b.clone(), cx)));
+        wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).hits().len() == 2));
+
+        // 从真实面板行点击到来源标题块。
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = cx.debug_bounds("backlink-0").expect("反链行已渲染");
+        cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let editor = workspace.read(cx).open.as_ref().unwrap().editor.as_ref().unwrap().read(cx);
+            assert_eq!(editor.path(), &b);
+            assert_eq!(editor.highlighted_block(), editor.headings().first().map(|(_, _, id)| *id));
+        });
+
+        // 切回目标；保存 / 外部更新后已有结果也需要刷新。
+        workspace.update_in(cx, |w, window, cx| w.open_note(VaultPath::new("a.md").unwrap(), window, cx));
+        wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).hits().len() == 2));
+        std::fs::write(dir.path().join("b.md"), "没有链接了\n").unwrap();
+        cx.update(|_, cx| search.update(cx, |s, cx| s.note_changed(b.clone(), cx)));
+        wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).hits().is_empty()));
+
+        std::fs::write(dir.path().join("b.md"), "# 来源\n\n[[a]]\n").unwrap();
+        cx.update(|_, cx| search.update(cx, |s, cx| s.note_changed(b.clone(), cx)));
+        wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).hits().len() == 1));
+        // 查询完成后、监听接到事件前内容改变：仍打开来源，但不闪烁错误块。
+        std::fs::write(dir.path().join("b.md"), "# 已改动\n\n前面多了一段\n\n[[a]]\n").unwrap();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = cx.debug_bounds("backlink-0").unwrap();
+        cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let editor = workspace.read(cx).open.as_ref().unwrap().editor.as_ref().unwrap().read(cx);
+            assert_eq!(editor.path(), &b);
+            assert!(editor.highlighted_block().is_none(), "stale position must not highlight another block");
+        });
+
+        // 连续切换及关闭不能被在途查询的旧结果覆盖。
+        workspace.update_in(cx, |w, window, cx| {
+            w.open_note(VaultPath::new("a.md").unwrap(), window, cx);
+            w.open_note(b, window, cx);
+            w.close_editor(window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(view.read(cx).hits().is_empty()));
     }
 
     /// 真实点击预览里的 wikilink（mouse down、一帧、mouse up——真机上两者之间必有重绘）：

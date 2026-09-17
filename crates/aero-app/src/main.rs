@@ -8,6 +8,7 @@
 //! - [`actions`]：快捷键总表（第 14 节）中 M1a 的部分
 
 mod actions;
+mod backlinks;
 mod branding;
 mod editor;
 mod file_tree;

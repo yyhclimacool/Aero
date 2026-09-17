@@ -18,6 +18,7 @@ pub mod document;
 pub mod index;
 pub mod links;
 pub mod parse;
+pub mod rename;
 pub mod text;
 pub mod vault;
 

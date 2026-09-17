@@ -257,23 +257,57 @@ impl Vault {
     }
 
     /// 重命名 / 移动一篇笔记；`<note>.assets/` 存在时一起搬（5.4）。目标已存在时拒绝，绝不覆盖。
-    /// 链接的同步更新是 M2 的事（方案 11 节），这里只动文件。
+    /// 这里只动文件；包含链接更新的操作使用 [`crate::rename::RenamePlan`]。
     pub fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<(), VaultError> {
         if from == to {
             return Ok(());
         }
         let (src, dst) = (self.fs_path(from), self.fs_path(to));
-        if dst.exists() {
-            return Err(VaultError::AlreadyExists(to.as_str().to_owned()));
-        }
+        self.validate_rename(from, to)?;
         if let Some(dir) = dst.parent() {
             fs::create_dir_all(dir).map_err(io_err(dir))?;
         }
-        fs::rename(&src, &dst).map_err(io_err(&src))?;
-        if let (Some(a), Some(b)) = (from.assets_dir(), to.assets_dir()) {
-            let (a, b) = (self.fs_path(&a), self.fs_path(&b));
-            if a.is_dir() && !b.exists() {
-                fs::rename(&a, &b).map_err(io_err(&a))?;
+        // create-only 发布新路径，目标在预检后被创建也不会被覆盖。
+        fs::hard_link(&src, &dst).map_err(io_err(&dst))?;
+        let assets = from
+            .assets_dir()
+            .zip(to.assets_dir())
+            .map(|(a, b)| (self.fs_path(&a), self.fs_path(&b)))
+            .filter(|(a, _)| a.is_dir());
+        if let Some((a, b)) = &assets {
+            if let Err(error) = fs::rename(a, b) {
+                let _ = fs::remove_file(&dst);
+                return Err(io_err(a)(error));
+            }
+        }
+        if let Err(error) = fs::remove_file(&src) {
+            if let Some((a, b)) = assets {
+                fs::rename(&b, &a).map_err(io_err(&b))?;
+            }
+            fs::remove_file(&dst).map_err(io_err(&dst))?;
+            return Err(io_err(&src)(error));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_rename(&self, from: &VaultPath, to: &VaultPath) -> Result<(), VaultError> {
+        let source = self.fs_path(from);
+        let meta = fs::symlink_metadata(&source).map_err(io_err(&source))?;
+        if !meta.is_file() {
+            return Err(VaultError::InvalidPath(from.to_string()));
+        }
+        let mut destinations = vec![to.clone()];
+        if let Some((a, b)) = from.assets_dir().zip(to.assets_dir())
+            && self.fs_path(&a).exists()
+        {
+            destinations.push(b);
+        }
+        for destination in destinations {
+            let path = self.fs_path(&destination);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => return Err(VaultError::AlreadyExists(destination.to_string())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err(&path)(e)),
             }
         }
         Ok(())

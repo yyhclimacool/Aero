@@ -430,6 +430,25 @@ impl Editor {
         self.reveal_block(id, cx);
     }
 
+    /// 反链来源定位：版本已经变化时拒绝使用旧位置。
+    pub fn reveal_backlink(&mut self, hit: &aero_index::Backlink, cx: &mut Context<Self>) -> bool {
+        if self.path != hit.path
+            || self.stamp.hash != hit.source_hash
+            || matches!(self.save_state, SaveState::Dirty | SaveState::Saving | SaveState::Failed(_))
+        {
+            return false;
+        }
+        let Some(unit) = self
+            .units
+            .iter()
+            .find(|unit| unit.range.start <= hit.range.start && hit.range.end <= unit.range.end)
+        else {
+            return false;
+        };
+        self.reveal_block(unit.id, cx);
+        true
+    }
+
     /// wikilink 标题片段跳转：按标题文本定位（与右侧大纲同源），找不到返回 false、什么都不动。
     /// 比对去掉行内标记（`**`、`` ` ``、`[[ ]]` 等）、忽略大小写与首尾空白；先找完全相等的，再退到去标记后相等的。
     pub fn reveal_heading(&mut self, heading: &str, cx: &mut Context<Self>) -> bool {

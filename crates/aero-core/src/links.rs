@@ -235,6 +235,27 @@ pub fn scan(src: &str) -> Vec<LinkSpan> {
 
 /// [`scan`] 的树版本：`root` 是用 [`crate::parse::comrak_options`] 解析 `src` 得到的（索引时与标签抽取共用一次解析）。
 pub(crate) fn scan_tree<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str) -> Vec<LinkSpan> {
+    scan_tree_impl(root, src, false)
+}
+
+/// 重命名时也扫描笔记嵌入；普通索引与预览仍由 [`scan`] 排除嵌入。
+pub(crate) fn scan_for_rename(src: &str) -> Vec<LinkSpan> {
+    if !src.contains("[[") {
+        return Vec::new();
+    }
+    // comrak 把 `![[...]]` 当成普通 Text。用等长的普通字符替换前导 ! 来识别其中
+    // 的 wikilink；代码、数学、HTML、链接 URL 等上下文仍由解析器排除，字节位置不变。
+    let mut surrogate = src.as_bytes().to_vec();
+    for (i, _) in src.match_indices("![[") {
+        surrogate[i] = b'x';
+    }
+    let surrogate = String::from_utf8(surrogate).expect("only ASCII bytes replaced");
+    let arena = Arena::new();
+    let root = parse_document(&arena, &surrogate, &crate::parse::comrak_options());
+    scan_tree_impl(root, src, true)
+}
+
+fn scan_tree_impl<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str, embeds: bool) -> Vec<LinkSpan> {
     if !src.contains("[[") {
         return Vec::new();
     }
@@ -247,7 +268,7 @@ pub(crate) fn scan_tree<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str) -> 
         let Some(cand) = sourcepos_range(&line_starts, src, node.data().sourcepos) else { continue };
         let Some(range) = anchor(src, cand) else { continue };
         // `![[x]]`：comrak 产出 Text("!") + WikiLink，靠前导 `!` 排除嵌入
-        if range.start > 0 && src.as_bytes()[range.start - 1] == b'!' {
+        if !embeds && range.start > 0 && src.as_bytes()[range.start - 1] == b'!' {
             continue;
         }
         let inner = &src[range.start + 2..range.end - 2];
@@ -271,6 +292,23 @@ pub(crate) fn scan_tree<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str) -> 
     out.sort_by_key(|s| s.range.start);
     out.dedup_by_key(|s| s.range.start);
     out
+}
+
+/// 只替换 `[[ target #fragment | alias ]]` 中的 target，保留所有空白、转义和其他字节。
+pub(crate) fn target_range(src: &str, span: &LinkSpan) -> Range<usize> {
+    let inner = &src[span.range.start + 2..span.range.end - 2];
+    let (head, _) = split_alias(inner);
+    let (target, _) = split_unescaped(head, '#');
+    let start = span.range.start + 2 + target.len() - target.trim_start().len();
+    start..start + target.trim().len()
+}
+
+pub(crate) fn escape_target(target: &str) -> Option<String> {
+    // `|`（包括 `\|`）总是别名分隔，当前语法无法表示包含它的目标。
+    if target.contains('|') || target.chars().any(char::is_control) {
+        return None;
+    }
+    Some(target.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]").replace('#', "\\#"))
 }
 
 /// 未解析目标要创建的文件路径：相对链接所在笔记目录，`[[foo.md]]` 与 `[[foo]]` 都建 `<dir>/foo.md`。

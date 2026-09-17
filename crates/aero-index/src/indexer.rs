@@ -36,6 +36,18 @@ pub struct SearchHit {
     pub score: f32,
 }
 
+/// 一次笔记间引用；同一块内多次引用分别列出。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Backlink {
+    pub path: VaultPath,
+    pub title: String,
+    pub range: std::ops::Range<usize>,
+    pub body: String,
+    pub label: String,
+    /// 点击前校验来源是否仍是查询时的版本，避免旧偏移定位到其他块。
+    pub source_hash: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncReport {
     pub indexed: usize,
@@ -200,6 +212,41 @@ impl Indexer {
 
     pub fn fts(&self) -> &dyn FullTextIndex {
         self.fts.as_ref()
+    }
+
+    /// 只读取已解析入链；每篇来源最多读取、解析一次。不修改索引或笔记。
+    pub fn backlinks(&self, path: &VaultPath, limit: usize) -> Result<Vec<Backlink>, IndexerError> {
+        let rows = self.meta.backlinks(path.as_str(), limit)?;
+        let mut source = None;
+        let mut doc = None;
+        let mut hits = Vec::new();
+        for row in rows {
+            let path = VaultPath::new(&row.source.path)?;
+            if source.as_ref() != Some(&path) {
+                doc = match self.vault.read(&path) {
+                    Ok((doc, stamp)) if stamp.hash == row.source.stamp.hash => Some(doc),
+                    // 文件监听尚未追上磁盘变化时，不展示位置已经失效的结果。
+                    Ok(_) => None,
+                    Err(VaultError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                        None
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                source = Some(path.clone());
+            }
+            let Some(doc) = &doc else { continue };
+            let Some(block) = doc.block_at(row.range.start) else { continue };
+            let text = doc.slice(row.range.clone()).to_string();
+            hits.push(Backlink {
+                path,
+                title: row.source.title,
+                range: row.range,
+                body: aero_core::index::plain_text(&doc.block_text(block), &block.kind),
+                label: aero_core::index::plain_text(&text, &aero_core::BlockKind::Paragraph),
+                source_hash: row.source.stamp.hash,
+            });
+        }
+        Ok(hits)
     }
 
     /// 与磁盘对齐：新文件与指纹变了的文件重索引，消失的文件删掉。`progress(done, total)` 每处理一篇调一次。
@@ -487,7 +534,7 @@ impl Indexer {
     }
 
     /// 重命名 / 移动：`note_id` 不变；块里存的 `path` / `title` 要跟着改，所以重写这些块。
-    /// 按旧名字解析到它的链接行退回未解析（与预览点击时的解析结果保持一致；M2 的改名同步会改写链接文本）。
+    /// 按旧名字解析到它的链接行退回未解析；调用方随后重索引 `RenamePlan` 已改写的来源笔记。
     pub fn rename_note(&mut self, old: &VaultPath, new: &VaultPath) -> Result<(), IndexerError> {
         let Some(row) = self.meta.note_by_path(old.as_str())? else {
             // 之前没索引过：当新文件处理
@@ -653,6 +700,83 @@ mod tests {
 
     fn paths(hits: &[SearchHit]) -> Vec<(String, u32)> {
         hits.iter().map(|h| (h.path.as_str().to_owned(), h.block_ord)).collect()
+    }
+
+    #[test]
+    fn backlinks_group_sources_preserve_occurrences_and_skip_non_links() {
+        let (dir, mut ix) = setup(&[
+            ("target.md", "# Target\n\n[[target]] [[#Target]]\n"),
+            ("z.md", "---\ntitle: 来源乙\n---\n\n> 引用 [[target#Target|别名]]\n"),
+            (
+                "a.md",
+                "\u{feff}# 来源甲\r\n\r\n中文 [[TARGET]] 与 [[target|同一笔记]]\r\n\r\n`[[target]]` ![[target]] [[missing]]\r\n\r\n```\r\n[[target]]\r\n```\r\n",
+            ),
+        ]);
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        let target = VaultPath::new("target.md").unwrap();
+        let hits = ix.backlinks(&target, 20).unwrap();
+        assert_eq!(hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), ["a.md", "a.md", "z.md"]);
+        assert_eq!(hits.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(), ["TARGET", "同一笔记", "别名"]);
+        assert_eq!(hits[2].title, "来源乙");
+        assert!(hits[0].body.contains("中文 TARGET 与 同一笔记"));
+        assert!(hits[2].body.contains("引用 别名"));
+        for hit in &hits {
+            let (doc, stamp) = ix.vault.read(&hit.path).unwrap();
+            assert_eq!(hit.source_hash, stamp.hash);
+            assert!(doc.slice(hit.range.clone()).to_string().starts_with("[["));
+        }
+        assert_eq!(ix.backlinks(&target, 1).unwrap(), hits[..1]);
+        assert!(ix.backlinks(&target, 0).unwrap().is_empty());
+        assert!(ix.backlinks(&VaultPath::new("absent.md").unwrap(), 20).unwrap().is_empty());
+
+        // 监听尚未处理的改动 / 删除不能把旧偏移用于新内容。
+        std::fs::write(dir.path().join("a.md"), "完全不同的内容\n").unwrap();
+        std::fs::remove_file(dir.path().join("z.md")).unwrap();
+        assert!(ix.backlinks(&target, 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn backlinks_follow_source_edits_renames_and_target_resolution() {
+        let (dir, mut ix) = setup(&[("a.md", "见 [[target]] 与 [[目标标题]]\n")]);
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        let target = VaultPath::new("target.md").unwrap();
+        assert!(ix.backlinks(&target, 20).unwrap().is_empty());
+        std::fs::write(dir.path().join("target.md"), "---\ntitle: 目标标题\n---\n正文\n").unwrap();
+        ix.index_note(&target).unwrap();
+        assert_eq!(ix.backlinks(&target, 20).unwrap().len(), 2);
+
+        let a = VaultPath::new("a.md").unwrap();
+        let renamed = VaultPath::new("renamed.md").unwrap();
+        ix.vault.rename(&a, &renamed).unwrap();
+        ix.rename_note(&a, &renamed).unwrap();
+        assert!(ix.backlinks(&target, 20).unwrap().iter().all(|h| h.path == renamed));
+        std::fs::write(dir.path().join("renamed.md"), "只有 [[target]]\n").unwrap();
+        ix.index_note(&renamed).unwrap();
+        assert_eq!(ix.backlinks(&target, 20).unwrap().len(), 1);
+
+        std::fs::remove_file(dir.path().join("target.md")).unwrap();
+        ix.remove_note(&target).unwrap();
+        assert!(ix.backlinks(&target, 20).unwrap().is_empty());
+        std::fs::write(dir.path().join("target.md"), "重建\n").unwrap();
+        ix.index_note(&target).unwrap();
+        assert_eq!(ix.backlinks(&target, 20).unwrap().len(), 1);
+        std::fs::remove_file(dir.path().join("renamed.md")).unwrap();
+        ix.remove_note(&renamed).unwrap();
+        assert!(ix.backlinks(&target, 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn backlinks_exclude_ambiguous_targets() {
+        let (_dir, mut ix) = setup(&[
+            ("a.md", "[[target]] [[x/target]] [[Shared]]\n"),
+            ("x/target.md", "---\ntitle: Shared\n---\nX\n"),
+            ("y/target.md", "---\ntitle: Shared\n---\nY\n"),
+        ]);
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        let hits = ix.backlinks(&VaultPath::new("x/target.md").unwrap(), 20).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].label, "x/target");
+        assert!(ix.backlinks(&VaultPath::new("y/target.md").unwrap(), 20).unwrap().is_empty());
     }
 
     #[test]
