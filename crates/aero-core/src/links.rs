@@ -303,7 +303,8 @@ pub(crate) fn target_range(src: &str, span: &LinkSpan) -> Range<usize> {
     start..start + target.trim().len()
 }
 
-pub(crate) fn escape_target(target: &str) -> Option<String> {
+/// 将目标转义为 wikilink 源码；无法表达的分隔符或控制字符返回 None。
+pub fn escape_target(target: &str) -> Option<String> {
     // `|`（包括 `\|`）总是别名分隔，当前语法无法表示包含它的目标。
     if target.contains('|') || target.chars().any(char::is_control) {
         return None;

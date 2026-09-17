@@ -341,6 +341,12 @@ impl Workspace {
                 this.on_link_clicked(target.clone(), fragment.clone(), window, cx)
             }
             EditorEvent::CloseRequested => this.close_editor(window, cx),
+            EditorEvent::LinkCompletionRequested(generation) => {
+                let Some(open) = this.open.as_ref() else { return };
+                let notes = open.search.read(cx).completion_notes(open.vault.clone(), cx);
+                let recent = open.recent.clone();
+                editor.update(cx, |e, cx| e.load_wiki_notes(*generation, notes, recent, cx));
+            }
         })
     }
 
@@ -1998,6 +2004,37 @@ mod tests {
                 "most recent available command is undo"
             );
             assert_eq!(workspace.read(cx).recent_commands, ["undo", "redo", "heading-2"]);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn wiki_completion_uses_workspace_catalog_when_index_is_unavailable(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Source\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let editor = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            // 停掉索引后再创建文件，验证从磁盘补全标题，而非依赖同步时机。
+            open.search.read(cx).close_blocking();
+            open.editor.clone().unwrap()
+        });
+        std::fs::write(dir.path().join("new.md"), "---\ntitle: 尚未索引\n---\n\nbody\n").unwrap();
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                let id = e.headings()[0].2;
+                e.focus_block(id, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.simulate_input(" [[尚未索引");
+        wait_until(cx, |cx| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds("wiki-row-0").is_some()
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| {
+            assert_eq!(editor.read(cx).index_snapshot().1, "# Source [[new]]\n");
         });
     }
 

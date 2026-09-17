@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aero_core::{Vault, VaultPath};
-use gpui_kit::{Entity, TestAppContext, VisualTestContext};
+use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 
 use super::Editor;
 
@@ -37,6 +37,219 @@ fn open(cx: &mut TestAppContext, body: &str) -> (tempfile::TempDir, Arc<Vault>, 
     let (v, p) = (vault.clone(), path.clone());
     let (editor, _) = cx.add_window_view(|_, cx| Editor::new(v, p, doc, stamp, cx));
     (dir, vault, path, editor)
+}
+
+fn wiki_catalog(editor: &Entity<Editor>, recent: &[&str], cx: &mut VisualTestContext) {
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            let notes = e
+                .vault
+                .notes()
+                .unwrap()
+                .into_iter()
+                .map(|p| {
+                    let title = e.vault.read(&p).unwrap().0.title_or(p.stem());
+                    (p, title)
+                })
+                .collect();
+            let generation = e.wiki.as_ref().expect("wiki menu").generation;
+            let task = cx.background_spawn(async move { Ok(notes) });
+            e.load_wiki_notes(
+                generation,
+                task,
+                recent.iter().map(|p| VaultPath::new(p).unwrap()).collect(),
+                cx,
+            );
+        })
+    });
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn wiki_keyboard_completion_alias_and_undo(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "正文\n");
+    std::fs::write(dir.path().join("b.md"), "---\ntitle: 知识库😀\n---\n").unwrap();
+    std::fs::write(dir.path().join("z.md"), "Z\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[");
+    wiki_catalog(&editor, &["z.md", "b.md"], cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let m = e.wiki.as_ref().unwrap();
+        assert_eq!(m.catalog.as_ref().unwrap().notes[m.matches[0]].0.as_str(), "z.md");
+        assert!(e.slash.is_none());
+    });
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "正文 [[b]]\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "正文 [[\n");
+    cx.simulate_keystrokes("cmd-shift-z");
+    assert_eq!(text(&editor, cx), "正文 [[b]]\n");
+    cx.simulate_input(" [[知");
+    wiki_catalog(&editor, &[], cx);
+    cx.simulate_input("识");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let m = e.wiki.as_ref().unwrap();
+        assert!(m.catalog.is_some(), "typing filters the loaded catalog without reloading");
+        assert_eq!(m.trigger.query, "知识");
+        assert_eq!(m.matches.len(), 1);
+    });
+    cx.simulate_keystrokes("shift-enter");
+    assert_eq!(text(&editor, cx), "正文 [[b]] [[b|知识库😀]]\n");
+    cx.simulate_input("自定义");
+    assert_eq!(text(&editor, cx), "正文 [[b]] [[b|自定义]]\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "正文 [[b]] [[b|知识库😀]]\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "正文 [[b]] [[知识\n");
+}
+
+#[gpui_kit::test]
+fn wiki_mouse_completion_reuses_closing_brackets_and_preserves_caret(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "正文 [[]] 后\n");
+    std::fs::create_dir(dir.path().join("x")).unwrap();
+    std::fs::create_dir(dir.path().join("y")).unwrap();
+    std::fs::write(dir.path().join("x/同名.md"), "X\n").unwrap();
+    std::fs::write(dir.path().join("y/同名.md"), "Y\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        editor.read(cx).focused.as_ref().unwrap().textarea.clone().update(cx, |ta, cx| {
+            let at = "正文 [[".len();
+            ta.set_selected_range(at..at, cx);
+        });
+    });
+    cx.simulate_input("y/同");
+    wiki_catalog(&editor, &[], cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let row = cx.debug_bounds("wiki-row-0").unwrap();
+    cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "正文 [[y/同名]] 后\n");
+    cx.simulate_input("!");
+    assert_eq!(text(&editor, cx), "正文 [[y/同名]]! 后\n");
+}
+
+#[gpui_kit::test]
+fn wiki_loading_failure_escape_and_stale_catalog(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "body\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[missing");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[missing\n", "loading is not an empty result");
+    let old = cx.update(|_, cx| editor.read(cx).wiki.as_ref().unwrap().generation);
+    cx.simulate_keystrokes("escape");
+    cx.update(|_, cx| assert!(editor.read(cx).focused.is_some()));
+    cx.simulate_input("2");
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            let task = cx.background_spawn(async { Ok(vec![]) });
+            e.load_wiki_notes(old, task, vec![], cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            let m = e.wiki.as_ref().unwrap();
+            assert!(m.catalog.is_none(), "old reply must not replace the new menu");
+            let generation = m.generation;
+            let task = cx.background_spawn(async { Err("test failure".into()) });
+            e.load_wiki_notes(generation, task, vec![], cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[missing2\n");
+    wiki_catalog(&editor, &[], cx);
+    cx.simulate_keystrokes("tab");
+    assert_eq!(text(&editor, cx), "body [[missing2]]\n");
+    cx.update(|_, cx| assert!(!editor.read(cx).vault.exists(&VaultPath::new("missing2.md").unwrap())));
+}
+
+#[gpui_kit::test]
+fn wiki_cursor_selection_and_removed_target_do_not_use_stale_menu(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "body\n");
+    std::fs::write(dir.path().join("b.md"), "B\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[b");
+    wiki_catalog(&editor, &[], cx);
+    std::fs::remove_file(dir.path().join("b.md")).unwrap();
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[b\n");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.wiki.as_ref().unwrap().error.is_some());
+        e.focused.as_ref().unwrap().textarea.clone().update(cx, |ta, cx| ta.set_selected_range(0..4, cx));
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(editor.read(cx).wiki.is_none()));
+    cx.simulate_input("new");
+    assert_eq!(text(&editor, cx), "new [[b\n");
+}
+
+#[gpui_kit::test]
+fn wiki_ime_preedit_does_not_confirm_or_write_source(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let (dir, _vault, _path, editor) = open(cx, "正文\n");
+    std::fs::write(dir.path().join("中文.md"), "Z\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[");
+    wiki_catalog(&editor, &["中文.md"], cx);
+    let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|window, cx| {
+        input.update(cx, |ta, cx| ta.replace_and_mark_text_in_range(None, "zhong", None, window, cx))
+    });
+    cx.run_until_parked();
+    // 平台一般将候选键交给 IME；即使动作冒泡也不能确认旧补全。
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| e.on_split_block(&crate::actions::SplitBlock, window, cx))
+    });
+    assert_eq!(text(&editor, cx), "正文 [[\n");
+    cx.update(|window, cx| input.update(cx, |ta, cx| ta.replace_text_in_range(None, "中文", window, cx)));
+    cx.run_until_parked();
+    wiki_catalog(&editor, &[], cx);
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "正文 [[中文]]\n");
+}
+
+#[gpui_kit::test]
+fn wiki_completion_in_callouts_and_tables_preserves_markdown(cx: &mut TestAppContext) {
+    let source = "> [!note]\n> 正文\n\n| A |\n| --- |\n| 内容 |\n\n```md\n代码\n```\n\n$$\n公式\n$$\n";
+    let (dir, _vault, _path, editor) = open(cx, source);
+    std::fs::write(dir.path().join("b.md"), "---\ntitle: 知识\n---\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for (ix, needle) in [(0, "正文"), (1, "内容"), (2, "代码"), (3, "公式")] {
+        focus_unit(&editor, ix, cx);
+        cx.update(|_, cx| {
+            editor.read(cx).focused.as_ref().unwrap().textarea.clone().update(cx, |ta, cx| {
+                let at = ta.value().find(needle).unwrap() + needle.len();
+                ta.set_selected_range(at..at, cx);
+            })
+        });
+        cx.simulate_input(" [[知识");
+        if ix < 2 {
+            wiki_catalog(&editor, &[], cx);
+            cx.simulate_keystrokes("shift-enter");
+            cx.simulate_input("别名");
+        } else {
+            cx.update(|_, cx| assert!(editor.read(cx).wiki.is_none()));
+        }
+    }
+    assert_eq!(
+        text(&editor, cx),
+        source
+            .replace("正文", "正文 [[b|别名]]")
+            .replace("内容", "内容 [[b\\|别名]]")
+            .replace("代码", "代码 [[知识")
+            .replace("公式", "公式 [[知识")
+    );
+    cx.update(|_, cx| assert_eq!(editor.read(cx).units.len(), 4, "alias must not split a table cell"));
 }
 
 #[gpui_kit::test]

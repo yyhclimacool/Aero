@@ -16,6 +16,8 @@ mod slash;
 mod tests;
 mod text_ops;
 mod units;
+mod wiki;
+mod wiki_ui;
 
 use std::ops::Range;
 use std::path::Path;
@@ -33,8 +35,8 @@ use gpui_kit::*;
 
 use crate::actions::{
     BlockDown, BlockUp, BlurEditor, ConvertBlock, CopySelectedBlocks, CutSelectedBlocks,
-    DeleteSelectedBlocks, DocRedo, DocUndo, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp, MenuConfirm,
-    SelectBlockDown, SelectBlockUp, SplitBlock,
+    DeleteSelectedBlocks, DocRedo, DocUndo, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp, LinkAlias,
+    MenuConfirm, SelectBlockDown, SelectBlockUp, SplitBlock,
 };
 use ops::{BlockType, Plan};
 use slash::SlashAction;
@@ -80,6 +82,8 @@ pub enum EditorEvent {
     },
     /// 横幅上的"关闭"：工作区丢掉这个编辑器
     CloseRequested,
+    /// 工作区提供本次菜单的笔记目录；返回时按 generation 丢弃旧请求。
+    LinkCompletionRequested(u64),
     /// 异步保存成功落盘；工作区据此增量更新索引
     Saved,
 }
@@ -172,6 +176,7 @@ struct Focused {
     enter_newline: bool,
     textarea: Entity<TextareaState>,
     _subscription: Subscription,
+    _cursor_subscription: Subscription,
 }
 
 pub struct Editor {
@@ -189,6 +194,8 @@ pub struct Editor {
     picker_open: bool,
     title_edit: Option<TitleEdit>,
     slash: Option<SlashMenu>,
+    wiki: Option<wiki::Menu>,
+    wiki_generation: u64,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
     /// 下一帧把这个块滚到合适位置（搜索命中定位、块选区移动）
@@ -246,6 +253,8 @@ impl Editor {
             picker_open: false,
             title_edit: None,
             slash: None,
+            wiki: None,
+            wiki_generation: 0,
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             reveal: None,
@@ -272,6 +281,7 @@ impl Editor {
         self.picker_open = open;
         if open {
             self.slash = None;
+            self.wiki = None;
         } else {
             // 同帧恢复再转移焦点可能不触发 Blur，下一帧按命令执行后的实际焦点收尾。
             cx.on_next_frame(window, |this, window, cx| {
@@ -306,6 +316,7 @@ impl Editor {
 
     /// 文件已被工作区重命名 / 移动：换掉路径，内容与脏状态不变。
     pub fn set_path(&mut self, path: VaultPath, cx: &mut Context<Self>) {
+        self.wiki = None;
         self.path = path;
         cx.emit(EditorEvent::Changed);
         cx.notify();
@@ -651,6 +662,17 @@ impl Editor {
         let cursor = clamp_to_char_boundary(&text, cursor.min(text.len()));
         let textarea = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 100_000));
         let subscription = cx.subscribe_in(&textarea, window, Self::on_input_event);
+        let cursor_subscription = cx.observe_in(&textarea, window, |this, textarea, _, cx| {
+            if this.focused.as_ref().is_some_and(|f| f.textarea == textarea)
+                && this.wiki.is_some()
+                && let Some(f) = &this.focused
+                && textarea.read(cx).value().as_ref() == this.doc.slice(f.range.clone()).to_string()
+                && !this.wiki_is_current(cx)
+            {
+                this.wiki = None;
+                cx.notify();
+            }
+        });
         textarea.update(cx, |ta, cx| {
             ta.set_value(text, window, cx);
             ta.set_selected_range(cursor..cursor, cx);
@@ -659,13 +681,22 @@ impl Editor {
         self.last_edit_at = None;
         log::debug!("focus {:?} id={:?} cursor={cursor}", range, id);
         self.selection = None;
-        self.focused = Some(Focused { range, id, enter_newline, textarea, _subscription: subscription });
+        self.wiki = None;
+        self.focused = Some(Focused {
+            range,
+            id,
+            enter_newline,
+            textarea,
+            _subscription: subscription,
+            _cursor_subscription: cursor_subscription,
+        });
         cx.notify();
     }
 
     /// 退出编辑态（不改焦点）。失焦即落盘（10.1）。
     fn exit_edit(&mut self, cx: &mut Context<Self>) {
         self.slash = None;
+        self.wiki = None;
         if self.focused.take().is_some() {
             self.last_edit_at = None;
             self.save_now(cx);
@@ -677,6 +708,14 @@ impl Editor {
     /// 编辑态里的 Esc（文本控件的 `Escape` 冒泡到这里）：先关菜单 / 标题编辑；否则退出编辑并选中刚才的块
     /// （`ui_design.md` 6："Esc 两段式退出"）。光标在没有块的空位上时直接回浏览态。
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wiki_composing(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if self.wiki.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.title_edit.is_some() {
             self.cancel_title_edit(true, window, cx);
             return;
@@ -705,6 +744,10 @@ impl Editor {
     }
 
     fn blur_to_browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wiki.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.title_edit.is_some() {
             self.cancel_title_edit(true, window, cx);
             return;
@@ -919,6 +962,7 @@ impl Editor {
         f.range.end = (f.range.end as isize + delta).max(f.range.start as isize) as usize;
         self.last_edit_at = Some(now);
         self.after_doc_change(cx);
+        self.update_wiki(cx);
         self.update_slash(cx);
     }
 
@@ -926,6 +970,10 @@ impl Editor {
 
     /// 每次控件文本变化后：光标前有 `/query` 就开着菜单并实时过滤，否则关掉。
     fn update_slash(&mut self, cx: &mut Context<Self>) {
+        if self.wiki.is_some() {
+            self.slash = None;
+            return;
+        }
         let Some((text, cursor)) = self.textarea_text_and_cursor(cx) else { return };
         let Some(f) = self.focused.as_ref() else { return };
         // 代码块等源码单位里 `/` 只是字符
@@ -1033,6 +1081,13 @@ impl Editor {
     }
 
     fn on_menu_confirm(&mut self, _: &MenuConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wiki_composing(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if self.confirm_wiki(None, false, window, cx) {
+            return;
+        }
         if self.slash.is_some() {
             self.slash_confirm(None, window, cx);
         } else {
@@ -1091,6 +1146,13 @@ impl Editor {
     /// ⏎：段落末新建段落、段落中拆块；列表项续行、空项退出列表（6、7.3）。
     /// 代码块等多行单位 propagate，让文本控件自己插入换行。
     fn on_split_block(&mut self, _: &SplitBlock, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wiki_composing(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if self.confirm_wiki(None, false, window, cx) {
+            return;
+        }
         if self.slash.is_some() {
             self.slash_confirm(None, window, cx);
             return;
@@ -1144,6 +1206,13 @@ impl Editor {
     // ---- ↑ / ↓ 跨块 ----
 
     fn on_block_up(&mut self, _: &BlockUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wiki_composing(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if self.move_wiki(-1, cx) {
+            return;
+        }
         if self.slash.is_some() {
             self.slash_move(-1, cx);
             return;
@@ -1165,6 +1234,13 @@ impl Editor {
     }
 
     fn on_block_down(&mut self, _: &BlockDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.wiki_composing(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if self.move_wiki(1, cx) {
+            return;
+        }
         if self.slash.is_some() {
             self.slash_move(1, cx);
             return;
@@ -1241,6 +1317,7 @@ impl Editor {
     /// 撤销 / 重做之后：光标放到受影响区间的末尾（编辑态下），像所有编辑器那样"跟着变化走"；
     /// 块选中态下改为选中受影响处的块（撤销一次块删除，被恢复的块就是选中的那块）。
     fn after_history(&mut self, affected: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        self.wiki = None;
         self.last_edit_at = None;
         let was_editing = self.focused.take().is_some();
         let was_selecting = self.selection.is_some();
@@ -1423,6 +1500,7 @@ impl Editor {
     /// 用磁盘内容替换文档（undo 栈随之丢弃）。编辑态退回浏览态：旧的控件区间对新文本已无意义，
     /// 而这里拿不到 `Window` 去重新聚焦——无未保存修改时通常也没人正在打字。
     fn reload(&mut self, disk: &[u8], stamp: FileStamp, cx: &mut Context<Self>) {
+        self.wiki = None;
         let Ok(doc) = Document::from_bytes(disk) else {
             log::warn!("reload {}: not valid UTF-8, keeping in-memory version", self.path.as_str());
             return;
@@ -1791,6 +1869,9 @@ impl Editor {
         if self.slash.is_some() {
             el = el.child(self.render_slash_menu(cx));
         }
+        if self.wiki.is_some() {
+            el = el.child(self.render_wiki_menu(cx));
+        }
         el.into_any_element()
     }
 
@@ -2139,6 +2220,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_backspace))
             .on_action(cx.listener(Self::on_convert_block))
             .on_action(cx.listener(Self::on_menu_confirm))
+            .on_action(cx.listener(Self::on_link_alias))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_blur_editor))
             .on_action(cx.listener(Self::on_select_up))

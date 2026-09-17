@@ -77,6 +77,8 @@ actions!(
         BlurEditor,
         /// `/` 菜单开着时 Tab 确认；否则交给文本控件
         MenuConfirm,
+        /// 笔记补全：⇧⏎ 插入并选中显示别名；其余情况仍是软换行。
+        LinkAlias,
         /// 块选中态（`ui_design.md` 6）：↑↓ 移动选中
         SelectBlockUp,
         SelectBlockDown,
@@ -191,6 +193,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", BlockDown, Some("Input")),
         KeyBinding::new("enter", SplitBlock, Some("Input")),
         KeyBinding::new("tab", MenuConfirm, Some("Input")),
+        KeyBinding::new("shift-enter", LinkAlias, Some("Input")),
         KeyBinding::new("cmd-z", DocUndo, Some("Input")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Input")),
         // 编辑态里 ⇧↑↓ 越过块边界时升级为块选中；否则 propagate 给控件扩展字符选区

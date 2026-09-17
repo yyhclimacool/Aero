@@ -155,6 +155,31 @@ impl SearchService {
         })
     }
 
+    /// 补全始终以当前文件列表为准；尚未索引的笔记从磁盘补标题，全部在后台完成。
+    pub fn completion_notes(
+        &self,
+        vault: Arc<Vault>,
+        cx: &App,
+    ) -> Task<Result<Vec<(VaultPath, String)>, String>> {
+        let titles = self.note_titles(cx);
+        cx.background_spawn(async move {
+            let mut titles: std::collections::HashMap<_, _> = titles.await.into_iter().collect();
+            let notes = vault.notes().map_err(|e| e.to_string())?;
+            Ok(notes
+                .into_iter()
+                .map(|path| {
+                    let title = titles.remove(&path).unwrap_or_else(|| {
+                        vault
+                            .read(&path)
+                            .map(|(doc, _)| doc.title_or(path.stem()))
+                            .unwrap_or_else(|_| path.stem().to_owned())
+                    });
+                    (path, title)
+                })
+                .collect())
+        })
+    }
+
     /// 预览点 wikilink 用的解析表：已索引笔记（含 front matter 标题）加磁盘上还没索引到的文件。
     /// 引擎还没打开时退化为只按磁盘文件列表解析（没有标题匹配）。
     pub fn link_resolver(&self, vault: Arc<Vault>, cx: &App) -> Task<Resolver> {
