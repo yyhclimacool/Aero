@@ -10,6 +10,7 @@
 //! 或粘贴出多个块时，控件仍然有归属，不会因为块消失而失焦。
 
 mod block_refs_ui;
+mod inline_links_ui;
 mod ops;
 mod preview;
 mod slash;
@@ -38,8 +39,8 @@ use gpui_kit::*;
 
 use crate::actions::{
     BlockDown, BlockUp, BlurEditor, ConvertBlock, CopySelectedBlocks, CutSelectedBlocks,
-    DeleteSelectedBlocks, DocRedo, DocUndo, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp, LinkAlias,
-    MenuConfirm, SelectBlockDown, SelectBlockUp, SplitBlock,
+    DeleteSelectedBlocks, DocRedo, DocUndo, EditLink, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp,
+    LinkAlias, MenuConfirm, SelectBlockDown, SelectBlockUp, SplitBlock,
 };
 use ops::{BlockType, Plan};
 use slash::SlashAction;
@@ -311,6 +312,8 @@ impl Editor {
             self.doc.can_undo()
         } else if action.as_any().is::<DocRedo>() {
             self.doc.can_redo()
+        } else if action.as_any().is::<EditLink>() {
+            self.focused.is_some() && self.title_edit.is_none()
         } else if let Some(action) = action.as_any().downcast_ref::<ConvertBlock>() {
             let Some(focused) = &self.focused else { return false };
             let Some(target) = BlockType::from_shortcut(action.0) else { return false };
@@ -2264,6 +2267,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_convert_block))
             .on_action(cx.listener(Self::on_menu_confirm))
             .on_action(cx.listener(Self::on_link_alias))
+            .on_action(cx.listener(Self::on_edit_link))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_blur_editor))
             .on_action(cx.listener(Self::on_select_up))

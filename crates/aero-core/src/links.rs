@@ -233,6 +233,38 @@ pub fn scan(src: &str) -> Vec<LinkSpan> {
     scan_tree(root, src)
 }
 
+/// 嵌入语法。区间含前导 `!`；`parameter` 是 `|` 后的宽度等参数，不是链接显示别名。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbedSpan {
+    pub range: Range<usize>,
+    pub target: String,
+    pub fragment: Option<String>,
+    pub parameter: Option<String>,
+}
+
+/// 与普通链接共用 Markdown 上下文识别，排除代码、数学、转义和 URL。
+pub fn scan_embeds(src: &str) -> Vec<EmbedSpan> {
+    scan_for_rename(src)
+        .into_iter()
+        .filter_map(|span| {
+            let start = span.range.start.checked_sub(1)?;
+            if src.as_bytes()[start] != b'!' || escaped_at(src, start) {
+                return None;
+            }
+            Some(EmbedSpan {
+                range: start..span.range.end,
+                target: span.target,
+                fragment: span.fragment,
+                parameter: span.alias,
+            })
+        })
+        .collect()
+}
+
+fn escaped_at(src: &str, at: usize) -> bool {
+    src[..at].bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 1
+}
+
 /// [`scan`] 的树版本：`root` 是用 [`crate::parse::comrak_options`] 解析 `src` 得到的（索引时与标签抽取共用一次解析）。
 pub(crate) fn scan_tree<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str) -> Vec<LinkSpan> {
     scan_tree_impl(root, src, false)
@@ -268,7 +300,10 @@ fn scan_tree_impl<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str, embeds: b
         let Some(cand) = sourcepos_range(&line_starts, src, node.data().sourcepos) else { continue };
         let Some(range) = anchor(src, cand) else { continue };
         // `![[x]]`：comrak 产出 Text("!") + WikiLink，靠前导 `!` 排除嵌入
-        if !embeds && range.start > 0 && src.as_bytes()[range.start - 1] == b'!' {
+        if range.start > 0
+            && src.as_bytes()[range.start - 1] == b'!'
+            && (!embeds || escaped_at(src, range.start - 1))
+        {
             continue;
         }
         let inner = &src[range.start + 2..range.end - 2];
@@ -580,6 +615,39 @@ mod tests {
         let s = one(src);
         assert_eq!(&src[s.range.clone()], "[[链接|L]]");
         assert!(src.is_char_boundary(s.range.start) && src.is_char_boundary(s.range.end));
+    }
+
+    #[test]
+    fn embed_scan_keeps_ranges_fragments_and_parameters_separate_from_links() {
+        let src = "中文 ![[C\\#.png|400]] ![[note#标题]] ![[#^block-id]] [[普通]]\n\n| 图 |\n| --- |\n| ![[paper.pdf#page=3\\|600]] |\n";
+        let embeds = scan_embeds(src);
+        assert_eq!(embeds.len(), 4);
+        assert_eq!(&src[embeds[0].range.clone()], "![[C\\#.png|400]]");
+        assert_eq!(embeds[0].target, "C#.png");
+        assert_eq!(embeds[0].parameter.as_deref(), Some("400"));
+        assert_eq!(embeds[1].fragment.as_deref(), Some("标题"));
+        assert_eq!(embeds[2].fragment.as_deref(), Some("^block-id"));
+        assert_eq!(embeds[3].fragment.as_deref(), Some("page=3"));
+        assert_eq!(embeds[3].parameter.as_deref(), Some("600"));
+        assert_eq!(scan(src).iter().map(|s| s.target.as_str()).collect::<Vec<_>>(), ["普通"]);
+    }
+
+    #[test]
+    fn embed_scan_respects_markdown_context_and_escaped_bang() {
+        for src in [
+            "`![[x]]`",
+            "```\n![[x]]\n```",
+            "$![[x]]$",
+            "\\![[x]]",
+            "!\\[[x]]",
+            "[a](https://host/![[x]])",
+            "![[multi\nline]]",
+        ] {
+            assert!(scan_embeds(src).is_empty(), "{src}");
+        }
+        assert_eq!(scan_embeds("\\\\![[x]]").len(), 1);
+        assert_eq!(scan_embeds("> [!note]\n> ![[x]]").len(), 1);
+        assert!(scan_for_rename("\\![[x]]").is_empty());
     }
 
     #[test]

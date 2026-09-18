@@ -13,11 +13,13 @@
 //! - [`vault`]：vault 路径、枚举、原子读写（第 5 节）
 
 pub mod anchors;
+pub mod attachments;
 pub mod block;
 pub mod block_refs;
 pub mod document;
 pub mod headings;
 pub mod index;
+pub mod inline_links;
 pub mod links;
 pub mod parse;
 pub mod rename;

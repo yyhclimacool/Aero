@@ -32,6 +32,7 @@ impl Editor {
             && menu.trigger.range.start == trigger.range.start
             && menu.trigger.fragment_target == trigger.fragment_target
             && menu.trigger.block_ref == trigger.block_ref
+            && menu.trigger.embed == trigger.embed
         {
             menu.trigger = trigger;
             if menu.headings.as_ref().is_some_and(|h| h.path == self.path) {
@@ -76,6 +77,7 @@ impl Editor {
         let Some(menu) = self.wiki.as_ref().filter(|m| m.generation == generation) else { return };
         let fragment_target = menu.trigger.fragment_target.clone();
         let block_ref = menu.trigger.block_ref;
+        let embed = menu.trigger.embed;
         let path = self.path.clone();
         let title = self.doc.title_or(path.stem());
         let source = fragment_target.as_ref().map(|_| self.doc.to_string());
@@ -85,9 +87,19 @@ impl Editor {
                 if let Some((_, t)) = notes.iter_mut().find(|(p, _)| p == &path) {
                     *t = title;
                 }
-                let catalog = wiki::Catalog::new(notes, recent);
+                let mut catalog = wiki::Catalog::new(notes, recent);
+                if embed {
+                    catalog.embed_source = Some(path.clone());
+                    if fragment_target.is_none() {
+                        catalog.attachments =
+                            aero_core::attachments::Catalog::read(&vault).map_err(|e| e.to_string())?;
+                    }
+                }
                 let (headings, blocks) = if let Some(target) = fragment_target {
                     use aero_core::links::Resolution;
+                    if embed && aero_core::attachments::Kind::for_path(&target).is_some() {
+                        return Err("图片和 PDF 不提供标题或块补全；嵌入笔记请使用 .md 文件名".into());
+                    }
                     let resolved = match catalog.resolver.resolve(&target, None, path.parent()) {
                         Resolution::Resolved { path, .. } => path,
                         Resolution::Ambiguous { .. } => return Err("笔记名称有歧义，请输入完整路径".into()),
@@ -209,18 +221,35 @@ impl Editor {
         } else {
             let Some(catalog) = &menu.catalog else { return true }; // 加载 / 失败不当作无匹配。
             if let Some(&index) = menu.matches.get(row.unwrap_or(menu.selected)) {
-                let (path, title) = &catalog.notes[index];
-                if !self.vault.exists(path) {
-                    menu.error = Some("该笔记已被移走或删除，Esc 关闭后重新输入 [[ 刷新".into());
-                    cx.notify();
-                    return true;
+                if let Some(attachment) =
+                    index.checked_sub(catalog.notes.len()).and_then(|i| catalog.attachments.entries.get(i))
+                {
+                    if !aero_core::attachments::available(&self.vault, &attachment.path) {
+                        menu.error = Some("附件已被移走或删除，Esc 关闭后重试".into());
+                        cx.notify();
+                        return true;
+                    }
+                    let Some(target) = catalog.attachments.target(index - catalog.notes.len(), &self.path)
+                    else {
+                        menu.error = Some("无法生成不歧义的附件路径，请调整文件名".into());
+                        cx.notify();
+                        return true;
+                    };
+                    (target, attachment.path.file_name().to_owned())
+                } else {
+                    let (path, title) = &catalog.notes[index];
+                    if !self.vault.exists(path) {
+                        menu.error = Some("该笔记已被移走或删除，Esc 关闭后重新输入 [[ 刷新".into());
+                        cx.notify();
+                        return true;
+                    }
+                    let Some(target) = catalog.target(index, self.path.parent()) else {
+                        menu.error = Some("无法为该笔记生成不歧义的链接，请先调整文件名".into());
+                        cx.notify();
+                        return true;
+                    };
+                    (target, title.clone())
                 }
-                let Some(target) = catalog.target(index, self.path.parent()) else {
-                    menu.error = Some("无法为该笔记生成不歧义的链接，请先调整文件名".into());
-                    cx.notify();
-                    return true;
-                };
-                (target, title.clone())
             } else {
                 let query = menu.trigger.query.trim();
                 let Some(target) = aero_core::links::escape_target(query)
@@ -234,9 +263,11 @@ impl Editor {
             }
         };
         let range = menu.trigger.range.clone();
+        let embed = menu.trigger.embed;
         let in_table =
             self.focused_unit().is_some_and(|ix| matches!(self.units[ix].kind, BlockKind::Table { .. }));
-        let (replacement, selected) = wiki::insertion(&target, alias.then_some(label.as_str()), in_table);
+        let (replacement, selected) =
+            wiki::insertion(&target, alias.then_some(label.as_str()), in_table, embed);
         let at = range.start;
         self.wiki = None;
         self.slash = None;
@@ -275,8 +306,23 @@ impl Editor {
                     let heading = &headings.entries[index];
                     (heading.text.clone(), format!("H{} · {}", heading.level, headings.path.as_str()))
                 } else {
-                    let (path, title) = &menu.catalog.as_ref().unwrap().notes[index];
-                    (title.clone(), path.as_str().to_owned())
+                    let catalog = menu.catalog.as_ref().unwrap();
+                    if let Some(attachment) = index
+                        .checked_sub(catalog.notes.len())
+                        .and_then(|i| catalog.attachments.entries.get(i))
+                    {
+                        let kind = match attachment.kind {
+                            aero_core::attachments::Kind::Image => "图片",
+                            aero_core::attachments::Kind::Pdf => "PDF",
+                        };
+                        (attachment.path.file_name().to_owned(), format!("{kind} · {}", attachment.path))
+                    } else {
+                        let (path, title) = &catalog.notes[index];
+                        (
+                            title.clone(),
+                            if menu.trigger.embed { format!("笔记 · {path}") } else { path.to_string() },
+                        )
+                    }
                 };
                 rows.push(
                     v_flex()
@@ -322,9 +368,19 @@ impl Editor {
         } else if menu.trigger.fragment_target.is_some() && menu.matches.is_empty() {
             "没有匹配的标题 · Esc 关闭".into()
         } else if menu.catalog.is_none() && menu.headings.is_none() && menu.blocks.is_none() {
-            "正在读取笔记…".into()
+            if menu.trigger.embed {
+                "正在读取笔记与附件…".into()
+            } else {
+                "正在读取笔记…".into()
+            }
         } else if menu.matches.is_empty() {
-            "没有匹配 · ⏎ 插入未解析链接".into()
+            if menu.trigger.embed {
+                "没有匹配 · ⏎ 插入未解析嵌入".into()
+            } else {
+                "没有匹配 · ⏎ 插入未解析链接".into()
+            }
+        } else if menu.trigger.embed {
+            "↑↓ 选择 · ⏎ / Tab 插入嵌入 · Esc 关闭".into()
         } else {
             "↑↓ 选择 · ⏎ / Tab 插入 · ⇧⏎ 编辑别名 · Esc 关闭".into()
         };

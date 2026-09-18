@@ -15,12 +15,14 @@ pub(super) struct Trigger {
     /// Some 表示片段补全；空目标表示当前笔记。已还原 Markdown 转义。
     pub fragment_target: Option<String>,
     pub block_ref: bool,
+    pub embed: bool,
 }
 
 /// 用临时闭合的链接交给现有解析器判定上下文，避免在代码、数学、转义、URL 中弹菜单。
 pub(super) fn trigger(text: &str, cursor: usize) -> Option<Trigger> {
     let before = text.get(..cursor)?;
     let start = before.rfind("[[")?;
+    let embed = start > 0 && before.as_bytes()[start - 1] == b'!';
     let query = &before[start + 2..];
     if query.contains(['[', ']', '\n', '\r', '|']) {
         return None;
@@ -42,17 +44,27 @@ pub(super) fn trigger(text: &str, cursor: usize) -> Option<Trigger> {
         .find("]]")
         .filter(|&i| !tail[..i].contains(['[', '\n', '\r', '|']))
         .map_or(cursor, |i| cursor + i + 2);
+    let start = if embed { start - 1 } else { start };
+    let placeholder = if embed { "![[aero-completion]]" } else { "[[aero-completion]]" };
     let mut probe = text.to_owned();
-    probe.replace_range(start..end, "[[aero-completion]]");
-    if !links::scan(&probe).iter().any(|s| s.range == (start..start + "[[aero-completion]]".len())) {
+    probe.replace_range(start..end, placeholder);
+    let expected = start..start + placeholder.len();
+    let valid = if embed {
+        links::scan_embeds(&probe).iter().any(|s| s.range == expected)
+    } else {
+        links::scan(&probe).iter().any(|s| s.range == expected)
+    };
+    if !valid {
         return None;
     }
-    Some(Trigger { range: start..end, cursor, query, fragment_target, block_ref })
+    Some(Trigger { range: start..end, cursor, query, fragment_target, block_ref, embed })
 }
 
 pub(super) struct Catalog {
     pub notes: Vec<(VaultPath, String)>,
     pub resolver: Resolver,
+    pub attachments: aero_core::attachments::Catalog,
+    pub embed_source: Option<VaultPath>,
     recent: Vec<VaultPath>,
 }
 
@@ -62,7 +74,7 @@ impl Catalog {
         for (path, title) in &notes {
             resolver.insert(path.clone(), Some(title));
         }
-        Self { notes, resolver, recent }
+        Self { notes, resolver, recent, attachments: Default::default(), embed_source: None }
     }
 
     pub fn filter(&self, query: &str) -> Vec<usize> {
@@ -78,7 +90,29 @@ impl Catalog {
                 Some((i, score + bonus))
             })
             .collect();
-        scored.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then_with(|| self.notes[*a].0.cmp(&self.notes[*b].0)));
+        if let Some(source) = &self.embed_source {
+            let assets = source.assets_dir();
+            scored.extend(self.attachments.entries.iter().enumerate().filter_map(|(i, entry)| {
+                let score = fuzzy_score(query, entry.path.file_name())
+                    .max(fuzzy_score(query, entry.path.as_str()))?;
+                let bonus = if assets.as_ref().is_some_and(|dir| entry.path.parent() == dir.as_str()) {
+                    20
+                } else if entry.path.parent() == source.parent() {
+                    10
+                } else {
+                    0
+                };
+                Some((self.notes.len() + i, score + bonus))
+            }));
+        }
+        let path = |i: usize| {
+            if i < self.notes.len() {
+                &self.notes[i].0
+            } else {
+                &self.attachments.entries[i - self.notes.len()].path
+            }
+        };
+        scored.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then_with(|| path(*a).cmp(path(*b))));
         scored.into_iter().take(8).map(|(i, _)| i).collect()
     }
 
@@ -88,6 +122,10 @@ impl Catalog {
         for target in
             [path.stem(), path.as_str().strip_suffix(".md").unwrap_or(path.as_str()), path.as_str(), title]
         {
+            // 图片 / PDF 后缀属于附件命名空间；同名笔记使用带 .md 的目标。
+            if self.embed_source.is_some() && aero_core::attachments::Kind::for_path(target).is_some() {
+                continue;
+            }
             if matches!(self.resolver.resolve(target, None, dir), Resolution::Resolved { path: p, .. } if p == *path)
                 && let Some(escaped) = links::escape_target(target)
                 && links::scan(&format!("[[{escaped}]]")).first().is_some_and(|s| s.target == target)
@@ -100,7 +138,16 @@ impl Catalog {
 }
 
 /// 别名选区是 UTF-8 字节范围，与 Textarea / Document 一致。
-pub(super) fn insertion(target: &str, alias: Option<&str>, in_table: bool) -> (String, Option<Range<usize>>) {
+pub(super) fn insertion(
+    target: &str,
+    alias: Option<&str>,
+    in_table: bool,
+    embed: bool,
+) -> (String, Option<Range<usize>>) {
+    // 嵌入的 | 后是尺寸等参数，不能写入普通链接的显示别名。
+    if embed {
+        return (format!("![[{target}]]"), None);
+    }
     match alias {
         Some(alias) => {
             let alias = alias
@@ -245,7 +292,7 @@ mod tests {
             "```\n[[abc\n```",
             "$[[abc$",
             "\\[[abc",
-            "![[abc",
+            "\\![[abc",
             "[[a|abc",
             "[[a\nabc",
             "[x](https://[[abc)",
@@ -285,7 +332,7 @@ mod tests {
         assert_eq!(c.target(0, "a"), Some("n".into()));
         assert_eq!(c.target(1, "a"), Some("b/n".into()));
         assert_eq!(c.target(2, ""), Some("C\\#".into()));
-        let (src, selection) = insertion("b/n", Some("中文😀"), false);
+        let (src, selection) = insertion("b/n", Some("中文😀"), false, false);
         assert_eq!(&src[selection.unwrap()], "中文😀");
         assert_eq!(links::scan(&src)[0].alias.as_deref(), Some("中文😀"));
     }
@@ -317,7 +364,7 @@ mod tests {
         let t = trigger(source, "[[note#标".len()).unwrap();
         assert_eq!(&source[t.range], "[[note#标题]]");
         assert!(trigger("[[note#标题|别名]]", "[[note#标".len()).is_none());
-        for source in ["`[[#h`", "![[#h", "\\[[#h", "[url](https://[[#h)"] {
+        for source in ["`[[#h`", "\\![[#h", "\\[[#h", "[url](https://[[#h)"] {
             let cursor = source.rfind('h').unwrap() + 1;
             assert!(trigger(source, cursor).is_none(), "{source}");
         }
@@ -350,7 +397,7 @@ mod tests {
         let source = "[[note#^old-id]] after";
         let t = trigger(source, "[[note#^ol".len()).unwrap();
         assert_eq!(&source[t.range], "[[note#^old-id]]");
-        for source in ["`[[#^x`", "![[#^x", "\\[[#^x", "[[n#^x|alias]]"] {
+        for source in ["`[[#^x`", "\\![[#^x", "\\[[#^x", "[[n#^x|alias]]"] {
             assert!(trigger(source, source.find('x').unwrap() + 1).is_none());
         }
         let doc = aero_core::Document::from_text("正文一 ^first\n\n正文二 ^second\n");
@@ -358,5 +405,45 @@ mod tests {
         assert_eq!(c.filter("二"), vec![1]);
         assert_eq!(c.filter("FIR"), vec![0]);
         assert_eq!(c.filter(""), vec![0, 1]);
+    }
+
+    #[test]
+    fn embed_trigger_includes_bang_and_preserves_parameters_and_context() {
+        for src in ["中文 ![[图", "![[note#标题", "![[#^段落"] {
+            let t = trigger(src, src.len()).unwrap();
+            assert!(t.embed);
+            assert!(src[t.range].starts_with("![["));
+        }
+        let src = "正文 ![[picture.png]] 后";
+        let t = trigger(src, "正文 ![[pic".len()).unwrap();
+        assert_eq!(&src[t.range], "![[picture.png]]");
+        for src in [
+            "\\![[pic",
+            "`![[pic`",
+            "$![[pic$",
+            "[x](https://![[pic)",
+            "![[pic.png|400]]",
+            "![[pic.pdf#page=3]]",
+        ] {
+            assert!(trigger(src, src.find("pic").unwrap() + 3).is_none(), "{src}");
+        }
+        assert_eq!(insertion("photo.png", Some("不是宽度"), true, true), ("![[photo.png]]".into(), None));
+    }
+
+    #[test]
+    fn embed_catalog_mixes_notes_and_attachments_without_target_collisions() {
+        let p = |s| VaultPath::new(s).unwrap();
+        let mut c = Catalog::new(
+            vec![(p("photo.png.md"), "照片说明".into()), (p("z.md"), "Z".into())],
+            vec![p("z.md")],
+        );
+        c.embed_source = Some(p("a.md"));
+        c.attachments =
+            aero_core::attachments::Catalog::new(vec![p("a.assets/photo.png"), p("other/paper.pdf")]);
+        let matches = c.filter("photo");
+        assert_eq!(matches, vec![2, 0]);
+        assert_eq!(c.target(0, "").as_deref(), Some("photo.png.md"));
+        assert_eq!(c.filter("paper"), vec![3]);
+        assert_eq!(c.filter("照片"), vec![0]);
     }
 }

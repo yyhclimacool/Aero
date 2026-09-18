@@ -2150,6 +2150,101 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn inline_link_command_palette_preserves_selection_and_saves_with_note_completion(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, _data, workspace) = open(cx, Some("# Source\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let editor = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            open.search.read(cx).close_blocking();
+            let editor = open.editor.clone().unwrap();
+            editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx));
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("https://example.com".into()));
+            editor
+        });
+        std::fs::write(dir.path().join("b.md"), "---\ntitle: Target\n---\n正文\n").unwrap();
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-shift-left");
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_input("插入或编辑链接");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = cx.debug_bounds("picker-row-0").unwrap();
+        cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            assert!(workspace.read(cx).quick_open.is_none());
+            assert_eq!(workspace.read(cx).recent_commands.first().copied(), Some("edit-link"));
+            assert_eq!(editor.read(cx).index_snapshot().1, "# [Source](https://example.com/)\n");
+        });
+        // 命令面板恢复原选区；新地址选区留在正文，可直接替换。
+        cx.simulate_input("https://new.example");
+        cx.simulate_keystrokes("cmd-right");
+        cx.simulate_input(" ");
+        cx.simulate_keystrokes("cmd-k");
+        cx.simulate_input("Target");
+        wait_until(cx, |cx| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds("wiki-row-0").is_some()
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| editor.update(cx, |e, cx| e.save_now(cx)));
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| matches!(editor.read(cx).save_state(), crate::editor::SaveState::Saved(_)))
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
+            "# [Source](https://new.example) [[b]]\n"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn embed_completion_loads_assets_and_note_fragments_without_index(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Source\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let editor = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            open.search.read(cx).close_blocking();
+            open.editor.clone().unwrap()
+        });
+        std::fs::create_dir(dir.path().join("a.assets")).unwrap();
+        std::fs::write(dir.path().join("a.assets/图.png"), b"image unchanged").unwrap();
+        std::fs::write(dir.path().join("b.md"), "---\ntitle: 嵌入笔记\n---\n\nneedle 正文\n").unwrap();
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx)));
+        cx.run_until_parked();
+        for query in [" ![[图", " ![[嵌入笔记", " ![[b#^needle"] {
+            cx.simulate_input(query);
+            wait_until(cx, |cx| {
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                cx.debug_bounds("wiki-row-0").is_some()
+            });
+            cx.simulate_keystrokes("enter");
+        }
+        let source = cx.update(|_, cx| editor.read(cx).index_snapshot().1);
+        assert!(source.starts_with("# Source ![[图.png]] ![[b]] ![[b#^"));
+        let embeds = aero_core::links::scan_embeds(&source);
+        assert_eq!(embeds.len(), 3);
+        let fragment = embeds[2].fragment.as_deref().unwrap();
+        assert!(
+            std::fs::read_to_string(dir.path().join("b.md"))
+                .unwrap()
+                .contains(&format!("needle 正文 {fragment}"))
+        );
+        assert_eq!(std::fs::read(dir.path().join("a.assets/图.png")).unwrap(), b"image unchanged");
+        assert!(aero_core::links::scan(&source).is_empty());
+        cx.update(|_, cx| editor.update(cx, |e, cx| e.save_now(cx)));
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| matches!(editor.read(cx).save_state(), crate::editor::SaveState::Saved(_)))
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+    }
+
+    #[gpui_kit::test]
     fn tag_completion_workspace_loads_front_matter_and_inserts(cx: &mut TestAppContext) {
         let (dir, _data, workspace) = open(cx, Some("body\n"));
         let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);

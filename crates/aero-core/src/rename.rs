@@ -223,14 +223,21 @@ fn resolves_to(resolver: &Resolver, target: &str, dir: &str, path: &VaultPath) -
     matches!(resolver.resolve(target, None, dir), Resolution::Resolved { path: p, .. } if &p == path)
 }
 
-fn replacement(target: &str, dir: &str, to: &VaultPath, after: &Resolver) -> Result<String, RenameError> {
+fn replacement(
+    target: &str,
+    dir: &str,
+    to: &VaultPath,
+    after: &Resolver,
+    embed: bool,
+) -> Result<String, RenameError> {
     let extension = target.to_ascii_lowercase().ends_with(".md");
     let name = if extension { to.file_name() } else { to.stem() };
     let qualified = if extension { to.as_str() } else { to.as_str().strip_suffix(".md").unwrap() };
     let preferred =
         target.rsplit_once('/').map_or_else(|| name.to_owned(), |(prefix, _)| format!("{prefix}/{name}"));
-    for candidate in [preferred, name.to_owned(), qualified.to_owned()] {
-        if resolves_to(after, &candidate, dir, to)
+    for candidate in [preferred, name.to_owned(), qualified.to_owned(), to.to_string()] {
+        if !(embed && crate::attachments::Kind::for_path(&candidate).is_some())
+            && resolves_to(after, &candidate, dir, to)
             && let Some(escaped) = links::escape_target(&candidate)
         {
             // 使用同一解析器确认新名字可由 wikilink 表达（含转义标点）。
@@ -257,7 +264,10 @@ fn rewrite(
         .map_err(|_| RenameError::Invalid(format!("{source}: 非 UTF-8")))?;
     let mut edits = Vec::new();
     for span in links::scan_for_rename(text) {
-        if !resolves_to(before, &span.target, source.parent(), from)
+        let embed = span.range.start > 0 && text.as_bytes()[span.range.start - 1] == b'!';
+        // 图片 / PDF 后缀属于附件命名空间；同名笔记必须带 `.md`。
+        if (embed && crate::attachments::Kind::for_path(&span.target).is_some())
+            || !resolves_to(before, &span.target, source.parent(), from)
             || resolves_to(after, &span.target, source.parent(), to)
         {
             continue;
@@ -265,7 +275,7 @@ fn rewrite(
         let range = links::target_range(text, &span);
         edits.push((
             bom + range.start..bom + range.end,
-            replacement(&span.target, source.parent(), to, after)?,
+            replacement(&span.target, source.parent(), to, after, embed)?,
         ));
     }
     let count = edits.len();
@@ -336,6 +346,34 @@ mod tests {
         assert!(!vault.exists(&path("notes/old.md")));
         assert_eq!(std::fs::read(dir.path().join("notes/new.assets/image.png")).unwrap(), b"image");
         assert!(!dir.path().join("notes/old.assets").exists());
+    }
+
+    #[test]
+    fn rename_preserves_attachment_embeds_and_disambiguates_note_extensions() {
+        for extension in ["png", "PDF"] {
+            let source = format!(
+                "![[photo.{extension}|400]] ![[photo.{extension}.md#标题]] [[photo.{extension}]] ![[old#标题]]\n"
+            );
+            let original = format!("photo.{extension}.md");
+            let renamed = format!("new.{extension}.md");
+            let (dir, vault) = setup(&[(original.as_str(), "# 标题\n"), ("source.md", &source)]);
+            std::fs::write(dir.path().join(format!("photo.{extension}")), b"attachment").unwrap();
+            let report =
+                RenamePlan::prepare(&vault, path(&original), path("old.md")).unwrap().execute().unwrap();
+            assert_eq!(report.links_changed, 2);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("source.md")).unwrap(),
+                format!("![[photo.{extension}|400]] ![[old.md#标题]] [[old]] ![[old#标题]]\n")
+            );
+            RenamePlan::prepare(&vault, path("old.md"), path(&renamed)).unwrap().execute().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("source.md")).unwrap(),
+                format!(
+                    "![[photo.{extension}|400]] ![[{renamed}#标题]] [[new.{extension}]] ![[{renamed}#标题]]\n"
+                )
+            );
+            assert_eq!(std::fs::read(dir.path().join(format!("photo.{extension}"))).unwrap(), b"attachment");
+        }
     }
 
     #[test]

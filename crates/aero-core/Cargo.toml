@@ -20,6 +20,8 @@ serde-saphyr = "1.2"
 toml = "1"
 ulid = "3"
 thiserror = "2"
+# ⌘K 剪贴板地址校验；复用工作区依赖树中的 URL 解析器。
+url = "2.5.8"
 
 [dev-dependencies]
 proptest = "1"

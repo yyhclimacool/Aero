@@ -79,6 +79,8 @@ actions!(
         MenuConfirm,
         /// 笔记补全：⇧⏎ 插入并选中显示别名；其余情况仍是软换行。
         LinkAlias,
+        /// ⌘K：选区变为行内链接，已有链接选中地址，无选区打开笔记补全。
+        EditLink,
         /// 块选中态（`ui_design.md` 6）：↑↓ 移动选中
         SelectBlockUp,
         SelectBlockDown,
@@ -147,6 +149,7 @@ pub fn commands() -> Vec<Command> {
         Command::new("panel", "折叠 / 展开右侧面板", "toggle panel ycmb", Vault, TogglePanel),
         Command::new("undo", "撤销", "undo cx", Editor, DocUndo),
         Command::new("redo", "重做", "redo cz", Editor, DocRedo),
+        Command::new("edit-link", "插入或编辑链接", "link url insert edit lj", Editor, EditLink),
         Command::new("quit", "退出 Aero", "quit exit tc", Global, Quit),
     ];
     for (n, (id, label, keywords)) in [
@@ -194,6 +197,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("enter", SplitBlock, Some("Input")),
         KeyBinding::new("tab", MenuConfirm, Some("Input")),
         KeyBinding::new("shift-enter", LinkAlias, Some("Input")),
+        KeyBinding::new("cmd-k", EditLink, Some("Editor > Input")),
         KeyBinding::new("cmd-z", DocUndo, Some("Input")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Input")),
         // 编辑态里 ⇧↑↓ 越过块边界时升级为块选中；否则 propagate 给控件扩展字符选区
@@ -240,6 +244,8 @@ pub fn init(cx: &mut App) {
             MenuItem::action("复制", gpui_kit::base::input::Copy),
             MenuItem::action("粘贴", gpui_kit::base::input::Paste),
             MenuItem::action("全选", gpui_kit::base::input::SelectAll),
+            MenuItem::separator(),
+            MenuItem::action("插入或编辑链接", EditLink),
         ]),
         Menu::new("视图").items(vec![
             MenuItem::action("文件", OpenFiles),
