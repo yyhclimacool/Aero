@@ -276,9 +276,8 @@ fn scan_tree_impl<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str, embeds: b
             continue;
         }
         let (head, alias) = split_alias(inner);
-        let (target_raw, fragment) = split_unescaped(head, '#');
-        let target = unescape(target_raw.trim());
-        let fragment = fragment.map(|f| unescape(f.trim())).filter(|f| !f.is_empty());
+        let (target, fragment) = split_target(head);
+        let fragment = fragment.filter(|f| !f.is_empty());
         if target.is_empty() && fragment.is_none() {
             continue;
         }
@@ -303,7 +302,14 @@ pub(crate) fn target_range(src: &str, span: &LinkSpan) -> Range<usize> {
     start..start + target.trim().len()
 }
 
-/// 将目标转义为 wikilink 源码；无法表达的分隔符或控制字符返回 None。
+/// 拆分 wikilink 的目标与片段（不含 `[[ ]]` / 别名），还原转义。
+/// 保留空片段 `Some("")`，供输入 `[[名称#` 时触发标题补全。
+pub fn split_target(head: &str) -> (String, Option<String>) {
+    let (target, fragment) = split_unescaped(head, '#');
+    (unescape(target.trim()), fragment.map(|f| unescape(f.trim())))
+}
+
+/// 将目标或片段转义为 wikilink 源码；无法表达的分隔符或控制字符返回 None。
 pub fn escape_target(target: &str) -> Option<String> {
     // `|`（包括 `\|`）总是别名分隔，当前语法无法表示包含它的目标。
     if target.contains('|') || target.chars().any(char::is_control) {

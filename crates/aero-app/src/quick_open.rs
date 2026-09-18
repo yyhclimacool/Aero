@@ -592,7 +592,7 @@ mod tests {
         let recent = vec![VaultPath::new("todo.md").unwrap()];
         let (picker, cx) = cx.add_window_view(|window, cx| {
             let mut picker = QuickOpen::new(vec![], vec![], window, cx);
-            picker.set_notes(vault, service, recent, cx);
+            picker.set_notes(vault, service.clone(), recent, cx);
             picker
         });
         let events: Rc<RefCell<Vec<String>>> = Rc::default();
@@ -641,5 +641,6 @@ mod tests {
         assert_eq!(events.borrow().last().map(String::as_str), Some("create zzz"));
         cx.simulate_keystrokes("escape");
         assert_eq!(events.borrow().last().map(String::as_str), Some("dismiss"));
+        cx.update(|_, cx| service.read(cx).close_blocking());
     }
 }

@@ -17,7 +17,7 @@ impl Editor {
         self.wiki.as_ref().is_some_and(|m| self.wiki_trigger(cx).as_ref() == Some(&m.trigger))
     }
 
-    pub(super) fn wiki_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(super) fn input_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.focused
             .as_ref()
             .is_some_and(|f| f.textarea.update(cx, |ta, cx| ta.marked_text_range(window, cx).is_some()))
@@ -30,20 +30,38 @@ impl Editor {
         };
         if let Some(menu) = &mut self.wiki
             && menu.trigger.range.start == trigger.range.start
+            && menu.trigger.fragment_target == trigger.fragment_target
+            && menu.trigger.block_ref == trigger.block_ref
         {
             menu.trigger = trigger;
+            if menu.headings.as_ref().is_some_and(|h| h.path == self.path) {
+                menu.headings = Some(wiki::HeadingCatalog::new(self.path.clone(), &self.doc));
+            }
+            if menu.blocks.as_ref().is_some_and(|b| b.path == self.path) {
+                menu.blocks = Some(wiki::BlockCatalog::new(self.path.clone(), &self.doc, None));
+            }
             menu.refilter();
         } else {
             self.wiki_generation += 1;
+            let local = trigger.fragment_target.as_deref() == Some("");
+            let block_ref = trigger.block_ref;
             self.wiki = Some(wiki::Menu {
                 trigger,
                 generation: self.wiki_generation,
                 catalog: None,
+                headings: (local && !block_ref)
+                    .then(|| wiki::HeadingCatalog::new(self.path.clone(), &self.doc)),
+                blocks: (local && block_ref)
+                    .then(|| wiki::BlockCatalog::new(self.path.clone(), &self.doc, None)),
                 error: None,
                 matches: Vec::new(),
                 selected: 0,
             });
-            cx.emit(EditorEvent::LinkCompletionRequested(self.wiki_generation));
+            if local {
+                self.wiki.as_mut().unwrap().refilter();
+            } else {
+                cx.emit(EditorEvent::LinkCompletionRequested(self.wiki_generation));
+            }
         }
         cx.notify();
     }
@@ -55,14 +73,41 @@ impl Editor {
         recent: Vec<VaultPath>,
         cx: &mut Context<Self>,
     ) {
+        let Some(menu) = self.wiki.as_ref().filter(|m| m.generation == generation) else { return };
+        let fragment_target = menu.trigger.fragment_target.clone();
+        let block_ref = menu.trigger.block_ref;
         let path = self.path.clone();
         let title = self.doc.title_or(path.stem());
+        let source = fragment_target.as_ref().map(|_| self.doc.to_string());
+        let vault = self.vault.clone();
         let task = cx.background_spawn(async move {
-            notes.await.map(|mut notes| {
+            notes.await.and_then(|mut notes| {
                 if let Some((_, t)) = notes.iter_mut().find(|(p, _)| p == &path) {
                     *t = title;
                 }
-                wiki::Catalog::new(notes, recent)
+                let catalog = wiki::Catalog::new(notes, recent);
+                let (headings, blocks) = if let Some(target) = fragment_target {
+                    use aero_core::links::Resolution;
+                    let resolved = match catalog.resolver.resolve(&target, None, path.parent()) {
+                        Resolution::Resolved { path, .. } => path,
+                        Resolution::Ambiguous { .. } => return Err("笔记名称有歧义，请输入完整路径".into()),
+                        Resolution::Unresolved => return Err("找不到目标笔记，请先选择有效的笔记名称".into()),
+                    };
+                    let (doc, hash) = if resolved == path {
+                        (Document::from_text(source.as_deref().unwrap_or_default()), None)
+                    } else {
+                        let (doc, stamp) = vault.read(&resolved).map_err(|e| e.to_string())?;
+                        (doc, Some(stamp.hash))
+                    };
+                    if block_ref {
+                        (None, Some(wiki::BlockCatalog::new(resolved, &doc, hash)))
+                    } else {
+                        (Some(wiki::HeadingCatalog::new(resolved, &doc)), None)
+                    }
+                } else {
+                    (None, None)
+                };
+                Ok((catalog, headings, blocks))
             })
         });
         cx.spawn(async move |this, cx| {
@@ -70,11 +115,25 @@ impl Editor {
             let _ = this.update(cx, |this, cx| {
                 let Some(menu) = this.wiki.as_mut().filter(|m| m.generation == generation) else { return };
                 match result {
-                    Ok(catalog) => {
+                    Ok((catalog, headings, blocks)) => {
                         menu.catalog = Some(catalog);
+                        menu.headings = headings.map(|h| {
+                            if h.path == this.path {
+                                wiki::HeadingCatalog::new(this.path.clone(), &this.doc)
+                            } else {
+                                h
+                            }
+                        });
+                        menu.blocks = blocks.map(|b| {
+                            if b.path == this.path {
+                                wiki::BlockCatalog::new(this.path.clone(), &this.doc, None)
+                            } else {
+                                b
+                            }
+                        });
                         menu.refilter();
                     }
-                    Err(err) => menu.error = Some(format!("无法读取笔记：{err}。Esc 关闭后重试")),
+                    Err(err) => menu.error = Some(format!("{err}。Esc 关闭后重试")),
                 }
                 cx.notify();
             });
@@ -96,7 +155,7 @@ impl Editor {
     }
 
     pub(super) fn on_link_alias(&mut self, _: &LinkAlias, window: &mut Window, cx: &mut Context<Self>) {
-        if self.wiki_composing(window, cx) || !self.confirm_wiki(None, true, window, cx) {
+        if self.input_composing(window, cx) || !self.confirm_wiki(None, true, window, cx) {
             cx.propagate();
         }
     }
@@ -112,34 +171,67 @@ impl Editor {
             self.wiki = None;
             return false;
         }
-        if self.wiki_composing(window, cx) {
+        if self.input_composing(window, cx) {
+            return true;
+        }
+        if self.wiki.as_ref().is_some_and(|m| m.trigger.block_ref) {
+            self.confirm_block_ref(row, alias, window, cx);
             return true;
         }
         let menu = self.wiki.as_mut().unwrap();
-        let Some(catalog) = &menu.catalog else { return true }; // 正在读取 / 失败时不能当成「没有匹配」。
-        let (target, label) = if let Some(&index) = menu.matches.get(row.unwrap_or(menu.selected)) {
-            let (path, title) = &catalog.notes[index];
-            if !self.vault.exists(path) {
-                menu.error = Some("该笔记已被移走或删除，Esc 关闭后重新输入 [[ 刷新".into());
+        let (target, label) = if let Some(target) = &menu.trigger.fragment_target {
+            let Some(headings) = &menu.headings else { return true };
+            let Some(&index) = menu.matches.get(row.unwrap_or(menu.selected)) else {
+                menu.error = Some("没有匹配的标题，请修改关键词或按 Esc 关闭".into());
+                cx.notify();
+                return true;
+            };
+            if headings.path != self.path && !self.vault.exists(&headings.path) {
+                menu.error = Some("目标笔记已被移走或删除，Esc 关闭后重试".into());
                 cx.notify();
                 return true;
             }
-            let Some(target) = catalog.target(index, self.path.parent()) else {
-                menu.error = Some("无法为该笔记生成不歧义的链接，请先调整文件名".into());
+            // 与笔记补全一样写入已消歧的目标；按 front matter 标题输入时也可在索引未就绪时点击。
+            let canonical = if target.is_empty() {
+                Some(String::new())
+            } else {
+                menu.catalog.as_ref().and_then(|c| {
+                    let index = c.notes.iter().position(|(p, _)| p == &headings.path)?;
+                    c.target(index, self.path.parent()).map(|s| aero_core::links::split_target(&s).0)
+                })
+            };
+            let Some(target) = canonical.as_deref().and_then(|t| headings.target(index, t)) else {
+                menu.error = Some("该标题含链接语法无法表示的字符，请调整标题".into());
                 cx.notify();
                 return true;
             };
-            (target, title.clone())
+            (target, headings.entries[index].text.clone())
         } else {
-            let query = menu.trigger.query.trim();
-            let Some(target) = aero_core::links::escape_target(query)
-                .filter(|_| aero_core::links::creation_path(self.path.parent(), query).is_some())
-            else {
-                menu.error = Some("请输入有效的笔记名称".into());
-                cx.notify();
-                return true;
-            };
-            (target, query.to_owned())
+            let Some(catalog) = &menu.catalog else { return true }; // 加载 / 失败不当作无匹配。
+            if let Some(&index) = menu.matches.get(row.unwrap_or(menu.selected)) {
+                let (path, title) = &catalog.notes[index];
+                if !self.vault.exists(path) {
+                    menu.error = Some("该笔记已被移走或删除，Esc 关闭后重新输入 [[ 刷新".into());
+                    cx.notify();
+                    return true;
+                }
+                let Some(target) = catalog.target(index, self.path.parent()) else {
+                    menu.error = Some("无法为该笔记生成不歧义的链接，请先调整文件名".into());
+                    cx.notify();
+                    return true;
+                };
+                (target, title.clone())
+            } else {
+                let query = menu.trigger.query.trim();
+                let Some(target) = aero_core::links::escape_target(query)
+                    .filter(|_| aero_core::links::creation_path(self.path.parent(), query).is_some())
+                else {
+                    menu.error = Some("请输入有效的笔记名称".into());
+                    cx.notify();
+                    return true;
+                };
+                (target, query.to_owned())
+            }
         };
         let range = menu.trigger.range.clone();
         let in_table =
@@ -169,9 +261,23 @@ impl Editor {
             |(b, height)| b.origin + point(px(0.), height + px(4.)),
         );
         let mut rows = Vec::new();
-        if let Some(catalog) = &menu.catalog {
+        if menu.catalog.is_some() || menu.headings.is_some() || menu.blocks.is_some() {
             for (row, &index) in menu.matches.iter().enumerate() {
-                let (path, title) = &catalog.notes[index];
+                let (title, detail) = if let Some(blocks) = &menu.blocks {
+                    let b = &blocks.entries[index];
+                    let id =
+                        b.persisted_id.as_deref().map_or("确认后生成 ID".into(), |id| format!("^{id}"));
+                    (
+                        b.excerpt.clone(),
+                        format!("{} · {id} · {}", block_kind_label(&b.kind), blocks.path.as_str()),
+                    )
+                } else if let Some(headings) = &menu.headings {
+                    let heading = &headings.entries[index];
+                    (heading.text.clone(), format!("H{} · {}", heading.level, headings.path.as_str()))
+                } else {
+                    let (path, title) = &menu.catalog.as_ref().unwrap().notes[index];
+                    (title.clone(), path.as_str().to_owned())
+                };
                 rows.push(
                     v_flex()
                         .id(("wiki-row", row))
@@ -192,13 +298,13 @@ impl Editor {
                         )
                         // 不让 mouse-up 再落到块预览的 on_click，改变刚插入后的光标。
                         .on_click(|_, _, cx| cx.stop_propagation())
-                        .child(div().text_size(px(13.)).truncate().child(title.clone()))
+                        .child(div().text_size(px(13.)).truncate().child(title))
                         .child(
                             div()
                                 .text_size(px(11.))
                                 .text_color(theme.muted_foreground)
                                 .truncate()
-                                .child(path.as_str().to_owned()),
+                                .child(detail),
                         )
                         .into_any_element(),
                 );
@@ -206,7 +312,16 @@ impl Editor {
         }
         let hint = if let Some(error) = &menu.error {
             error.clone()
-        } else if menu.catalog.is_none() {
+        } else if menu.trigger.block_ref && menu.blocks.is_none() {
+            "正在读取块…".into()
+        } else if menu.trigger.block_ref && menu.matches.is_empty() {
+            "没有匹配的块 · Esc 关闭".into()
+        } else if !menu.trigger.block_ref && menu.trigger.fragment_target.is_some() && menu.headings.is_none()
+        {
+            "正在读取标题…".into()
+        } else if menu.trigger.fragment_target.is_some() && menu.matches.is_empty() {
+            "没有匹配的标题 · Esc 关闭".into()
+        } else if menu.catalog.is_none() && menu.headings.is_none() && menu.blocks.is_none() {
             "正在读取笔记…".into()
         } else if menu.matches.is_empty() {
             "没有匹配 · ⏎ 插入未解析链接".into()
@@ -241,5 +356,19 @@ impl Editor {
             ),
         )
         .into_any_element()
+    }
+}
+
+fn block_kind_label(kind: &BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Paragraph => "段落",
+        BlockKind::Heading { .. } => "标题",
+        BlockKind::List { .. } | BlockKind::ListItem { .. } => "列表",
+        BlockKind::CodeFence { .. } | BlockKind::CodeBlock => "代码",
+        BlockKind::Table => "表格",
+        BlockKind::BlockQuote => "引用",
+        BlockKind::Callout { .. } => "提示块",
+        BlockKind::MathBlock => "公式",
+        _ => "块",
     }
 }

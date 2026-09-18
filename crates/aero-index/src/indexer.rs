@@ -465,13 +465,18 @@ impl Indexer {
                 (new_count..old_count).map(|ord| IndexBlock::pk_of(&note_id, ord)).collect();
             self.fts.delete(&gone)?;
         }
-        self.meta.upsert_note(&NoteRow {
-            note_id: note_id.clone(),
-            path: path.as_str().to_owned(),
-            title: title.clone(),
-            stamp,
-            block_count: new_count,
-        })?;
+        let tags =
+            blocks.first().map(|b| b.tags.clone()).unwrap_or_else(|| aero_core::index::tags_for_note(doc));
+        self.meta.upsert_note_with_tags(
+            &NoteRow {
+                note_id: note_id.clone(),
+                path: path.as_str().to_owned(),
+                title: title.clone(),
+                stamp,
+                block_count: new_count,
+            },
+            &tags,
+        )?;
         let old_title = existing.as_ref().map(|r| r.title.clone()).filter(|t| *t != title);
         if old_title.is_some() {
             // 靠旧标题解析到这篇的行不再成立；补挂时能按新标题 / 文件名解析上的会挂回来
@@ -660,6 +665,10 @@ impl Indexer {
             .into_iter()
             .filter_map(|r| VaultPath::new(&r.path).ok().map(|p| (p, r.title)))
             .collect())
+    }
+
+    pub fn tag_counts(&self, exclude_path: Option<&VaultPath>) -> Result<Vec<crate::TagCount>, IndexerError> {
+        Ok(self.meta.tag_counts(exclude_path.map(VaultPath::as_str))?)
     }
 
     /// 已索引的笔记数 / 块数。
@@ -1015,6 +1024,53 @@ mod tests {
     }
 
     #[test]
+    fn tag_directory_tracks_content_front_matter_rename_and_deletion() {
+        let (dir, mut ix) = setup(&[
+            ("a.md", "---\ntags: [Rust, 中文]\n---\n\nbody #rust #rust/cli\n\nmore #rust\n"),
+            ("b.md", "---\ntag: rust\n---\n"),
+            ("c.md", "`#ghost` [[x#anchor]]\n"),
+        ]);
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        let list = |ix: &Indexer| {
+            ix.tag_counts(None).unwrap().into_iter().map(|t| (t.tag, t.note_count)).collect::<Vec<_>>()
+        };
+        assert_eq!(list(&ix), [("rust".into(), 2), ("rust/cli".into(), 1), ("中文".into(), 1)]);
+        let a = VaultPath::new("a.md").unwrap();
+        std::fs::write(dir.path().join("a.md"), "body #new\n").unwrap();
+        ix.refresh_note(&a).unwrap();
+        assert_eq!(list(&ix), [("new".into(), 1), ("rust".into(), 1)]);
+        let renamed = VaultPath::new("renamed.md").unwrap();
+        ix.vault.rename(&a, &renamed).unwrap();
+        ix.rename_note(&a, &renamed).unwrap();
+        assert_eq!(ix.tag_counts(Some(&renamed)).unwrap()[0].tag, "rust");
+        std::fs::remove_file(dir.path().join("b.md")).unwrap();
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        assert_eq!(list(&ix), [("new".into(), 1)]);
+    }
+
+    #[test]
+    fn tag_directory_rebuilds_from_schema_three_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let source = "---\ntags: [rust]\n---\n\nbody #中文\n";
+        std::fs::write(dir.path().join("a.md"), source).unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let mut ix = Indexer::open(vault.clone(), data.path()).unwrap();
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        drop(ix);
+        let db = rusqlite::Connection::open(data.path().join(vault.id()).join("meta.sqlite")).unwrap();
+        db.execute_batch("DROP TABLE note_tags; UPDATE index_state SET version = 3 WHERE name = 'meta';")
+            .unwrap();
+        drop(db);
+        let mut ix = Indexer::open(vault, data.path()).unwrap();
+        let report = ix.sync_all(|_, _| {});
+        assert!(report.errors.is_empty());
+        assert_eq!(report.indexed, 1);
+        assert_eq!(ix.tag_counts(None).unwrap().len(), 2);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+    }
+
+    #[test]
     fn search_parses_note_wide_tag_filters() {
         let (_dir, mut ix) = setup(&[
             ("a.md", "---\ntags: [rust, cli]\n---\n\nanchor\n\nsecond\n"),
@@ -1060,7 +1116,7 @@ mod tests {
         let index_dir = data.path().join(vault.id());
         let path = VaultPath::new("a.md").unwrap();
         let (_, stamp) = vault.read(&path).unwrap();
-        let mut meta = Meta::open(&index_dir.join("meta.sqlite")).unwrap();
+        let meta = Meta::open(&index_dir.join("meta.sqlite")).unwrap();
         meta.upsert_note(&crate::meta::NoteRow {
             note_id: "legacy".into(),
             path: "a.md".into(),

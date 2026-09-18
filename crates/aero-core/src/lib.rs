@@ -14,11 +14,14 @@
 
 pub mod anchors;
 pub mod block;
+pub mod block_refs;
 pub mod document;
+pub mod headings;
 pub mod index;
 pub mod links;
 pub mod parse;
 pub mod rename;
+pub mod tags;
 pub mod text;
 pub mod vault;
 

@@ -12,6 +12,9 @@ pub(super) struct Trigger {
     pub range: Range<usize>,
     pub cursor: usize,
     pub query: String,
+    /// Some 表示片段补全；空目标表示当前笔记。已还原 Markdown 转义。
+    pub fragment_target: Option<String>,
+    pub block_ref: bool,
 }
 
 /// 用临时闭合的链接交给现有解析器判定上下文，避免在代码、数学、转义、URL 中弹菜单。
@@ -19,27 +22,32 @@ pub(super) fn trigger(text: &str, cursor: usize) -> Option<Trigger> {
     let before = text.get(..cursor)?;
     let start = before.rfind("[[")?;
     let query = &before[start + 2..];
-    if query.contains(['[', ']', '\n', '\r', '#', '|']) {
+    if query.contains(['[', ']', '\n', '\r', '|']) {
         return None;
     }
+    let (target, fragment) = links::split_target(query);
+    let block_ref = fragment.as_ref().is_some_and(|f| f.starts_with('^'));
+    let fragment_target = fragment.as_ref().map(|_| target.clone());
+    let query = fragment.map_or(target, |f| if block_ref { f[1..].into() } else { f });
     let tail = &text[cursor..];
     if let Some(end) = tail.find("]]")
         && !tail[..end].contains(['[', '\n', '\r'])
-        && tail[..end].contains(['#', '|'])
+        && (tail[..end].contains('|')
+            || (fragment_target.is_none() && links::split_target(&tail[..end]).1.is_some()))
     {
         return None; // 现有链接带片段 / 别名时暂不补全，保留完整源码。
     }
     // 已经有闭括号（含在现有目标中间编辑）时一并替换，避免留下双重 ]]。
     let end = tail
         .find("]]")
-        .filter(|&i| !tail[..i].contains(['[', '\n', '\r', '#', '|']))
+        .filter(|&i| !tail[..i].contains(['[', '\n', '\r', '|']))
         .map_or(cursor, |i| cursor + i + 2);
     let mut probe = text.to_owned();
     probe.replace_range(start..end, "[[aero-completion]]");
     if !links::scan(&probe).iter().any(|s| s.range == (start..start + "[[aero-completion]]".len())) {
         return None;
     }
-    Some(Trigger { range: start..end, cursor, query: query.to_owned() })
+    Some(Trigger { range: start..end, cursor, query, fragment_target, block_ref })
 }
 
 pub(super) struct Catalog {
@@ -113,6 +121,8 @@ pub(super) struct Menu {
     pub trigger: Trigger,
     pub generation: u64,
     pub catalog: Option<Catalog>,
+    pub headings: Option<HeadingCatalog>,
+    pub blocks: Option<BlockCatalog>,
     pub error: Option<String>,
     pub matches: Vec<usize>,
     pub selected: usize,
@@ -120,11 +130,97 @@ pub(super) struct Menu {
 
 impl Menu {
     pub fn refilter(&mut self) {
-        self.matches = self.catalog.as_ref().map_or_else(Vec::new, |c| c.filter(&self.trigger.query));
+        self.matches = if self.trigger.block_ref {
+            self.blocks.as_ref().map_or_else(Vec::new, |b| b.filter(&self.trigger.query))
+        } else if self.trigger.fragment_target.is_some() {
+            self.headings.as_ref().map_or_else(Vec::new, |h| h.filter(&self.trigger.query))
+        } else {
+            self.catalog.as_ref().map_or_else(Vec::new, |c| c.filter(&self.trigger.query))
+        };
+        // 本篇排除正在插链接的块及其容器，避免半成品查询成为自己的候选。
+        if let Some(blocks) = &self.blocks
+            && blocks.hash.is_none()
+        {
+            self.matches.retain(|&i| {
+                let range = &blocks.entries[i].range;
+                !(range.start <= self.trigger.cursor && self.trigger.range.start <= range.end)
+            });
+        }
+        self.matches.truncate(8);
         self.selected = 0;
-        if self.catalog.is_some() {
+        if self.catalog.is_some() || self.headings.is_some() || self.blocks.is_some() {
             self.error = None;
         }
+    }
+}
+
+pub(super) struct BlockCatalog {
+    pub path: VaultPath,
+    pub entries: Vec<aero_core::block_refs::Candidate>,
+    pub hash: Option<u64>,
+}
+
+impl BlockCatalog {
+    pub fn new(path: VaultPath, doc: &aero_core::Document, hash: Option<u64>) -> Self {
+        Self { path, entries: aero_core::block_refs::candidates(doc), hash }
+    }
+
+    pub fn filter(&self, query: &str) -> Vec<usize> {
+        let mut scored: Vec<_> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                fuzzy_score(query.trim(), &b.excerpt)
+                    .max(b.persisted_id.as_deref().and_then(|id| fuzzy_score(query.trim(), id)))
+                    .map(|score| (i, score))
+            })
+            .collect();
+        scored.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then(a.cmp(b)));
+        scored.into_iter().map(|(i, _)| i).collect()
+    }
+}
+
+pub(super) struct HeadingCatalog {
+    pub path: VaultPath,
+    pub entries: Vec<aero_core::headings::Heading>,
+}
+
+impl HeadingCatalog {
+    pub fn new(path: VaultPath, doc: &aero_core::Document) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let entries = aero_core::headings::list(doc)
+            .into_iter()
+            // 同文本标题只提供首处，片段链接本身不能区分重复标题。
+            .filter(|h| !h.text.is_empty() && seen.insert(h.text.clone()))
+            .collect();
+        Self { path, entries }
+    }
+
+    pub fn filter(&self, query: &str) -> Vec<usize> {
+        let mut scored: Vec<_> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| fuzzy_score(query.trim(), &h.text).map(|s| (i, s)))
+            .collect();
+        scored.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then(a.cmp(b)));
+        scored.into_iter().take(8).map(|(i, _)| i).collect()
+    }
+
+    /// 用链接解析器验证片段原样往返，不把无法表示的标题插成另一条链接。
+    pub fn target(&self, index: usize, target: &str) -> Option<String> {
+        let heading = &self.entries.get(index)?.text;
+        let escaped_target = links::escape_target(target)?;
+        let fragment = links::escape_target(heading)?;
+        let target_source = format!("{escaped_target}#{fragment}");
+        let source = format!("[[{target_source}]]");
+        links::scan(&source)
+            .first()
+            .filter(|s| {
+                s.range == (0..source.len()) && s.target == target && s.fragment.as_ref() == Some(heading)
+            })
+            .map(|_| target_source)
     }
 }
 
@@ -151,7 +247,6 @@ mod tests {
             "\\[[abc",
             "![[abc",
             "[[a|abc",
-            "[[a#abc",
             "[[a\nabc",
             "[x](https://[[abc)",
             "[[a]]abc",
@@ -207,5 +302,61 @@ mod tests {
         assert_eq!(c.target(0, "sub"), Some("Root title".into()));
         let c = Catalog::new(vec![(p("note.md"), "note".into()), (p("sub/note.md"), "note".into())], vec![]);
         assert_eq!(c.target(0, "sub"), None, "cannot silently choose the local note");
+    }
+
+    #[test]
+    fn heading_trigger_decodes_targets_and_preserves_existing_link_parts() {
+        for (source, target, query) in
+            [("[[#", "", ""), ("[[目录/笔记#小节", "目录/笔记", "小节"), (r"[[C\##语言", "C#", "语言")]
+        {
+            let t = trigger(source, source.len()).unwrap();
+            assert_eq!(t.fragment_target.as_deref(), Some(target));
+            assert_eq!(t.query, query);
+        }
+        let source = "[[note#标题]] 后";
+        let t = trigger(source, "[[note#标".len()).unwrap();
+        assert_eq!(&source[t.range], "[[note#标题]]");
+        assert!(trigger("[[note#标题|别名]]", "[[note#标".len()).is_none());
+        for source in ["`[[#h`", "![[#h", "\\[[#h", "[url](https://[[#h)"] {
+            let cursor = source.rfind('h').unwrap() + 1;
+            assert!(trigger(source, cursor).is_none(), "{source}");
+        }
+        let t = trigger(r"[[C\#", 5).unwrap();
+        assert!(t.fragment_target.is_none());
+        assert_eq!(t.query, "C#");
+    }
+
+    #[test]
+    fn heading_catalog_orders_filters_deduplicates_and_validates_fragments() {
+        let doc = aero_core::Document::from_text("# Start\n\n## 中文 C#\n\n## Start\n\n### A | B\n");
+        let c = HeadingCatalog::new(VaultPath::new("note.md").unwrap(), &doc);
+        assert_eq!(c.entries.len(), 3);
+        assert_eq!(c.filter(""), vec![0, 1, 2]);
+        assert_eq!(c.filter("文c"), vec![1]);
+        assert_eq!(c.target(1, "C#"), Some(r"C\##中文 C\#".into()));
+        assert_eq!(c.target(0, ""), Some("#Start".into()));
+        assert!(c.target(2, "note").is_none());
+        assert!(c.filter("不存在").is_empty());
+    }
+
+    #[test]
+    fn block_ref_trigger_filters_excerpt_and_existing_id() {
+        for (src, target, query) in [("[[#^", "", ""), (r"[[C\##^正文", "C#", "正文")] {
+            let t = trigger(src, src.len()).unwrap();
+            assert!(t.block_ref);
+            assert_eq!(t.fragment_target.as_deref(), Some(target));
+            assert_eq!(t.query, query);
+        }
+        let source = "[[note#^old-id]] after";
+        let t = trigger(source, "[[note#^ol".len()).unwrap();
+        assert_eq!(&source[t.range], "[[note#^old-id]]");
+        for source in ["`[[#^x`", "![[#^x", "\\[[#^x", "[[n#^x|alias]]"] {
+            assert!(trigger(source, source.find('x').unwrap() + 1).is_none());
+        }
+        let doc = aero_core::Document::from_text("正文一 ^first\n\n正文二 ^second\n");
+        let c = BlockCatalog::new(VaultPath::new("note.md").unwrap(), &doc, None);
+        assert_eq!(c.filter("二"), vec![1]);
+        assert_eq!(c.filter("FIR"), vec![0]);
+        assert_eq!(c.filter(""), vec![0, 1]);
     }
 }

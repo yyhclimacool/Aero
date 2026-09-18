@@ -123,7 +123,7 @@ fn tag_token(token: &str) -> Option<(String, bool)> {
     normalize_tag(tag).map(|tag| (tag, exclude))
 }
 
-fn tag_char(c: char) -> bool {
+pub(crate) fn tag_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '-' | '_' | '/')
 }
 
@@ -421,6 +421,13 @@ fn note_tags(doc: &Document, tag_sources: &[&str]) -> Vec<String> {
         }
     }
     tags
+}
+
+/// 笔记级标签（小写、去重），包含仅有 front matter、没有可索引正文块的笔记。
+pub fn tags_for_note(doc: &Document) -> Vec<String> {
+    let text = doc.to_string();
+    let (sources, _) = crate::parse::inline_scan(&text);
+    note_tags(doc, &sources)
 }
 
 /// 块源码去掉 Markdown 标记后的正文，供全文索引与结果摘要用。

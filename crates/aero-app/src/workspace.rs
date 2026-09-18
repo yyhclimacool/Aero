@@ -347,6 +347,17 @@ impl Workspace {
                 let recent = open.recent.clone();
                 editor.update(cx, |e, cx| e.load_wiki_notes(*generation, notes, recent, cx));
             }
+            EditorEvent::TagCompletionRequested(generation) => {
+                let Some(open) = this.open.as_ref() else { return };
+                let e = editor.read(cx);
+                let task = open.search.read(cx).completion_tags(
+                    open.vault.clone(),
+                    e.path().clone(),
+                    e.tag_completion_source(),
+                    cx,
+                );
+                editor.update(cx, |e, cx| e.load_tags(*generation, task, cx));
+            }
         })
     }
 
@@ -363,11 +374,11 @@ impl Workspace {
         let Some(open) = self.open.as_ref() else { return };
         let editor = open.editor.clone();
         if target.trim().is_empty() {
-            // `[[#标题]]`：同篇锚点
+            // `[[#标题]]` / `[[#^id]]`：同篇锚点
             if let (Some(fragment), Some(editor)) = (fragment, editor) {
-                editor.update(cx, |e, cx| {
-                    e.reveal_heading(&fragment, cx);
-                });
+                if let Err(error) = editor.update(cx, |e, cx| e.reveal_fragment(&fragment, cx)) {
+                    window.push_notification(Notification::info(error).title("Aero"), cx);
+                }
             }
             return;
         }
@@ -387,6 +398,9 @@ impl Workspace {
                             LinkAction::Ambiguous { target, candidates }
                         }
                         aero_core::links::Resolution::Unresolved => {
+                            if fragment.as_deref().is_some_and(|f| f.starts_with('^')) {
+                                return LinkAction::Failed(format!("找不到块引用的目标笔记：{target}"));
+                            }
                             let Some(path) = aero_core::links::creation_path(&source_dir, &target) else {
                                 return LinkAction::Failed(format!("无效的链接目标：{target}"));
                             };
@@ -410,11 +424,10 @@ impl Workspace {
                     let editor = this.open.as_ref().and_then(|o| o.editor.clone());
                     if let (Some(fragment), Some(editor)) = (fragment, editor)
                         && editor.read(cx).path() == &path
-                        && !editor.update(cx, |e, cx| e.reveal_heading(&fragment, cx))
+                        && let Err(error) = editor.update(cx, |e, cx| e.reveal_fragment(&fragment, cx))
                     {
                         window.push_notification(
-                            Notification::info(format!("{} 里没有标题「{fragment}」", path.as_str()))
-                                .title("Aero"),
+                            Notification::info(format!("{}：{error}", path.as_str())).title("Aero"),
                             cx,
                         );
                     }
@@ -1894,6 +1907,7 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         cx.update(|window, cx| assert_eq!(window.focused(cx), Some(search_focus)));
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
     }
 
     #[gpui_kit::test]
@@ -1928,6 +1942,7 @@ mod tests {
         });
         cx.simulate_input("X");
         cx.update(|_, cx| assert_eq!(editor.read(cx).index_snapshot().1, "X# Heading\n"));
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
     }
 
     #[gpui_kit::test]
@@ -2005,6 +2020,8 @@ mod tests {
             );
             assert_eq!(workspace.read(cx).recent_commands, ["undo", "redo", "heading-2"]);
         });
+        // 临时目录早于 GPUI 实体释放，先停止索引线程，避免在已删除的目录中继续初始化 RocksDB。
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
     }
 
     #[gpui_kit::test]
@@ -2036,6 +2053,123 @@ mod tests {
         cx.update(|_, cx| {
             assert_eq!(editor.read(cx).index_snapshot().1, "# Source [[new]]\n");
         });
+    }
+
+    #[gpui_kit::test]
+    fn heading_completion_inserts_and_clicks_fragment_without_index(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Source\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let editor = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            open.search.read(cx).close_blocking();
+            open.editor.clone().unwrap()
+        });
+        std::fs::write(dir.path().join("b.md"), "---\ntitle: 尚未索引\n---\n\n# Intro\n\n**中文**\n----\n")
+            .unwrap();
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input(" [[尚未索引#文");
+        wait_until(cx, |cx| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds("wiki-row-0").is_some()
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| {
+            assert_eq!(editor.read(cx).index_snapshot().1, "# Source [[b#中文]]\n");
+            let link = aero_core::links::scan(&editor.read(cx).index_snapshot().1).remove(0);
+            editor.update(cx, |_, cx| {
+                cx.emit(crate::editor::EditorEvent::LinkClicked {
+                    target: link.target,
+                    fragment: link.fragment,
+                })
+            });
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let open = workspace.read(cx).open.as_ref().unwrap();
+                let e = open.editor.as_ref().unwrap().read(cx);
+                e.path().as_str() == "b.md"
+                    && e.headings()
+                        .iter()
+                        .any(|(_, text, id)| text == "中文" && e.highlighted_block() == Some(*id))
+            })
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "# Source [[b#中文]]\n");
+    }
+
+    #[gpui_kit::test]
+    fn block_ref_completion_assigns_indexes_and_clicks_target(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Source\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let (editor, search, backlinks) = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.editor.clone().unwrap(), open.search.clone(), open.backlinks.clone())
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        let original = "---\ntitle: 尚未索引\n---\n\nneedle 正文\n";
+        std::fs::write(dir.path().join("b.md"), original).unwrap();
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input(" [[尚未索引#^needle");
+        wait_until(cx, |cx| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds("wiki-row-0").is_some()
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.md")).unwrap(), original);
+        cx.simulate_keystrokes("enter");
+        let source = cx.update(|_, cx| editor.read(cx).index_snapshot().1);
+        let link = aero_core::links::scan(&source).remove(0);
+        assert_eq!(link.target, "b");
+        let fragment = link.fragment.clone().unwrap();
+        assert!(fragment.starts_with('^'));
+        let target = std::fs::read_to_string(dir.path().join("b.md")).unwrap();
+        assert!(target.contains(&format!("needle 正文 {fragment}")));
+        cx.update(|_, cx| {
+            editor.update(cx, |_, cx| {
+                cx.emit(crate::editor::EditorEvent::LinkClicked {
+                    target: link.target,
+                    fragment: link.fragment,
+                })
+            })
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let open = workspace.read(cx).open.as_ref().unwrap();
+                let e = open.editor.as_ref().unwrap().read(cx);
+                e.path().as_str() == "b.md" && e.highlighted_block().is_some()
+            })
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+        wait_until(cx, |cx| cx.update(|_, cx| backlinks.read(cx).hits().len() == 1));
+        assert_eq!(hit_paths(cx, &search, "needle"), ["b.md"]);
+        cx.update(|_, cx| search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn tag_completion_workspace_loads_front_matter_and_inserts(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("body\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let editor = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            open.search.read(cx).close_blocking();
+            open.editor.clone().unwrap()
+        });
+        std::fs::write(dir.path().join("tags.md"), "---\ntags: [rust]\n---\n").unwrap();
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.start_writing(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input("next #Ru");
+        wait_until(cx, |cx| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds("tag-row-0").is_some()
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| assert!(editor.read(cx).index_snapshot().1.trim_end().ends_with("next #rust")));
     }
 
     #[gpui_kit::test]

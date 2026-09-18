@@ -66,6 +66,380 @@ fn wiki_catalog(editor: &Entity<Editor>, recent: &[&str], cx: &mut VisualTestCon
 }
 
 #[gpui_kit::test]
+fn block_ref_current_note_assigns_and_inserts_as_one_undo_group(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "目标正文\n\n引用\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("未保存");
+    focus_unit(&editor, 1, cx);
+    cx.simulate_input(" [[#^未保存");
+    let before = text(&editor, cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let m = e.wiki.as_ref().unwrap();
+        assert_eq!(m.matches.len(), 1);
+        assert!(e.tag_menu.is_none());
+        assert!(!e.doc.to_string().contains(" ^"));
+    });
+    cx.simulate_keystrokes("tab");
+    let completed = text(&editor, cx);
+    let span = aero_core::links::scan(&completed).remove(0);
+    let fragment = span.fragment.unwrap();
+    assert!(fragment.starts_with('^'));
+    assert_eq!(fragment.len(), 7);
+    assert_eq!(completed, format!("目标正文未保存 {fragment}\n\n引用 [[#{fragment}]]\n"));
+    cx.simulate_input("!");
+    assert!(text(&editor, cx).contains(&format!("[[#{fragment}]]!")));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), completed);
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), before);
+    cx.simulate_keystrokes("cmd-shift-z");
+    assert_eq!(text(&editor, cx), completed);
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            e.reveal_fragment(&fragment, cx).unwrap();
+            assert_eq!(e.highlight, Some(e.units[0].id));
+        })
+    });
+}
+
+#[gpui_kit::test]
+fn block_ref_mouse_writes_external_id_and_undo_keeps_it(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "body [[]] after\n");
+    let target = dir.path().join("C#.md");
+    let original = "# Intro\n\n```rs\nneedle 中文\n```\n";
+    std::fs::write(&target, original).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        editor.read(cx).focused.as_ref().unwrap().textarea.clone().update(cx, |ta, cx| {
+            ta.set_selected_range(7..7, cx);
+        })
+    });
+    cx.simulate_input("C\\##^needle");
+    wiki_catalog(&editor, &[], cx);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), original, "loading cannot assign an ID");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let row = cx.debug_bounds("wiki-row-0").unwrap();
+    cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    let completed = text(&editor, cx);
+    let span = aero_core::links::scan(&completed).remove(0);
+    assert_eq!(span.target, "C#");
+    let id = span.fragment.unwrap().strip_prefix('^').unwrap().to_owned();
+    let changed = std::fs::read_to_string(&target).unwrap();
+    let doc = aero_core::Document::from_text(&changed);
+    let block = aero_core::block_refs::resolve(&doc, &id).unwrap();
+    assert!(
+        doc.blocks()
+            .iter()
+            .any(|(_, b)| b.id == block && matches!(b.kind, aero_core::BlockKind::CodeFence { .. }))
+    );
+    cx.simulate_input("!");
+    assert_eq!(text(&editor, cx), completed.replace("]] after", "]]! after"));
+    cx.simulate_keystrokes("cmd-z");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "body [[C\\##^needle]] after\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), changed);
+    cx.simulate_keystrokes("cmd-shift-z");
+    assert_eq!(text(&editor, cx), completed);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), changed);
+}
+
+#[gpui_kit::test]
+fn block_ref_external_stale_file_and_removed_file_never_overwrite(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "body\n");
+    let target = dir.path().join("b.md");
+    std::fs::write(&target, "needle\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[b#^needle");
+    wiki_catalog(&editor, &[], cx);
+    std::fs::write(&target, "external edit\n").unwrap();
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[b#^needle\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "external edit\n");
+    cx.update(|_, cx| {
+        assert!(editor.read(cx).wiki.as_ref().unwrap().error.as_deref().unwrap().contains("变化"))
+    });
+    std::fs::remove_file(&target).unwrap();
+    cx.simulate_keystrokes("tab");
+    assert_eq!(text(&editor, cx), "body [[b#^needle\n");
+    assert!(!target.exists());
+}
+
+#[gpui_kit::test]
+fn block_ref_reuses_existing_id_and_handles_ime_alias_in_table(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let (_dir, _vault, _path, editor) = open(cx, "| A |\n| --- |\n| 内容 |\n\n中文😀 ^stable-id\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|_, cx| {
+        input.update(cx, |ta, cx| {
+            let at = ta.value().find("内容").unwrap() + "内容".len();
+            ta.set_selected_range(at..at, cx);
+        })
+    });
+    cx.simulate_input(" [[#^");
+    let before = text(&editor, cx);
+    cx.update(|window, cx| {
+        input.update(cx, |ta, cx| ta.replace_and_mark_text_in_range(None, "zhong", None, window, cx))
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| e.on_split_block(&crate::actions::SplitBlock, window, cx))
+    });
+    assert_eq!(text(&editor, cx), before);
+    cx.update(|window, cx| input.update(cx, |ta, cx| ta.replace_text_in_range(None, "中文", window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-enter");
+    assert_eq!(text(&editor, cx), "| A |\n| --- |\n| 内容 [[#^stable-id\\|中文😀]] |\n\n中文😀 ^stable-id\n");
+    cx.simulate_input("别名");
+    assert!(text(&editor, cx).contains("[[#^stable-id\\|别名]]"));
+    cx.update(|_, cx| assert_eq!(editor.read(cx).units.len(), 2));
+}
+
+#[gpui_kit::test]
+fn block_ref_mode_transition_empty_and_duplicate_ids_are_safe(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "body\n");
+    let target = dir.path().join("b.md");
+    let original = "needle ^dup\n\nother ^dup\n";
+    std::fs::write(&target, original).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[b#");
+    let old = cx.update(|_, cx| editor.read(cx).wiki.as_ref().unwrap().generation);
+    cx.simulate_input("^");
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            assert_ne!(old, e.wiki.as_ref().unwrap().generation);
+            let task = cx.background_spawn(async { Ok(vec![]) });
+            e.load_wiki_notes(old, task, vec![], cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[b#^\n");
+    wiki_catalog(&editor, &[], cx);
+    cx.simulate_input("needle");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[b#^needle\n");
+    cx.update(|_, cx| {
+        assert!(editor.read(cx).wiki.as_ref().unwrap().error.as_deref().unwrap().contains("重复"))
+    });
+    cx.simulate_input("missing");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[b#^needlemissing\n");
+    cx.simulate_keystrokes("escape");
+    cx.update(|_, cx| assert!(editor.read(cx).wiki.is_none()));
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+}
+
+#[gpui_kit::test]
+fn block_ref_reveal_expands_callout_and_ignores_missing_or_ambiguous_id(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) =
+        open(cx, "> [!note]- 折叠\n> 内文 ^inside\n\nfirst ^dup\n\nsecond ^dup\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-折叠").is_none());
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            e.reveal_fragment("^inside", cx).unwrap();
+            assert_eq!(e.highlight, Some(e.units[0].id));
+            assert!(e.reveal_fragment("^missing", cx).is_err());
+            assert!(e.reveal_fragment("^dup", cx).is_err());
+            assert_eq!(e.highlight, Some(e.units[0].id));
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-折叠").is_some());
+}
+
+#[gpui_kit::test]
+fn heading_completion_uses_unsaved_current_note_and_undo(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "# 原标题\n\n正文\n\n## 第二节\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("未保存");
+    focus_unit(&editor, 1, cx);
+    cx.simulate_input(" [[#");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let m = e.wiki.as_ref().unwrap();
+        assert_eq!(m.headings.as_ref().unwrap().entries[0].text, "原标题未保存");
+        assert!(e.tag_menu.is_none());
+    });
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("up");
+    cx.simulate_keystrokes("tab");
+    assert_eq!(text(&editor, cx), "# 原标题未保存\n\n正文 [[#原标题未保存]]\n\n## 第二节\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "# 原标题未保存\n\n正文 [[#\n\n## 第二节\n");
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.simulate_input("!");
+    assert!(text(&editor, cx).contains("[[#原标题未保存]]!"));
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            assert!(e.reveal_heading("原标题未保存", cx));
+            assert_eq!(e.highlight, Some(e.headings()[0].2));
+        });
+    });
+}
+
+#[gpui_kit::test]
+fn heading_completion_mouse_resolves_title_and_reuses_closing_brackets(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "正文 [[知识#]] 后\n");
+    std::fs::write(dir.path().join("C#.md"), "---\ntitle: 知识\n---\n\n# Intro\n\n## **中文** C#\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        editor.read(cx).focused.as_ref().unwrap().textarea.clone().update(cx, |ta, cx| {
+            let at = "正文 [[知识#".len();
+            ta.set_selected_range(at..at, cx);
+        });
+    });
+    cx.simulate_input("文c");
+    wiki_catalog(&editor, &[], cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let row = cx.debug_bounds("wiki-row-0").unwrap();
+    cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "正文 [[C\\##中文 C\\#]] 后\n");
+    cx.simulate_input("!");
+    assert_eq!(text(&editor, cx), "正文 [[C\\##中文 C\\#]]! 后\n");
+    let span = aero_core::links::scan(&text(&editor, cx)).remove(0);
+    assert_eq!(span.target, "C#");
+    assert_eq!(span.fragment.as_deref(), Some("中文 C#"));
+}
+
+#[gpui_kit::test]
+fn heading_completion_mode_change_rejects_old_reply_and_blocks_empty_results(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "body\n");
+    std::fs::write(dir.path().join("b.md"), "# Target\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[b");
+    let old = cx.update(|_, cx| editor.read(cx).wiki.as_ref().unwrap().generation);
+    cx.simulate_input("#");
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            assert_ne!(e.wiki.as_ref().unwrap().generation, old);
+            let notes = cx.background_spawn(async { Ok(vec![]) });
+            e.load_wiki_notes(old, notes, vec![], cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(editor.read(cx).wiki.as_ref().unwrap().catalog.is_none()));
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[b#\n");
+    wiki_catalog(&editor, &[], cx);
+    cx.simulate_input("不存在");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[b#不存在\n");
+    cx.simulate_keystrokes("escape");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.wiki.is_none());
+        let input = e.focused.as_ref().unwrap().textarea.clone();
+        input.update(cx, |ta, cx| ta.set_selected_range(0..ta.value().len(), cx));
+    });
+    cx.simulate_input("body [[missing#");
+    wiki_catalog(&editor, &[], cx);
+    cx.simulate_keystrokes("tab");
+    assert_eq!(text(&editor, cx), "body [[missing#\n");
+    cx.update(|_, cx| {
+        assert!(editor.read(cx).wiki.as_ref().unwrap().error.is_some());
+    });
+    assert!(!dir.path().join("missing.md").exists());
+}
+
+#[gpui_kit::test]
+fn heading_completion_rejects_ambiguous_or_removed_notes(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "body\n");
+    for folder in ["x", "y"] {
+        std::fs::create_dir(dir.path().join(folder)).unwrap();
+        std::fs::write(dir.path().join(folder).join("b.md"), "# Target\n").unwrap();
+    }
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[b#");
+    wiki_catalog(&editor, &[], cx);
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[b#\n");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.wiki.as_ref().unwrap().error.as_deref().unwrap().contains("歧义"));
+        e.focused
+            .as_ref()
+            .unwrap()
+            .textarea
+            .clone()
+            .update(cx, |ta, cx| ta.set_selected_range(0..ta.value().len(), cx));
+    });
+    cx.simulate_input("body [[y/b#");
+    wiki_catalog(&editor, &[], cx);
+    std::fs::remove_file(dir.path().join("y/b.md")).unwrap();
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body [[y/b#\n");
+    cx.update(|_, cx| {
+        assert!(editor.read(cx).wiki.as_ref().unwrap().error.as_deref().unwrap().contains("删除"))
+    });
+}
+
+#[gpui_kit::test]
+fn heading_completion_ime_alias_and_table_structure(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let (_dir, _vault, _path, editor) = open(cx, "# 中文😀\n\n| A |\n| --- |\n| 内容 |\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 1, cx);
+    let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|_, cx| {
+        input.update(cx, |ta, cx| {
+            let at = ta.value().find("内容").unwrap() + "内容".len();
+            ta.set_selected_range(at..at, cx);
+        })
+    });
+    cx.simulate_input(" [[#");
+    let before = text(&editor, cx);
+    cx.update(|window, cx| {
+        input.update(cx, |ta, cx| ta.replace_and_mark_text_in_range(None, "zhong", None, window, cx))
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| e.on_split_block(&crate::actions::SplitBlock, window, cx))
+    });
+    assert_eq!(text(&editor, cx), before);
+    cx.update(|window, cx| input.update(cx, |ta, cx| ta.replace_text_in_range(None, "中文", window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-enter");
+    assert_eq!(text(&editor, cx), "# 中文😀\n\n| A |\n| --- |\n| 内容 [[#中文😀\\|中文😀]] |\n");
+    cx.simulate_input("显示文字");
+    assert!(text(&editor, cx).contains("[[#中文😀\\|显示文字]]"));
+    cx.update(|_, cx| assert_eq!(editor.read(cx).units.len(), 2));
+}
+
+#[gpui_kit::test]
+fn heading_reveal_expands_callout_and_matches_setext(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) =
+        open(cx, "标题\n----\n\n> [!note]- 折叠\n> ## **内部** 标题\n>\n> 正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-折叠").is_none());
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            assert!(e.reveal_heading("标题", cx));
+            assert_eq!(e.highlight, Some(e.units[0].id));
+            assert!(e.reveal_heading("内部 标题", cx));
+            assert_eq!(e.highlight, Some(e.units[1].id));
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("callout-body-折叠").is_some());
+}
+
+#[gpui_kit::test]
 fn wiki_keyboard_completion_alias_and_undo(cx: &mut TestAppContext) {
     let (dir, _vault, _path, editor) = open(cx, "正文\n");
     std::fs::write(dir.path().join("b.md"), "---\ntitle: 知识库😀\n---\n").unwrap();
@@ -250,6 +624,185 @@ fn wiki_completion_in_callouts_and_tables_preserves_markdown(cx: &mut TestAppCon
             .replace("公式", "公式 [[知识")
     );
     cx.update(|_, cx| assert_eq!(editor.read(cx).units.len(), 4, "alias must not split a table cell"));
+}
+
+fn tag_catalog(editor: &Entity<Editor>, entries: &[(&str, u64)], cx: &mut VisualTestContext) {
+    let candidates = entries
+        .iter()
+        .map(|(tag, count)| aero_index::TagCount { tag: (*tag).into(), note_count: *count })
+        .collect();
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            let generation = e.tag_menu.as_ref().expect("tag menu").generation;
+            let task = cx.background_spawn(async move { Ok(candidates) });
+            e.load_tags(generation, task, cx);
+        })
+    });
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn tag_completion_keyboard_frequency_filter_and_undo(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "body\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" #");
+    tag_catalog(&editor, &[("rust", 2), ("中文", 5)], cx);
+    cx.update(|_, cx| {
+        let m = editor.read(cx).tag_menu.as_ref().unwrap();
+        assert_eq!(m.candidates.as_ref().unwrap()[m.matches[0]].tag, "中文");
+    });
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("tab");
+    assert_eq!(text(&editor, cx), "body #rust\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "body #\n");
+    cx.simulate_keystrokes("cmd-shift-z");
+    assert_eq!(text(&editor, cx), "body #rust\n");
+    cx.simulate_input(" #R");
+    tag_catalog(&editor, &[("rust", 2), ("rust/cli", 1), ("other", 8)], cx);
+    cx.simulate_input("u");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let menu = e.tag_menu.as_ref().unwrap();
+        assert!(menu.candidates.is_some(), "typing must filter without reloading");
+        assert_eq!(menu.matches.len(), 2);
+        assert!(e.slash.is_none() && e.wiki.is_none());
+    });
+    cx.simulate_keystrokes("down");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body #rust #rust/cli\n");
+    cx.simulate_input(" next");
+    assert_eq!(text(&editor, cx), "body #rust #rust/cli next\n");
+}
+
+#[gpui_kit::test]
+fn tag_completion_mouse_replaces_suffix_and_preserves_punctuation(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "body #st，tail\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        editor
+            .read(cx)
+            .focused
+            .as_ref()
+            .unwrap()
+            .textarea
+            .clone()
+            .update(cx, |ta, cx| ta.set_selected_range(6..6, cx))
+    });
+    cx.simulate_input("ru");
+    tag_catalog(&editor, &[("rust/cli", 1)], cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let row = cx.debug_bounds("tag-row-0").unwrap();
+    cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "body #rust/cli，tail\n");
+    cx.simulate_input(" next");
+    assert_eq!(text(&editor, cx), "body #rust/cli next，tail\n");
+}
+
+#[gpui_kit::test]
+fn tag_completion_loading_failure_empty_and_stale_reply(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "body\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" #r");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body #r\n");
+    let old = cx.update(|_, cx| editor.read(cx).tag_menu.as_ref().unwrap().generation);
+    cx.simulate_keystrokes("escape");
+    cx.update(|_, cx| assert!(editor.read(cx).focused.is_some()));
+    cx.simulate_input("u");
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            let task = cx.background_spawn(async { Ok(vec![]) });
+            e.load_tags(old, task, cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            let menu = e.tag_menu.as_ref().unwrap();
+            assert!(menu.candidates.is_none());
+            let generation = menu.generation;
+            let task = cx.background_spawn(async { Err("test".into()) });
+            e.load_tags(generation, task, cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body #ru\n");
+    tag_catalog(&editor, &[], cx);
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "body #ru\n\n\n");
+    cx.update(|_, cx| assert!(editor.read(cx).tag_menu.is_none()));
+}
+
+#[gpui_kit::test]
+fn tag_completion_ime_and_selection_do_not_confirm_stale_menu(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let (_dir, _vault, _path, editor) = open(cx, "正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" #");
+    tag_catalog(&editor, &[("中文/工具", 1)], cx);
+    let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|window, cx| {
+        input.update(cx, |ta, cx| ta.replace_and_mark_text_in_range(None, "zhong", None, window, cx))
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| e.on_split_block(&crate::actions::SplitBlock, window, cx))
+    });
+    assert_eq!(text(&editor, cx), "正文 #\n");
+    cx.update(|window, cx| input.update(cx, |ta, cx| ta.replace_text_in_range(None, "中文", window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "正文 #中文/工具\n");
+    cx.simulate_input(" #");
+    tag_catalog(&editor, &[("rust", 1)], cx);
+    cx.update(|_, cx| {
+        editor
+            .read(cx)
+            .focused
+            .as_ref()
+            .unwrap()
+            .textarea
+            .clone()
+            .update(cx, |ta, cx| ta.set_selected_range(0..6, cx))
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(editor.read(cx).tag_menu.is_none()));
+    cx.simulate_input("新正文");
+    assert_eq!(text(&editor, cx), "新正文 #中文/工具 #\n");
+}
+
+#[gpui_kit::test]
+fn tag_completion_respects_heading_and_works_in_callout_and_table(cx: &mut TestAppContext) {
+    let source = "# Heading\n\n> [!note]\n> 引用\n\n| A |\n| --- |\n| 单元 |\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for (ix, needle) in [(0, "Heading"), (1, "引用"), (2, "单元")] {
+        focus_unit(&editor, ix, cx);
+        cx.update(|_, cx| {
+            editor.read(cx).focused.as_ref().unwrap().textarea.clone().update(cx, |ta, cx| {
+                let at = ta.value().find(needle).unwrap() + needle.len();
+                ta.set_selected_range(at..at, cx);
+            })
+        });
+        cx.simulate_input(" #ru");
+        if ix == 0 {
+            cx.update(|_, cx| assert!(editor.read(cx).tag_menu.is_none()));
+        } else {
+            tag_catalog(&editor, &[("rust", 1)], cx);
+            cx.simulate_keystrokes("enter");
+        }
+    }
+    assert_eq!(
+        text(&editor, cx),
+        source.replace("Heading", "Heading #ru").replace("引用", "引用 #rust").replace("单元", "单元 #rust")
+    );
 }
 
 #[gpui_kit::test]

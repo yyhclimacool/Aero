@@ -1,5 +1,5 @@
 //! 元数据库（方案 10.2 的 M1b 子集）：每篇笔记的 `note_id`、路径、标题、文件指纹与已索引块数，
-//! 以及 M2 的 wikilink 关系表 `links`（保存时整篇重建该笔记的行）。
+//! 以及 M2 的 wikilink 关系表 `links` 与笔记级标签目录 `note_tags`。
 //! 它是索引状态的权威（10.5）：启动时用指纹决定哪些文件要重索引；保存时用块数算出要删的旧 pk。
 //! 附件表随 M2 后续加入。
 
@@ -10,8 +10,14 @@ use aero_core::FileStamp;
 use aero_core::links::LinkSpan;
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// 3：links 表加 `resolved_note_id` 索引（失效入链 / 反链查询）。
-const SCHEMA_VERSION: i64 = 3;
+/// 4：增加笔记级标签目录；旧缓存按既有版本策略从 Markdown 重建。
+const SCHEMA_VERSION: i64 = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagCount {
+    pub tag: String,
+    pub note_count: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteRow {
@@ -88,6 +94,7 @@ impl Meta {
         tx.execute_batch(&format!(
             "DROP TABLE IF EXISTS notes;
              DROP TABLE IF EXISTS links;
+             DROP TABLE IF EXISTS note_tags;
              DROP TABLE IF EXISTS index_state;
              CREATE TABLE notes (
                  note_id     TEXT PRIMARY KEY,
@@ -108,6 +115,12 @@ impl Meta {
              );
              CREATE INDEX links_source_idx ON links(source_note_id);
              CREATE INDEX links_target_idx ON links(resolved_note_id);
+             CREATE TABLE note_tags (
+                 note_id TEXT NOT NULL,
+                 tag TEXT NOT NULL,
+                 PRIMARY KEY(note_id, tag)
+             );
+             CREATE INDEX note_tags_tag_idx ON note_tags(tag);
              CREATE TABLE index_state (name TEXT PRIMARY KEY, version INTEGER NOT NULL);
              INSERT INTO index_state (name, version) VALUES ('meta', {SCHEMA_VERSION});"
         ))?;
@@ -148,7 +161,7 @@ impl Meta {
         rows.collect()
     }
 
-    pub fn upsert_note(&mut self, row: &NoteRow) -> rusqlite::Result<()> {
+    pub fn upsert_note(&self, row: &NoteRow) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO notes (note_id, path, title, mtime_ns, size, hash, block_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -169,8 +182,35 @@ impl Meta {
     }
 
     pub fn remove_note(&mut self, note_id: &str) -> rusqlite::Result<()> {
-        self.conn.execute("DELETE FROM notes WHERE note_id = ?1", params![note_id])?;
-        Ok(())
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM note_tags WHERE note_id = ?1", params![note_id])?;
+        tx.execute("DELETE FROM notes WHERE note_id = ?1", params![note_id])?;
+        tx.commit()
+    }
+
+    /// 笔记指纹与标签同时提交；失败时旧指纹仍可促使下一次同步重试。
+    pub fn upsert_note_with_tags(&mut self, row: &NoteRow, tags: &[String]) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.upsert_note(row)?;
+        tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [&row.note_id])?;
+        {
+            let mut insert =
+                tx.prepare_cached("INSERT OR IGNORE INTO note_tags(note_id, tag) VALUES (?1, ?2)")?;
+            for tag in tags {
+                insert.execute(params![row.note_id, tag])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// 每篇笔记至多计一次，只统计实际使用的标签，不额外制造祖先标签。
+    /// 排除当前笔记后，调用方可用未保存版本的标签补回。
+    pub fn tag_counts(&self, exclude_path: Option<&str>) -> rusqlite::Result<Vec<TagCount>> {
+        let mut st = self.conn.prepare(
+            "SELECT t.tag, count(*) FROM note_tags t JOIN notes n ON n.note_id = t.note_id
+             WHERE (?1 IS NULL OR n.path != ?1) GROUP BY t.tag ORDER BY count(*) DESC, t.tag",
+        )?;
+        st.query_map([exclude_path], |r| Ok(TagCount { tag: r.get(0)?, note_count: r.get(1)? }))?.collect()
     }
 
     /// 只改路径（重命名 / 移动），`note_id` 与块不变。
@@ -347,6 +387,64 @@ fn mtime_ns(t: SystemTime) -> i64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tag_counts_replace_deduplicate_exclude_and_remove_notes() {
+        let mut m = Meta::in_memory().unwrap();
+        let a = NoteRow {
+            note_id: "a".into(),
+            path: "a.md".into(),
+            title: "A".into(),
+            stamp: stamp(1),
+            block_count: 0,
+        };
+        let b = NoteRow { note_id: "b".into(), path: "b.md".into(), ..a.clone() };
+        m.upsert_note_with_tags(&a, &["rust".into(), "rust".into(), "中文/工具".into()]).unwrap();
+        m.upsert_note_with_tags(&b, &["rust".into()]).unwrap();
+        assert_eq!(
+            m.tag_counts(None).unwrap(),
+            [
+                TagCount { tag: "rust".into(), note_count: 2 },
+                TagCount { tag: "中文/工具".into(), note_count: 1 }
+            ]
+        );
+        assert_eq!(m.tag_counts(Some("a.md")).unwrap(), [TagCount { tag: "rust".into(), note_count: 1 }]);
+        m.upsert_note(&NoteRow { stamp: stamp(2), ..a.clone() }).unwrap();
+        assert_eq!(m.tag_counts(None).unwrap()[0].note_count, 2, "stamp-only update preserves tags");
+        m.upsert_note_with_tags(&a, &["rust/cli".into()]).unwrap();
+        m.rename_note("a", "renamed.md", "A").unwrap();
+        assert_eq!(
+            m.tag_counts(Some("renamed.md")).unwrap(),
+            [TagCount { tag: "rust".into(), note_count: 1 }]
+        );
+        m.remove_note("b").unwrap();
+        assert_eq!(m.tag_counts(None).unwrap(), [TagCount { tag: "rust/cli".into(), note_count: 1 }]);
+        m.reset().unwrap();
+        assert!(m.tag_counts(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tag_write_failure_rolls_back_note_stamp_and_previous_tags() {
+        let mut m = Meta::in_memory().unwrap();
+        let row = NoteRow {
+            note_id: "a".into(),
+            path: "a.md".into(),
+            title: "A".into(),
+            stamp: stamp(1),
+            block_count: 1,
+        };
+        m.upsert_note_with_tags(&row, &["old".into()]).unwrap();
+        m.conn.execute_batch("CREATE TRIGGER deny_tag BEFORE INSERT ON note_tags WHEN NEW.tag = 'fail' BEGIN SELECT RAISE(ABORT, 'test'); END;").unwrap();
+        assert!(
+            m.upsert_note_with_tags(
+                &NoteRow { stamp: stamp(2), ..row.clone() },
+                &["new".into(), "fail".into()]
+            )
+            .is_err()
+        );
+        assert_eq!(m.note_by_path("a.md").unwrap(), Some(row));
+        assert_eq!(m.tag_counts(None).unwrap(), [TagCount { tag: "old".into(), note_count: 1 }]);
+    }
+
     fn stamp(n: u64) -> FileStamp {
         FileStamp { mtime: UNIX_EPOCH + Duration::from_secs(n), size: n, hash: n * 7 }
     }
@@ -495,7 +593,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("meta.sqlite");
         {
-            let mut m = Meta::open(&db).unwrap();
+            let m = Meta::open(&db).unwrap();
             m.upsert_note(&NoteRow {
                 note_id: "n".into(),
                 path: "p.md".into(),

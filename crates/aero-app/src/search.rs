@@ -180,6 +180,54 @@ impl SearchService {
         })
     }
 
+    /// 正常运行时读标签目录；启动同步 / 索引不可用时从磁盘补齐，均不阻塞 UI。
+    /// 当前笔记用内存版本替换，且调用方已移除正在补全的半成品标签。
+    pub fn completion_tags(
+        &self,
+        vault: Arc<Vault>,
+        current_path: VaultPath,
+        current_source: String,
+        cx: &App,
+    ) -> Task<Result<Vec<aero_index::TagCount>, String>> {
+        let indexer = self.indexer.clone();
+        let ready = self.phase() == Phase::Idle;
+        cx.background_spawn(async move {
+            let indexed = if ready {
+                let guard = indexer.lock().unwrap();
+                guard
+                    .as_ref()
+                    .map(|ix| ix.tag_counts(Some(&current_path)).map_err(|e| e.to_string()))
+                    .transpose()?
+            } else {
+                None
+            };
+            let mut counts = std::collections::BTreeMap::<String, u64>::new();
+            if let Some(indexed) = indexed {
+                for item in indexed {
+                    counts.insert(item.tag, item.note_count);
+                }
+            } else {
+                for path in vault.notes().map_err(|e| e.to_string())? {
+                    if path == current_path {
+                        continue;
+                    }
+                    let doc = match vault.read(&path) {
+                        Ok((doc, _)) => doc,
+                        Err(_) if !vault.exists(&path) => continue,
+                        Err(err) => return Err(err.to_string()),
+                    };
+                    for tag in aero_core::index::tags_for_note(&doc) {
+                        *counts.entry(tag).or_default() += 1;
+                    }
+                }
+            }
+            for tag in aero_core::index::tags_for_note(&aero_core::Document::from_text(&current_source)) {
+                *counts.entry(tag).or_default() += 1;
+            }
+            Ok(counts.into_iter().map(|(tag, note_count)| aero_index::TagCount { tag, note_count }).collect())
+        })
+    }
+
     /// 预览点 wikilink 用的解析表：已索引笔记（含 front matter 标题）加磁盘上还没索引到的文件。
     /// 引擎还没打开时退化为只按磁盘文件列表解析（没有标题匹配）。
     pub fn link_resolver(&self, vault: Arc<Vault>, cx: &App) -> Task<Resolver> {
@@ -557,6 +605,44 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path.as_str(), "b.md");
         cx.update(|cx| service.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn tag_completion_merges_unsaved_note_and_falls_back_without_index(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        for (file, source) in [
+            ("a.md", "body #old\n"),
+            ("b.md", "body #Rust #rust\n"),
+            ("c.md", "---\ntags: [rust]\n---\n"),
+            ("ignored.md", "body #ghost\n"),
+            (".gitignore", "ignored.md\n"),
+        ] {
+            std::fs::write(dir.path().join(file), source).unwrap();
+        }
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        let query = |cx: &mut TestAppContext| {
+            let task = cx.update(|cx| {
+                service.read(cx).completion_tags(
+                    vault.clone(),
+                    VaultPath::new("a.md").unwrap(),
+                    "body #fresh #fresh #rust\n".into(),
+                    cx,
+                )
+            });
+            cx.foreground_executor()
+                .block_on(task)
+                .unwrap()
+                .into_iter()
+                .map(|t| (t.tag, t.note_count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(query(cx), [("fresh".into(), 1), ("rust".into(), 3)]);
+        cx.update(|cx| service.read(cx).close_blocking());
+        std::fs::write(dir.path().join("new.md"), "---\ntags: [中文/工具]\n---\n").unwrap();
+        assert_eq!(query(cx), [("fresh".into(), 1), ("rust".into(), 3), ("中文/工具".into(), 1)]);
     }
 
     /// 关掉之后引擎句柄已释放：同一份索引能立刻再打开（锁拿得到，不是删掉重建）；
