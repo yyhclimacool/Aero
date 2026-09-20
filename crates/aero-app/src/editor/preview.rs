@@ -47,6 +47,9 @@ pub(super) fn markdown(
     editor: Entity<super::Editor>,
 ) -> TextView {
     let block_editor = editor.clone();
+    let highlight_editor = editor.clone();
+    let highlight_style = style.clone();
+    let highlight_id = id.clone();
     TextView::markdown(id.clone(), text)
         .style(style.clone())
         .selectable(false)
@@ -66,6 +69,36 @@ pub(super) fn markdown(
             let id: SharedString = format!("{id}-callout-{}", callout.offset).into();
             render_callout(id, callout, style.clone(), reveal, &state, &block_editor, cx)
         })
+        .markdown_block_parser(|node, cx| {
+            if !matches!(
+                node,
+                markdown_ast::Node::Paragraph(_)
+                    | markdown_ast::Node::Heading(_)
+                    | markdown_ast::Node::Table(_)
+            ) {
+                return None;
+            }
+            let pos = node.position()?;
+            let preview = aero_core::highlight::preview(cx.source(), pos.start.offset..pos.end.offset)?;
+            Some(
+                MarkdownNode::new("highlight", (pos.start.offset, preview))
+                    .markdown(cx.node_source(node)?.to_owned()),
+            )
+        })
+        .markdown_block_renderer("highlight", move |node, window, cx| {
+            let (offset, preview) =
+                node.data::<(usize, aero_core::highlight::Preview)>().expect("highlight parser data");
+            let id: SharedString = format!("{highlight_id}-highlight-{offset}").into();
+            match preview {
+                aero_core::highlight::Preview::Html(html) => {
+                    highlight_html(id, html, &highlight_style, &highlight_editor, window, cx)
+                        .into_any_element()
+                }
+                aero_core::highlight::Preview::Table { alignments, rows } => {
+                    highlight_table(id, alignments, rows, &highlight_style, &highlight_editor, window, cx)
+                }
+            }
+        })
         .on_link_click(move |url, event, _window, cx| match link_click(url, event) {
             LinkClick::Ignore => {}
             // 外部链接保持默认行为：系统浏览器打开
@@ -75,6 +108,135 @@ pub(super) fn markdown(
             }),
         })
         .w_full()
+}
+
+fn highlight_html(
+    id: SharedString,
+    lines: &[String],
+    style: &TextViewStyle,
+    editor: &Entity<super::Editor>,
+    window: &Window,
+    cx: &App,
+) -> Div {
+    let color = super::highlight_ui::color_hex(cx);
+    let line_height = window.text_style().line_height_in_pixels(window.rem_size());
+    v_flex().w_full().items_start().children(lines.iter().enumerate().map(|(ix, html)| {
+        let editor = editor.clone();
+        // TextView 内部使用 h_full；最小高度放在独立容器，避免换行内容被按一行测量。
+        div().min_h(line_height).max_w_full().child(
+            TextView::html(
+                SharedString::from(format!("{id}-line-{ix}")),
+                html.replace("<mark>", &format!("<mark color=\"{color}\">")),
+            )
+            .style(style.clone())
+            .selectable(false)
+            .on_link_click(move |url, event, _, cx| match link_click(url, event) {
+                LinkClick::Ignore => {}
+                LinkClick::External => cx.open_url(url),
+                LinkClick::Note { target, fragment } => editor.update(cx, |_, cx| {
+                    cx.emit(super::EditorEvent::LinkClicked { target, fragment });
+                }),
+            })
+            .max_w_full(),
+        )
+    }))
+}
+
+fn highlight_table(
+    id: SharedString,
+    alignments: &[aero_core::highlight::Alignment],
+    rows: &[Vec<aero_core::highlight::Cell>],
+    style: &TextViewStyle,
+    editor: &Entity<super::Editor>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    use aero_core::highlight::Alignment;
+    use gpui_kit::base::{ScrollableMask, StyledExt as _};
+
+    let text_style = window.text_style();
+    let font_size = text_style.font_size.to_pixels(window.rem_size());
+    let mut widths = vec![48.0_f32; alignments.len()];
+    for (row_ix, row) in rows.iter().enumerate() {
+        for (ix, cell) in row.iter().enumerate() {
+            let mut font = text_style.font();
+            if row_ix == 0 {
+                font.weight = FontWeight::SEMIBOLD;
+            }
+            for line in cell.text.lines() {
+                let run = TextRun {
+                    len: line.len(),
+                    font: font.clone(),
+                    color: cx.theme().foreground,
+                    ..Default::default()
+                };
+                let width = window.text_system().layout_line(line, font_size, &[run], None).width;
+                widths[ix] = widths[ix].max(f32::from(width) + 17.);
+            }
+        }
+    }
+    let floors: Vec<f32> = widths.iter().map(|w| (w / 2.).clamp(160., 480.).min(*w)).collect();
+    let scroll = window.use_keyed_state(id.clone(), cx, |_, _| ScrollHandle::default()).read(cx).clone();
+    let mut cell_style = style.clone();
+    cell_style.paragraph_gap = rems(0.);
+    let track = div().min_w_full().w(px(floors.iter().sum::<f32>() + 2.)).children(
+        rows.iter().enumerate().map(|(row_ix, row)| {
+            h_flex()
+                .w_full()
+                .items_stretch()
+                .border_color(cx.theme().border)
+                .when(row_ix + 1 < rows.len(), |el| el.border_b_1())
+                .when(row_ix == 0, |el| {
+                    el.bg(cx.theme().muted).font_weight(FontWeight::SEMIBOLD).refine_style(&style.table_head)
+                })
+                .children(row.iter().enumerate().map(|(ix, cell)| {
+                    div()
+                        .debug_selector(move || format!("highlight-cell-{row_ix}-{ix}"))
+                        .flex_basis(px(widths[ix]))
+                        .flex_grow(widths[ix])
+                        .flex_shrink(1.)
+                        .min_w(px(floors[ix]))
+                        .overflow_hidden()
+                        .px_2()
+                        .py_1()
+                        .when(ix + 1 < alignments.len(), |el| el.border_r_1().border_color(cx.theme().border))
+                        .refine_style(&style.table_cell)
+                        .child(
+                            // GPUI 对齐文字时背景终点不含偏移；用容器对齐自然宽度的文字。
+                            highlight_html(
+                                format!("{id}-{row_ix}-{ix}").into(),
+                                &cell.html,
+                                &cell_style,
+                                editor,
+                                window,
+                                cx,
+                            )
+                            .text_left()
+                            .when(matches!(alignments[ix], Alignment::Center), |el| el.items_center())
+                            .when(matches!(alignments[ix], Alignment::Right), |el| el.items_end()),
+                        )
+                }))
+        }),
+    );
+    // HTML 表格解析会跳过空单元格且丢弃 align，容器结构必须保留在原生布局中。
+    div()
+        .w_full()
+        .pb(rems(1.))
+        .relative()
+        .child(
+            div()
+                .id(id.clone())
+                .debug_selector(|| "highlight-table".to_owned())
+                .w_full()
+                .border_1()
+                .border_color(cx.theme().border)
+                .refine_style(&style.table)
+                .overflow_hidden()
+                .track_scroll(&scroll)
+                .child(track),
+        )
+        .child(ScrollableMask::new(Axis::Horizontal, &scroll).id(id))
+        .into_any_element()
 }
 
 /// 预览里一次链接点击该怎么处理。

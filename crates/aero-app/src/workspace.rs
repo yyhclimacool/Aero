@@ -2150,6 +2150,84 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn auto_pairs_workspace_completion_save_and_undo(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Source\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let editor = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            open.search.read(cx).close_blocking();
+            let editor = open.editor.clone().unwrap();
+            editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx));
+            editor
+        });
+        std::fs::write(dir.path().join("b.md"), "---\ntitle: Target\n---\n正文\n").unwrap();
+        cx.run_until_parked();
+        cx.simulate_input(" (**中文**) [[Target");
+        wait_until(cx, |cx| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds("wiki-row-0").is_some()
+        });
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| editor.update(cx, |e, cx| e.save_now(cx)));
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| matches!(editor.read(cx).save_state(), crate::editor::SaveState::Saved(_)))
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "# Source (**中文**) [[b]]\n");
+        cx.simulate_keystrokes("cmd-z");
+        cx.update(|_, cx| {
+            assert_eq!(editor.read(cx).index_snapshot().1, "# Source (**中文**) [[Target]]\n");
+            editor.update(cx, |e, cx| e.save_now(cx));
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| matches!(editor.read(cx).save_state(), crate::editor::SaveState::Saved(_)))
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
+            "# Source (**中文**) [[Target]]\n"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn inline_format_command_palette_restores_selection_and_saves(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# Source\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let editor = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            open.search.read(cx).close_blocking();
+            let editor = open.editor.clone().unwrap();
+            editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx));
+            editor
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("alt-shift-left");
+        cx.simulate_keystrokes("cmd-shift-p");
+        cx.simulate_input("粗体");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = cx.debug_bounds("picker-row-0").unwrap();
+        cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            assert!(workspace.read(cx).quick_open.is_none());
+            assert_eq!(workspace.read(cx).recent_commands.first().copied(), Some("format-bold"));
+            assert_eq!(editor.read(cx).index_snapshot().1, "# **Source**\n");
+        });
+        // 命令面板返回后保持正文选区，可以直接替换，再取消格式。
+        cx.simulate_input("中文");
+        cx.simulate_keystrokes("shift-left shift-left");
+        cx.simulate_keystrokes("cmd-b");
+        cx.update(|_, cx| editor.update(cx, |e, cx| e.save_now(cx)));
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| matches!(editor.read(cx).save_state(), crate::editor::SaveState::Saved(_)))
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "# 中文\n");
+    }
+
+    #[gpui_kit::test]
     fn inline_link_command_palette_preserves_selection_and_saves_with_note_completion(
         cx: &mut TestAppContext,
     ) {

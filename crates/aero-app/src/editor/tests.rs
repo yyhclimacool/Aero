@@ -83,6 +83,513 @@ fn selected_inline_text(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> 
 }
 
 #[gpui_kit::test]
+fn highlight_color_is_painted_in_source_and_removed_by_toggle(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "正文 中文😀 后文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "中文😀", cx);
+    cx.simulate_keystrokes("cmd-shift-h");
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let focused = editor.read(cx).focused.as_ref().unwrap();
+        let painted = focused.highlight.painted();
+        assert!(!painted.is_empty(), "source mode must paint a background, not only insert ==");
+        let ta = focused.textarea.read(cx);
+        let at = ta.value().find("中文😀").unwrap();
+        assert_eq!(painted[0].left(), ta.range_to_bounds(&(at..at)).unwrap().left());
+        assert!(painted.iter().all(|r| r.size.width > gpui_kit::px(0.) && r.size.height > gpui_kit::px(0.)));
+    });
+    cx.simulate_keystrokes("cmd-shift-h");
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(editor.read(cx).focused.as_ref().unwrap().highlight.painted().is_empty());
+    });
+    assert_eq!(text(&editor, cx), "正文 中文😀 后文\n");
+    cx.simulate_keystrokes("cmd-z");
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(!editor.read(cx).focused.as_ref().unwrap().highlight.painted().is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn highlight_source_wraps_by_row_and_does_not_paint_code(cx: &mut TestAppContext) {
+    let source = format!("=={}==\n\n```md\n==code==\n```\n", "中文文字 ".repeat(300).trim_end());
+    assert_eq!(aero_core::highlight::ranges(&source).len(), 1, "fixture must contain a parsed highlight");
+    let (_dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let f = editor.read(cx).focused.as_ref().unwrap();
+        let rows = f.highlight.painted();
+        assert!(rows.len() > 1, "wrapped highlight must have one rectangle per visual row");
+        let bounds = f.textarea.read(cx).text_bounds().unwrap();
+        assert!(rows.iter().all(|r| r.size.width <= bounds.size.width));
+    });
+    focus_unit(&editor, 1, cx);
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(editor.read(cx).focused.as_ref().unwrap().highlight.painted().is_empty());
+    });
+}
+
+fn highlight_quads(cx: &mut VisualTestContext) -> Vec<gpui_kit::Quad> {
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window
+            .painted_quads()
+            .into_iter()
+            .filter(|q| q.background.as_solid() == Some(super::highlight_ui::color(cx)))
+            .collect()
+    })
+}
+
+#[gpui_kit::test]
+fn highlight_history_clears_source_and_preview_background(cx: &mut TestAppContext) {
+    let source = "正文 中文😀 后文\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "中文😀", cx);
+    cx.simulate_keystrokes("cmd-shift-h");
+    assert!(!highlight_quads(cx).is_empty());
+    for (key, highlighted) in [("cmd-z", false), ("cmd-shift-z", true)] {
+        cx.simulate_keystrokes(key);
+        assert_eq!(!highlight_quads(cx).is_empty(), highlighted, "source {key}");
+    }
+    cx.simulate_keystrokes("escape");
+    assert!(!highlight_quads(cx).is_empty(), "preview must paint yellow");
+    for (key, highlighted) in [("cmd-z", false), ("cmd-shift-z", true)] {
+        cx.simulate_keystrokes(key);
+        assert_eq!(!highlight_quads(cx).is_empty(), highlighted, "preview {key}");
+    }
+    assert_eq!(text(&editor, cx), source.replace("中文😀", "==中文😀=="));
+}
+
+#[gpui_kit::test]
+fn highlight_delimiter_deletion_invalidates_source_background(cx: &mut TestAppContext) {
+    let source = "==中文😀==\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    assert!(!highlight_quads(cx).is_empty());
+    select_inline_text(&editor, "==", cx);
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text(&editor, cx), "中文😀==\n");
+    assert!(highlight_quads(cx).is_empty());
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+    assert!(!highlight_quads(cx).is_empty());
+    cx.simulate_keystrokes("cmd-shift-z");
+    assert!(highlight_quads(cx).is_empty());
+}
+
+#[gpui_kit::test]
+fn highlight_preview_paints_table_and_nested_callout_in_both_themes(cx: &mut TestAppContext) {
+    let source = "| 表头 |\n|---|\n| ==单元格== |\n\n> [!note]+ Outer\n> ==正文==\n>\n> > [!tip]+ Inner\n> > ==嵌套==\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    for mode in [gpui_kit::component::ThemeMode::Light, gpui_kit::component::ThemeMode::Dark] {
+        cx.update(|window, cx| gpui_kit::component::Theme::change(mode, Some(window), cx));
+        cx.run_until_parked();
+        assert_eq!(highlight_quads(cx).len(), 3, "one background per highlighted body in {mode:?}");
+        let toggle = cx.debug_bounds("callout-toggle-Outer").unwrap();
+        cx.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(highlight_quads(cx).len(), 1, "folding hides both callout highlights");
+        let toggle = cx.debug_bounds("callout-toggle-Outer").unwrap();
+        cx.simulate_click(toggle.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(highlight_quads(cx).len(), 3);
+    }
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn highlight_preview_accepts_trailing_whitespace(cx: &mut TestAppContext) {
+    let source = "==正文==  \n续行\n\n# ==标题==  \n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    assert_eq!(highlight_quads(cx).len(), 2);
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn highlight_preview_preserves_empty_cells_and_column_alignment(cx: &mut TestAppContext) {
+    let source =
+        "| A | B | C |\n|:---|---:|:---:|\n| ==left== | ==long== | ==center== |\n| | ==x== | ==中== |\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    let quads = highlight_quads(cx);
+    assert_eq!(quads.len(), 5);
+    assert!(quads[3].bounds.left() > quads[0].bounds.right(), "empty first cell must keep x in column B");
+    assert_eq!(quads[1].bounds.right(), quads[3].bounds.right(), "column B must remain right-aligned");
+    assert_eq!(quads[2].bounds.center().x, quads[4].bounds.center().x, "column C must remain centered");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn highlight_preview_preserves_hard_break_inside_mark(cx: &mut TestAppContext) {
+    let source = "==a  \nb==\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    let quads = highlight_quads(cx);
+    assert_eq!(quads.len(), 2, "hard break splits highlighted text into two visual rows");
+    assert!(quads[1].bounds.top() > quads[0].bounds.top());
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn highlight_preview_preserves_inline_html_break(cx: &mut TestAppContext) {
+    let source = "==a==<br>==b==\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    let quads = highlight_quads(cx);
+    assert_eq!(quads.len(), 2);
+    assert!(quads[1].bounds.top() > quads[0].bounds.top(), "inline HTML break must remain a new row");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn highlight_preview_wraps_long_text_without_horizontal_clipping(cx: &mut TestAppContext) {
+    let source = format!("=={}==\n", "中文 wrap ".repeat(70).trim_end());
+    let (_dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    let quads = highlight_quads(cx);
+    assert!(quads.len() > 1);
+    for quad in quads {
+        assert!(quad.bounds.size.width > gpui_kit::ScaledPixels(0.));
+        assert!(quad.bounds.left() >= quad.content_mask.bounds.left());
+        assert!(quad.bounds.right() <= quad.content_mask.bounds.right());
+    }
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn highlight_wrapped_paragraph_reserves_height_before_table(cx: &mut TestAppContext) {
+    use gpui_kit::{px, size};
+    let source = format!(
+        "=={}==\n\n| 表头 | 内容 |\n|---|---|\n| 普通 | 单元格 |\n",
+        "这是一段用于检查自动换行的黄色高亮文本，包含中文😀，也包含 English words。".repeat(4),
+    );
+    let (_dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for width in [1280., 620., 420., 1000.] {
+        cx.simulate_resize(size(px(width), px(1400.)));
+        cx.run_until_parked();
+        for return_from_edit in [false, true] {
+            if return_from_edit {
+                focus_unit(&editor, 0, cx);
+                cx.simulate_keystrokes("escape");
+                cx.run_until_parked();
+            }
+            let quads = highlight_quads(cx);
+            assert!(quads.len() > 1, "fixture must wrap before the table");
+            let scale = cx.update(|window, _| window.scale_factor());
+            let paragraph = cx.debug_bounds("unit-1").unwrap().scale(scale);
+            let table = cx.debug_bounds("unit-2").unwrap().scale(scale);
+            let last_line = quads.iter().map(|q| q.bounds.bottom()).max().unwrap();
+            assert!(
+                last_line <= paragraph.bottom(),
+                "{width}: painted bottom {last_line:?}, paragraph {paragraph:?}"
+            );
+            assert!(
+                last_line <= table.top(),
+                "{width}: table {table:?} overlaps highlighted text ending at {last_line:?}"
+            );
+        }
+    }
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn highlight_wrapped_table_cells_reserve_height_before_next_row(cx: &mut TestAppContext) {
+    use gpui_kit::{px, size};
+    let content = "中文😀 wrapped text ".repeat(8);
+    let content = content.trim_end();
+    let source = format!(
+        "| Left | Center | Right |\n|:---|:---:|---:|\n| =={content}== | =={content}== | =={content}== |\n| next | next | next |\n"
+    );
+    let (_dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for width in [1280., 620., 420., 1000.] {
+        cx.simulate_resize(size(px(width), px(1400.)));
+        cx.run_until_parked();
+        let quads = highlight_quads(cx);
+        assert!(quads.len() > 3, "fixture must wrap in the table cells");
+        let scale = cx.update(|window, _| window.scale_factor());
+        let cell = cx.debug_bounds("highlight-cell-1-0").unwrap().scale(scale);
+        let next = cx.debug_bounds("highlight-cell-2-0").unwrap().scale(scale);
+        for quad in quads {
+            assert!(
+                quad.bounds.bottom() <= cell.bottom(),
+                "{width}: painted {:?} outside row {cell:?}",
+                quad.bounds
+            );
+            assert!(quad.bounds.bottom() <= next.top(), "{width}: highlight overlaps next row");
+        }
+    }
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn highlight_table_preserves_hard_breaks_and_empty_rows(cx: &mut TestAppContext) {
+    let source = "| A | B |\n|---|---:|\n| | |\n| | ==a<br><br>b== |\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.run_until_parked();
+    let quads = highlight_quads(cx);
+    assert_eq!(quads.len(), 2);
+    assert_eq!(quads[0].bounds.right(), quads[1].bounds.right());
+    assert!(quads[1].bounds.top() >= quads[0].bounds.bottom() + quads[0].bounds.size.height);
+    let empty_row = cx.debug_bounds("highlight-cell-1-0").unwrap();
+    let body = cx.debug_bounds("highlight-cell-2-1").unwrap();
+    assert!(empty_row.size.height > gpui_kit::px(0.));
+    assert!(body.top() >= empty_row.bottom());
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn inline_format_shortcuts_toggle_and_keep_selection_with_atomic_history(cx: &mut TestAppContext) {
+    let source = "正文 中文😀 末尾\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    for (key, delimiter) in
+        [("cmd-b", "**"), ("cmd-i", "*"), ("cmd-e", "`"), ("cmd-shift-s", "~~"), ("cmd-shift-h", "==")]
+    {
+        select_inline_text(&editor, "中文😀", cx);
+        cx.simulate_keystrokes(key);
+        let wrapped = source.replace("中文😀", &format!("{delimiter}中文😀{delimiter}"));
+        assert_eq!(text(&editor, cx), wrapped, "{key}");
+        assert_eq!(selected_inline_text(&editor, cx), "中文😀");
+        cx.simulate_keystrokes(key);
+        assert_eq!(text(&editor, cx), source);
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), wrapped);
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), source);
+        cx.simulate_keystrokes("cmd-shift-z");
+        assert_eq!(text(&editor, cx), wrapped);
+        cx.simulate_keystrokes("cmd-shift-z");
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn inline_format_empty_markers_type_inside_and_toggle_off(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_at(0, None, window, cx)));
+    for (key, marker) in
+        [("cmd-b", "**"), ("cmd-i", "*"), ("cmd-e", "`"), ("cmd-shift-s", "~~"), ("cmd-shift-h", "==")]
+    {
+        cx.simulate_keystrokes(key);
+        assert_eq!(text(&editor, cx), format!("{marker}{marker}\n"));
+        cx.simulate_keystrokes(key);
+        assert_eq!(text(&editor, cx), "\n");
+        cx.simulate_keystrokes(key);
+        cx.simulate_input("中文");
+        assert_eq!(text(&editor, cx), format!("{marker}中文{marker}\n"));
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), format!("{marker}{marker}\n"));
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), "\n");
+    }
+}
+
+#[gpui_kit::test]
+fn inline_format_tables_callouts_links_and_whitespace(cx: &mut TestAppContext) {
+    let source = "> [!note]- 提示\n> 中文\n\n| 表头 |\n|---|\n| a\\|中文 |\n\n[中文](https://example.com)\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for ix in 0..3 {
+        focus_unit(&editor, ix, cx);
+        select_inline_text(&editor, "中文", cx);
+        cx.simulate_keystrokes("cmd-b");
+    }
+    assert_eq!(text(&editor, cx), source.replace("中文", "**中文**"));
+    cx.update(|_, cx| assert_eq!(editor.read(cx).units.len(), 3));
+}
+
+#[gpui_kit::test]
+fn inline_format_invalid_context_keeps_document_and_history(cx: &mut TestAppContext) {
+    let source = "```md\ninside\n```\n\n[链接](https://inside)\n\n$inside$\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for ix in 0..3 {
+        focus_unit(&editor, ix, cx);
+        select_inline_text(&editor, "inside", cx);
+        cx.simulate_keystrokes("cmd-b");
+        assert_eq!(text(&editor, cx), source);
+        cx.update(|_, cx| assert!(!editor.read(cx).doc.can_undo()));
+    }
+}
+
+#[gpui_kit::test]
+fn inline_format_preedit_is_untouched(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let (_dir, _vault, _path, editor) = open(cx, "正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|window, cx| {
+        input.update(cx, |ta, cx| ta.replace_and_mark_text_in_range(None, "拼音", None, window, cx));
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-b");
+    assert_eq!(text(&editor, cx), "正文\n");
+    cx.update(|window, cx| input.update(cx, |ta, cx| ta.replace_text_in_range(None, "中文", window, cx)));
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "正文中文\n");
+    select_inline_text(&editor, "中文", cx);
+    cx.simulate_keystrokes("cmd-b");
+    assert_eq!(text(&editor, cx), "正文**中文**\n");
+}
+
+#[gpui_kit::test]
+fn auto_pairs_typing_skips_all_generated_delimiters_and_keeps_caret(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" (**中** ==文== `码` $x$ \"引\")!");
+    assert_eq!(text(&editor, cx), "正文 (**中** ==文== `码` $x$ \"引\")!\n");
+    cx.simulate_input("末");
+    assert_eq!(text(&editor, cx), "正文 (**中** ==文== `码` $x$ \"引\")!末\n");
+}
+
+#[gpui_kit::test]
+fn auto_pairs_empty_backspace_and_undo_redo_are_atomic(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" ");
+    let original = text(&editor, cx);
+    for (left, right) in
+        [("(", ")"), ("\"", "\""), ("`", "`"), ("$", "$"), ("**", "**"), ("==", "=="), ("[[", "]]")]
+    {
+        cx.simulate_input(left);
+        let paired = text(&editor, cx);
+        assert_eq!(paired, original.replacen('\n', &format!("{left}{right}\n"), 1));
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(text(&editor, cx), original, "{left}");
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), paired);
+        cx.simulate_keystrokes("cmd-shift-z");
+        assert_eq!(text(&editor, cx), original);
+    }
+}
+
+#[gpui_kit::test]
+fn auto_pairs_skip_has_no_undo_entry_and_loaded_closers_are_literal(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "body\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("(");
+    assert_eq!(text(&editor, cx), "body()\n");
+    cx.simulate_input(")");
+    assert_eq!(text(&editor, cx), "body()\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "body\n");
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.simulate_keystrokes("left");
+    cx.simulate_input(")");
+    assert_eq!(text(&editor, cx), "body())\n"); // 重建编辑控件后不猜测原有符号的来源。
+}
+
+#[gpui_kit::test]
+fn auto_pairs_work_with_wikilink_embed_completion_and_reuse_brackets(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "正文\n");
+    std::fs::write(dir.path().join("b.md"), "# B\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    for prefix in [" [[", " ![["] {
+        cx.simulate_input(prefix);
+        assert!(text(&editor, cx).ends_with("[[]]\n"));
+        cx.simulate_input("b");
+        wiki_catalog(&editor, &[], cx);
+        cx.simulate_keystrokes("enter");
+    }
+    assert_eq!(text(&editor, cx), "正文 [[b]] ![[b]]\n");
+    cx.simulate_input(" [[missing]]!");
+    assert_eq!(text(&editor, cx), "正文 [[b]] ![[b]] [[missing]]!\n");
+    cx.update(|_, cx| assert!(editor.read(cx).wiki.is_none()));
+}
+
+#[gpui_kit::test]
+fn auto_pairs_preserve_paste_selection_and_code_context(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "body\n\n```\ncode\n```\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(" ( [[ ** $ `".into())));
+    cx.simulate_keystrokes("cmd-v");
+    assert!(text(&editor, cx).starts_with("body ( [[ ** $ `\n"));
+    select_inline_text(&editor, "body", cx);
+    cx.simulate_input("(");
+    assert!(text(&editor, cx).starts_with("( ( [[ ** $ `\n"));
+    focus_unit(&editor, 1, cx);
+    select_inline_text(&editor, "code", cx);
+    cx.simulate_keystrokes("right");
+    cx.simulate_input(" ( [[ ** $ \"");
+    assert!(text(&editor, cx).contains("code ( [[ ** $ \"\n```"));
+}
+
+#[gpui_kit::test]
+fn auto_pairs_nested_callouts_and_tables_preserve_structure(cx: &mut TestAppContext) {
+    let source = "> [!note]\n> 正文\n\n| A | B |\n| --- | --- |\n| 中文 | 末 |\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for (ix, label) in [(0, "正文"), (1, "中文")] {
+        focus_unit(&editor, ix, cx);
+        select_inline_text(&editor, label, cx);
+        cx.simulate_keystrokes("right");
+        cx.simulate_input(" ((文");
+        cx.simulate_keystrokes("backspace");
+        cx.simulate_keystrokes("backspace");
+        cx.simulate_input("中)");
+    }
+    assert_eq!(text(&editor, cx), source.replace("正文", "正文 (中)").replace("中文", "中文 (中)"));
+    cx.update(|_, cx| assert_eq!(editor.read(cx).units.len(), 2));
+}
+
+#[gpui_kit::test]
+fn auto_pairs_ime_preedit_and_committed_punctuation_stay_literal(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let (_dir, _vault, _path, editor) = open(cx, "正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.observe_pair_key(
+                &gpui_kit::KeystrokeEvent {
+                    keystroke: gpui_kit::Keystroke::parse("(").unwrap(),
+                    action: None,
+                    context_stack: vec![],
+                },
+                window,
+                cx,
+            )
+        });
+        input.update(cx, |ta, cx| ta.replace_and_mark_text_in_range(None, "(", None, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "正文\n");
+    cx.update(|window, cx| input.update(cx, |ta, cx| ta.replace_text_in_range(None, "(", window, cx)));
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "正文(\n");
+    cx.simulate_input("(");
+    assert_eq!(text(&editor, cx), "正文(()\n");
+}
+
+#[gpui_kit::test]
 fn inline_link_shortcut_wraps_selection_prefills_url_and_undoes_atomically(cx: &mut TestAppContext) {
     let (_dir, _vault, _path, editor) = open(cx, "正文 中文😀 后\n");
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -222,7 +729,7 @@ fn embed_completion_inserts_images_pdf_and_notes_with_one_step_undo(cx: &mut Tes
     cx.simulate_keystrokes("enter");
     assert_eq!(text(&editor, cx), "正文 ![[图\\#.png]]\n");
     cx.simulate_keystrokes("cmd-z");
-    assert_eq!(text(&editor, cx), "正文 ![[图\n");
+    assert_eq!(text(&editor, cx), "正文 ![[图]]\n");
     cx.simulate_keystrokes("cmd-shift-z");
     cx.simulate_input(" ![[文档");
     wiki_catalog(&editor, &[], cx);
@@ -324,7 +831,7 @@ fn embed_completion_loading_errors_stale_replies_and_unresolved_targets(cx: &mut
     });
     cx.run_until_parked();
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body ![[missing\n");
+    assert_eq!(text(&editor, cx), "body ![[missing]]\n");
     cx.update(|_, cx| {
         editor.update(cx, |e, cx| {
             assert!(e.wiki.as_ref().unwrap().catalog.is_none());
@@ -335,7 +842,7 @@ fn embed_completion_loading_errors_stale_replies_and_unresolved_targets(cx: &mut
     });
     cx.run_until_parked();
     cx.simulate_keystrokes("tab");
-    assert_eq!(text(&editor, cx), "body ![[missing\n");
+    assert_eq!(text(&editor, cx), "body ![[missing]]\n");
     wiki_catalog(&editor, &[], cx);
     cx.simulate_keystrokes("enter");
     assert_eq!(text(&editor, cx), "body ![[missing]]\n");
@@ -395,7 +902,7 @@ fn embed_completion_rejects_removed_attachment_and_pdf_fragment_namespace(cx: &m
     cx.simulate_input(" ![[paper.pdf#");
     wiki_catalog(&editor, &[], cx);
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body ![[paper.pdf#\n");
+    assert_eq!(text(&editor, cx), "body ![[paper.pdf#]]\n");
     cx.update(|_, cx| {
         assert!(editor.read(cx).wiki.as_ref().unwrap().error.as_deref().unwrap().contains("PDF"));
         editor
@@ -423,7 +930,7 @@ fn embed_completion_rejects_removed_attachment_and_pdf_fragment_namespace(cx: &m
     });
     std::fs::remove_file(&asset).unwrap();
     cx.simulate_keystrokes("tab");
-    assert!(text(&editor, cx).ends_with(" ![[paper.pdf\n"));
+    assert!(text(&editor, cx).ends_with(" ![[paper.pdf]]\n"));
     cx.update(|_, cx| {
         assert!(editor.read(cx).wiki.as_ref().unwrap().error.as_deref().unwrap().contains("附件"))
     });
@@ -522,14 +1029,14 @@ fn block_ref_external_stale_file_and_removed_file_never_overwrite(cx: &mut TestA
     wiki_catalog(&editor, &[], cx);
     std::fs::write(&target, "external edit\n").unwrap();
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[b#^needle\n");
+    assert_eq!(text(&editor, cx), "body [[b#^needle]]\n");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "external edit\n");
     cx.update(|_, cx| {
         assert!(editor.read(cx).wiki.as_ref().unwrap().error.as_deref().unwrap().contains("变化"))
     });
     std::fs::remove_file(&target).unwrap();
     cx.simulate_keystrokes("tab");
-    assert_eq!(text(&editor, cx), "body [[b#^needle\n");
+    assert_eq!(text(&editor, cx), "body [[b#^needle]]\n");
     assert!(!target.exists());
 }
 
@@ -585,17 +1092,17 @@ fn block_ref_mode_transition_empty_and_duplicate_ids_are_safe(cx: &mut TestAppCo
     });
     cx.run_until_parked();
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[b#^\n");
+    assert_eq!(text(&editor, cx), "body [[b#^]]\n");
     wiki_catalog(&editor, &[], cx);
     cx.simulate_input("needle");
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[b#^needle\n");
+    assert_eq!(text(&editor, cx), "body [[b#^needle]]\n");
     cx.update(|_, cx| {
         assert!(editor.read(cx).wiki.as_ref().unwrap().error.as_deref().unwrap().contains("重复"))
     });
     cx.simulate_input("missing");
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[b#^needlemissing\n");
+    assert_eq!(text(&editor, cx), "body [[b#^needlemissing]]\n");
     cx.simulate_keystrokes("escape");
     cx.update(|_, cx| assert!(editor.read(cx).wiki.is_none()));
     assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
@@ -640,7 +1147,7 @@ fn heading_completion_uses_unsaved_current_note_and_undo(cx: &mut TestAppContext
     cx.simulate_keystrokes("tab");
     assert_eq!(text(&editor, cx), "# 原标题未保存\n\n正文 [[#原标题未保存]]\n\n## 第二节\n");
     cx.simulate_keystrokes("cmd-z");
-    assert_eq!(text(&editor, cx), "# 原标题未保存\n\n正文 [[#\n\n## 第二节\n");
+    assert_eq!(text(&editor, cx), "# 原标题未保存\n\n正文 [[#]]\n\n## 第二节\n");
     cx.simulate_keystrokes("cmd-shift-z");
     cx.simulate_input("!");
     assert!(text(&editor, cx).contains("[[#原标题未保存]]!"));
@@ -697,11 +1204,11 @@ fn heading_completion_mode_change_rejects_old_reply_and_blocks_empty_results(cx:
     cx.run_until_parked();
     cx.update(|_, cx| assert!(editor.read(cx).wiki.as_ref().unwrap().catalog.is_none()));
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[b#\n");
+    assert_eq!(text(&editor, cx), "body [[b#]]\n");
     wiki_catalog(&editor, &[], cx);
     cx.simulate_input("不存在");
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[b#不存在\n");
+    assert_eq!(text(&editor, cx), "body [[b#不存在]]\n");
     cx.simulate_keystrokes("escape");
     cx.update(|_, cx| {
         let e = editor.read(cx);
@@ -712,7 +1219,7 @@ fn heading_completion_mode_change_rejects_old_reply_and_blocks_empty_results(cx:
     cx.simulate_input("body [[missing#");
     wiki_catalog(&editor, &[], cx);
     cx.simulate_keystrokes("tab");
-    assert_eq!(text(&editor, cx), "body [[missing#\n");
+    assert_eq!(text(&editor, cx), "body [[missing#]]\n");
     cx.update(|_, cx| {
         assert!(editor.read(cx).wiki.as_ref().unwrap().error.is_some());
     });
@@ -731,7 +1238,7 @@ fn heading_completion_rejects_ambiguous_or_removed_notes(cx: &mut TestAppContext
     cx.simulate_input(" [[b#");
     wiki_catalog(&editor, &[], cx);
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[b#\n");
+    assert_eq!(text(&editor, cx), "body [[b#]]\n");
     cx.update(|_, cx| {
         let e = editor.read(cx);
         assert!(e.wiki.as_ref().unwrap().error.as_deref().unwrap().contains("歧义"));
@@ -746,7 +1253,7 @@ fn heading_completion_rejects_ambiguous_or_removed_notes(cx: &mut TestAppContext
     wiki_catalog(&editor, &[], cx);
     std::fs::remove_file(dir.path().join("y/b.md")).unwrap();
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[y/b#\n");
+    assert_eq!(text(&editor, cx), "body [[y/b#]]\n");
     cx.update(|_, cx| {
         assert!(editor.read(cx).wiki.as_ref().unwrap().error.as_deref().unwrap().contains("删除"))
     });
@@ -822,7 +1329,7 @@ fn wiki_keyboard_completion_alias_and_undo(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("enter");
     assert_eq!(text(&editor, cx), "正文 [[b]]\n");
     cx.simulate_keystrokes("cmd-z");
-    assert_eq!(text(&editor, cx), "正文 [[\n");
+    assert_eq!(text(&editor, cx), "正文 [[]]\n");
     cx.simulate_keystrokes("cmd-shift-z");
     assert_eq!(text(&editor, cx), "正文 [[b]]\n");
     cx.simulate_input(" [[知");
@@ -842,7 +1349,7 @@ fn wiki_keyboard_completion_alias_and_undo(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("cmd-z");
     assert_eq!(text(&editor, cx), "正文 [[b]] [[b|知识库😀]]\n");
     cx.simulate_keystrokes("cmd-z");
-    assert_eq!(text(&editor, cx), "正文 [[b]] [[知识\n");
+    assert_eq!(text(&editor, cx), "正文 [[b]] [[知识]]\n");
 }
 
 #[gpui_kit::test]
@@ -878,7 +1385,7 @@ fn wiki_loading_failure_escape_and_stale_catalog(cx: &mut TestAppContext) {
     focus_unit(&editor, 0, cx);
     cx.simulate_input(" [[missing");
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[missing\n", "loading is not an empty result");
+    assert_eq!(text(&editor, cx), "body [[missing]]\n", "loading is not an empty result");
     let old = cx.update(|_, cx| editor.read(cx).wiki.as_ref().unwrap().generation);
     cx.simulate_keystrokes("escape");
     cx.update(|_, cx| assert!(editor.read(cx).focused.is_some()));
@@ -901,7 +1408,7 @@ fn wiki_loading_failure_escape_and_stale_catalog(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[missing2\n");
+    assert_eq!(text(&editor, cx), "body [[missing2]]\n");
     wiki_catalog(&editor, &[], cx);
     cx.simulate_keystrokes("tab");
     assert_eq!(text(&editor, cx), "body [[missing2]]\n");
@@ -918,7 +1425,7 @@ fn wiki_cursor_selection_and_removed_target_do_not_use_stale_menu(cx: &mut TestA
     wiki_catalog(&editor, &[], cx);
     std::fs::remove_file(dir.path().join("b.md")).unwrap();
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "body [[b\n");
+    assert_eq!(text(&editor, cx), "body [[b]]\n");
     cx.update(|_, cx| {
         let e = editor.read(cx);
         assert!(e.wiki.as_ref().unwrap().error.is_some());
@@ -927,7 +1434,7 @@ fn wiki_cursor_selection_and_removed_target_do_not_use_stale_menu(cx: &mut TestA
     cx.run_until_parked();
     cx.update(|_, cx| assert!(editor.read(cx).wiki.is_none()));
     cx.simulate_input("new");
-    assert_eq!(text(&editor, cx), "new [[b\n");
+    assert_eq!(text(&editor, cx), "new [[b]]\n");
 }
 
 #[gpui_kit::test]
@@ -948,7 +1455,7 @@ fn wiki_ime_preedit_does_not_confirm_or_write_source(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         editor.update(cx, |e, cx| e.on_split_block(&crate::actions::SplitBlock, window, cx))
     });
-    assert_eq!(text(&editor, cx), "正文 [[\n");
+    assert_eq!(text(&editor, cx), "正文 [[]]\n");
     cx.update(|window, cx| input.update(cx, |ta, cx| ta.replace_text_in_range(None, "中文", window, cx)));
     cx.run_until_parked();
     wiki_catalog(&editor, &[], cx);

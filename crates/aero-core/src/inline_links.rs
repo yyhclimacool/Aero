@@ -150,17 +150,17 @@ fn overlaps(outer: &Range<usize>, inner: &Range<usize>) -> bool {
 
 /// comrak 的行 / 列是 1-based 字节位置，末端含最后一字节。
 /// 表格解析先移除 `\|` 的反斜杠，行内节点列号需映射回原始单元格。
-struct SourceMap<'s> {
+pub(crate) struct SourceMap<'s> {
     src: &'s str,
     starts: Vec<usize>,
 }
 
 impl<'s> SourceMap<'s> {
-    fn new(src: &'s str) -> Self {
+    pub(crate) fn new(src: &'s str) -> Self {
         Self { src, starts: std::iter::once(0).chain(src.match_indices('\n').map(|(i, _)| i + 1)).collect() }
     }
 
-    fn range<'a>(&self, node: &'a AstNode<'a>) -> Option<Range<usize>> {
+    pub(crate) fn range<'a>(&self, node: &'a AstNode<'a>) -> Option<Range<usize>> {
         let src = self.src;
         let sp = node.data().sourcepos;
         let offset = |line: usize, column: usize| self.starts.get(line.checked_sub(1)?).map(|s| s + column);
@@ -192,7 +192,7 @@ impl<'s> SourceMap<'s> {
     }
 }
 
-fn same_structure(before: &[parse::ParsedBlock], after: &[parse::ParsedBlock]) -> bool {
+pub(crate) fn same_structure(before: &[parse::ParsedBlock], after: &[parse::ParsedBlock]) -> bool {
     let signature = |(depth, block): (usize, &parse::ParsedBlock)| {
         (depth, block.kind.clone(), block.attrs.clone(), block.persisted_id.clone())
     };

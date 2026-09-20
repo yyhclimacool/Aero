@@ -102,6 +102,10 @@ actions!(
 #[action(namespace = editor, no_json)]
 pub struct ConvertBlock(pub u8);
 
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = editor, no_json)]
+pub struct FormatInline(pub aero_core::inline_format::Format);
+
 #[derive(Clone, Copy)]
 pub enum CommandScope {
     Global,
@@ -152,6 +156,16 @@ pub fn commands() -> Vec<Command> {
         Command::new("edit-link", "插入或编辑链接", "link url insert edit lj", Editor, EditLink),
         Command::new("quit", "退出 Aero", "quit exit tc", Global, Quit),
     ];
+    use aero_core::inline_format::Format;
+    for (id, label, keywords, format) in [
+        ("format-bold", "粗体", "bold strong ct", Format::Bold),
+        ("format-italic", "斜体", "italic emphasis xt", Format::Italic),
+        ("format-code", "行内代码", "inline code hndm", Format::Code),
+        ("format-strike", "删除线", "strikethrough scx", Format::Strike),
+        ("format-highlight", "黄色高亮", "highlight yellow hsgl", Format::Highlight),
+    ] {
+        commands.push(Command::new(id, label, keywords, Editor, FormatInline(format)));
+    }
     for (n, (id, label, keywords)) in [
         ("text", "转换为正文", "text paragraph zw"),
         ("heading-1", "转换为标题 1", "heading 1 bt1"),
@@ -172,6 +186,7 @@ pub fn commands() -> Vec<Command> {
 }
 
 pub fn init(cx: &mut App) {
+    use aero_core::inline_format::Format;
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-o", OpenVault, None),
@@ -198,6 +213,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("tab", MenuConfirm, Some("Input")),
         KeyBinding::new("shift-enter", LinkAlias, Some("Input")),
         KeyBinding::new("cmd-k", EditLink, Some("Editor > Input")),
+        KeyBinding::new("cmd-b", FormatInline(Format::Bold), Some("Editor > Input")),
+        KeyBinding::new("cmd-i", FormatInline(Format::Italic), Some("Editor > Input")),
+        KeyBinding::new("cmd-e", FormatInline(Format::Code), Some("Editor > Input")),
+        KeyBinding::new("cmd-shift-s", FormatInline(Format::Strike), Some("Editor > Input")),
+        KeyBinding::new("cmd-shift-h", FormatInline(Format::Highlight), Some("Editor > Input")),
         KeyBinding::new("cmd-z", DocUndo, Some("Input")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Input")),
         // 编辑态里 ⇧↑↓ 越过块边界时升级为块选中；否则 propagate 给控件扩展字符选区
@@ -246,6 +266,12 @@ pub fn init(cx: &mut App) {
             MenuItem::action("全选", gpui_kit::base::input::SelectAll),
             MenuItem::separator(),
             MenuItem::action("插入或编辑链接", EditLink),
+            MenuItem::separator(),
+            MenuItem::action("粗体", FormatInline(Format::Bold)),
+            MenuItem::action("斜体", FormatInline(Format::Italic)),
+            MenuItem::action("行内代码", FormatInline(Format::Code)),
+            MenuItem::action("删除线", FormatInline(Format::Strike)),
+            MenuItem::action("黄色高亮", FormatInline(Format::Highlight)),
         ]),
         Menu::new("视图").items(vec![
             MenuItem::action("文件", OpenFiles),

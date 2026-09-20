@@ -10,8 +10,12 @@
 //! 或粘贴出多个块时，控件仍然有归属，不会因为块消失而失焦。
 
 mod block_refs_ui;
+mod highlight_ui;
+mod inline_format_ui;
 mod inline_links_ui;
 mod ops;
+mod pairs;
+mod pairs_ui;
 mod preview;
 mod slash;
 mod tags;
@@ -40,7 +44,7 @@ use gpui_kit::*;
 use crate::actions::{
     BlockDown, BlockUp, BlurEditor, ConvertBlock, CopySelectedBlocks, CutSelectedBlocks,
     DeleteSelectedBlocks, DocRedo, DocUndo, EditLink, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp,
-    LinkAlias, MenuConfirm, SelectBlockDown, SelectBlockUp, SplitBlock,
+    FormatInline, LinkAlias, MenuConfirm, SelectBlockDown, SelectBlockUp, SplitBlock,
 };
 use ops::{BlockType, Plan};
 use slash::SlashAction;
@@ -180,6 +184,9 @@ struct Focused {
     /// Enter 直接换行（代码块等）还是拆块
     enter_newline: bool,
     textarea: Entity<TextareaState>,
+    pairs: pairs::State,
+    highlight: highlight_ui::SourceHighlight,
+    _pair_keys: Subscription,
     _subscription: Subscription,
     _cursor_subscription: Subscription,
 }
@@ -312,7 +319,7 @@ impl Editor {
             self.doc.can_undo()
         } else if action.as_any().is::<DocRedo>() {
             self.doc.can_redo()
-        } else if action.as_any().is::<EditLink>() {
+        } else if action.as_any().is::<EditLink>() || action.as_any().is::<FormatInline>() {
             self.focused.is_some() && self.title_edit.is_none()
         } else if let Some(action) = action.as_any().downcast_ref::<ConvertBlock>() {
             let Some(focused) = &self.focused else { return false };
@@ -695,7 +702,16 @@ impl Editor {
         let cursor = clamp_to_char_boundary(&text, cursor.min(text.len()));
         let textarea = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 100_000));
         let subscription = cx.subscribe_in(&textarea, window, Self::on_input_event);
-        let cursor_subscription = cx.observe_in(&textarea, window, |this, textarea, _, cx| {
+        let editor = cx.weak_entity();
+        let pair_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            let _ = editor.update(cx, |this, cx| this.observe_pair_key(event, window, cx));
+        });
+        let cursor_subscription = cx.observe_in(&textarea, window, |this, textarea, window, cx| {
+            if this.focused.as_ref().is_some_and(|f| f.textarea == textarea && f.pairs.pending.is_some())
+                && this.input_composing(window, cx)
+            {
+                this.focused.as_mut().unwrap().pairs.pending = None;
+            }
             if this.focused.as_ref().is_some_and(|f| f.textarea == textarea)
                 && (this.wiki.is_some() || this.tag_menu.is_some())
                 && let Some(f) = &this.focused
@@ -726,6 +742,9 @@ impl Editor {
             id,
             enter_newline,
             textarea,
+            pairs: Default::default(),
+            highlight: Default::default(),
+            _pair_keys: pair_keys,
             _subscription: subscription,
             _cursor_subscription: cursor_subscription,
         });
@@ -966,7 +985,7 @@ impl Editor {
         &mut self,
         textarea: &Entity<TextareaState>,
         event: &InputEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let is_current = self.focused.as_ref().is_some_and(|f| &f.textarea == textarea);
@@ -974,7 +993,7 @@ impl Editor {
             return;
         }
         match event {
-            InputEvent::Change => self.on_change(cx),
+            InputEvent::Change => self.on_change(window, cx),
             // ⏎ 由 SplitBlock 动作截获（见 actions.rs）；⇧⏎ 软换行由控件自己插入，随后的 Change 已经写回
             InputEvent::PressEnter { .. } | InputEvent::Focus => {}
             // 弹层暂借焦点，保留控件和选区供命令执行，但仍按失焦规则保存。
@@ -984,7 +1003,8 @@ impl Editor {
     }
 
     /// 控件文本 → 文档：收缩成最小编辑写回。
-    fn on_change(&mut self, cx: &mut Context<Self>) {
+    fn on_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paired = self.complete_pairs(window, cx);
         let Some(f) = self.focused.as_mut() else { return };
         let new_text = f.textarea.read(cx).value();
         let old_text = self.doc.slice(f.range.clone()).to_string();
@@ -992,7 +1012,8 @@ impl Editor {
 
         let now = Instant::now();
         let small = !edit.text.contains('\n') && edit.text.len() <= 8 && edit.range.len() <= 8;
-        let coalesce = small && self.last_edit_at.is_some_and(|t| now.duration_since(t) < COALESCE_WINDOW);
+        let coalesce =
+            !paired && small && self.last_edit_at.is_some_and(|t| now.duration_since(t) < COALESCE_WINDOW);
         let delta = edit.delta();
         let result = if coalesce { self.doc.edit_coalescing(edit) } else { self.doc.edit(edit) };
         if let Err(err) = result {
@@ -1000,7 +1021,7 @@ impl Editor {
             return;
         }
         f.range.end = (f.range.end as isize + delta).max(f.range.start as isize) as usize;
-        self.last_edit_at = Some(now);
+        self.last_edit_at = (!paired).then_some(now);
         self.after_doc_change(cx);
         self.update_wiki(cx);
         self.update_tags(cx);
@@ -1889,7 +1910,11 @@ impl Editor {
     fn render_textarea(&self, kind: Option<&BlockKind>, cx: &Context<Self>) -> AnyElement {
         let Some(f) = self.focused.as_ref() else { return div().into_any_element() };
         let theme = cx.theme();
-        let mut el = div().w_full().child(Textarea::new(&f.textarea));
+        let mut el = div()
+            .relative()
+            .w_full()
+            .child(highlight_ui::background(f.textarea.clone(), f.highlight.clone()))
+            .child(Textarea::new(&f.textarea));
         match kind {
             Some(BlockKind::Heading { level }) => {
                 el = el
@@ -2268,6 +2293,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_menu_confirm))
             .on_action(cx.listener(Self::on_link_alias))
             .on_action(cx.listener(Self::on_edit_link))
+            .on_action(cx.listener(Self::on_format_inline))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_blur_editor))
             .on_action(cx.listener(Self::on_select_up))
