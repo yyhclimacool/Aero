@@ -10,6 +10,6 @@ pub mod indexer;
 pub mod meta;
 pub mod zvec_fts;
 
-pub use indexer::{Backlink, Indexer, IndexerError, Refresh, SearchHit, SyncPlan, SyncReport};
+pub use indexer::{Backlink, BacklinkPage, Indexer, IndexerError, Refresh, SearchHit, SyncPlan, SyncReport};
 pub use meta::{Meta, NoteRow, TagCount};
 pub use zvec_fts::{ZvecFts, ensure_initialized};

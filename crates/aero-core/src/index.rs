@@ -8,6 +8,7 @@
 //! 供 headless 测试与没有引擎时的 CLI 使用；它们不追求性能。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::block::{Block, BlockKind};
 use crate::document::Document;
@@ -22,6 +23,7 @@ pub struct IndexBlock {
     pub path: String,
     /// 所属笔记标题
     pub title: String,
+    pub aliases: Arc<[String]>,
     /// 块的正文（源文本去掉标记）
     pub body: String,
     /// 所属笔记的标签（front matter `tags` + 正文行内 `#tag`），笔记级：同一篇的每个块都带同一组
@@ -245,7 +247,8 @@ pub fn blocks_and_links_for_note(
     let text = doc.to_string();
     let (tag_sources, links) = crate::parse::inline_scan(&text);
     let tags = note_tags(doc, &tag_sources);
-    let blocks = indexable_leaves(doc)
+    let aliases: Arc<[String]> = doc.front_matter_aliases().into();
+    let mut blocks: Vec<_> = indexable_leaves(doc)
         .into_iter()
         .enumerate()
         .map(|(ord, b)| {
@@ -257,11 +260,24 @@ pub fn blocks_and_links_for_note(
                 block_ord: ord as u32,
                 path: path.to_owned(),
                 title: title.to_owned(),
+                aliases: aliases.clone(),
                 body,
                 tags: tags.clone(),
             }
         })
         .collect();
+    if blocks.is_empty() && !aliases.is_empty() {
+        blocks.push(IndexBlock {
+            pk: IndexBlock::pk_of(note_id, 0),
+            note_id: note_id.to_owned(),
+            block_ord: 0,
+            path: path.to_owned(),
+            title: title.to_owned(),
+            aliases,
+            body: String::new(),
+            tags,
+        });
+    }
     (blocks, links)
 }
 
@@ -618,7 +634,8 @@ impl FullTextIndex for MemoryFullTextIndex {
             .filter(|d| tags.iter().all(|t| has(d, t)))
             .filter(|d| !excluded.iter().any(|t| has(d, t)))
             .filter_map(|d| {
-                let hay = format!("{}\n{}\n{}", d.title, d.body, d.tags.join(" ")).to_lowercase();
+                let hay = format!("{}\n{}\n{}\n{}", d.title, d.aliases.join("\n"), d.body, d.tags.join(" "))
+                    .to_lowercase();
                 let mut score = 0usize;
                 for t in &terms {
                     let n = hay.matches(t.as_str()).count();
@@ -747,6 +764,51 @@ impl VectorIndex for MemoryVectorIndex {
 mod tests {
     use super::*;
 
+    #[test]
+    fn alias_metadata_is_shared_across_blocks() {
+        let doc = Document::from_text(&format!(
+            "---\naliases: {}\n---\n\n{}",
+            "long-alias".repeat(32),
+            "body\n\n".repeat(32)
+        ));
+        let blocks = blocks_for_note(&doc, "n", "n.md", "Display");
+        assert_eq!(blocks.len(), 32);
+        for block in &blocks[1..] {
+            assert_eq!(block.aliases[0].as_ptr(), blocks[0].aliases[0].as_ptr());
+        }
+    }
+
+    #[test]
+    fn alias_only_note_is_searchable_without_front_matter_in_body() {
+        let doc = Document::from_text("---\naliases: Quicksilver\nsecret: hidden\n---\n");
+        let blocks = blocks_for_note(&doc, "n", "n.md", "Display");
+        let mut idx = MemoryFullTextIndex::new();
+        idx.upsert(&blocks).unwrap();
+        let hits = idx.search(&FtsQuery::new("Quicksilver")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(idx.fetch(&[hits[0].pk.clone()]).unwrap()[0].body.is_empty());
+        assert!(idx.search(&FtsQuery::new("hidden")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn aliases_are_searchable_without_changing_body_and_are_replaced() {
+        let mut idx = MemoryFullTextIndex::new();
+        let doc = Document::from_text(
+            "---\naliases: [Quicksilver, '雪 山']\ntags: [rust/cli]\n---\n\nordinary body\n",
+        );
+        let blocks = blocks_for_note(&doc, "n", "n.md", "Display");
+        idx.upsert(&blocks).unwrap();
+        let mut q = FtsQuery::parse("quicksilver #rust");
+        assert_eq!(idx.search(&q).unwrap().len(), 1);
+        assert_eq!(idx.fetch(&["n#0".into()]).unwrap()[0].body, "ordinary body");
+        q.note_id = Some("other".into());
+        assert!(idx.search(&q).unwrap().is_empty());
+        assert!(idx.search(&FtsQuery::parse("quicksilver -#rust")).unwrap().is_empty());
+        idx.upsert(&blocks_for_note(&Document::from_text("ordinary body\n"), "n", "n.md", "Display"))
+            .unwrap();
+        assert!(idx.search(&FtsQuery::new("quicksilver")).unwrap().is_empty());
+    }
+
     fn block(note: &str, ord: u32, body: &str, tags: &[&str]) -> IndexBlock {
         IndexBlock {
             pk: IndexBlock::pk_of(note, ord),
@@ -754,6 +816,7 @@ mod tests {
             block_ord: ord,
             path: format!("{note}.md"),
             title: note.into(),
+            aliases: Arc::default(),
             body: body.into(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
         }

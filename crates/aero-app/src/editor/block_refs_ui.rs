@@ -22,7 +22,7 @@ impl Editor {
             } else {
                 let catalog = menu.catalog.as_ref().ok_or("笔记目录尚未加载")?;
                 let index =
-                    catalog.notes.iter().position(|(p, _)| p == &blocks.path).ok_or("目标笔记已变化")?;
+                    catalog.notes.iter().position(|note| note.path == blocks.path).ok_or("目标笔记已变化")?;
                 catalog.target(index, self.path.parent()).ok_or("无法生成不歧义的链接，请调整笔记名称")?
             };
             let (id, edit, touched) = if blocks.path == self.path {

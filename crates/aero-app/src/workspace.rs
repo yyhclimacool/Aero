@@ -276,6 +276,7 @@ impl Workspace {
             Ok((doc, stamp)) => {
                 let vault = open.vault.clone();
                 let editor = cx.new(|cx| Editor::new(vault, path.clone(), doc, stamp, cx));
+                editor.update(cx, |e, cx| e.connect_link_preview(open.search.clone(), cx));
                 let sub = self.subscribe_editor(&editor, window, cx);
                 let Some(open) = self.open.as_mut() else { return };
                 open.editor_sub = Some(sub);
@@ -284,6 +285,7 @@ impl Workspace {
                 open.recent.insert(0, path.clone());
                 open.recent.truncate(20);
                 open.backlinks.update(cx, |v, cx| v.set_note(Some(path.clone()), cx));
+                editor.update(cx, |e, cx| e.connect_backlinks(open.backlinks.clone(), cx));
                 open.tree.update(cx, |t, cx| t.select(Some(path), cx));
                 editor.update(cx, |e, cx| e.focus_browse(window, cx));
             }
@@ -326,6 +328,11 @@ impl Workspace {
     ) -> Subscription {
         cx.subscribe_in(editor, window, |this, editor, event, window, cx| match event {
             EditorEvent::Changed => cx.notify(),
+            EditorEvent::BacklinksRequested => {
+                this.panel_visible = true;
+                this.context_tab = ContextTab::Backlinks;
+                cx.notify();
+            }
             EditorEvent::Saved | EditorEvent::Reloaded => {
                 this.index_editor(editor, cx);
                 cx.notify();
@@ -967,6 +974,7 @@ impl Workspace {
                 }
                 let current = editor.read(cx).path().clone();
                 open.backlinks.update(cx, |v, cx| v.set_note(Some(current.clone()), cx));
+                editor.update(cx, |e, cx| e.connect_backlinks(open.backlinks.clone(), cx));
                 open.tree.update(cx, |t, cx| {
                     t.rescan();
                     t.select(Some(current), cx);
@@ -1649,6 +1657,10 @@ mod tests {
                 let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
                 let backlinks = cx.new(|cx| BacklinksView::new(search.clone(), cx));
                 backlinks.update(cx, |v, cx| v.set_note(Some(VaultPath::new("a.md").unwrap()), cx));
+                editor.update(cx, |e, cx| {
+                    e.connect_link_preview(search.clone(), cx);
+                    e.connect_backlinks(backlinks.clone(), cx);
+                });
                 let watcher = cx.new(|cx| VaultWatcher::new(vault.clone(), cx));
                 VaultSession {
                     vault,
@@ -2453,6 +2465,86 @@ mod tests {
             );
         }
         cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn backlink_count_and_selected_block_filter_use_full_index(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("first ^one\n\nsecond ^two\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let (search, view) = cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.search.clone(), open.backlinks.clone())
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        std::fs::write(dir.path().join("b.md"), format!("{}\n[[a#^one]] [[a#^two]]\n", "[[a]] ".repeat(205)))
+            .unwrap();
+        cx.update(|_, cx| search.update(cx, |s, cx| s.note_changed(VaultPath::new("b.md").unwrap(), cx)));
+        wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).total() == Some(207)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let unit = cx.debug_bounds("unit-1").unwrap();
+        cx.simulate_click(unit.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let filter = cx.debug_bounds("backlinks-block").expect("selected ^id block exposes its references");
+        cx.simulate_click(filter.center(), gpui_kit::Modifiers::default());
+        wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).hits().len() == 1));
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).total(), Some(207));
+            assert_eq!(view.read(cx).hits()[0].label, "a#^one");
+        });
+        workspace.update_in(cx, |w, _, cx| {
+            w.panel_visible = false;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let count = cx.debug_bounds("backlink-count").unwrap();
+        cx.simulate_click(count.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(workspace.read(cx).panel_visible));
+        workspace.update_in(cx, |w, window, cx| w.rename_current("renamed".into(), window, cx));
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let editor = workspace.read(cx).open.as_ref().unwrap().editor.as_ref().unwrap();
+                editor.read(cx).path().as_str() == "renamed.md" && view.read(cx).total() == Some(207)
+            })
+        });
+        // The toast occludes the filter until its virtual-time transitions finish.
+        for duration in [400, 5000, 250] {
+            cx.executor().advance_clock(std::time::Duration::from_millis(duration));
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let unit = cx.debug_bounds("unit-2").unwrap();
+        cx.simulate_click(unit.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let filter = cx.debug_bounds("backlinks-block").expect("renamed editor still tracks block selection");
+        cx.update(|_, cx| {
+            let editor = workspace.read(cx).open.as_ref().unwrap().editor.as_ref().unwrap();
+            assert_eq!(editor.read(cx).selected_reference(cx).as_deref(), Some("two"));
+        });
+        let indexed = cx.update(|_, cx| {
+            search.read(cx).backlinks(VaultPath::new("renamed.md").unwrap(), Some("^two".into()), 200, cx)
+        });
+        let indexed = cx.foreground_executor().block_on(indexed).unwrap();
+        assert_eq!(indexed.matched, 1);
+        assert_eq!(indexed.hits.len(), 1);
+        cx.simulate_click(filter.center(), gpui_kit::Modifiers::default());
+        wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).hits().len() == 1));
+        cx.update(|_, cx| assert_eq!(view.read(cx).hits()[0].label, "renamed#^two"));
+        workspace.update_in(cx, |w, window, cx| w.open_note(VaultPath::new("b.md").unwrap(), window, cx));
+        wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).total() == Some(0)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("backlinks-block").is_none());
+        cx.update(|_, cx| search.read(cx).close_blocking());
     }
 
     #[gpui_kit::test]

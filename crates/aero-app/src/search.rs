@@ -7,12 +7,14 @@
 //!   在空闲 flush 之后顺带做（合并段文件，搜索不会越用越慢）；
 //! - 进度用原子量暴露，前台定时器轮询刷新状态栏（`ui_design.md` 2.1）。
 
+use std::future::poll_fn;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use aero_core::links::Resolver;
+use aero_core::links::{NoteSummary, Resolver};
 use aero_core::{FileStamp, Vault, VaultPath};
 use aero_index::{Indexer, Refresh, SearchHit, SyncReport};
 use gpui_kit::*;
@@ -47,6 +49,14 @@ struct Shared {
     cancelled: AtomicBool,
     error: Mutex<Option<String>>,
     report: Mutex<Option<SyncReport>>,
+    writes: Mutex<WriteProgress>,
+}
+
+/// Write N can start only after N - 1 completes. Queries snapshot the submitted count.
+#[derive(Default)]
+struct WriteProgress {
+    completed: usize,
+    waiters: Vec<Waker>,
 }
 
 const PHASE_OPENING: u8 = 0;
@@ -54,9 +64,48 @@ const PHASE_SYNCING: u8 = 1;
 const PHASE_IDLE: u8 = 2;
 const PHASE_FAILED: u8 = 3;
 
+impl Shared {
+    async fn wait_for_writes(&self, through: usize, wait_for_sync: bool) -> bool {
+        poll_fn(|cx| {
+            let mut writes = self.writes.lock().unwrap();
+            if self.cancelled.load(Ordering::Acquire) {
+                return Poll::Ready(false);
+            }
+            let syncing = matches!(self.phase.load(Ordering::Acquire), PHASE_OPENING | PHASE_SYNCING);
+            if writes.completed >= through && (!wait_for_sync || !syncing) {
+                return Poll::Ready(true);
+            }
+            if !writes.waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
+                writes.waiters.push(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    fn finish_write(&self, through: usize) {
+        self.writes.lock().unwrap().completed = through;
+        self.wake_waiters();
+    }
+
+    fn set_phase(&self, phase: u8) {
+        self.phase.store(phase, Ordering::Release);
+        self.wake_waiters();
+    }
+
+    fn wake_waiters(&self) {
+        // Register under the same lock as draining, so completion/close cannot lose a wakeup.
+        let waiters = std::mem::take(&mut self.writes.lock().unwrap().waiters);
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+}
+
 pub struct SearchService {
     indexer: Arc<Mutex<Option<Indexer>>>,
     shared: Arc<Shared>,
+    submitted_writes: usize,
     /// 打开 + 全量对齐的专用线程；[`Self::close_blocking`] 会等它停下
     sync_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     _poll: Option<Task<()>>,
@@ -91,6 +140,7 @@ impl SearchService {
         SearchService {
             indexer,
             shared,
+            submitted_writes: 0,
             sync_thread: Mutex::new(sync_thread),
             _poll: Some(poll),
             flush_task: None,
@@ -117,10 +167,13 @@ impl SearchService {
         }
     }
 
-    /// 全文搜索。引擎还没打开时返回空。
+    /// 全文搜索。先等调用前已提交的写操作；引擎还没打开时返回空。
     pub fn search(&self, text: String, limit: usize, cx: &App) -> Task<Result<Vec<SearchHit>, String>> {
         let indexer = self.indexer.clone();
+        let shared = self.shared.clone();
+        let through = self.submitted_writes;
         cx.background_spawn(async move {
+            shared.wait_for_writes(through, false).await;
             let guard = indexer.lock().unwrap();
             match guard.as_ref() {
                 Some(ix) => ix.search(&text, limit).map_err(|e| e.to_string()),
@@ -133,48 +186,49 @@ impl SearchService {
     pub fn backlinks(
         &self,
         path: VaultPath,
+        fragment: Option<String>,
         limit: usize,
         cx: &App,
-    ) -> Task<Result<Vec<aero_index::Backlink>, String>> {
+    ) -> Task<Result<aero_index::BacklinkPage, String>> {
         let indexer = self.indexer.clone();
+        let shared = self.shared.clone();
+        let through = self.submitted_writes;
         cx.background_spawn(async move {
+            shared.wait_for_writes(through, false).await;
             let guard = indexer.lock().unwrap();
             match guard.as_ref() {
-                Some(ix) => ix.backlinks(&path, limit).map_err(|e| e.to_string()),
-                None => Ok(Vec::new()),
+                Some(ix) => ix.backlinks(&path, fragment.as_deref(), limit).map_err(|e| e.to_string()),
+                None => Err("索引不可用".into()),
             }
         })
     }
 
-    /// 已索引笔记的 `(路径, 标题)`（快速打开用）；引擎还没打开时返回空。
-    pub fn note_titles(&self, cx: &App) -> Task<Vec<(VaultPath, String)>> {
+    /// Indexed catalog entries; empty while the engine is unavailable.
+    pub fn note_summaries(&self, cx: &App) -> Task<Vec<NoteSummary>> {
         let indexer = self.indexer.clone();
+        let shared = self.shared.clone();
+        let through = self.submitted_writes;
         cx.background_spawn(async move {
+            shared.wait_for_writes(through, false).await;
             let guard = indexer.lock().unwrap();
-            guard.as_ref().and_then(|ix| ix.note_titles().ok()).unwrap_or_default()
+            guard.as_ref().and_then(|ix| ix.note_summaries().ok()).unwrap_or_default()
         })
     }
 
-    /// 补全始终以当前文件列表为准；尚未索引的笔记从磁盘补标题，全部在后台完成。
-    pub fn completion_notes(
-        &self,
-        vault: Arc<Vault>,
-        cx: &App,
-    ) -> Task<Result<Vec<(VaultPath, String)>, String>> {
-        let titles = self.note_titles(cx);
+    /// 补全始终以当前文件列表为准；尚未索引的笔记从磁盘补标题与别名，全部在后台完成。
+    pub fn completion_notes(&self, vault: Arc<Vault>, cx: &App) -> Task<Result<Vec<NoteSummary>, String>> {
+        let summaries = self.note_summaries(cx);
         cx.background_spawn(async move {
-            let mut titles: std::collections::HashMap<_, _> = titles.await.into_iter().collect();
+            let mut summaries: std::collections::HashMap<_, _> =
+                summaries.await.into_iter().map(|note| (note.path.clone(), note)).collect();
             let notes = vault.notes().map_err(|e| e.to_string())?;
             Ok(notes
                 .into_iter()
                 .map(|path| {
-                    let title = titles.remove(&path).unwrap_or_else(|| {
-                        vault
-                            .read(&path)
-                            .map(|(doc, _)| doc.title_or(path.stem()))
-                            .unwrap_or_else(|_| path.stem().to_owned())
-                    });
-                    (path, title)
+                    summaries.remove(&path).unwrap_or_else(|| match vault.read(&path) {
+                        Ok((doc, _)) => NoteSummary::from_document(path, &doc),
+                        Err(_) => NoteSummary { title: path.stem().to_owned(), path, aliases: Vec::new() },
+                    })
                 })
                 .collect())
         })
@@ -190,9 +244,11 @@ impl SearchService {
         cx: &App,
     ) -> Task<Result<Vec<aero_index::TagCount>, String>> {
         let indexer = self.indexer.clone();
-        let ready = self.phase() == Phase::Idle;
+        let shared = self.shared.clone();
+        let through = self.submitted_writes;
         cx.background_spawn(async move {
-            let indexed = if ready {
+            shared.wait_for_writes(through, false).await;
+            let indexed = if shared.phase.load(Ordering::Acquire) == PHASE_IDLE {
                 let guard = indexer.lock().unwrap();
                 guard
                     .as_ref()
@@ -228,66 +284,60 @@ impl SearchService {
         })
     }
 
-    /// 预览点 wikilink 用的解析表：已索引笔记（含 front matter 标题）加磁盘上还没索引到的文件。
-    /// 引擎还没打开时退化为只按磁盘文件列表解析（没有标题匹配）。
+    /// 预览点 wikilink 用的解析表：已索引笔记（含 front matter 标题与别名）加尚未索引的文件。
+    /// 引擎不可用时在后台读取文档，保留标题与别名匹配。
     pub fn link_resolver(&self, vault: Arc<Vault>, cx: &App) -> Task<Resolver> {
         let indexer = self.indexer.clone();
+        let shared = self.shared.clone();
+        let through = self.submitted_writes;
         cx.background_spawn(async move {
+            shared.wait_for_writes(through, false).await;
             let mut guard = indexer.lock().unwrap();
-            match guard.as_mut().map(|ix| ix.link_resolver()) {
-                Some(Ok(resolver)) => resolver,
-                _ => Resolver::from_notes(vault.notes().unwrap_or_default()),
+            if let Some(Ok(resolver)) = guard.as_mut().map(|ix| ix.link_resolver()) {
+                return resolver;
             }
+            drop(guard);
+            let mut resolver = Resolver::new();
+            for path in vault.notes().unwrap_or_default() {
+                match vault.read(&path) {
+                    Ok((doc, _)) => {
+                        let note = NoteSummary::from_document(path, &doc);
+                        resolver.insert(note.path, Some(&note.title), &note.aliases);
+                    }
+                    Err(_) => resolver.insert(path, None, &[]),
+                }
+            }
+            resolver
         })
     }
 
     /// 编辑器保存后：用刚落盘的文本增量索引。
     pub fn note_saved(&mut self, path: VaultPath, text: String, stamp: FileStamp, cx: &mut Context<Self>) {
-        self.run(cx, move |ix| ix.index_text(&path, &text, stamp).map(|_| true).map_err(|e| e.to_string()));
+        self.run(cx, false, move |ix| {
+            ix.index_text(&path, &text, stamp).map(|_| true).map_err(|e| e.to_string())
+        });
     }
 
     /// 文件在磁盘上被外部改动后重读。
     pub fn note_changed(&mut self, path: VaultPath, cx: &mut Context<Self>) {
-        self.run(cx, move |ix| ix.index_note(&path).map(|_| true).map_err(|e| e.to_string()));
+        self.run(cx, false, move |ix| ix.index_note(&path).map(|_| true).map_err(|e| e.to_string()));
     }
 
     pub fn note_removed(&mut self, path: VaultPath, cx: &mut Context<Self>) {
-        self.run(cx, move |ix| ix.remove_note(&path).map(|_| true).map_err(|e| e.to_string()));
+        self.run(cx, false, move |ix| ix.remove_note(&path).map(|_| true).map_err(|e| e.to_string()));
     }
 
     pub fn notes_renamed(&mut self, report: aero_core::rename::RenameReport, cx: &mut Context<Self>) {
-        // 启动同步可能仍持有旧文件列表；等它结束再应用重命名，否则任务会在引擎尚未打开时丢失。
-        if matches!(self.phase(), Phase::Opening | Phase::Syncing { .. }) {
-            let mut report = Some(report);
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(PROGRESS_POLL).await;
-                    let done = this
-                        .update(cx, |this, cx| {
-                            if this.shared.cancelled.load(Ordering::Acquire) {
-                                return true;
-                            }
-                            if matches!(this.phase(), Phase::Opening | Phase::Syncing { .. }) {
-                                return false;
-                            }
-                            if matches!(this.phase(), Phase::Idle) {
-                                this.notes_renamed(report.take().expect("applied once"), cx);
-                            }
-                            true
-                        })
-                        .unwrap_or(true);
-                    if done {
-                        return;
+        // 启动同步可能仍持有旧文件列表；在队列内等它结束，后续 Reloaded 保存不能插队。
+        self.run(cx, true, move |ix| {
+            let mut errors = Vec::new();
+            if let Err(rename_error) = ix.rename_note(&report.from, &report.to) {
+                // A later queued rename may already have moved the intermediate file on disk.
+                for path in [&report.from, &report.to] {
+                    if let Err(e) = ix.refresh_note(path) {
+                        errors.push(format!("{rename_error}; {}: {e}", path.as_str()));
                     }
                 }
-            })
-            .detach();
-            return;
-        }
-        self.run(cx, move |ix| {
-            let mut errors = Vec::new();
-            if let Err(e) = ix.rename_note(&report.from, &report.to) {
-                errors.push(e.to_string());
             }
             for path in report.updated.iter().filter(|p| **p != report.to) {
                 if let Err(e) = ix.refresh_note(path) {
@@ -303,7 +353,7 @@ impl SearchService {
         if paths.is_empty() {
             return;
         }
-        self.run(cx, move |ix| {
+        self.run(cx, false, move |ix| {
             let mut errors = Vec::new();
             let mut written = false;
             for path in &paths {
@@ -320,7 +370,7 @@ impl SearchService {
     /// 目录级变化（重命名 / 删除文件夹、事件溢出）后与磁盘整体对齐一次：新文件索引、消失的删掉、
     /// 指纹没变的跳过。只 stat 不读内容，万篇量级也在百毫秒内。
     pub fn resync(&mut self, cx: &mut Context<Self>) {
-        self.run(cx, |ix| {
+        self.run(cx, false, |ix| {
             let report = ix.sync_all(|_, _| {});
             for e in &report.errors {
                 log::warn!("index resync: {e}");
@@ -338,6 +388,8 @@ impl SearchService {
     /// 同理，切换到同一个 vault 时新句柄必须在旧句柄关掉之后再开，否则锁不上。
     pub fn close_blocking(&self) {
         self.shared.cancelled.store(true, Ordering::Release);
+        // Only an operation already holding the indexer lock can delay close, never queued work.
+        self.shared.wake_waiters();
         // 等同步线程停下（它每篇检查一次 cancelled；还在打开索引时会在存进锁之前看到 cancelled）
         if let Some(handle) = self.sync_thread.lock().unwrap_or_else(|p| p.into_inner()).take()
             && let Err(e) = handle.join()
@@ -368,20 +420,39 @@ impl SearchService {
         self.last_optimize = Instant::now() - OPTIMIZE_MIN_INTERVAL;
     }
 
-    /// 在后台线程上对索引做一次写操作。`op` 返回是否真的写了东西（只对齐了指纹算没写）；
-    /// 写了才安排空闲 flush 并计入 optimize 策略。
+    /// 按提交顺序在后台写入；等前一项完成（重命名还要等启动同步），再拿索引锁。
+    /// `op` 返回是否真的写了东西；写了才安排空闲 flush 并计入 optimize 策略。
     fn run(
         &mut self,
         cx: &mut Context<Self>,
+        wait_for_sync: bool,
         op: impl FnOnce(&mut Indexer) -> Result<bool, String> + Send + 'static,
     ) {
+        let previous = self.submitted_writes;
+        self.submitted_writes += 1;
         let indexer = self.indexer.clone();
+        let shared = self.shared.clone();
         let task = cx.background_spawn(async move {
-            let mut guard = indexer.lock().unwrap();
-            match guard.as_mut() {
-                Some(ix) => op(ix),
-                None => Ok(false),
+            if !shared.wait_for_writes(previous, wait_for_sync).await {
+                return Ok(false);
             }
+            let result = {
+                let mut guard = indexer.lock().unwrap();
+                // Close can race with acquiring the lock after the asynchronous wait.
+                if shared.cancelled.load(Ordering::Acquire)
+                    || (wait_for_sync && shared.phase.load(Ordering::Acquire) == PHASE_FAILED)
+                {
+                    Ok(false)
+                } else {
+                    match guard.as_mut() {
+                        Some(ix) => op(ix),
+                        None => Ok(false),
+                    }
+                }
+            };
+            // Errors and no-op writes release the next item too. No foreground callback is needed.
+            shared.finish_write(previous + 1);
+            result
         });
         cx.spawn(async move |this, cx| {
             let written = match task.await {
@@ -392,6 +463,9 @@ impl SearchService {
                 }
             };
             let _ = this.update(cx, |this, cx| {
+                if this.shared.cancelled.load(Ordering::Acquire) {
+                    return;
+                }
                 if written {
                     this.writes_since_optimize += 1;
                     this.schedule_flush(cx);
@@ -473,7 +547,7 @@ fn spawn_sync(
             Err(e) => {
                 log::error!("index open: {e}");
                 *shared.error.lock().unwrap() = Some(e.to_string());
-                shared.phase.store(PHASE_FAILED, Ordering::Release);
+                shared.set_phase(PHASE_FAILED);
                 return;
             }
         };
@@ -482,12 +556,12 @@ fn spawn_sync(
             Err(e) => {
                 log::error!("index plan: {e}");
                 *shared.error.lock().unwrap() = Some(e.to_string());
-                shared.phase.store(PHASE_FAILED, Ordering::Release);
+                shared.set_phase(PHASE_FAILED);
                 return;
             }
         };
         shared.total.store(plan.notes.len(), Ordering::Relaxed);
-        shared.phase.store(PHASE_SYNCING, Ordering::Release);
+        shared.set_phase(PHASE_SYNCING);
         let mut report = SyncReport::default();
         for (i, (path, row)) in plan.notes.iter().enumerate() {
             if shared.cancelled.load(Ordering::Acquire) {
@@ -533,14 +607,14 @@ fn spawn_sync(
             report.errors.len()
         );
         *shared.report.lock().unwrap() = Some(report);
-        shared.phase.store(PHASE_IDLE, Ordering::Release);
+        shared.set_phase(PHASE_IDLE);
     });
     match spawned {
         Ok(handle) => Some(handle),
         Err(e) => {
             log::error!("cannot spawn index thread: {e}");
             *shared_outer.error.lock().unwrap() = Some(e.to_string());
-            shared_outer.phase.store(PHASE_FAILED, Ordering::Release);
+            shared_outer.set_phase(PHASE_FAILED);
             None
         }
     }
@@ -570,41 +644,300 @@ mod tests {
         }
     }
 
-    /// 启动同步的旧文件列表处理完后，重命名更新仍必须执行一次。
     #[gpui_kit::test]
-    fn rename_index_update_waits_for_initial_sync(cx: &mut TestAppContext) {
+    fn front_matter_alias_catalog_fallback_and_resolver(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.md"), "targetunique\n").unwrap();
-        std::fs::write(dir.path().join("b.md"), "[[a]]\n").unwrap();
         let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.md"),
+            "---\ntitle: Display\naliases: ['雪 山', Quicksilver]\n---\nbody\n",
+        )
+        .unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        // A file not present in the indexed catalog must still expose its aliases.
+        std::fs::write(dir.path().join("b.md"), "---\naliases: Unindexed\n---\nbody\n").unwrap();
+        for indexed in [true, false] {
+            if !indexed {
+                cx.update(|cx| service.read(cx).close_blocking());
+            }
+            let task = cx.update(|cx| service.read(cx).completion_notes(vault.clone(), cx));
+            let notes = cx.foreground_executor().block_on(task).unwrap();
+            assert_eq!(notes[0].title, "Display");
+            assert_eq!(notes[0].aliases, ["雪 山", "Quicksilver"]);
+            assert_eq!(notes[1].aliases, ["Unindexed"]);
+            let task = cx.update(|cx| service.read(cx).link_resolver(vault.clone(), cx));
+            let resolver = cx.foreground_executor().block_on(task);
+            assert!(
+                matches!(resolver.resolve("Quicksilver", None, ""), aero_core::links::Resolution::Resolved { path, .. } if path.as_str() == "a.md")
+            );
+            assert!(
+                matches!(resolver.resolve("Display", None, ""), aero_core::links::Resolution::Resolved { path, .. } if path.as_str() == "a.md")
+            );
+            assert!(
+                matches!(resolver.resolve("Unindexed", None, ""), aero_core::links::Resolution::Resolved { path, .. } if path.as_str() == "b.md")
+            );
+        }
+    }
+
+    /// Freeze startup without depending on the OS sync thread or wall-clock delays.
+    fn set_phase(service: &Entity<SearchService>, phase: u8, cx: &mut TestAppContext) {
+        service.update(cx, |s, _| s.shared.set_phase(phase));
+    }
+
+    #[gpui_kit::test]
+    fn queued_writes_preserve_submission_order_even_after_error(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "body\n").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        let report = aero_core::rename::RenamePlan::prepare(
+            &vault,
+            VaultPath::new("a.md").unwrap(),
+            VaultPath::new("new.md").unwrap(),
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        set_phase(&service, super::PHASE_SYNCING, cx);
+        service.update(cx, |s, cx| {
+            s.notes_renamed(report, cx);
+            for i in 0..16 {
+                let order = order.clone();
+                s.run(cx, false, move |_| {
+                    order.lock().unwrap().push(i);
+                    if i == 3 { Err("intentional write failure".into()) } else { Ok(false) }
+                });
+            }
+        });
+        let barrier = cx.update(|cx| service.read(cx).note_summaries(cx));
+        cx.run_until_parked();
+        assert!(order.lock().unwrap().is_empty(), "writes overtook the pending rename");
+        assert!(!barrier.is_ready());
+        set_phase(&service, super::PHASE_IDLE, cx);
+        cx.foreground_executor().block_on(barrier);
+        assert_eq!(*order.lock().unwrap(), (0..16).collect::<Vec<_>>());
+        cx.update(|cx| service.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn save_rename_reload_queries_observe_only_the_new_path(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let old_source = "---\naliases: OldAlias\n---\nrenameunique #old\n";
+        let new_source = "---\naliases: NewAlias\n---\nrenameunique #fresh\n";
+        std::fs::write(dir.path().join("a.md"), old_source).unwrap();
+        std::fs::write(dir.path().join("b.md"), "[[a]]\n").unwrap();
         let vault = Arc::new(Vault::open(dir.path()).unwrap());
         let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
         idle(cx, &service);
         let from = VaultPath::new("a.md").unwrap();
-        let to = VaultPath::new("new.md").unwrap();
+        let to = VaultPath::new("新名字.md").unwrap();
+        let (_, old_stamp) = vault.read(&from).unwrap();
         let report = aero_core::rename::RenamePlan::prepare(&vault, from.clone(), to.clone())
             .unwrap()
             .execute()
             .unwrap();
-        // 固定在“同步未完成”这个边界，避免依赖真线程跑得快慢。
+        std::fs::write(dir.path().join(to.as_str()), new_source).unwrap();
+        let (_, new_stamp) = vault.read(&to).unwrap();
+        // The old save was submitted before rename; editor Reloaded saves the new path after it.
         service.update(cx, |s, cx| {
-            s.shared.phase.store(super::PHASE_SYNCING, std::sync::atomic::Ordering::Release);
+            s.note_saved(from.clone(), old_source.into(), old_stamp, cx);
             s.notes_renamed(report, cx);
+            s.note_saved(to.clone(), new_source.into(), new_stamp, cx);
+        });
+        // No executor drain between submitting the writes and creating all five queries.
+        let (search, backlinks, summaries, resolver, tags) = cx.update(|cx| {
+            let s = service.read(cx);
+            (
+                s.search("renameunique".into(), 10, cx),
+                s.backlinks(to.clone(), None, 10, cx),
+                s.note_summaries(cx),
+                s.link_resolver(vault.clone(), cx),
+                s.completion_tags(vault.clone(), VaultPath::new("b.md").unwrap(), String::new(), cx),
+            )
+        });
+        let hits = cx.foreground_executor().block_on(search).unwrap();
+        assert_eq!(hits.iter().map(|hit| &hit.path).collect::<Vec<_>>(), [&to]);
+        let hits = cx.foreground_executor().block_on(backlinks).unwrap().hits;
+        assert_eq!(hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(), ["b.md"]);
+        let notes = cx.foreground_executor().block_on(summaries);
+        assert!(!notes.iter().any(|note| note.path == from));
+        assert_eq!(notes.iter().find(|note| note.path == to).unwrap().aliases, ["NewAlias"]);
+        let resolver = cx.foreground_executor().block_on(resolver);
+        assert!(matches!(resolver.resolve("NewAlias", None, ""),
+            aero_core::links::Resolution::Resolved { path, .. } if path == to));
+        let tags = cx.foreground_executor().block_on(tags).unwrap();
+        assert_eq!(
+            tags.into_iter().map(|t| (t.tag, t.note_count)).collect::<Vec<_>>(),
+            [("fresh".into(), 1)]
+        );
+        cx.update(|cx| service.read(cx).close_blocking());
+    }
+
+    /// Both opening and syncing renames occupy their queue position before editor Reloaded saves.
+    #[gpui_kit::test]
+    fn rename_index_update_waits_for_initial_sync(cx: &mut TestAppContext) {
+        for phase in [super::PHASE_OPENING, super::PHASE_SYNCING] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.md"), "targetunique\n").unwrap();
+            std::fs::write(dir.path().join("b.md"), "[[a]]\n").unwrap();
+            let data = tempfile::tempdir().unwrap();
+            let vault = Arc::new(Vault::open(dir.path()).unwrap());
+            let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+            idle(cx, &service);
+            let from = VaultPath::new("a.md").unwrap();
+            let to = VaultPath::new("new.md").unwrap();
+            let report = aero_core::rename::RenamePlan::prepare(&vault, from.clone(), to.clone())
+                .unwrap()
+                .execute()
+                .unwrap();
+            let (doc, stamp) = vault.read(&to).unwrap();
+            set_phase(&service, phase, cx);
+            service.update(cx, |s, cx| {
+                s.notes_renamed(report, cx);
+                s.note_saved(to.clone(), doc.text().to_string(), stamp, cx);
+            });
+            let (search, backlinks, summaries, resolver, tags) = cx.update(|cx| {
+                let s = service.read(cx);
+                (
+                    s.search("targetunique".into(), 10, cx),
+                    s.backlinks(to.clone(), None, 10, cx),
+                    s.note_summaries(cx),
+                    s.link_resolver(vault.clone(), cx),
+                    s.completion_tags(vault.clone(), to.clone(), String::new(), cx),
+                )
+            });
+            cx.run_until_parked();
+            assert!(!search.is_ready(), "search overtook startup rename");
+            assert!(!backlinks.is_ready(), "backlinks overtook startup rename");
+            assert!(!summaries.is_ready(), "catalog overtook startup rename");
+            assert!(!resolver.is_ready(), "resolver overtook startup rename");
+            assert!(!tags.is_ready(), "tags overtook startup rename");
+            set_phase(&service, super::PHASE_IDLE, cx);
+            let hits = cx.foreground_executor().block_on(search).unwrap();
+            assert_eq!(hits.iter().map(|hit| &hit.path).collect::<Vec<_>>(), [&to]);
+            let hits = cx.foreground_executor().block_on(backlinks).unwrap().hits;
+            assert_eq!(hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(), ["b.md"]);
+            assert!(!cx.foreground_executor().block_on(summaries).iter().any(|note| note.path == from));
+            cx.foreground_executor().block_on(resolver);
+            cx.foreground_executor().block_on(tags).unwrap();
+            cx.update(|cx| service.read(cx).close_blocking());
+        }
+    }
+
+    #[gpui_kit::test]
+    fn queued_successive_renames_remove_obsolete_paths(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let source = "---\naliases: stablealias\n---\nrenamechainunique\n";
+        std::fs::write(dir.path().join("a.md"), source).unwrap();
+        std::fs::write(dir.path().join("ref.md"), "[[a]]\n").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        set_phase(&service, super::PHASE_SYNCING, cx);
+        for (from, to) in [("a.md", "b.md"), ("b.md", "c.md")] {
+            let from = VaultPath::new(from).unwrap();
+            let to = VaultPath::new(to).unwrap();
+            let report =
+                aero_core::rename::RenamePlan::prepare(&vault, from, to.clone()).unwrap().execute().unwrap();
+            let (doc, stamp) = vault.read(&to).unwrap();
+            service.update(cx, |s, cx| {
+                s.notes_renamed(report, cx);
+                s.note_saved(to, doc.text().to_string(), stamp, cx);
+            });
+        }
+        set_phase(&service, super::PHASE_IDLE, cx);
+        let task = cx.update(|cx| service.read(cx).search("renamechainunique".into(), 10, cx));
+        let hits = cx.foreground_executor().block_on(task).unwrap();
+        assert_eq!(hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(), ["c.md"]);
+        let task = cx.update(|cx| service.read(cx).backlinks(VaultPath::new("c.md").unwrap(), None, 10, cx));
+        assert_eq!(cx.foreground_executor().block_on(task).unwrap().total, 1);
+        cx.update(|cx| service.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn queries_do_not_wait_for_later_submissions(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "body\n").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        let from = VaultPath::new("a.md").unwrap();
+        let (_, stamp) = vault.read(&from).unwrap();
+        service.update(cx, |s, cx| s.note_saved(from.clone(), "body\n".into(), stamp, cx));
+        let (search, backlinks, summaries, resolver, tags) = cx.update(|cx| {
+            let s = service.read(cx);
+            (
+                s.search("body".into(), 10, cx),
+                s.backlinks(from.clone(), None, 10, cx),
+                s.note_summaries(cx),
+                s.link_resolver(vault.clone(), cx),
+                s.completion_tags(vault.clone(), from.clone(), String::new(), cx),
+            )
+        });
+        let report = aero_core::rename::RenamePlan::prepare(&vault, from, VaultPath::new("new.md").unwrap())
+            .unwrap()
+            .execute()
+            .unwrap();
+        set_phase(&service, super::PHASE_SYNCING, cx);
+        service.update(cx, |s, cx| s.notes_renamed(report, cx));
+        cx.run_until_parked();
+        assert!(search.is_ready());
+        assert!(backlinks.is_ready());
+        assert!(summaries.is_ready());
+        assert!(resolver.is_ready());
+        assert!(tags.is_ready());
+        cx.update(|cx| service.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn close_cancels_pending_writes_without_waiting_for_startup(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "body\n").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        let report = aero_core::rename::RenamePlan::prepare(
+            &vault,
+            VaultPath::new("a.md").unwrap(),
+            VaultPath::new("new.md").unwrap(),
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        set_phase(&service, super::PHASE_OPENING, cx);
+        service.update(cx, |s, cx| {
+            s.notes_renamed(report, cx);
+            s.run(cx, false, |_| panic!("queued write must be cancelled"));
+        });
+        let search = cx.update(|cx| service.read(cx).search("body".into(), 10, cx));
+        cx.run_until_parked();
+        assert!(!search.is_ready());
+        // Must release the engine on this thread without running the queued tasks or making startup ready.
+        cx.update(|cx| {
+            let s = service.read(cx);
+            s.close_blocking();
+            assert!(s.indexer.lock().unwrap().is_none());
+            assert!(s.sync_thread.lock().unwrap().is_none());
         });
         cx.run_until_parked();
-        let task = cx.update(|cx| service.read(cx).search("targetunique".into(), 10, cx));
-        assert_eq!(cx.foreground_executor().block_on(task).unwrap()[0].path, from);
-        service
-            .update(cx, |s, _| s.shared.phase.store(super::PHASE_IDLE, std::sync::atomic::Ordering::Release));
-        cx.executor().advance_clock(Duration::from_millis(200));
+        assert!(search.is_ready(), "close did not wake the query barrier");
+        assert!(cx.foreground_executor().block_on(search).unwrap().is_empty());
+        service.update(cx, |s, cx| {
+            s.run(cx, false, |_| panic!("write submitted after close must be cancelled"))
+        });
         cx.run_until_parked();
-        let task = cx.update(|cx| service.read(cx).search("targetunique".into(), 10, cx));
-        assert_eq!(cx.foreground_executor().block_on(task).unwrap()[0].path, to);
-        let task = cx.update(|cx| service.read(cx).backlinks(to, 10, cx));
-        let hits = cx.foreground_executor().block_on(task).unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].path.as_str(), "b.md");
-        cx.update(|cx| service.read(cx).close_blocking());
+        let reopened = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &reopened);
+        cx.update(|cx| reopened.read(cx).close_blocking());
     }
 
     #[gpui_kit::test]

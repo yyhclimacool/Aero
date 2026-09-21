@@ -1,7 +1,7 @@
 //! 快速打开（`ui_design.md` 3.2）：居中弹出的模糊搜索框，范围是笔记标题与路径。
 //!
 //! 空输入显示最近打开的笔记；`⏎` 打开，`⌘⏎` 或无匹配时新建同名笔记；`Esc` 关闭。
-//! 候选先用文件名（同步、立刻可用），索引就位后换成 front matter 标题。别名（aliases）随 M2 的属性解析加入。
+//! 候选先用文件名（同步、立刻可用），后台补齐 front matter 标题与别名；显示标题不变。
 
 use std::sync::Arc;
 
@@ -33,15 +33,14 @@ pub enum QuickOpenEvent {
 
 impl EventEmitter<QuickOpenEvent> for QuickOpen {}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Candidate {
-    pub path: VaultPath,
-    pub title: String,
-}
+use aero_core::links::NoteSummary;
 
 pub struct QuickOpen {
     input: Entity<InputState>,
-    candidates: Vec<Candidate>,
+    candidates: Vec<NoteSummary>,
+    /// 丢弃上一次 set_notes 尚未完成的目录结果。
+    catalog_generation: u64,
+    catalog_status: Option<Result<(), String>>,
     has_vault: bool,
     /// 最近打开的在前
     recent: Vec<VaultPath>,
@@ -70,6 +69,8 @@ impl QuickOpen {
         let mut this = QuickOpen {
             input,
             candidates: Vec::new(),
+            catalog_generation: 0,
+            catalog_status: None,
             has_vault: false,
             recent: Vec::new(),
             commands,
@@ -97,23 +98,22 @@ impl QuickOpen {
             .notes()
             .unwrap_or_default()
             .into_iter()
-            .map(|p| Candidate { title: p.stem().to_owned(), path: p })
+            .map(|p| NoteSummary { title: p.stem().to_owned(), path: p, aliases: Vec::new() })
             .collect();
         self.recent = recent;
         self.has_vault = true;
+        self.catalog_status = None;
         self.refilter(cx);
-        let titles = service.read(cx).note_titles(cx);
+        self.catalog_generation += 1;
+        let generation = self.catalog_generation;
+        let notes = service.read(cx).completion_notes(vault, cx);
         cx.spawn(async move |this, cx| {
-            let titles = titles.await;
-            if titles.is_empty() {
-                return;
-            }
+            let notes = notes.await;
             let _ = this.update(cx, |this, cx| {
-                for (path, title) in titles {
-                    if let Some(c) = this.candidates.iter_mut().find(|c| c.path == path) {
-                        c.title = title;
-                    }
+                if this.catalog_generation != generation {
+                    return;
                 }
+                this.catalog_status = Some(notes.map(|notes| this.candidates = notes));
                 if !this.command_mode {
                     this.refilter(cx);
                 }
@@ -164,7 +164,10 @@ impl QuickOpen {
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let q = self.query(cx);
         self.command_mode = q.starts_with('>');
-        self.has_query = self.has_vault && !self.command_mode && !q.is_empty();
+        self.has_query = self.has_vault
+            && !self.command_mode
+            && !q.is_empty()
+            && matches!(self.catalog_status, Some(Ok(())));
         self.shown = if let Some(query) = q.strip_prefix('>') {
             let query = query.trim();
             let mut scored: Vec<_> = self
@@ -204,7 +207,9 @@ impl QuickOpen {
                 .iter()
                 .enumerate()
                 .filter_map(|(i, c)| {
-                    let s = fuzzy_score(&q, &c.title).max(fuzzy_score(&q, c.path.as_str()))?;
+                    let s = fuzzy_score(&q, &c.title)
+                        .max(fuzzy_score(&q, c.path.as_str()))
+                        .max(c.aliases.iter().filter_map(|alias| fuzzy_score(&q, alias)).max())?;
                     // 最近打开的加一点分
                     let bonus =
                         self.recent.iter().position(|r| r == &c.path).map_or(0, |p| 20 - (p as i32).min(10));
@@ -261,7 +266,7 @@ impl QuickOpen {
         }
         let q = self.query(cx);
         if create || self.shown.is_empty() || self.selected >= self.shown.len() {
-            if !q.is_empty() {
+            if self.has_query {
                 cx.emit(QuickOpenEvent::Create(q));
             }
             return;
@@ -393,17 +398,33 @@ impl Render for QuickOpen {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
                     .children(rows)
-                    .when(empty, |el| {
-                        el.child(div().px_3().py_2().text_sm().text_color(muted).child(
-                            if self.command_mode {
-                                "没有匹配的可用命令。"
-                            } else if !self.has_vault {
-                                "请先打开 Vault，或输入 > 搜索命令。"
-                            } else {
-                                "这个 vault 里还没有笔记。"
-                            },
-                        ))
-                    })
+                    .when(
+                        self.has_vault && !self.command_mode && !matches!(self.catalog_status, Some(Ok(()))),
+                        |el| {
+                            let message = match &self.catalog_status {
+                                Some(Err(error)) => format!("无法读取笔记目录：{error}"),
+                                _ => "正在读取标题与别名…".to_owned(),
+                            };
+                            el.child(div().px_3().py_2().text_sm().text_color(muted).child(message))
+                        },
+                    )
+                    .when(
+                        empty
+                            && (!self.has_vault
+                                || self.command_mode
+                                || matches!(self.catalog_status, Some(Ok(())))),
+                        |el| {
+                            el.child(div().px_3().py_2().text_sm().text_color(muted).child(
+                                if self.command_mode {
+                                    "没有匹配的可用命令。"
+                                } else if !self.has_vault {
+                                    "请先打开 Vault，或输入 > 搜索命令。"
+                                } else {
+                                    "这个 vault 里还没有笔记。"
+                                },
+                            ))
+                        },
+                    )
                     .children(create_row)
                     .vertical_scrollbar(&self.scroll),
             )
@@ -433,6 +454,101 @@ mod tests {
         assert!(fuzzy_score("rc", "Rust CLI").unwrap() > fuzzy_score("rc", "arch").unwrap());
         assert_eq!(fuzzy_score("GPUI", "gpui 笔记"), fuzzy_score("gpui", "GPUI 笔记"));
         assert_eq!(fuzzy_score("", "x"), Some(0));
+    }
+
+    #[gpui_kit::test]
+    fn front_matter_alias_filters_without_changing_display_title(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("n.md"),
+            "---\ntitle: Display\naliases: [quicksilver, '雪 山']\n---\n",
+        )
+        .unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        // With no engine available, the async disk catalog must still provide aliases.
+        cx.update(|cx| service.read(cx).close_blocking());
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(vec![], vec![], window, cx);
+            picker.set_notes(vault, service, vec![], cx);
+            picker
+        });
+        cx.run_until_parked();
+        cx.simulate_input("quicksilver");
+        cx.update(|_, cx| {
+            assert_eq!(picker.read(cx).shown_paths(), ["n.md"]);
+            assert_eq!(picker.read(cx).candidates[0].title, "Display");
+        });
+        picker.update_in(cx, |p, window, cx| {
+            p.input.update(cx, |s, cx| s.set_value("雪山", window, cx));
+            p.refilter(cx);
+        });
+        cx.update(|_, cx| assert_eq!(picker.read(cx).shown_paths(), ["n.md"]));
+    }
+
+    #[gpui_kit::test]
+    fn pending_alias_catalog_never_creates_from_an_empty_match(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("n.md"), "---\naliases: shared-name\n---\nbody\n").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        cx.update(|cx| service.read(cx).close_blocking());
+        let (picker, visual) = cx.add_window_view(|window, cx| QuickOpen::new(vec![], vec![], window, cx));
+        let created = Rc::new(RefCell::new(Vec::new()));
+        visual.update(|window, cx| {
+            let sink = created.clone();
+            cx.subscribe(&picker, move |_, event, _| {
+                if let QuickOpenEvent::Create(name) = event {
+                    sink.borrow_mut().push(name.clone());
+                }
+            })
+            .detach();
+            picker.update(cx, |p, cx| {
+                p.set_notes(vault, service, vec![], cx);
+                p.input.update(cx, |s, cx| s.set_value("shared-name", window, cx));
+                p.refilter(cx);
+                p.confirm(false, cx);
+            });
+        });
+        visual.run_until_parked();
+        assert!(created.borrow().is_empty(), "partial catalog must not imply a missing note");
+        assert_eq!(
+            picker.read_with(visual, |p, _| p
+                .shown_paths()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()),
+            ["n.md"]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn failed_alias_catalog_does_not_offer_creation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        cx.update(|cx| service.read(cx).close_blocking());
+        dir.close().unwrap();
+        let (picker, visual) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(vec![], vec![], window, cx);
+            picker.set_notes(vault, service, vec![], cx);
+            picker
+        });
+        visual.run_until_parked();
+        picker.update_in(visual, |p, window, cx| {
+            p.input.update(cx, |s, cx| s.set_value("missing", window, cx));
+            p.refilter(cx);
+            assert_eq!(p.rows(), 0, "catalog failure is not an empty vault");
+        });
     }
 
     #[gpui_kit::test]
