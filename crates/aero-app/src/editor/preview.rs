@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use aero_core::{CalloutKind, Fold};
 use gpui_kit::assets::IconName;
+use gpui_kit::base::text::{MarkdownNode, TextView, TextViewStyle, markdown_ast};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::text::{MarkdownNode, TextView, TextViewStyle, markdown_ast};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -50,7 +50,7 @@ pub(super) fn markdown(
     let highlight_editor = editor.clone();
     let highlight_style = style.clone();
     let highlight_id = id.clone();
-    TextView::markdown(id.clone(), text)
+    with_links(TextView::markdown(id.clone(), text), &editor)
         .style(style.clone())
         .selectable(false)
         .markdown_block_parser(|node, cx| {
@@ -110,6 +110,16 @@ pub(super) fn markdown(
         .w_full()
 }
 
+fn with_links(view: TextView, editor: &Entity<super::Editor>) -> TextView {
+    let style_editor = editor.clone();
+    let hover_editor = editor.clone();
+    view.link_style(move |url, cx| style_editor.read(cx).preview_link_style(url, cx)).on_link_hover(
+        move |url, entered, bounds, window, cx| {
+            hover_editor.update(cx, |editor, cx| editor.hover_link(url, entered, bounds, window, cx));
+        },
+    )
+}
+
 fn highlight_html(
     id: SharedString,
     lines: &[String],
@@ -124,9 +134,12 @@ fn highlight_html(
         let editor = editor.clone();
         // TextView 内部使用 h_full；最小高度放在独立容器，避免换行内容被按一行测量。
         div().min_h(line_height).max_w_full().child(
-            TextView::html(
-                SharedString::from(format!("{id}-line-{ix}")),
-                html.replace("<mark>", &format!("<mark color=\"{color}\">")),
+            with_links(
+                TextView::html(
+                    SharedString::from(format!("{id}-line-{ix}")),
+                    html.replace("<mark>", &format!("<mark color=\"{color}\">")),
+                ),
+                &editor,
             )
             .style(style.clone())
             .selectable(false)
@@ -177,8 +190,7 @@ fn highlight_table(
     }
     let floors: Vec<f32> = widths.iter().map(|w| (w / 2.).clamp(160., 480.).min(*w)).collect();
     let scroll = window.use_keyed_state(id.clone(), cx, |_, _| ScrollHandle::default()).read(cx).clone();
-    let mut cell_style = style.clone();
-    cell_style.paragraph_gap = rems(0.);
+    let cell_style = style.clone().with_paragraph_gap(rems(0.));
     let track = div().min_w_full().w(px(floors.iter().sum::<f32>() + 2.)).children(
         rows.iter().enumerate().map(|(row_ix, row)| {
             h_flex()
@@ -187,7 +199,7 @@ fn highlight_table(
                 .border_color(cx.theme().border)
                 .when(row_ix + 1 < rows.len(), |el| el.border_b_1())
                 .when(row_ix == 0, |el| {
-                    el.bg(cx.theme().muted).font_weight(FontWeight::SEMIBOLD).refine_style(&style.table_head)
+                    el.bg(cx.theme().muted).font_weight(FontWeight::SEMIBOLD).refine_style(style.table_head())
                 })
                 .children(row.iter().enumerate().map(|(ix, cell)| {
                     div()
@@ -200,7 +212,7 @@ fn highlight_table(
                         .px_2()
                         .py_1()
                         .when(ix + 1 < alignments.len(), |el| el.border_r_1().border_color(cx.theme().border))
-                        .refine_style(&style.table_cell)
+                        .refine_style(style.table_cell())
                         .child(
                             // GPUI 对齐文字时背景终点不含偏移；用容器对齐自然宽度的文字。
                             highlight_html(
@@ -230,7 +242,7 @@ fn highlight_table(
                 .w_full()
                 .border_1()
                 .border_color(cx.theme().border)
-                .refine_style(&style.table)
+                .refine_style(style.table())
                 .overflow_hidden()
                 .track_scroll(&scroll)
                 .child(track),

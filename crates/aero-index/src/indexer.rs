@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aero_core::index::blocks_and_links_for_note;
-use aero_core::links::{Resolution, Resolver};
+use aero_core::links::{NoteSummary, Resolution, Resolver};
 use aero_core::{
     Document, FileStamp, FtsQuery, FullTextIndex, IndexBlock, IndexError, Vault, VaultError, VaultPath,
 };
@@ -48,6 +48,13 @@ pub struct Backlink {
     pub source_hash: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct BacklinkPage {
+    pub total: u64,
+    pub matched: u64,
+    pub hits: Vec<Backlink>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncReport {
     pub indexed: usize,
@@ -80,8 +87,8 @@ pub struct SyncPlan {
 
 /// 全量重建时每写多少块 `flush()` 一次（ADR 0003：不分批峰值内存 900 MB，分批 ≈ 280 MB）。
 const FLUSH_EVERY_BLOCKS: usize = 10_000;
-/// 块 / 过滤字段的布局版本；变了就整体重建。3：`tags_filter` 连祖先标签一起写（父标签查询）。
-const FTS_VERSION: i64 = 3;
+/// 4: separate indexed title + aliases + body from stored display fields.
+const FTS_VERSION: i64 = 4;
 
 /// wikilink 解析用的笔记表：路径 / 文件名 / 标题 → 路径，以及路径 → `note_id`。
 /// 从 `notes` 表建一次，之后随每次入库 / 删除 / 改名增量维护，单篇保存不再全表重读、不再走 vault。
@@ -100,16 +107,16 @@ impl LinkUniverse {
             LinkUniverse { resolver: Resolver::new(), id_by_path: HashMap::with_capacity(rows.len()) };
         for row in rows {
             if let Ok(path) = VaultPath::new(&row.path) {
-                u.insert(path, &row.note_id, Some(&row.title));
+                u.insert(path, &row.note_id, Some(&row.title), &row.aliases);
             }
         }
         u
     }
 
     /// `title` 为 None：只登记路径（预分配阶段，标题要等读了文件才知道）。
-    fn insert(&mut self, path: VaultPath, note_id: &str, title: Option<&str>) {
+    fn insert(&mut self, path: VaultPath, note_id: &str, title: Option<&str>, aliases: &[String]) {
         self.id_by_path.insert(path.as_str().to_owned(), note_id.to_owned());
-        self.resolver.insert(path, title);
+        self.resolver.insert(path, title, aliases);
     }
 
     fn remove(&mut self, path: &VaultPath) {
@@ -134,8 +141,8 @@ impl LinkUniverse {
 /// 改动太多（全量同步）就退化为重判全部名字有竞争的行。
 #[derive(Default)]
 struct Touched {
-    /// `(路径, 改动前的标题)`
-    notes: Vec<(VaultPath, Option<String>)>,
+    /// Previous title and aliases; current names are in the resolver.
+    notes: Vec<NoteSummary>,
     /// 超过这么多篇就不逐篇算邻域了
     overflow: bool,
 }
@@ -143,11 +150,11 @@ struct Touched {
 const TOUCHED_LIMIT: usize = 64;
 
 impl Touched {
-    fn push(&mut self, path: VaultPath, old_title: Option<String>) {
+    fn push(&mut self, path: VaultPath, old_title: Option<String>, old_aliases: Vec<String>) {
         if self.notes.len() >= TOUCHED_LIMIT {
             self.overflow = true;
         } else {
-            self.notes.push((path, old_title));
+            self.notes.push(NoteSummary { path, title: old_title.unwrap_or_default(), aliases: old_aliases });
         }
     }
 }
@@ -215,8 +222,16 @@ impl Indexer {
     }
 
     /// 只读取已解析入链；每篇来源最多读取、解析一次。不修改索引或笔记。
-    pub fn backlinks(&self, path: &VaultPath, limit: usize) -> Result<Vec<Backlink>, IndexerError> {
-        let rows = self.meta.backlinks(path.as_str(), limit)?;
+    pub fn backlinks(
+        &self,
+        path: &VaultPath,
+        fragment: Option<&str>,
+        limit: usize,
+    ) -> Result<BacklinkPage, IndexerError> {
+        let total = self.meta.backlink_count(path.as_str(), None)?;
+        let matched =
+            if fragment.is_some() { self.meta.backlink_count(path.as_str(), fragment)? } else { total };
+        let rows = self.meta.backlinks(path.as_str(), fragment, limit)?;
         let mut source = None;
         let mut doc = None;
         let mut hits = Vec::new();
@@ -246,7 +261,7 @@ impl Indexer {
                 source_hash: row.source.stamp.hash,
             });
         }
-        Ok(hits)
+        Ok(BacklinkPage { total, matched, hits })
     }
 
     /// 与磁盘对齐：新文件与指纹变了的文件重索引，消失的文件删掉。`progress(done, total)` 每处理一篇调一次。
@@ -310,7 +325,7 @@ impl Indexer {
                     .entry(path.as_str().to_owned())
                     .or_insert_with(|| ulid::Ulid::generate().to_string());
                 if !universe.resolver.contains(path) {
-                    universe.insert(path.clone(), id, None);
+                    universe.insert(path.clone(), id, None, &[]);
                 }
             }
         }
@@ -346,7 +361,7 @@ impl Indexer {
 
     fn forget_preassigned(&mut self, path: &VaultPath) -> Result<(), IndexerError> {
         if let Some(id) = self.preassigned.remove(path.as_str()) {
-            self.touched.push(path.clone(), None);
+            self.touched.push(path.clone(), None, Vec::new());
             if let Some(u) = self.links.as_mut() {
                 u.remove(path);
             }
@@ -467,27 +482,35 @@ impl Indexer {
         }
         let tags =
             blocks.first().map(|b| b.tags.clone()).unwrap_or_else(|| aero_core::index::tags_for_note(doc));
+        let aliases =
+            blocks.first().map(|b| b.aliases.to_vec()).unwrap_or_else(|| doc.front_matter_aliases());
         self.meta.upsert_note_with_tags(
             &NoteRow {
                 note_id: note_id.clone(),
                 path: path.as_str().to_owned(),
                 title: title.clone(),
+                aliases: aliases.clone(),
                 stamp,
                 block_count: new_count,
             },
             &tags,
         )?;
-        let old_title = existing.as_ref().map(|r| r.title.clone()).filter(|t| *t != title);
-        if old_title.is_some() {
-            // 靠旧标题解析到这篇的行不再成立；补挂时能按新标题 / 文件名解析上的会挂回来
+        let names_changed = existing.as_ref().is_some_and(|r| r.title != title || r.aliases != aliases);
+        if names_changed {
+            // Flush first: queued rows may still point here through removed names.
+            // Otherwise bulk flush can restore stale resolutions after invalidation.
+            self.flush_link_batch()?;
             self.meta.unresolve_incoming(&note_id)?;
         }
-        // 只有"这篇是新的"或"标题变了"才会影响别人指向它的行；正文改动不用重判入链
-        // （被大量引用的笔记每次保存都重判几千行，保存后可搜索的延迟会跟着涨）
-        if existing.is_none() || old_title.is_some() {
-            self.touched.push(path.clone(), old_title);
+        // Body-only saves do not re-evaluate incoming links.
+        if existing.is_none() || names_changed {
+            self.touched.push(
+                path.clone(),
+                existing.as_ref().map(|r| r.title.clone()),
+                existing.as_ref().map(|r| r.aliases.clone()).unwrap_or_default(),
+            );
         }
-        self.universe()?.insert(path.clone(), &note_id, Some(&title));
+        self.universe()?.insert(path.clone(), &note_id, Some(&title), &aliases);
         // 同篇锚点 `[[#h]]` 不是笔记间关系，不进表
         let universe = self.links.as_ref().expect("universe built above");
         let rows: Vec<LinkRow> = spans
@@ -529,8 +552,8 @@ impl Indexer {
         // 指向它的行退回未解析：目标重建后会重新挂上，而不是留着一个悬空 id
         self.meta.unresolve_incoming(&row.note_id)?;
         if let Ok(path) = VaultPath::new(&row.path) {
-            // 先记邻域再移除：它的标题组要从 title_of 里查
-            self.touched.push(path.clone(), Some(row.title.clone()));
+            // Keep old names for the removed note's reconciliation neighborhood.
+            self.touched.push(path.clone(), Some(row.title.clone()), row.aliases.clone());
             if let Some(u) = self.links.as_mut() {
                 u.remove(&path);
             }
@@ -550,7 +573,8 @@ impl Indexer {
         self.meta.rename_note(&row.note_id, new.as_str(), &title)?;
         self.flush_link_batch()?;
         self.meta.unresolve_incoming(&row.note_id)?;
-        self.touched.push(old.clone(), Some(row.title.clone()));
+        self.touched.push(old.clone(), Some(row.title.clone()), row.aliases.clone());
+        self.touched.push(new.clone(), None, Vec::new());
         if let Some(u) = self.links.as_mut() {
             u.remove(old);
         }
@@ -577,7 +601,7 @@ impl Indexer {
             let mut v: Vec<VaultPath> = touched
                 .notes
                 .iter()
-                .flat_map(|(p, old_title)| universe.resolver.neighbors(p, old_title.as_deref()))
+                .flat_map(|old| universe.resolver.neighbors(&old.path, Some(&old.title), &old.aliases))
                 .collect();
             v.sort();
             v.dedup();
@@ -605,8 +629,15 @@ impl Indexer {
     pub fn link_resolver(&mut self) -> Result<Resolver, IndexerError> {
         let mut resolver = self.universe()?.resolver.clone();
         for path in self.vault.notes()? {
-            if !resolver.contains(&path) {
-                resolver.insert(path, None);
+            if !resolver.contains(&path) || self.preassigned.contains_key(path.as_str()) {
+                match self.vault.read(&path) {
+                    Ok((doc, _)) => resolver.insert(
+                        path.clone(),
+                        Some(&doc.title_or(path.stem())),
+                        &doc.front_matter_aliases(),
+                    ),
+                    Err(_) => resolver.insert(path, None, &[]),
+                }
             }
         }
         Ok(resolver)
@@ -657,13 +688,19 @@ impl Indexer {
         Ok(self.fts.optimize()?)
     }
 
-    /// 已索引笔记的 `(路径, 标题)`，给快速打开做候选（标题来自 front matter，没有则是文件名）。
-    pub fn note_titles(&self) -> Result<Vec<(VaultPath, String)>, IndexerError> {
+    /// Indexed catalog with unchanged display titles and alternate lookup names.
+    pub fn note_summaries(&self) -> Result<Vec<NoteSummary>, IndexerError> {
         Ok(self
             .meta
             .all_notes()?
             .into_iter()
-            .filter_map(|r| VaultPath::new(&r.path).ok().map(|p| (p, r.title)))
+            .filter_map(|r| {
+                VaultPath::new(&r.path).ok().map(|path| NoteSummary {
+                    path,
+                    title: r.title,
+                    aliases: r.aliases,
+                })
+            })
             .collect())
     }
 
@@ -712,6 +749,134 @@ mod tests {
     }
 
     #[test]
+    fn alias_links_reconcile_edits_collisions_removal_and_deletion() {
+        for order in [["a.md", "b.md", "source.md"], ["source.md", "b.md", "a.md"]] {
+            let (dir, mut ix) = setup(&[
+                ("a.md", "---\naliases: [shared, old]\n---\nbody\n"),
+                ("b.md", "body\n"),
+                ("source.md", "[[shared]] [[old]] [[new]]\n"),
+            ]);
+            for name in order {
+                ix.index_note(&VaultPath::new(name).unwrap()).unwrap();
+            }
+            let a = VaultPath::new("a.md").unwrap();
+            let b = VaultPath::new("b.md").unwrap();
+            assert_eq!(ix.backlinks(&a, None, 20).unwrap().hits.len(), 2);
+            std::fs::write(dir.path().join("b.md"), "---\ntitle: shared\n---\nbody\n").unwrap();
+            ix.index_note(&b).unwrap();
+            assert_eq!(ix.backlinks(&a, None, 20).unwrap().hits.len(), 1);
+            assert!(ix.backlinks(&b, None, 20).unwrap().hits.is_empty());
+            std::fs::write(dir.path().join("a.md"), "---\naliases: [new]\n---\nbody\n").unwrap();
+            ix.index_note(&a).unwrap();
+            assert_eq!(ix.backlinks(&a, None, 20).unwrap().hits[0].label, "new");
+            assert_eq!(ix.backlinks(&b, None, 20).unwrap().hits[0].label, "shared");
+            std::fs::remove_file(dir.path().join("a.md")).unwrap();
+            ix.remove_note(&a).unwrap();
+            assert!(ix.backlinks(&a, None, 20).unwrap().hits.is_empty());
+            assert_eq!(ix.meta.pending_links().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn alias_batch_overflow_does_not_reintroduce_old_resolutions() {
+        let (dir, mut ix) = setup(&[("target.md", "---\naliases: oldname\n---\nbody\n")]);
+        ix.index_note(&VaultPath::new("target.md").unwrap()).unwrap();
+        assert!(matches!(
+            ix.link_resolver().unwrap().resolve("oldname", None, ""),
+            Resolution::Resolved { .. }
+        ));
+        for i in 0..TOUCHED_LIMIT + 2 {
+            std::fs::write(dir.path().join(format!("a{i:03}.md")), "[[oldname]]\n").unwrap();
+        }
+        std::fs::write(dir.path().join("target.md"), "---\naliases: newname\n---\nbody\n").unwrap();
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        assert!(ix.backlinks(&VaultPath::new("target.md").unwrap(), None, 200).unwrap().hits.is_empty());
+        assert_eq!(ix.meta.pending_links().unwrap().len(), TOUCHED_LIMIT + 2);
+    }
+
+    #[test]
+    fn alias_collisions_in_large_sync_resolve_after_removing_a_competitor() {
+        let (dir, mut ix) =
+            setup(&[("a.md", "---\naliases: shared\n---\nbody\n"), ("source.md", "[[shared]]\n")]);
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        let a = VaultPath::new("a.md").unwrap();
+        assert_eq!(ix.backlinks(&a, None, 20).unwrap().hits.len(), 1);
+        for i in 0..TOUCHED_LIMIT + 2 {
+            std::fs::write(dir.path().join(format!("b{i:03}.md")), "body\n").unwrap();
+        }
+        std::fs::write(dir.path().join("z.md"), "---\naliases: shared\n---\nbody\n").unwrap();
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        assert!(ix.backlinks(&a, None, 20).unwrap().hits.is_empty());
+        assert_eq!(ix.meta.pending_links().unwrap().len(), 1);
+        std::fs::remove_file(dir.path().join("z.md")).unwrap();
+        ix.remove_note(&VaultPath::new("z.md").unwrap()).unwrap();
+        assert_eq!(ix.backlinks(&a, None, 20).unwrap().hits.len(), 1);
+        let new = VaultPath::new("renamed.md").unwrap();
+        ix.vault.rename(&a, &new).unwrap();
+        ix.rename_note(&a, &new).unwrap();
+        assert_eq!(ix.backlinks(&new, None, 20).unwrap().hits.len(), 1);
+        assert_eq!(
+            ix.note_summaries().unwrap().into_iter().find(|n| n.path == new).unwrap().aliases,
+            ["shared"]
+        );
+    }
+
+    #[test]
+    fn alias_path_names_yield_to_new_filename_matches_incrementally() {
+        let (dir, mut ix) = setup(&[
+            ("a.md", "---\naliases: ['nested/target', 'target.md']\n---\nbody\n"),
+            ("source.md", "[[nested/target]] [[target.md]]\n"),
+        ]);
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        let a = VaultPath::new("a.md").unwrap();
+        assert_eq!(ix.backlinks(&a, None, 20).unwrap().hits.len(), 2);
+        std::fs::write(dir.path().join("target.md"), "body\n").unwrap();
+        let target = VaultPath::new("target.md").unwrap();
+        ix.index_note(&target).unwrap();
+        assert!(ix.backlinks(&a, None, 20).unwrap().hits.is_empty());
+        assert_eq!(ix.backlinks(&target, None, 20).unwrap().hits.len(), 2);
+    }
+
+    #[test]
+    fn aliases_survive_index_reopen_and_replaced_aliases_leave_search() {
+        let (dir, _) = setup(&[("n.md", "---\ntitle: Display\naliases: Quicksilver\n---\nbody\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let mut ix = Indexer::open(vault.clone(), data.path()).unwrap();
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        ix.flush().unwrap();
+        drop(ix);
+        let mut ix = Indexer::open(vault, data.path()).unwrap();
+        assert_eq!(ix.note_summaries().unwrap()[0].aliases, ["Quicksilver"]);
+        assert_eq!(ix.search("quicksilver", 10).unwrap()[0].body, "body");
+        assert!(matches!(
+            ix.link_resolver().unwrap().resolve("Quicksilver", None, ""),
+            Resolution::Resolved { .. }
+        ));
+        std::fs::write(dir.path().join("n.md"), "---\ntitle: Display\naliases: Replacement\n---\nbody\n")
+            .unwrap();
+        ix.index_note(&VaultPath::new("n.md").unwrap()).unwrap();
+        assert!(ix.search("quicksilver", 10).unwrap().is_empty());
+        assert_eq!(ix.search("replacement", 10).unwrap()[0].title, "Display");
+    }
+
+    #[test]
+    fn unindexed_resolver_reads_front_matter_names() {
+        let (_dir, mut ix) = setup(&[("a.md", "---\ntitle: Display\naliases: Quicksilver\n---\nbody\n")]);
+        for preassigned in [false, true] {
+            if preassigned {
+                ix.plan_sync().unwrap();
+            }
+            let resolver = ix.link_resolver().unwrap();
+            for name in ["Display", "Quicksilver"] {
+                assert!(
+                    matches!(resolver.resolve(name, None, ""), Resolution::Resolved { path, .. } if path.as_str() == "a.md")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn backlinks_group_sources_preserve_occurrences_and_skip_non_links() {
         let (dir, mut ix) = setup(&[
             ("target.md", "# Target\n\n[[target]] [[#Target]]\n"),
@@ -723,7 +888,7 @@ mod tests {
         ]);
         assert!(ix.sync_all(|_, _| {}).errors.is_empty());
         let target = VaultPath::new("target.md").unwrap();
-        let hits = ix.backlinks(&target, 20).unwrap();
+        let hits = ix.backlinks(&target, None, 20).unwrap().hits;
         assert_eq!(hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), ["a.md", "a.md", "z.md"]);
         assert_eq!(hits.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(), ["TARGET", "同一笔记", "别名"]);
         assert_eq!(hits[2].title, "来源乙");
@@ -734,14 +899,14 @@ mod tests {
             assert_eq!(hit.source_hash, stamp.hash);
             assert!(doc.slice(hit.range.clone()).to_string().starts_with("[["));
         }
-        assert_eq!(ix.backlinks(&target, 1).unwrap(), hits[..1]);
-        assert!(ix.backlinks(&target, 0).unwrap().is_empty());
-        assert!(ix.backlinks(&VaultPath::new("absent.md").unwrap(), 20).unwrap().is_empty());
+        assert_eq!(ix.backlinks(&target, None, 1).unwrap().hits, hits[..1]);
+        assert!(ix.backlinks(&target, None, 0).unwrap().hits.is_empty());
+        assert!(ix.backlinks(&VaultPath::new("absent.md").unwrap(), None, 20).unwrap().hits.is_empty());
 
         // 监听尚未处理的改动 / 删除不能把旧偏移用于新内容。
         std::fs::write(dir.path().join("a.md"), "完全不同的内容\n").unwrap();
         std::fs::remove_file(dir.path().join("z.md")).unwrap();
-        assert!(ix.backlinks(&target, 20).unwrap().is_empty());
+        assert!(ix.backlinks(&target, None, 20).unwrap().hits.is_empty());
     }
 
     #[test]
@@ -749,29 +914,29 @@ mod tests {
         let (dir, mut ix) = setup(&[("a.md", "见 [[target]] 与 [[目标标题]]\n")]);
         assert!(ix.sync_all(|_, _| {}).errors.is_empty());
         let target = VaultPath::new("target.md").unwrap();
-        assert!(ix.backlinks(&target, 20).unwrap().is_empty());
+        assert!(ix.backlinks(&target, None, 20).unwrap().hits.is_empty());
         std::fs::write(dir.path().join("target.md"), "---\ntitle: 目标标题\n---\n正文\n").unwrap();
         ix.index_note(&target).unwrap();
-        assert_eq!(ix.backlinks(&target, 20).unwrap().len(), 2);
+        assert_eq!(ix.backlinks(&target, None, 20).unwrap().hits.len(), 2);
 
         let a = VaultPath::new("a.md").unwrap();
         let renamed = VaultPath::new("renamed.md").unwrap();
         ix.vault.rename(&a, &renamed).unwrap();
         ix.rename_note(&a, &renamed).unwrap();
-        assert!(ix.backlinks(&target, 20).unwrap().iter().all(|h| h.path == renamed));
+        assert!(ix.backlinks(&target, None, 20).unwrap().hits.iter().all(|h| h.path == renamed));
         std::fs::write(dir.path().join("renamed.md"), "只有 [[target]]\n").unwrap();
         ix.index_note(&renamed).unwrap();
-        assert_eq!(ix.backlinks(&target, 20).unwrap().len(), 1);
+        assert_eq!(ix.backlinks(&target, None, 20).unwrap().hits.len(), 1);
 
         std::fs::remove_file(dir.path().join("target.md")).unwrap();
         ix.remove_note(&target).unwrap();
-        assert!(ix.backlinks(&target, 20).unwrap().is_empty());
+        assert!(ix.backlinks(&target, None, 20).unwrap().hits.is_empty());
         std::fs::write(dir.path().join("target.md"), "重建\n").unwrap();
         ix.index_note(&target).unwrap();
-        assert_eq!(ix.backlinks(&target, 20).unwrap().len(), 1);
+        assert_eq!(ix.backlinks(&target, None, 20).unwrap().hits.len(), 1);
         std::fs::remove_file(dir.path().join("renamed.md")).unwrap();
         ix.remove_note(&renamed).unwrap();
-        assert!(ix.backlinks(&target, 20).unwrap().is_empty());
+        assert!(ix.backlinks(&target, None, 20).unwrap().hits.is_empty());
     }
 
     #[test]
@@ -782,10 +947,10 @@ mod tests {
             ("y/target.md", "---\ntitle: Shared\n---\nY\n"),
         ]);
         assert!(ix.sync_all(|_, _| {}).errors.is_empty());
-        let hits = ix.backlinks(&VaultPath::new("x/target.md").unwrap(), 20).unwrap();
+        let hits = ix.backlinks(&VaultPath::new("x/target.md").unwrap(), None, 20).unwrap().hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].label, "x/target");
-        assert!(ix.backlinks(&VaultPath::new("y/target.md").unwrap(), 20).unwrap().is_empty());
+        assert!(ix.backlinks(&VaultPath::new("y/target.md").unwrap(), None, 20).unwrap().hits.is_empty());
     }
 
     #[test]
@@ -910,12 +1075,20 @@ mod tests {
         assert!(ix.touched.notes.is_empty(), "正文改动：{:?}", ix.touched.notes);
 
         ix.index_document(&b, &Document::from_text("---\ntitle: B2\n---\nnew\n"), stamp).unwrap();
-        assert_eq!(ix.touched.notes, [(b.clone(), Some("B".to_owned()))], "改标题要重判");
+        assert_eq!(
+            ix.touched.notes,
+            [NoteSummary { path: b.clone(), title: "B".into(), aliases: vec![] }],
+            "改标题要重判"
+        );
         ix.reconcile_links().unwrap();
 
         let c = VaultPath::new("c.md").unwrap();
         ix.index_document(&c, &Document::from_text("c\n"), stamp).unwrap();
-        assert_eq!(ix.touched.notes, [(c, None)], "新笔记要重判");
+        assert_eq!(
+            ix.touched.notes,
+            [NoteSummary { path: c, title: String::new(), aliases: vec![] }],
+            "新笔记要重判"
+        );
     }
 
     /// 全量同步中途取消（新文件预分配了 id 却没入库）再重来：不留悬空 id，最终照样挂对。
@@ -1121,6 +1294,7 @@ mod tests {
             note_id: "legacy".into(),
             path: "a.md".into(),
             title: "a".into(),
+            aliases: Vec::new(),
             stamp,
             block_count: 1,
         })

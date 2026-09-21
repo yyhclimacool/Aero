@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use aero_core::VaultPath;
-use aero_core::links::{self, Resolution, Resolver};
+use aero_core::links::{self, NoteSummary, Resolution, Resolver};
 
 use crate::quick_open::fuzzy_score;
 
@@ -61,7 +61,7 @@ pub(super) fn trigger(text: &str, cursor: usize) -> Option<Trigger> {
 }
 
 pub(super) struct Catalog {
-    pub notes: Vec<(VaultPath, String)>,
+    pub notes: Vec<NoteSummary>,
     pub resolver: Resolver,
     pub attachments: aero_core::attachments::Catalog,
     pub embed_source: Option<VaultPath>,
@@ -69,10 +69,10 @@ pub(super) struct Catalog {
 }
 
 impl Catalog {
-    pub fn new(notes: Vec<(VaultPath, String)>, recent: Vec<VaultPath>) -> Self {
+    pub fn new(notes: Vec<NoteSummary>, recent: Vec<VaultPath>) -> Self {
         let mut resolver = Resolver::new();
-        for (path, title) in &notes {
-            resolver.insert(path.clone(), Some(title));
+        for note in &notes {
+            resolver.insert(note.path.clone(), Some(&note.title), &note.aliases);
         }
         Self { notes, resolver, recent, attachments: Default::default(), embed_source: None }
     }
@@ -83,9 +83,11 @@ impl Catalog {
             .notes
             .iter()
             .enumerate()
-            .filter_map(|(i, (path, title))| {
-                let score = fuzzy_score(query, title).max(fuzzy_score(query, path.as_str()))?;
-                let recent = self.recent.iter().position(|p| p == path);
+            .filter_map(|(i, note)| {
+                let score = fuzzy_score(query, &note.title)
+                    .max(fuzzy_score(query, note.path.as_str()))
+                    .max(note.aliases.iter().filter_map(|alias| fuzzy_score(query, alias)).max())?;
+                let recent = self.recent.iter().position(|p| p == &note.path);
                 let bonus = recent.map_or(0, |r| 20 - r.min(19) as i32);
                 Some((i, score + bonus))
             })
@@ -107,7 +109,7 @@ impl Catalog {
         }
         let path = |i: usize| {
             if i < self.notes.len() {
-                &self.notes[i].0
+                &self.notes[i].path
             } else {
                 &self.attachments.entries[i - self.notes.len()].path
             }
@@ -116,11 +118,13 @@ impl Catalog {
         scored.into_iter().take(8).map(|(i, _)| i).collect()
     }
 
-    /// 先尝试短文件名；有重名时写路径，并用同一解析器验证，不猜目标。
+    /// 先尝试短文件名、路径与标题，最后尝试唯一别名；用同一解析器验证，不猜目标。
     pub fn target(&self, index: usize, dir: &str) -> Option<String> {
-        let (path, title) = self.notes.get(index)?;
+        let NoteSummary { path, title, aliases } = self.notes.get(index)?;
         for target in
             [path.stem(), path.as_str().strip_suffix(".md").unwrap_or(path.as_str()), path.as_str(), title]
+                .into_iter()
+                .chain(aliases.iter().map(String::as_str))
         {
             // 图片 / PDF 后缀属于附件命名空间；同名笔记使用带 .md 的目标。
             if self.embed_source.is_some() && aero_core::attachments::Kind::for_path(target).is_some() {
@@ -275,6 +279,10 @@ impl HeadingCatalog {
 mod tests {
     use super::*;
 
+    fn n(path: &str, title: &str) -> NoteSummary {
+        NoteSummary { path: VaultPath::new(path).unwrap(), title: title.into(), aliases: vec![] }
+    }
+
     #[test]
     fn wiki_trigger_respects_markdown_context_and_utf8() {
         for (text, cursor, expected) in [
@@ -305,14 +313,47 @@ mod tests {
     }
 
     #[test]
+    fn front_matter_alias_matches_keep_titles_and_insert_safe_targets() {
+        let a = NoteSummary::from_document(
+            VaultPath::new("a/n.md").unwrap(),
+            &aero_core::Document::from_text("---\ntitle: Display A\naliases: [quicksilver, '雪 山']\n---\n"),
+        );
+        let b = NoteSummary::from_document(
+            VaultPath::new("b/n.md").unwrap(),
+            &aero_core::Document::from_text("---\ntitle: Display B\naliases: [quicksilver]\n---\n"),
+        );
+        let c = Catalog::new(vec![a, b], vec![]);
+        assert_eq!(c.filter("quicksilver"), [0, 1]);
+        assert_eq!(c.filter("雪山"), [0]);
+        assert_eq!(c.notes[0].title, "Display A");
+        assert!(matches!(c.resolver.resolve("quicksilver", None, ""), Resolution::Ambiguous { .. }));
+        for index in c.filter("quicksilver") {
+            let target = c.target(index, "else").unwrap();
+            assert_eq!(
+                c.resolver.resolve(&target, None, "else"),
+                Resolution::Resolved { path: c.notes[index].path.clone(), fragment: None }
+            );
+            assert_ne!(target, "quicksilver");
+        }
+        let mut root = n("note.md", "note");
+        root.aliases = vec!["shadowed".into(), "unique alias".into()];
+        let mut local = n("sub/note.md", "note");
+        local.aliases = vec!["shadowed".into()];
+        let c = Catalog::new(vec![root, local], vec![]);
+        assert_eq!(c.target(0, "sub").as_deref(), Some("unique alias"));
+        let mut notes = c.notes;
+        notes[0].aliases = vec!["shadowed".into(), "unsafe|alias".into(), "unique#alias".into()];
+        let c = Catalog::new(notes, vec![]);
+        let target = c.target(0, "sub").unwrap();
+        assert_eq!(target, r"unique\#alias");
+        assert_eq!(links::scan(&format!("[[{target}]]"))[0].target, "unique#alias");
+    }
+
+    #[test]
     fn wiki_candidates_rank_recent_and_match_title_or_path() {
         let p = |s| VaultPath::new(s).unwrap();
         let c = Catalog::new(
-            vec![
-                (p("a.md"), "Alpha".into()),
-                (p("中文/目标.md"), "知识库".into()),
-                (p("z.md"), "Zulu".into()),
-            ],
+            vec![n("a.md", "Alpha"), n("中文/目标.md", "知识库"), n("z.md", "Zulu")],
             vec![p("z.md")],
         );
         assert_eq!(c.filter("")[0], 2);
@@ -324,11 +365,7 @@ mod tests {
 
     #[test]
     fn wiki_targets_disambiguate_and_escape_fragment_characters() {
-        let p = |s| VaultPath::new(s).unwrap();
-        let c = Catalog::new(
-            vec![(p("a/n.md"), "N".into()), (p("b/n.md"), "N".into()), (p("a/C#.md"), "C#".into())],
-            vec![],
-        );
+        let c = Catalog::new(vec![n("a/n.md", "N"), n("b/n.md", "N"), n("a/C#.md", "C#")], vec![]);
         assert_eq!(c.target(0, "a"), Some("n".into()));
         assert_eq!(c.target(1, "a"), Some("b/n".into()));
         assert_eq!(c.target(2, ""), Some("C\\#".into()));
@@ -341,13 +378,9 @@ mod tests {
     fn wiki_existing_aliases_and_shadowed_paths_are_not_retargeted() {
         assert!(trigger("[[note#heading]]", 4).is_none());
         assert!(trigger("[[note|alias]]", 4).is_none());
-        let p = |s| VaultPath::new(s).unwrap();
-        let c = Catalog::new(
-            vec![(p("note.md"), "Root title".into()), (p("sub/note.md"), "Local title".into())],
-            vec![],
-        );
+        let c = Catalog::new(vec![n("note.md", "Root title"), n("sub/note.md", "Local title")], vec![]);
         assert_eq!(c.target(0, "sub"), Some("Root title".into()));
-        let c = Catalog::new(vec![(p("note.md"), "note".into()), (p("sub/note.md"), "note".into())], vec![]);
+        let c = Catalog::new(vec![n("note.md", "note"), n("sub/note.md", "note")], vec![]);
         assert_eq!(c.target(0, "sub"), None, "cannot silently choose the local note");
     }
 
@@ -433,10 +466,7 @@ mod tests {
     #[test]
     fn embed_catalog_mixes_notes_and_attachments_without_target_collisions() {
         let p = |s| VaultPath::new(s).unwrap();
-        let mut c = Catalog::new(
-            vec![(p("photo.png.md"), "照片说明".into()), (p("z.md"), "Z".into())],
-            vec![p("z.md")],
-        );
+        let mut c = Catalog::new(vec![n("photo.png.md", "照片说明"), n("z.md", "Z")], vec![p("z.md")]);
         c.embed_source = Some(p("a.md"));
         c.attachments =
             aero_core::attachments::Catalog::new(vec![p("a.assets/photo.png"), p("other/paper.pdf")]);

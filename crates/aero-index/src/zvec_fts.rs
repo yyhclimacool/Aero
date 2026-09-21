@@ -1,6 +1,7 @@
 //! `FullTextIndex` 的 zvec 实现（ADR 0003 / 方案 10.3）。
 //!
-//! 一个 vault 一个 Collection，字段：`note_id`、`block_ord`、`path`、`title`、`tags`、`tags_filter`、`body`（jieba + lowercase 全文索引）。
+//! One collection per vault: `search_text` indexes title + aliases + body (jieba + lowercase).
+//! Display title/body and losslessly encoded aliases are stored separately; tags retain their filters.
 //! 写路径只用 `upsert` / `delete(pk)`；`delete_by_filter` 会留下僵尸主键（ADR 0003），这里不暴露。
 //! zvec 是进程级全局状态，`initialize()` 只做一次；API 同步，调用方放到后台线程。
 
@@ -124,7 +125,7 @@ impl ZvecFts {
             } else {
                 fts.set_match_string(text).map_err(engine)?;
             }
-            let mut sq = SearchQuery::fts("body", &fts, topk).map_err(engine)?;
+            let mut sq = SearchQuery::fts("search_text", &fts, topk).map_err(engine)?;
             sq.set_fts_params(FtsQueryParams::new(Some("AND")).map_err(engine)?).map_err(engine)?;
             sq
         };
@@ -243,7 +244,9 @@ fn create(dir: &Path) -> Result<Collection, IndexError> {
         .add_field(FieldSchema::new("title", DataType::String, false, 0).map_err(engine)?)
         .add_field(FieldSchema::new("tags", DataType::String, false, 0).map_err(engine)?)
         .add_field(FieldSchema::new("tags_filter", DataType::String, false, 0).map_err(engine)?)
-        .add_indexed_field("body", DataType::String, fts)
+        .add_field(FieldSchema::new("aliases", DataType::String, false, 0).map_err(engine)?)
+        .add_field(FieldSchema::new("body", DataType::String, false, 0).map_err(engine)?)
+        .add_indexed_field("search_text", DataType::String, fts)
         .build()
         .map_err(engine)?;
     Collection::create_and_open(&dir.to_string_lossy(), &schema, Some(&options()?)).map_err(engine)
@@ -268,6 +271,9 @@ fn to_doc(b: &IndexBlock) -> Result<Doc, IndexError> {
         .collect();
     d.add_string("tags_filter", &tags_filter).map_err(engine)?;
     d.add_string("body", &b.body).map_err(engine)?;
+    d.add_string("aliases", &aero_core::document::encode_aliases(&b.aliases)).map_err(engine)?;
+    d.add_string("search_text", &format!("{}\n{}\n{}", b.title, b.aliases.join("\n"), b.body))
+        .map_err(engine)?;
     Ok(d)
 }
 
@@ -280,6 +286,9 @@ fn from_doc(d: &Doc) -> Result<IndexBlock, IndexError> {
         block_ord: d.get_i32("block_ord").map_err(engine)?.unwrap_or_default() as u32,
         path: s("path")?,
         title: s("title")?,
+        aliases: aero_core::document::decode_aliases(&s("aliases")?)
+            .map_err(|e| IndexError::Engine(e.to_string()))?
+            .into(),
         body: s("body")?,
         tags,
     })
@@ -290,16 +299,20 @@ impl FullTextIndex for ZvecFts {
         if blocks.is_empty() {
             return Ok(());
         }
-        let docs: Vec<Doc> = blocks.iter().map(to_doc).collect::<Result<_, _>>()?;
-        let refs: Vec<&Doc> = docs.iter().collect();
-        let r = self.col()?.upsert(&refs).map_err(engine)?;
-        if r.error_count > 0 {
-            let first = r.results.iter().find(|x| !x.success).map(|x| x.message.clone()).unwrap_or_default();
-            return Err(IndexError::Engine(format!(
-                "upsert: {} of {} failed: {first}",
-                r.error_count,
-                blocks.len()
-            )));
+        // Bound encoded metadata copies even when one note contains many blocks.
+        for batch in blocks.chunks(128) {
+            let docs: Vec<Doc> = batch.iter().map(to_doc).collect::<Result<_, _>>()?;
+            let refs: Vec<&Doc> = docs.iter().collect();
+            let r = self.col()?.upsert(&refs).map_err(engine)?;
+            if r.error_count > 0 {
+                let first =
+                    r.results.iter().find(|x| !x.success).map(|x| x.message.clone()).unwrap_or_default();
+                return Err(IndexError::Engine(format!(
+                    "upsert: {} of {} failed: {first}",
+                    r.error_count,
+                    batch.len()
+                )));
+            }
         }
         Ok(())
     }
@@ -385,6 +398,38 @@ impl std::fmt::Debug for ZvecFts {
 mod tests {
     use super::*;
 
+    #[test]
+    fn aliases_and_title_are_indexed_separately_from_display_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fts");
+        let mut idx = ZvecFts::open(&path).unwrap();
+        let doc = aero_core::Document::from_text(
+            "---\naliases: [quicksilver, '雪 山', 'a|b', 'a,b']\ntags: [rust/cli]\n---\n\nordinary body\n",
+        );
+        let blocks = aero_core::index::blocks_for_note(&doc, "n", "n.md", "Distinctive");
+        idx.upsert(&blocks).unwrap();
+        let mut q = FtsQuery::parse("quicksilver #rust");
+        assert_eq!(hit_pks(&idx, &q), ["n#0"]);
+        assert_eq!(hit_pks(&idx, &FtsQuery::new("Distinctive")), ["n#0"]);
+        assert_eq!(idx.fetch(&["n#0".into()]).unwrap(), blocks);
+        assert_eq!(blocks[0].body, "ordinary body");
+        q.note_id = Some("other".into());
+        assert!(idx.search(&q).unwrap().is_empty());
+        assert!(idx.search(&FtsQuery::parse("quicksilver -#rust")).unwrap().is_empty());
+        idx.flush().unwrap();
+        drop(idx);
+        let mut idx = ZvecFts::open(&path).unwrap();
+        assert_eq!(idx.fetch(&["n#0".into()]).unwrap(), blocks);
+        idx.upsert(&aero_core::index::blocks_for_note(
+            &aero_core::Document::from_text("ordinary body\n"),
+            "n",
+            "n.md",
+            "Distinctive",
+        ))
+        .unwrap();
+        assert!(idx.search(&FtsQuery::new("quicksilver")).unwrap().is_empty());
+    }
+
     fn block(note: &str, ord: u32, body: &str) -> IndexBlock {
         IndexBlock {
             pk: IndexBlock::pk_of(note, ord),
@@ -392,6 +437,7 @@ mod tests {
             block_ord: ord,
             path: format!("{note}.md"),
             title: note.to_uppercase(),
+            aliases: Default::default(),
             body: body.into(),
             tags: vec![],
         }

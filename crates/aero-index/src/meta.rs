@@ -10,8 +10,8 @@ use aero_core::FileStamp;
 use aero_core::links::LinkSpan;
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// 4：增加笔记级标签目录；旧缓存按既有版本策略从 Markdown 重建。
-const SCHEMA_VERSION: i64 = 4;
+/// 5: persist front matter aliases; older caches rebuild from Markdown.
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagCount {
@@ -24,6 +24,7 @@ pub struct NoteRow {
     pub note_id: String,
     pub path: String,
     pub title: String,
+    pub aliases: Vec<String>,
     pub stamp: FileStamp,
     pub block_count: u32,
 }
@@ -103,7 +104,8 @@ impl Meta {
                  mtime_ns    INTEGER NOT NULL,
                  size        INTEGER NOT NULL,
                  hash        INTEGER NOT NULL,
-                 block_count INTEGER NOT NULL
+                 block_count INTEGER NOT NULL,
+                 aliases     TEXT NOT NULL
              );
              CREATE TABLE links (
                  source_note_id  TEXT NOT NULL,
@@ -146,7 +148,7 @@ impl Meta {
     pub fn note_by_path(&self, path: &str) -> rusqlite::Result<Option<NoteRow>> {
         self.conn
             .query_row(
-                "SELECT note_id, path, title, mtime_ns, size, hash, block_count FROM notes WHERE path = ?1",
+                "SELECT note_id, path, title, mtime_ns, size, hash, block_count, aliases FROM notes WHERE path = ?1",
                 params![path],
                 row_to_note,
             )
@@ -155,7 +157,7 @@ impl Meta {
 
     pub fn all_notes(&self) -> rusqlite::Result<Vec<NoteRow>> {
         let mut st = self.conn.prepare(
-            "SELECT note_id, path, title, mtime_ns, size, hash, block_count FROM notes ORDER BY path",
+            "SELECT note_id, path, title, mtime_ns, size, hash, block_count, aliases FROM notes ORDER BY path",
         )?;
         let rows = st.query_map([], row_to_note)?;
         rows.collect()
@@ -163,11 +165,12 @@ impl Meta {
 
     pub fn upsert_note(&self, row: &NoteRow) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO notes (note_id, path, title, mtime_ns, size, hash, block_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO notes (note_id, path, title, mtime_ns, size, hash, block_count, aliases)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(note_id) DO UPDATE SET
                  path = excluded.path, title = excluded.title, mtime_ns = excluded.mtime_ns,
-                 size = excluded.size, hash = excluded.hash, block_count = excluded.block_count",
+                 size = excluded.size, hash = excluded.hash, block_count = excluded.block_count,
+                 aliases = excluded.aliases",
             params![
                 row.note_id,
                 row.path,
@@ -175,7 +178,8 @@ impl Meta {
                 mtime_ns(row.stamp.mtime),
                 row.stamp.size as i64,
                 row.stamp.hash as i64,
-                row.block_count as i64
+                row.block_count as i64,
+                aero_core::document::encode_aliases(&row.aliases)
             ],
         )?;
         Ok(())
@@ -227,17 +231,32 @@ impl Meta {
     }
 
     /// 按来源路径、出现顺序列出入链。自身链接不属于笔记间的反链。
-    pub fn backlinks(&self, path: &str, limit: usize) -> rusqlite::Result<Vec<BacklinkRow>> {
+    pub fn backlink_count(&self, path: &str, fragment: Option<&str>) -> rusqlite::Result<u64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM notes dst JOIN links l ON l.resolved_note_id = dst.note_id
+             JOIN notes n ON n.note_id = l.source_note_id
+             WHERE dst.path = ?1 AND n.note_id != dst.note_id AND (?2 IS NULL OR l.fragment = ?2)",
+            params![path, fragment],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn backlinks(
+        &self,
+        path: &str,
+        fragment: Option<&str>,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<BacklinkRow>> {
         let mut st = self.conn.prepare(
-            "SELECT n.note_id, n.path, n.title, n.mtime_ns, n.size, n.hash, n.block_count,
+            "SELECT n.note_id, n.path, n.title, n.mtime_ns, n.size, n.hash, n.block_count, n.aliases,
                     l.byte_start, l.byte_end
              FROM notes dst JOIN links l ON l.resolved_note_id = dst.note_id
              JOIN notes n ON n.note_id = l.source_note_id
-             WHERE dst.path = ?1 AND n.note_id != dst.note_id
-             ORDER BY n.path, l.byte_start LIMIT ?2",
+             WHERE dst.path = ?1 AND n.note_id != dst.note_id AND (?2 IS NULL OR l.fragment = ?2)
+             ORDER BY n.path, l.byte_start LIMIT ?3",
         )?;
-        st.query_map(params![path, limit.min(i64::MAX as usize) as i64], |r| {
-            Ok(BacklinkRow { source: row_to_note(r)?, range: r.get(7)?..r.get(8)? })
+        st.query_map(params![path, fragment, limit.min(i64::MAX as usize) as i64], |r| {
+            Ok(BacklinkRow { source: row_to_note(r)?, range: r.get(8)?..r.get(9)? })
         })?
         .collect()
     }
@@ -370,6 +389,9 @@ fn row_to_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
         note_id: r.get(0)?,
         path: r.get(1)?,
         title: r.get(2)?,
+        aliases: aero_core::document::decode_aliases(&r.get::<_, String>(7)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        })?,
         stamp: FileStamp {
             mtime: UNIX_EPOCH + Duration::from_nanos(ns.max(0) as u64),
             size: r.get::<_, i64>(4)? as u64,
@@ -388,12 +410,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aliases_persist_reopen_update_remove_and_reset_old_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("meta.sqlite");
+        let mut m = Meta::open(&db).unwrap();
+        let mut row = NoteRow {
+            note_id: "n".into(),
+            path: "n.md".into(),
+            title: "Display".into(),
+            aliases: vec![
+                "雪 山".into(),
+                "a|b".into(),
+                "a,b".into(),
+                "line\nbreak".into(),
+                "quoted \"yes\"".into(),
+            ],
+            stamp: stamp(1),
+            block_count: 1,
+        };
+        m.upsert_note_with_tags(&row, &["rust".into()]).unwrap();
+        drop(m);
+        let mut m = Meta::open(&db).unwrap();
+        assert_eq!(m.note_by_path("n.md").unwrap(), Some(row.clone()));
+        assert_eq!(m.all_notes().unwrap(), [row.clone()]);
+        row.aliases = vec!["New".into()];
+        row.title = "Retitled".into();
+        row.stamp = stamp(2);
+        m.upsert_note_with_tags(&row, &["new".into()]).unwrap();
+        assert_eq!(m.note_by_path("n.md").unwrap(), Some(row.clone()));
+        m.remove_note("n").unwrap();
+        assert!(m.all_notes().unwrap().is_empty());
+        m.upsert_note(&row).unwrap();
+        m.conn.execute("UPDATE index_state SET version = 4 WHERE name = 'meta'", []).unwrap();
+        drop(m);
+        assert!(Meta::open(&db).unwrap().all_notes().unwrap().is_empty());
+    }
+
+    #[test]
     fn tag_counts_replace_deduplicate_exclude_and_remove_notes() {
         let mut m = Meta::in_memory().unwrap();
         let a = NoteRow {
             note_id: "a".into(),
             path: "a.md".into(),
             title: "A".into(),
+            aliases: Vec::new(),
             stamp: stamp(1),
             block_count: 0,
         };
@@ -429,6 +489,7 @@ mod tests {
             note_id: "a".into(),
             path: "a.md".into(),
             title: "A".into(),
+            aliases: Vec::new(),
             stamp: stamp(1),
             block_count: 1,
         };
@@ -436,7 +497,12 @@ mod tests {
         m.conn.execute_batch("CREATE TRIGGER deny_tag BEFORE INSERT ON note_tags WHEN NEW.tag = 'fail' BEGIN SELECT RAISE(ABORT, 'test'); END;").unwrap();
         assert!(
             m.upsert_note_with_tags(
-                &NoteRow { stamp: stamp(2), ..row.clone() },
+                &NoteRow {
+                    stamp: stamp(2),
+                    title: "Changed".into(),
+                    aliases: vec!["Changed alias".into()],
+                    ..row.clone()
+                },
                 &["new".into(), "fail".into()]
             )
             .is_err()
@@ -457,6 +523,7 @@ mod tests {
             note_id: "n1".into(),
             path: "a.md".into(),
             title: "a".into(),
+            aliases: Vec::new(),
             stamp: stamp(1),
             block_count: 3,
         };
@@ -484,6 +551,7 @@ mod tests {
             note_id: "n".into(),
             path: "a.md".into(),
             title: "a".into(),
+            aliases: Vec::new(),
             stamp: stamp(1),
             block_count: 1,
         })
@@ -506,6 +574,7 @@ mod tests {
                 note_id: id.into(),
                 path: path.into(),
                 title: path.into(),
+                aliases: Vec::new(),
                 stamp: stamp(1),
                 block_count: 1,
             })
@@ -550,6 +619,7 @@ mod tests {
             note_id: "n1".into(),
             path: "notes.md".into(),
             title: "notes".into(),
+            aliases: Vec::new(),
             stamp: stamp(1),
             block_count: 1,
         })
@@ -562,6 +632,7 @@ mod tests {
             note_id: "n2".into(),
             path: "b.md".into(),
             title: "b".into(),
+            aliases: Vec::new(),
             stamp: stamp(2),
             block_count: 1,
         })
@@ -598,6 +669,7 @@ mod tests {
                 note_id: "n".into(),
                 path: "p.md".into(),
                 title: "p".into(),
+                aliases: Vec::new(),
                 stamp: stamp(3),
                 block_count: 1,
             })

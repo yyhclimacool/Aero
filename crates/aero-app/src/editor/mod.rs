@@ -9,10 +9,12 @@
 //! 聚焦的"真相"是 `focused.range`（随编辑漂移的字节区间），而不是块 id：这样把段落删空、
 //! 或粘贴出多个块时，控件仍然有归属，不会因为块消失而失焦。
 
+mod backlinks_ui;
 mod block_refs_ui;
 mod highlight_ui;
 mod inline_format_ui;
 mod inline_links_ui;
+mod link_preview;
 mod ops;
 mod pairs;
 mod pairs_ui;
@@ -34,9 +36,9 @@ use std::time::{Duration, Instant};
 
 use aero_core::{Block, BlockId, BlockKind, Document, Edit, FileStamp, Vault, VaultError, VaultPath};
 use gpui_kit::base::input::{Backspace, Escape, Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::base::text::TextViewStyle;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::text::TextViewStyle;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -93,6 +95,7 @@ pub enum EditorEvent {
     /// 工作区提供本次菜单的笔记目录；返回时按 generation 丢弃旧请求。
     LinkCompletionRequested(u64),
     TagCompletionRequested(u64),
+    BacklinksRequested,
     /// 异步保存成功落盘；工作区据此增量更新索引
     Saved,
 }
@@ -200,6 +203,9 @@ pub struct Editor {
     units: Vec<Unit>,
     preview: Entity<preview::PreviewState>,
     _preview_subscription: Subscription,
+    link_preview: link_preview::LinkPreview,
+    backlinks: Option<Entity<crate::backlinks::BacklinksView>>,
+    backlinks_subscription: Option<Subscription>,
     focused: Option<Focused>,
     /// 块选中态；与 `focused` 互斥
     selection: Option<BlockSelection>,
@@ -262,6 +268,9 @@ impl Editor {
             units,
             preview,
             _preview_subscription: preview_subscription,
+            link_preview: link_preview::LinkPreview::default(),
+            backlinks: None,
+            backlinks_subscription: None,
             focused: None,
             selection: None,
             picker_open: false,
@@ -296,6 +305,7 @@ impl Editor {
     pub fn set_picker_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.picker_open = open;
         if open {
+            self.cancel_link_preview(cx);
             self.slash = None;
             self.wiki = None;
             self.tag_menu = None;
@@ -337,7 +347,8 @@ impl Editor {
     pub fn set_path(&mut self, path: VaultPath, cx: &mut Context<Self>) {
         self.wiki = None;
         self.tag_menu = None;
-        self.path = path;
+        let old_path = std::mem::replace(&mut self.path, path);
+        self.repath_link_preview(&old_path, cx);
         cx.emit(EditorEvent::Changed);
         cx.notify();
     }
@@ -698,6 +709,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_link_preview(cx);
         let text = self.doc.slice(range.clone()).to_string();
         let cursor = clamp_to_char_boundary(&text, cursor.min(text.len()));
         let textarea = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 100_000));
@@ -706,7 +718,15 @@ impl Editor {
         let pair_keys = cx.intercept_keystrokes(move |event, window, cx| {
             let _ = editor.update(cx, |this, cx| this.observe_pair_key(event, window, cx));
         });
-        let cursor_subscription = cx.observe_in(&textarea, window, |this, textarea, window, cx| {
+        let mut last_selection = None;
+        let cursor_subscription = cx.observe_in(&textarea, window, move |this, textarea, window, cx| {
+            if this.focused.as_ref().is_some_and(|f| f.textarea == textarea) {
+                let selection = textarea.read(cx).selected_range();
+                if last_selection.as_ref() != Some(&selection) {
+                    last_selection = Some(selection);
+                    cx.notify();
+                }
+            }
             if this.focused.as_ref().is_some_and(|f| f.textarea == textarea && f.pairs.pending.is_some())
                 && this.input_composing(window, cx)
             {
@@ -753,6 +773,7 @@ impl Editor {
 
     /// 退出编辑态（不改焦点）。失焦即落盘（10.1）。
     fn exit_edit(&mut self, cx: &mut Context<Self>) {
+        self.cancel_link_preview(cx);
         self.slash = None;
         self.wiki = None;
         self.tag_menu = None;
@@ -767,6 +788,7 @@ impl Editor {
     /// 编辑态里的 Esc（文本控件的 `Escape` 冒泡到这里）：先关菜单 / 标题编辑；否则退出编辑并选中刚才的块
     /// （`ui_design.md` 6："Esc 两段式退出"）。光标在没有块的空位上时直接回浏览态。
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_link_preview(cx);
         if self.input_composing(window, cx) {
             cx.propagate();
             return;
@@ -791,6 +813,7 @@ impl Editor {
 
     /// 块选中态里的 Esc（或程序化的 `BlurEditor`）：回浏览态。没什么可退的就 propagate。
     fn on_blur_editor(&mut self, _: &BlurEditor, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_link_preview(cx);
         let busy = self.title_edit.is_some()
             || self.slash.is_some()
             || self.focused.is_some()
@@ -1159,7 +1182,9 @@ impl Editor {
 
     /// 文本已改：重解析、刷新单位、标脏、排队保存。
     fn after_doc_change(&mut self, cx: &mut Context<Self>) {
+        self.cancel_link_preview(cx);
         self.doc.reparse();
+        self.update_local_link_names();
         self.units = units::units(&self.doc);
         if let Some(f) = self.focused.as_mut() {
             f.id = unit_at(&self.units, f.range.start)
@@ -1457,6 +1482,7 @@ impl Editor {
                 match result {
                     Ok(stamp) => {
                         this.stamp = stamp;
+                        this.update_local_link_names();
                         if this.doc.version() == version {
                             this.dirty = false;
                             this.save_state = SaveState::Saved(Instant::now());
@@ -1539,6 +1565,7 @@ impl Editor {
             Ok(Disk::Unchanged) => {
                 if self.is_deleted() {
                     self.set_banner(None, cx);
+                    self.update_local_link_names();
                     if self.dirty {
                         self.schedule_save(cx);
                     }
@@ -1570,8 +1597,10 @@ impl Editor {
             return;
         };
         log::info!("reload {} (changed on disk)", self.path.as_str());
+        self.cancel_link_preview(cx);
         self.focused = None;
         self.doc = doc;
+        self.update_local_link_names();
         self.stamp = stamp;
         self.units = units::units(&self.doc);
         self.clamp_selection();
@@ -1619,8 +1648,10 @@ impl Editor {
             return;
         }
         log::warn!("{}: deleted on disk", self.path.as_str());
+        self.cancel_link_preview(cx);
         self.save_task = None;
         self.set_banner(Some(Banner::Deleted), cx);
+        self.update_local_link_names();
         cx.emit(EditorEvent::Deleted);
         cx.emit(EditorEvent::Changed);
     }
@@ -1671,6 +1702,7 @@ impl Editor {
         self.save_task = None;
         self.save_state = SaveState::Saved(Instant::now());
         self.set_banner(None, cx);
+        self.repath_link_preview(&old, cx);
         cx.emit(EditorEvent::PathsTouched(vec![old, path]));
         cx.emit(EditorEvent::Saved);
         cx.emit(EditorEvent::Changed);
@@ -1859,24 +1891,35 @@ impl Editor {
 
     fn text_view_style(&self, cx: &App) -> TextViewStyle {
         let theme = cx.theme();
-        TextViewStyle {
-            paragraph_gap: rems(0.5),
-            heading_base_font_size: px(BODY_FONT_SIZE),
-            heading_font_size: Some(Arc::new(|level, base| match level {
+        let radius = theme.semantic_tokens().radius.md;
+        TextViewStyle::default()
+            .with_foreground(theme.foreground)
+            .with_muted_foreground(theme.muted_foreground)
+            .with_link(theme.link)
+            .with_selection(theme.selection)
+            .with_code_background(theme.muted)
+            .with_border(theme.border)
+            .with_inline_code(HighlightStyle { background_color: Some(theme.accent), ..Default::default() })
+            .with_code_block(StyleRefinement::default().rounded(radius))
+            .with_paragraph_gap(rems(0.5))
+            .with_heading_base_font_size(px(BODY_FONT_SIZE))
+            .with_heading_font_size(|level, base| match level {
                 1 => base * 1.75,
                 2 => base * 1.4,
                 3 => base * 1.2,
                 _ => base,
-            })),
-            highlight_theme: theme.highlight_theme.clone(),
-            is_dark: theme.mode.is_dark(),
-            table: StyleRefinement {
+            })
+            .with_dark(theme.mode.is_dark())
+            .with_table(StyleRefinement {
                 overflow: PointRefinement { x: Some(Overflow::Scroll), y: None },
-                ..Default::default()
-            },
-            table_head: StyleRefinement::default().font_weight(FontWeight::SEMIBOLD),
-            ..Default::default()
-        }
+                ..StyleRefinement::default().rounded(radius)
+            })
+            .with_table_head(
+                StyleRefinement::default()
+                    .bg(theme.table_head)
+                    .text_color(theme.table_head_foreground)
+                    .font_weight(FontWeight::SEMIBOLD),
+            )
     }
 
     fn is_focused_block(&self, id: BlockId) -> bool {
@@ -2274,6 +2317,7 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.validate_link_preview_scroll(cx);
         let (foreground, muted) = (cx.theme().foreground, cx.theme().muted_foreground);
         let roots = self.doc.blocks().roots.clone();
         let blocks = self.render_blocks(&roots, cx);
@@ -2307,6 +2351,7 @@ impl Render for Editor {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| this.cancel_link_preview(cx)))
             .child(
                 // 左内边距多留 gutter 的宽度：块行向左伸出去画 `⠿ +`，正文仍是 720 宽
                 v_flex()
@@ -2321,6 +2366,7 @@ impl Render for Editor {
                     .text_color(foreground)
                     .children(self.render_banner(cx))
                     .child(self.render_title(cx))
+                    .children(self.render_backlink_count(cx))
                     .child(v_flex().w_full().gap(px(8.)).children(blocks))
                     .when(empty, |el| el.child(div().text_color(muted).child("点击这里开始写，或按 ⏎")))
                     .child(
@@ -2337,6 +2383,7 @@ impl Render for Editor {
                     ),
             )
             .vertical_scrollbar(&self.scroll)
+            .children(self.render_link_preview(cx))
     }
 }
 

@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use crate::links::{self, Resolution, Resolver};
-use crate::{FileStamp, SourceText, Vault, VaultError, VaultPath};
+use crate::{Document, FileStamp, Vault, VaultError, VaultPath};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RenameError {
@@ -55,21 +55,24 @@ impl RenamePlan {
         let mut before = Resolver::new();
         let mut observed = Vec::with_capacity(paths.len());
         let mut title = None;
+        let mut aliases = Vec::new();
         // 先建完整解析表，避免扫描顺序把同名笔记误认成唯一目标。
         for path in paths {
             let (bytes, stamp) = vault.read_bytes(&path)?;
-            let source =
-                SourceText::decode(&bytes).map_err(|_| VaultError::Utf8 { path: vault.fs_path(&path) })?;
-            let note_title = crate::document::front_matter_title(&source.text).map(|(_, title)| title);
-            before.insert(path.clone(), note_title.as_deref());
+            let doc =
+                Document::from_bytes(&bytes).map_err(|_| VaultError::Utf8 { path: vault.fs_path(&path) })?;
+            let note_title = doc.front_matter_title().map(|(_, title)| title);
+            let note_aliases = doc.front_matter_aliases();
+            before.insert(path.clone(), note_title.as_deref(), &note_aliases);
             if path == from {
                 title = note_title;
+                aliases = note_aliases;
             }
             observed.push((path, stamp));
         }
         let mut after = before.clone();
         after.remove(&from);
-        after.insert(to.clone(), title.as_deref());
+        after.insert(to.clone(), title.as_deref(), &aliases);
         let mut changes = Vec::new();
         let mut links_changed = 0;
         for (path, stamp) in &observed {
@@ -374,6 +377,24 @@ mod tests {
             );
             assert_eq!(std::fs::read(dir.path().join(format!("photo.{extension}"))).unwrap(), b"attachment");
         }
+    }
+
+    #[test]
+    fn rename_preserves_front_matter_aliases_and_ignores_body_title() {
+        let original = "\u{feff}---\r\naliases: [old, '雪 山']\r\ncustom: untouched\r\n---\r\n\r\nbody\r\n";
+        let source = "\u{feff}[[old]] [[雪 山]] [[old.md]]\r\n";
+        let (dir, vault) = setup(&[("old.md", original), ("source.md", source)]);
+        let report = RenamePlan::prepare(&vault, path("old.md"), path("new.md")).unwrap().execute().unwrap();
+        assert_eq!(report.links_changed, 1);
+        assert_eq!(
+            std::fs::read(dir.path().join("source.md")).unwrap(),
+            source.replace("[[old.md]]", "[[new.md]]").as_bytes()
+        );
+        assert_eq!(std::fs::read(dir.path().join("new.md")).unwrap(), original.as_bytes());
+
+        let (dir, vault) = setup(&[("old.md", "body\n\ntitle: old\n"), ("source.md", "[[old]]\n")]);
+        RenamePlan::prepare(&vault, path("old.md"), path("new.md")).unwrap().execute().unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("source.md")).unwrap(), "[[new]]\n");
     }
 
     #[test]

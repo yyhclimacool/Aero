@@ -70,7 +70,7 @@ impl Editor {
     pub fn load_wiki_notes(
         &mut self,
         generation: u64,
-        notes: Task<Result<Vec<(VaultPath, String)>, String>>,
+        notes: Task<Result<Vec<aero_core::links::NoteSummary>, String>>,
         recent: Vec<VaultPath>,
         cx: &mut Context<Self>,
     ) {
@@ -79,13 +79,15 @@ impl Editor {
         let block_ref = menu.trigger.block_ref;
         let embed = menu.trigger.embed;
         let path = self.path.clone();
-        let title = self.doc.title_or(path.stem());
+        let summary = aero_core::links::NoteSummary::from_document(path.clone(), &self.doc);
         let source = fragment_target.as_ref().map(|_| self.doc.to_string());
         let vault = self.vault.clone();
         let task = cx.background_spawn(async move {
             notes.await.and_then(|mut notes| {
-                if let Some((_, t)) = notes.iter_mut().find(|(p, _)| p == &path) {
-                    *t = title;
+                if let Some(note) = notes.iter_mut().find(|note| note.path == path) {
+                    *note = summary;
+                } else {
+                    notes.push(summary);
                 }
                 let mut catalog = wiki::Catalog::new(notes, recent);
                 if embed {
@@ -208,7 +210,7 @@ impl Editor {
                 Some(String::new())
             } else {
                 menu.catalog.as_ref().and_then(|c| {
-                    let index = c.notes.iter().position(|(p, _)| p == &headings.path)?;
+                    let index = c.notes.iter().position(|note| note.path == headings.path)?;
                     c.target(index, self.path.parent()).map(|s| aero_core::links::split_target(&s).0)
                 })
             };
@@ -237,7 +239,7 @@ impl Editor {
                     };
                     (target, attachment.path.file_name().to_owned())
                 } else {
-                    let (path, title) = &catalog.notes[index];
+                    let aero_core::links::NoteSummary { path, title, .. } = &catalog.notes[index];
                     if !self.vault.exists(path) {
                         menu.error = Some("该笔记已被移走或删除，Esc 关闭后重新输入 [[ 刷新".into());
                         cx.notify();
@@ -317,7 +319,7 @@ impl Editor {
                         };
                         (attachment.path.file_name().to_owned(), format!("{kind} · {}", attachment.path))
                     } else {
-                        let (path, title) = &catalog.notes[index];
+                        let aero_core::links::NoteSummary { path, title, .. } = &catalog.notes[index];
                         (
                             title.clone(),
                             if menu.trigger.embed { format!("笔记 · {path}") } else { path.to_string() },

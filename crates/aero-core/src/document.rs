@@ -147,6 +147,30 @@ impl Document {
         Some((range.start + r.start..range.start + r.end, text))
     }
 
+    /// Actual front matter only; string scalar or list, preserving multiword names.
+    /// Invalid YAML yields no aliases; invalid list items are ignored individually.
+    pub fn front_matter_aliases(&self) -> Vec<String> {
+        #[derive(serde::Deserialize)]
+        struct FrontMatter {
+            #[serde(default)]
+            aliases: AliasValues,
+        }
+        let Some(fm) = self.blocks.roots.first().filter(|b| b.kind == BlockKind::FrontMatter) else {
+            return Vec::new();
+        };
+        let source = self.block_text(fm);
+        let yaml = source.lines().skip(1).take_while(|line| *line != "---").collect::<Vec<_>>().join("\n");
+        let Ok(front) = serde_saphyr::from_str::<FrontMatter>(&yaml) else { return Vec::new() };
+        let mut seen = std::collections::HashSet::new();
+        front
+            .aliases
+            .0
+            .into_iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && seen.insert(s.to_lowercase()))
+            .collect()
+    }
+
     /// 笔记标题：front matter `title`，没有则 `fallback`（通常是文件名）。
     pub fn title_or(&self, fallback: &str) -> String {
         self.front_matter_title().map(|(_, t)| t).unwrap_or_else(|| fallback.to_owned())
@@ -387,6 +411,66 @@ impl Document {
     }
 }
 
+/// Lossless cache encoding shared by metadata and full-text storage.
+/// Only serializes string lists; never used to rewrite Markdown front matter.
+pub fn encode_aliases(aliases: &[String]) -> String {
+    serde_saphyr::to_string(&aliases).expect("string lists are YAML serializable")
+}
+
+pub fn decode_aliases(yaml: &str) -> Result<Vec<String>, serde_saphyr::Error> {
+    serde_saphyr::from_str(yaml)
+}
+
+#[derive(Default)]
+struct AliasValue<const LIST: bool>(Vec<String>);
+type AliasValues = AliasValue<true>;
+
+impl<'de, const LIST: bool> serde::Deserialize<'de> for AliasValue<LIST> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<const LIST: bool>;
+        impl<'de, const LIST: bool> serde::de::Visitor<'de> for V<LIST> {
+            type Value = AliasValue<LIST>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an alias string or list of alias strings")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(AliasValue(vec![v.to_owned()]))
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(AliasValue::default())
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(AliasValue::default())
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(AliasValue::default())
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(AliasValue::default())
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(AliasValue::default())
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+                Ok(AliasValue::default())
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                if LIST {
+                    while let Some(AliasValue(v)) = seq.next_element::<AliasValue<false>>()? {
+                        out.extend(v);
+                    }
+                } else {
+                    while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                }
+                Ok(AliasValue(out))
+            }
+        }
+        d.deserialize_any(V::<LIST>)
+    }
+}
+
 /// 按起点排好序的候选旧块，支持取出离某位置最近的一个。
 #[derive(Default)]
 struct Candidates {
@@ -474,6 +558,36 @@ pub fn front_matter_title(src: &str) -> Option<(Range<usize>, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aliases_parse_only_actual_front_matter_without_rewriting() {
+        for (yaml, expected) in [
+            ("aliases: '  Multi  word  '", vec!["Multi  word"]),
+            (
+                "aliases: [ÉCOLE, école, '雪 山', '', ' ', 42, true, null, [nested], {x: y}, Last]",
+                vec!["ÉCOLE", "雪 山", "Last"],
+            ),
+            (
+                "aliases:\n  - First\n  - 2.5\n  - false\n  - [nested]\n  - {x: y}\n  - ' First '\n  - 'Second name'",
+                vec!["First", "Second name"],
+            ),
+            ("aliases: [broken", vec![]),
+            ("aliases: {nested: name}", vec![]),
+            ("aliases: 123", vec![]),
+            ("aliases: null", vec![]),
+        ] {
+            let source =
+                format!("\u{feff}---\r\n{}\r\n---\r\n\r\naliases: [body]\r\n", yaml.replace('\n', "\r\n"));
+            let doc = Document::from_bytes(source.as_bytes()).unwrap();
+            assert_eq!(doc.front_matter_aliases(), expected, "{yaml}");
+            assert_eq!(doc.to_bytes(), source.as_bytes());
+        }
+        for source in
+            ["aliases: [body]\n", "body\n\n---\naliases: [body]\n---\n", "---\naliases: [unclosed]\n"]
+        {
+            assert!(Document::from_text(source).front_matter_aliases().is_empty(), "{source}");
+        }
+    }
 
     #[test]
     fn front_matter_title_value_range() {

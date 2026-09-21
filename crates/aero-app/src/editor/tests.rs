@@ -48,8 +48,8 @@ fn wiki_catalog(editor: &Entity<Editor>, recent: &[&str], cx: &mut VisualTestCon
                 .unwrap()
                 .into_iter()
                 .map(|p| {
-                    let title = e.vault.read(&p).unwrap().0.title_or(p.stem());
-                    (p, title)
+                    let doc = e.vault.read(&p).unwrap().0;
+                    aero_core::links::NoteSummary::from_document(p, &doc)
                 })
                 .collect();
             let generation = e.wiki.as_ref().expect("wiki menu").generation;
@@ -80,6 +80,45 @@ fn selected_inline_text(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> 
         let ta = editor.read(cx).focused.as_ref().unwrap().textarea.read(cx);
         ta.value()[ta.selected_range()].to_owned()
     })
+}
+
+#[gpui_kit::test]
+fn backlink_selection_notifies_when_the_caret_moves_between_nested_blocks(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "> first ^one\n>\n> second ^two\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _subscription = cx.update(|_, cx| {
+        let observed = observed.clone();
+        cx.observe(&editor, move |editor, cx| {
+            observed.lock().unwrap().push(editor.read(cx).selected_reference(cx));
+        })
+    });
+    select_inline_text(&editor, "second", cx);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).selected_reference(cx).as_deref(), Some("two")));
+    assert_eq!(observed.lock().unwrap().last().and_then(|id| id.as_deref()), Some("two"));
+}
+
+#[gpui_kit::test]
+fn backlinks_connect_with_an_existing_selection(cx: &mut TestAppContext) {
+    let (_dir, vault, path, editor) = open(cx, "first ^one\n");
+    let data = tempfile::tempdir().unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    let (search, view) = cx.update(|_, cx| {
+        let search = cx.new(|cx| crate::search::SearchService::new(vault, data.path().into(), cx));
+        let view = cx.new(|cx| crate::backlinks::BacklinksView::new(search.clone(), cx));
+        view.update(cx, |view, cx| view.set_note(Some(path), cx));
+        editor.update(cx, |e, cx| e.connect_backlinks(view.clone(), cx));
+        (search, view)
+    });
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(view.clone(), window, cx));
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("backlinks-block").is_some(), "connecting must pick up an already focused ^id");
+    cx.update(|_, cx| search.read(cx).close_blocking());
 }
 
 #[gpui_kit::test]
@@ -753,6 +792,24 @@ fn embed_completion_inserts_images_pdf_and_notes_with_one_step_undo(cx: &mut Tes
 }
 
 #[gpui_kit::test]
+fn front_matter_alias_completion_inserts_canonical_target_and_display_title(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "body\n");
+    std::fs::write(
+        dir.path().join("b.md"),
+        "---\ntitle: Display\naliases: [Quicksilver]\n---\n\n# Heading\n",
+    )
+    .unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[quicksilver");
+    wiki_catalog(&editor, &[], cx);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).wiki.as_ref().unwrap().matches.len(), 1));
+    cx.simulate_keystrokes("shift-enter");
+    assert_eq!(text(&editor, cx), "body [[b|Display]]\n");
+    assert_eq!(selected_inline_text(&editor, cx), "Display");
+}
+
+#[gpui_kit::test]
 fn embed_completion_mouse_disambiguates_and_preserves_closing_brackets_and_caret(cx: &mut TestAppContext) {
     let (dir, _vault, _path, editor) = open(cx, "body ![[]] after\n");
     for folder in ["x", "y"] {
@@ -1322,7 +1379,7 @@ fn wiki_keyboard_completion_alias_and_undo(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         let e = editor.read(cx);
         let m = e.wiki.as_ref().unwrap();
-        assert_eq!(m.catalog.as_ref().unwrap().notes[m.matches[0]].0.as_str(), "z.md");
+        assert_eq!(m.catalog.as_ref().unwrap().notes[m.matches[0]].path.as_str(), "z.md");
         assert!(e.slash.is_none());
     });
     cx.simulate_keystrokes("down");
@@ -1878,8 +1935,8 @@ fn table_preview_enables_horizontal_overflow(cx: &mut TestAppContext) {
         let e = editor.read(cx);
         assert_eq!(e.units.len(), 1);
         let style = e.text_view_style(cx);
-        assert_eq!(style.table.overflow.x, Some(gpui_kit::Overflow::Scroll));
-        assert_eq!(style.table_head.text.font_weight, Some(gpui_kit::FontWeight::SEMIBOLD));
+        assert_eq!(style.table().overflow.x, Some(gpui_kit::Overflow::Scroll));
+        assert_eq!(style.table_head().text.font_weight, Some(gpui_kit::FontWeight::SEMIBOLD));
     });
     focus_unit(&editor, 0, cx);
     cx.update(|_, cx| {

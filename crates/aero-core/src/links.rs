@@ -41,6 +41,20 @@ pub enum Resolution {
 
 pub const NOTE_URL_PREFIX: &str = "aero://note/";
 
+/// Shared catalog entry: display title is separate from alternate lookup names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteSummary {
+    pub path: VaultPath,
+    pub title: String,
+    pub aliases: Vec<String>,
+}
+
+impl NoteSummary {
+    pub fn from_document(path: VaultPath, doc: &crate::Document) -> Self {
+        Self { title: doc.title_or(path.stem()), aliases: doc.front_matter_aliases(), path }
+    }
+}
+
 /// 解析目标用的笔记表：路径、文件名、标题都做过小写归一，查找不区分大小写
 /// （macOS 默认文件系统不区分大小写，`[[Cargo]]` 与 `cargo.md` 是同一篇）。
 ///
@@ -51,10 +65,13 @@ pub struct Resolver {
     by_path: HashMap<String, VaultPath>,
     /// 小写文件名（去 `.md`）→ 路径们（有序，便于稳定的歧义提示）
     by_stem: HashMap<String, Vec<VaultPath>>,
-    /// 小写标题 → 路径们
-    by_title: HashMap<String, Vec<VaultPath>>,
-    /// 小写路径 → 登记时的小写标题（移除时 O(1) 找到 `by_title` 里的那一组）
-    title_of: HashMap<String, String>,
+    /// Normalized titles and aliases share the same priority and groups.
+    by_name: HashMap<String, Vec<VaultPath>>,
+    /// Name lookup's filename component → owners, for targeted precedence invalidation.
+    /// `folder/name` and `name.md` can both be shadowed by a new `name.md` file.
+    by_name_stem: HashMap<String, Vec<VaultPath>>,
+    /// Normalized path → deduplicated registered names, for targeted removal.
+    names_of: HashMap<String, Vec<String>>,
 }
 
 impl Resolver {
@@ -66,33 +83,38 @@ impl Resolver {
     pub fn from_notes(notes: impl IntoIterator<Item = VaultPath>) -> Self {
         let mut r = Self::new();
         for p in notes {
-            r.insert(p, None);
+            r.insert(p, None, &[]);
         }
         r
     }
 
-    /// 登记一篇笔记；`title` 是 front matter 标题（与文件名相同时不必给，给了也无妨）。
-    /// 同一路径重复登记会先移除旧登记。
-    pub fn insert(&mut self, path: VaultPath, title: Option<&str>) {
+    /// Register title and aliases at equal priority; replace all old names for this path.
+    pub fn insert(&mut self, path: VaultPath, title: Option<&str>, aliases: &[String]) {
         self.remove(&path);
         let key = fold(path.as_str());
         insert_sorted(self.by_stem.entry(fold(path.stem())).or_default(), path.clone());
-        if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
-            let t = fold(t);
-            insert_sorted(self.by_title.entry(t.clone()).or_default(), path.clone());
-            self.title_of.insert(key.clone(), t);
+        let names = normalized_names(title, aliases);
+        for name in &names {
+            insert_sorted(self.by_name.entry(name.clone()).or_default(), path.clone());
+            for stem in name_stems(name) {
+                insert_sorted(self.by_name_stem.entry(stem).or_default(), path.clone());
+            }
         }
+        self.names_of.insert(key.clone(), names);
         self.by_path.insert(key, path);
     }
 
     pub fn remove(&mut self, path: &VaultPath) {
         let key = fold(path.as_str());
-        if self.by_path.remove(&key).is_none() {
-            return;
-        }
-        remove_from_group(&mut self.by_stem, &fold(path.stem()), path);
-        if let Some(t) = self.title_of.remove(&key) {
-            remove_from_group(&mut self.by_title, &t, path);
+        let Some(registered) = self.by_path.remove(&key) else { return };
+        remove_from_group(&mut self.by_stem, &fold(registered.stem()), &registered);
+        if let Some(names) = self.names_of.remove(&key) {
+            for name in names {
+                remove_from_group(&mut self.by_name, &name, &registered);
+                for stem in name_stems(&name) {
+                    remove_from_group(&mut self.by_name_stem, &stem, &registered);
+                }
+            }
         }
     }
 
@@ -100,22 +122,29 @@ impl Resolver {
         self.by_path.contains_key(&fold(path.as_str()))
     }
 
-    /// 一篇笔记登记 / 移除 / 改标题后，判定可能受影响的笔记：与它同文件名、同标题，
-    /// 以及文件名等于它标题、标题等于它文件名的（含它自己）。`title` 给当前登记的标题以外还想查的标题（比如改前的）。
-    pub fn neighbors(&self, path: &VaultPath, title: Option<&str>) -> Vec<VaultPath> {
+    /// Notes sharing stems, titles or aliases with current OR previous names.
+    /// Callers must carry old aliases as well as the old title through removals/edits.
+    pub fn neighbors(
+        &self,
+        path: &VaultPath,
+        old_title: Option<&str>,
+        old_aliases: &[String],
+    ) -> Vec<VaultPath> {
         let key = fold(path.as_str());
-        let stem = fold(path.stem());
-        let mut keys = vec![stem];
-        if let Some(t) = self.title_of.get(&key) {
-            keys.push(t.clone());
+        let mut keys = vec![fold(path.stem())];
+        if let Some(names) = self.names_of.get(&key) {
+            keys.extend(names.iter().cloned());
         }
-        if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
-            keys.push(fold(t));
-        }
+        keys.extend(normalized_names(old_title, old_aliases));
         let mut out: Vec<VaultPath> = vec![path.clone()];
         for k in &keys {
-            for group in [self.by_stem.get(k), self.by_title.get(k)].into_iter().flatten() {
+            if let Some(group) = self.by_name.get(k) {
                 out.extend(group.iter().cloned());
+            }
+            for stem in name_stems(k) {
+                for group in [self.by_stem.get(&stem), self.by_name_stem.get(&stem)].into_iter().flatten() {
+                    out.extend(group.iter().cloned());
+                }
             }
         }
         out.sort();
@@ -128,10 +157,10 @@ impl Resolver {
     /// 全量同步收尾用；单篇场景用 [`Self::neighbors`]。
     pub fn contested(&self) -> Vec<VaultPath> {
         let mut out: Vec<VaultPath> = Vec::new();
-        for group in self.by_stem.values().chain(self.by_title.values()).filter(|g| g.len() > 1) {
+        for group in self.by_stem.values().chain(self.by_name.values()).filter(|g| g.len() > 1) {
             out.extend(group.iter().cloned());
         }
-        for (key, titled) in &self.by_title {
+        for (key, titled) in &self.by_name_stem {
             if let Some(named) = self.by_stem.get(key)
                 && (titled.len() != 1 || named.len() != 1 || titled[0] != named[0])
             {
@@ -152,8 +181,9 @@ impl Resolver {
         self.by_path.is_empty()
     }
 
-    /// 精确路径（相对链接所在目录，再相对 vault 根，各自 ±`.md`）→ 唯一文件名 → 唯一 front matter 标题。
-    /// 文件名 / 标题命中多篇时为歧义；含 `..`、空段或绝对路径的目标直接判未解析，不落到文件名 / 标题匹配。
+    /// Exact relative/root path (±`.md`) → unique stem → unique title or alias.
+    /// Titles and aliases have equal priority. Ambiguities are sorted by path.
+    /// Escaping paths are rejected before any name matching.
     pub fn resolve(&self, target: &str, fragment: Option<&str>, note_dir: &str) -> Resolution {
         let target = target.trim();
         if target.is_empty() || escapes(target) {
@@ -184,12 +214,32 @@ impl Resolver {
             Some(many) if many.len() > 1 => return Resolution::Ambiguous { candidates: many.to_vec() },
             _ => {}
         }
-        match self.by_title.get(&fold(target)).map(Vec::as_slice) {
+        match self.by_name.get(&fold(target)).map(Vec::as_slice) {
             Some([one]) => resolved(one.clone()),
             Some(many) if many.len() > 1 => Resolution::Ambiguous { candidates: many.to_vec() },
             _ => Resolution::Unresolved,
         }
     }
+}
+
+fn name_stems(name: &str) -> [String; 2] {
+    let normalized = name.replace('\\', "/");
+    let leaf = normalized.rsplit('/').next().unwrap_or(&normalized);
+    // Exact path probing appends .md even to targets already ending in .md.
+    [leaf.to_owned(), leaf.strip_suffix(".md").unwrap_or(leaf).to_owned()]
+}
+
+fn normalized_names(title: Option<&str>, aliases: &[String]) -> Vec<String> {
+    let mut names: Vec<_> = title
+        .into_iter()
+        .chain(aliases.iter().map(String::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(fold)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn fold(s: &str) -> String {
@@ -558,7 +608,7 @@ mod tests {
     fn resolver(notes: &[&str], titles: &[(&str, &str)]) -> Resolver {
         let mut r = Resolver::from_notes(notes.iter().map(|s| note(s)));
         for &(path, title) in titles {
-            r.insert(note(path), Some(title));
+            r.insert(note(path), Some(title), &[]);
         }
         r
     }
@@ -785,12 +835,61 @@ mod tests {
     }
 
     #[test]
+    fn aliases_share_title_priority_and_preserve_path_stem_precedence() {
+        let mut r = Resolver::new();
+        let aliases = vec![" Shared ".into(), "SHARED".into(), "ÉCOLE".into()];
+        r.insert(note("a.md"), Some("Shared"), &aliases);
+        assert_eq!(
+            r.resolve("shared", None, ""),
+            Resolution::Resolved { path: note("a.md"), fragment: None }
+        );
+        assert!(r.contested().is_empty());
+        r.insert(note("b.md"), Some("école"), &[]);
+        assert_eq!(
+            r.resolve("École", None, ""),
+            Resolution::Ambiguous { candidates: vec![note("a.md"), note("b.md")] }
+        );
+        r.insert(note("sub/shared.md"), None, &[]);
+        assert_eq!(
+            r.resolve("shared", None, ""),
+            Resolution::Resolved { path: note("sub/shared.md"), fragment: None }
+        );
+        r.insert(note("shared.md"), None, &[]);
+        assert_eq!(
+            r.resolve("shared", None, ""),
+            Resolution::Resolved { path: note("shared.md"), fragment: None }
+        );
+        r.insert(note("a.md"), Some("New"), &[]);
+        assert_eq!(
+            r.neighbors(&note("a.md"), Some("Shared"), &aliases),
+            [note("a.md"), note("b.md"), note("shared.md"), note("sub/shared.md")]
+        );
+        assert_eq!(r.resolve("école", None, ""), Resolution::Resolved { path: note("b.md"), fragment: None });
+        r.remove(&note("b.md"));
+        assert_eq!(r.resolve("école", None, ""), Resolution::Unresolved);
+        assert_eq!(r.resolve("New", None, ""), Resolution::Resolved { path: note("a.md"), fragment: None });
+    }
+
+    #[test]
+    fn path_shaped_aliases_participate_in_filename_neighborhoods() {
+        let mut r = Resolver::new();
+        let aliases = vec!["nested/target".into(), "target.md".into()];
+        r.insert(note("a.md"), None, &aliases);
+        r.insert(note("target.md"), None, &[]);
+        assert_eq!(r.neighbors(&note("target.md"), None, &[]), [note("a.md"), note("target.md")]);
+        assert_eq!(r.contested(), [note("a.md"), note("target.md")]);
+        r.insert(note("a.md"), None, &[]);
+        assert_eq!(r.neighbors(&note("target.md"), None, &[]), [note("target.md")]);
+        assert!(r.contested().is_empty());
+    }
+
+    #[test]
     fn resolver_insert_remove_and_retitle() {
         let mut r = Resolver::new();
-        r.insert(note("a.md"), Some("甲"));
+        r.insert(note("a.md"), Some("甲"), &[]);
         assert!(matches!(r.resolve("甲", None, ""), Resolution::Resolved { .. }));
         // 改标题：旧标题不再命中
-        r.insert(note("a.md"), Some("乙"));
+        r.insert(note("a.md"), Some("乙"), &[]);
         assert_eq!(r.resolve("甲", None, ""), Resolution::Unresolved);
         assert!(matches!(r.resolve("乙", None, ""), Resolution::Resolved { .. }));
         assert_eq!(r.len(), 1);
@@ -811,10 +910,13 @@ mod tests {
         assert!(Resolver::from_notes([note("a.md"), note("b.md")]).contested().is_empty());
 
         // 单篇视角：x 的邻居是同标题组 / 文件名等于其标题的 y，与自己；再给个"改前标题"能把那一组也带上
-        assert_eq!(r.neighbors(&note("x.md"), None), [note("x.md"), note("y.md")]);
-        assert_eq!(r.neighbors(&note("x.md"), Some("solo")), [note("solo.md"), note("x.md"), note("y.md")]);
-        assert_eq!(r.neighbors(&note("a/readme.md"), None), [note("a/readme.md"), note("b/readme.md")]);
-        assert_eq!(r.neighbors(&note("gone.md"), None), [note("gone.md")]);
+        assert_eq!(r.neighbors(&note("x.md"), None, &[]), [note("x.md"), note("y.md")]);
+        assert_eq!(
+            r.neighbors(&note("x.md"), Some("solo"), &[]),
+            [note("solo.md"), note("x.md"), note("y.md")]
+        );
+        assert_eq!(r.neighbors(&note("a/readme.md"), None, &[]), [note("a/readme.md"), note("b/readme.md")]);
+        assert_eq!(r.neighbors(&note("gone.md"), None, &[]), [note("gone.md")]);
     }
 
     #[test]
