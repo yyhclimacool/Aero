@@ -1,0 +1,41 @@
+# M2 选区浮动工具条验收
+
+更新日期：2026-09-22。对应 [UI 设计 5.9](../ui_design.md)、[方案 6.3.10](../project_plan.md) 的颜色与格式。颜色菜单本身见 [颜色验收](m2-colors.md)，行内格式快捷键见 [行内格式验收](m2-inline-format.md)。
+
+已交付：编辑态选区上方的浮动工具条（格式按钮、链接、颜色、转换），出现 / 消失时机，按下态。
+还没做：更多菜单（复制块链接、添加块 id，跟 5.3 块菜单一起做）。
+
+## 范围
+
+- 只在编辑态出现。块选中态不画工具条，块级操作走块菜单（5.3）。
+- 出现时机：鼠标拖出非空选区并松手立刻出现；键盘改选区后停止变化 300 ms 再出现。程序化改选区（测试、命令面板恢复选区）走 300 ms 那条路。
+- 位置：锚在选区首行上方 8 px；靠近窗口顶部时翻到选区下方；选区滚出视口不画；滚过一屏收掉。
+- 条目：粗体、斜体、删除线、行内代码、链接、颜色、转换块类型。每一项都有等价快捷键（14 节），工具条是发现路径。
+- 当前选区已带的格式以按下态显示；再点一次取消。颜色按钮在选区有颜色（含高亮）或颜色菜单开着时按下。
+- 颜色按钮打开的就是 7.7 的颜色菜单（同一个 `Editor::open_color_menu`）。
+- 转换按钮列出与 `/` 菜单相同的块类型（文本、标题、列表、引用、代码块、分割线），点一项走现有的 `convert_at`。
+- 消失：开始输入 / 选区消失立刻收；Esc 先关子菜单（颜色、转换），再关工具条，再按才退到块选中态；打开子菜单时工具条不消失。命令面板打开时收掉。
+- 点按钮不抢焦点：用 `mouse_down` + `stop_propagation`，选区留在正文上。加格式 / 上色后工具条留着，按下态跟着变。
+
+## 自动化
+
+新增 5 项回归（core 1、app 4），全量 **496 项通过**（app 267、链接绘制集成 17、core 156、往返 5、index 50、反链计数集成 1）。`inline_format::active` 给按下态：选区落在格式元素里（恰好覆盖或只选一段）都算，嵌套时多种同时按下。
+
+- `selection_toolbar_appears_after_pause_and_toggles_bold`：选区刚停下来没有工具条，300 ms 后画出；点粗体包上标记、选区保持、按下态亮起，再点取消。
+- `selection_toolbar_opens_color_menu_and_escapes_in_layers`：颜色按钮打开颜色菜单且工具条留着，过滤后确认写出行内颜色，颜色按钮按下；Esc 先收工具条仍在编辑态，再 Esc 才进块选中态。
+- `selection_toolbar_hides_without_selection_and_shows_on_mouse_up`：方向键收掉选区立刻关工具条；`show_toolbar_now`（鼠标松手）立刻出现、不等 300 ms；块选中态不出现。
+- `selection_toolbar_converts_the_current_block`：转换按钮打开菜单，点标题 1 写成对应标记，还在编辑态。
+
+```sh
+cargo fmt -p aero-core -p aero-index -p aero-app -- --check
+cargo test --locked --offline -p aero-core -p aero-app -- inline_format::tests::active_formats selection_toolbar
+cargo test --locked -p aero-core -p aero-index -p aero-app
+```
+
+## 尚未实现 / 已知限制
+
+- 更多菜单：复制块链接、添加 / 复制块 id 还没有独立入口，工具条上也不放空按钮。跟 5.3 块菜单一起做。
+- 块菜单（5.3）里的颜色与转换子菜单：块菜单本身还没做。
+- 「应用到整块」开关：7.7 的，不是工具条的。
+- 原生窗口视觉：无头 GPUI 断言了出现 / 点击 / 按下态，像素级位置与浅深主题观感要人工看一眼。
+- 工具条在选区首行上方，长选区只锚第一行；跨块选区会先升级成块选中态，工具条本来就不会出现。

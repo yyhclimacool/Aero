@@ -3,7 +3,7 @@
 //! 写回：`⌘⇧H` 应用上次使用的颜色（编辑态给选中的文字、块选中态给选中的块）。
 //! 菜单：`⌘/`、`/颜色` 或命令面板打开，9 色 + 默认 × 文字 / 背景 两组，可输入过滤。
 //! 菜单打开时焦点借给它自己的过滤输入框，编辑态的控件与选区都留着。
-//! 5.9 的选区浮动工具条接上后，`A ▾` 打开的也是 [`Editor::open_color_menu`]。
+//! 5.9 的选区浮动工具条上的 `A ▾` 打开的也是 [`Editor::open_color_menu`]。
 
 use aero_core::colors::{self, Inline, Slot};
 use gpui_kit::base::input::{InputEvent, InputState};
@@ -276,6 +276,9 @@ impl Editor {
             Some(f) => f.textarea.update(cx, |state, cx| state.focus(window, cx)),
             None => self.focus_handle.focus(window, cx),
         }
+        if self.toolbar.is_some() {
+            self.refresh_toolbar(cx);
+        }
         cx.notify();
         true
     }
@@ -361,6 +364,9 @@ impl Editor {
         }
         if let Some(color) = item.color {
             crate::colors::remember(item.slot, color, cx);
+        }
+        if self.toolbar.is_some() {
+            self.refresh_toolbar(cx);
         }
         cx.notify();
     }

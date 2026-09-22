@@ -40,6 +40,9 @@ impl Editor {
             let selected = plan.selection.start - f.range.start..plan.selection.end - f.range.start;
             f.textarea.update(cx, |ta, cx| ta.set_selected_range(selected, cx));
         }
+        if self.toolbar.is_some() {
+            self.refresh_toolbar(cx);
+        }
         cx.notify();
         true
     }

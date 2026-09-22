@@ -30,6 +30,7 @@ mod tags_ui;
 #[cfg(test)]
 mod tests;
 mod text_ops;
+mod toolbar;
 mod units;
 mod wiki;
 mod wiki_ui;
@@ -234,6 +235,9 @@ pub struct Editor {
     slash: Option<SlashMenu>,
     /// 颜色菜单（7.7）；开着时焦点在它的过滤输入框上
     color_menu: Option<colors_ui::ColorMenu>,
+    /// 选区浮动工具条（5.9）与它的延迟出现计时
+    toolbar: Option<toolbar::Toolbar>,
+    toolbar_task: Option<Task<()>>,
     /// 块选中态里"选区头"那一块的矩形，每帧更新；颜色菜单靠它定位
     head_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     wiki: Option<wiki::Menu>,
@@ -306,6 +310,8 @@ impl Editor {
             title_edit: None,
             slash: None,
             color_menu: None,
+            toolbar: None,
+            toolbar_task: None,
             head_bounds: Rc::default(),
             wiki: None,
             wiki_generation: 0,
@@ -339,6 +345,7 @@ impl Editor {
             self.cancel_link_preview(cx);
             self.slash = None;
             self.color_menu = None;
+            self.hide_toolbar(cx);
             self.wiki = None;
             self.tag_menu = None;
         } else {
@@ -738,6 +745,8 @@ impl Editor {
                 let selection = textarea.read(cx).selected_range();
                 if last_selection.as_ref() != Some(&selection) {
                     last_selection = Some(selection);
+                    // 选区停下来 300 ms 后浮出工具条（5.9）
+                    this.schedule_toolbar(cx);
                     cx.notify();
                 }
             }
@@ -790,6 +799,7 @@ impl Editor {
         self.cancel_link_preview(cx);
         self.slash = None;
         self.color_menu = None;
+        self.hide_toolbar(cx);
         self.wiki = None;
         self.tag_menu = None;
         if self.focused.take().is_some() {
@@ -812,6 +822,9 @@ impl Editor {
             return;
         }
         if self.close_color_menu(window, cx) {
+            return;
+        }
+        if self.dismiss_toolbar(cx) {
             return;
         }
         if self.tag_menu.take().is_some() || self.wiki.take().is_some() {
@@ -2461,7 +2474,11 @@ impl Render for Editor {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .on_scroll_wheel(cx.listener(|this, _, _, cx| this.cancel_link_preview(cx)))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                this.cancel_link_preview(cx);
+                this.toolbar_scrolled(cx);
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.show_toolbar_now(cx)))
             .child(
                 // 左内边距多留 gutter 的宽度：块行向左伸出去画 `⠿ +`，正文仍是 720 宽
                 v_flex()
@@ -2494,6 +2511,7 @@ impl Render for Editor {
             )
             .vertical_scrollbar(&self.scroll)
             .children(self.render_link_preview(cx))
+            .children(self.render_toolbar(cx))
             // 颜色菜单画在编辑器根上：块选中态没有控件可挂，位置由 `color_menu_position` 给
             .children(self.color_menu.is_some().then(|| self.render_color_menu(cx)))
             .children(self.render_image_viewer(window, cx))

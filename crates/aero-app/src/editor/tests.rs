@@ -436,6 +436,121 @@ fn slash_colors_hit_directly_or_open_the_menu(cx: &mut TestAppContext) {
     assert!(!color_menu_open(&editor, cx));
 }
 
+fn toolbar_open(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|_, cx| editor.read(cx).toolbar_open())
+}
+
+/// 选区停 300 ms 后工具条才出现；程序化改选区走这条路，不走鼠标松手。
+fn appear_toolbar(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(toolbar_open(editor, cx), "选区停 300 ms 后工具条该出现");
+    assert!(cx.debug_bounds("selection-toolbar").is_some(), "工具条要画出来");
+}
+
+fn click_toolbar(id: &'static str, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let bounds = cx.debug_bounds(id).unwrap_or_else(|| panic!("missing {id}"));
+    cx.simulate_click(bounds.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// 选区浮动工具条（5.9）：键盘选区等 300 ms 出现，点粗体加 / 去格式，按下态跟着变。
+#[gpui_kit::test]
+fn selection_toolbar_appears_after_pause_and_toggles_bold(cx: &mut TestAppContext) {
+    let source = "正文 中文😀 后文\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "中文😀", cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(!toolbar_open(&editor, cx), "选区刚停下来时还没有工具条");
+    assert!(cx.debug_bounds("selection-toolbar").is_none());
+    appear_toolbar(&editor, cx);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).toolbar_active(), Some(Vec::new())));
+    click_toolbar("toolbar-bold", cx);
+    assert_eq!(text(&editor, cx), "正文 **中文😀** 后文\n");
+    assert_eq!(selected_inline_text(&editor, cx), "中文😀");
+    assert!(toolbar_open(&editor, cx), "加格式后工具条留着");
+    cx.update(|_, cx| {
+        assert_eq!(editor.read(cx).toolbar_active(), Some(vec![aero_core::inline_format::Format::Bold]))
+    });
+    click_toolbar("toolbar-bold", cx);
+    assert_eq!(text(&editor, cx), source);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).toolbar_active(), Some(Vec::new())));
+}
+
+/// 工具条 `A ▾` 打开颜色菜单；Esc 先关菜单、再关工具条、再退到块选中态。
+#[gpui_kit::test]
+fn selection_toolbar_opens_color_menu_and_escapes_in_layers(cx: &mut TestAppContext) {
+    let source = "正文 中文😀 后文\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "中文😀", cx);
+    appear_toolbar(&editor, cx);
+    click_toolbar("toolbar-color", cx);
+    assert!(color_menu_open(&editor, cx), "A ▾ 打开颜色菜单");
+    assert!(toolbar_open(&editor, cx), "子菜单开着时工具条不消失");
+    cx.simulate_input("蓝");
+    cx.simulate_keystrokes("enter");
+    assert!(!color_menu_open(&editor, cx));
+    assert_eq!(text(&editor, cx), "正文 [中文😀]{.blue} 后文\n");
+    assert_eq!(selected_inline_text(&editor, cx), "中文😀");
+    assert!(toolbar_open(&editor, cx), "上色后工具条留着");
+    cx.update(|_, cx| assert!(editor.read(cx).toolbar_colored(), "有颜色时 A ▾ 按下"));
+    cx.simulate_keystrokes("escape");
+    assert!(!toolbar_open(&editor, cx), "Esc 先收工具条");
+    assert!(cx.update(|_, cx| editor.read(cx).is_editing()), "还在编辑态");
+    assert_eq!(text(&editor, cx), "正文 [中文😀]{.blue} 后文\n");
+    cx.simulate_keystrokes("escape");
+    assert!(!cx.update(|_, cx| editor.read(cx).is_editing()), "再 Esc 才进块选中态");
+}
+
+/// 选区消失或块选中态都不画工具条；鼠标松手立刻出现，不等 300 ms。
+#[gpui_kit::test]
+fn selection_toolbar_hides_without_selection_and_shows_on_mouse_up(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "第一段\n\n第二段\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "第一段", cx);
+    appear_toolbar(&editor, cx);
+    cx.simulate_keystrokes("right");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(!toolbar_open(&editor, cx), "选区没了工具条立刻收掉");
+    select_inline_text(&editor, "第一段", cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(!toolbar_open(&editor, cx), "还没松手 / 还没等到 300 ms");
+    // 鼠标松手走 `show_toolbar_now`：立刻出现，不走 300 ms 那条计时
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.show_toolbar_now(cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(toolbar_open(&editor, cx), "鼠标松手立刻出现");
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(0, 1, window, cx)));
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(!toolbar_open(&editor, cx), "块选中态不出现工具条");
+}
+
+/// `转换 ▾` 用现有的块类型转换；当前类型按下。
+#[gpui_kit::test]
+fn selection_toolbar_converts_the_current_block(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "一段话\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "一段话", cx);
+    appear_toolbar(&editor, cx);
+    click_toolbar("toolbar-convert", cx);
+    assert!(cx.update(|_, cx| editor.read(cx).toolbar_convert_open()));
+    assert!(cx.debug_bounds("toolbar-convert-menu").is_some());
+    click_toolbar("toolbar-convert-item-1", cx);
+    assert_eq!(text(&editor, cx), "# 一段话\n");
+    assert!(cx.update(|_, cx| editor.read(cx).is_editing()), "转换后还在编辑态");
+}
+
 /// 行内颜色（7.7）：`⌘⇧H` 用上次的颜色包住选区，选区保持在原文字上，预览里上色。
 #[gpui_kit::test]
 fn inline_color_wraps_the_selection_and_paints_it_in_preview(cx: &mut TestAppContext) {

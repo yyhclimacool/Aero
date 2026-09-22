@@ -45,6 +45,26 @@ pub struct Plan {
     pub selection: Range<usize>,
 }
 
+/// 选区已经带着的行内格式，按 [`Format`] 的固定顺序返回（选区浮动工具条的按下态，UI 设计 5.9）。
+///
+/// 判定是"选区落在这种格式的元素里"，恰好覆盖元素或只选中其中一段都算。
+pub fn active(src: &str, selection: Range<usize>) -> Vec<Format> {
+    let arena = Arena::new();
+    let root = parse_document(&arena, src, &parse::comrak_options());
+    let positions = SourceMap::new(src);
+    [Format::Bold, Format::Italic, Format::Code, Format::Strike, Format::Highlight]
+        .into_iter()
+        .filter(|format| {
+            root.descendants().any(|node| {
+                format.matches(&node.data().value)
+                    && positions
+                        .range(node)
+                        .is_some_and(|r| r.start <= selection.start && selection.end <= r.end)
+            })
+        })
+        .collect()
+}
+
 pub fn plan(src: &str, mut selection: Range<usize>, format: Format) -> Option<Plan> {
     let selected = src.get(selection.clone())?;
     if selected.contains(['\n', '\r']) {
@@ -304,6 +324,25 @@ mod tests {
                 assert!(plan("`code`{.red}", selection, format).is_none());
             }
         }
+    }
+
+    /// 工具条按下态：选区带着哪些格式。
+    #[test]
+    fn active_formats_report_what_the_selection_already_carries() {
+        let src = "前 **粗 `码` ==亮==** 与 *斜* 与 ~~删~~ 后\n";
+        let find = |needle: &str| {
+            let at = src.find(needle).expect(needle);
+            at..at + needle.len()
+        };
+        // 嵌在粗体里的行内代码：两种都算
+        assert_eq!(active(src, find("码")), [Format::Bold, Format::Code]);
+        assert_eq!(active(src, find("亮")), [Format::Bold, Format::Highlight]);
+        // 恰好覆盖元素本身（含标记）也算
+        assert_eq!(active(src, find("*斜*")), [Format::Italic]);
+        assert_eq!(active(src, find("删")), [Format::Strike]);
+        // 普通文字什么都没带
+        assert!(active(src, find("与")).is_empty());
+        assert!(active("干净的一行\n", 0..6).is_empty());
     }
 
     #[test]

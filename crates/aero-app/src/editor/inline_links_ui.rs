@@ -2,25 +2,28 @@ use super::*;
 
 impl Editor {
     pub(super) fn on_edit_link(&mut self, _: &EditLink, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(f) = &self.focused else {
-            cx.propagate();
-            return;
-        };
-        if self.title_edit.is_some() || !f.textarea.focus_handle(cx).is_focused(window) {
+        if !self.editing_with_keyboard(window, cx) {
             cx.propagate();
             return;
         }
-        if self.input_composing(window, cx) {
+        if !self.edit_link(window, cx) {
             cx.propagate();
-            return;
         }
-        let f = self.focused.as_ref().unwrap();
+    }
+
+    /// ⌘K / 工具条的 🔗：选区变行内链接，已有链接选中地址，无选区打开笔记补全。
+    /// 返回是否由编辑器处理。
+    pub(super) fn edit_link(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.focused.is_none() || self.title_edit.is_some() {
+            return false;
+        }
+        let f = self.focused.as_ref().expect("已确认在编辑态");
         let ta = f.textarea.read(cx);
         let selected = ta.selected_range();
         // 已在半成品 wikilink 中时重新打开现有菜单，不插入另一对括号。
         if selected.is_empty() && wiki::trigger(&ta.value(), ta.cursor()).is_some() {
             self.update_wiki(cx);
-            return;
+            return true;
         }
         let selection = f.range.start + selected.start..f.range.start + selected.end;
         let clipboard =
@@ -28,7 +31,7 @@ impl Editor {
         let Some(plan) =
             aero_core::inline_links::plan(&self.doc.to_string(), selection, clipboard.as_deref())
         else {
-            return;
+            return true;
         };
         self.slash = None;
         self.wiki = None;
@@ -47,7 +50,11 @@ impl Editor {
         if plan.complete_note {
             self.update_wiki(cx);
         }
+        if self.toolbar.is_some() {
+            self.refresh_toolbar(cx);
+        }
         cx.emit(EditorEvent::Changed);
         cx.notify();
+        true
     }
 }
