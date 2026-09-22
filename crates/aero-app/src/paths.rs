@@ -28,6 +28,19 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 链接悬停预览（`ui_design.md` 8.1 / 12）。存在应用级 `state.toml` 里。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkPreviewMode {
+    /// 悬停 500 ms 后显示
+    #[default]
+    Hover,
+    /// 按住 ⌘ 才显示
+    Command,
+    /// 不显示
+    Off,
+}
+
 /// 应用级持久状态，`state.toml`。
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -36,6 +49,7 @@ pub struct PersistedState {
     pub recent_vaults: Vec<PathBuf>,
     pub sidebar_visible: Option<bool>,
     pub panel_visible: Option<bool>,
+    pub link_preview: LinkPreviewMode,
 }
 
 impl PersistedState {
@@ -67,6 +81,23 @@ impl PersistedState {
 
     pub fn forget_vault(&mut self, root: &Path) {
         self.recent_vaults.retain(|p| p != root);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_preview_mode_roundtrips_and_defaults_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = PersistedState::default();
+        assert_eq!(state.link_preview, LinkPreviewMode::Hover);
+        state.link_preview = LinkPreviewMode::Command;
+        state.save(dir.path());
+        assert_eq!(PersistedState::load(dir.path()).link_preview, LinkPreviewMode::Command);
+        fs::write(dir.path().join("state.toml"), "recent_vaults = []\n").unwrap();
+        assert_eq!(PersistedState::load(dir.path()).link_preview, LinkPreviewMode::Hover);
     }
 }
 

@@ -23,7 +23,7 @@ use crate::backlinks::{BacklinkOpened, BacklinksView};
 use crate::branding;
 use crate::editor::{Editor, EditorEvent, SaveState};
 use crate::file_tree::{FileTree, FileTreeEvent, unique_note_name};
-use crate::paths::{PersistedState, display_path};
+use crate::paths::{LinkPreviewMode, PersistedState, display_path};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::search::{Phase, SearchService};
 use crate::search_view::{SearchView, SearchViewEvent};
@@ -122,6 +122,9 @@ impl Workspace {
                 editor.update(cx, |e, cx| e.check_external(cx));
             }
         });
+        let preview = state.link_preview;
+        crate::editor::set_preview_mode(preview, cx);
+        crate::actions::sync_menus(preview, cx);
         let mut this = Workspace {
             data_dir,
             quick_open: None,
@@ -836,6 +839,37 @@ impl Workspace {
             self.state.save(&self.data_dir);
         }
         cx.notify();
+    }
+
+    fn set_link_preview(&mut self, mode: LinkPreviewMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.link_preview == mode {
+            return;
+        }
+        self.state.link_preview = mode;
+        self.state.save(&self.data_dir);
+        crate::editor::set_preview_mode(mode, cx);
+        crate::actions::sync_menus(mode, cx);
+        if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
+            editor.update(cx, |editor, cx| editor.preview_mode_changed(window, cx));
+        }
+        cx.notify();
+    }
+
+    fn on_link_preview_hover(&mut self, _: &LinkPreviewHover, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_link_preview(LinkPreviewMode::Hover, window, cx);
+    }
+
+    fn on_link_preview_command(
+        &mut self,
+        _: &LinkPreviewCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_link_preview(LinkPreviewMode::Command, window, cx);
+    }
+
+    fn on_link_preview_off(&mut self, _: &LinkPreviewOff, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_link_preview(LinkPreviewMode::Off, window, cx);
     }
 
     fn on_open_tags(&mut self, _: &OpenTags, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1720,6 +1754,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_search))
             .on_action(cx.listener(Self::on_open_files))
             .on_action(cx.listener(Self::on_open_tags))
+            .on_action(cx.listener(Self::on_link_preview_hover))
+            .on_action(cx.listener(Self::on_link_preview_command))
+            .on_action(cx.listener(Self::on_link_preview_off))
             .on_action(cx.listener(Self::on_quick_open))
             .on_action(cx.listener(Self::on_command_palette))
             .on_action(cx.listener(Self::on_toggle_sidebar))
@@ -3342,5 +3379,16 @@ mod tests {
             let e = open.editor.as_ref().unwrap().read(cx);
             assert_eq!(e.path().as_str(), "新笔记.md", "拒绝撤销后应留在新建笔记上");
         });
+    }
+
+    #[gpui_kit::test]
+    fn link_preview_setting_is_saved_and_restored(cx: &mut TestAppContext) {
+        use crate::paths::LinkPreviewMode;
+        let (_dir, data, workspace) = open(cx, Some("body\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        workspace.update_in(cx, |w, window, cx| {
+            w.on_link_preview_command(&crate::actions::LinkPreviewCommand, window, cx)
+        });
+        assert_eq!(PersistedState::load(data.path()).link_preview, LinkPreviewMode::Command);
     }
 }

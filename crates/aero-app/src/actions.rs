@@ -31,6 +31,12 @@ actions!(
         OpenFiles,
         /// 左侧栏切到标签视图（`ui_design.md` 4.3）
         OpenTags,
+        /// 链接悬停预览：悬停 500 ms（8.1）
+        LinkPreviewHover,
+        /// 链接悬停预览：按住 ⌘ 才显示
+        LinkPreviewCommand,
+        /// 链接悬停预览：关闭
+        LinkPreviewOff,
         /// ⌘P：快速打开（3.2）
         QuickOpen,
         CommandPalette,
@@ -168,6 +174,21 @@ pub fn commands() -> Vec<Command> {
         Command::new("search", "全文搜索", "search find qwss", Vault, OpenSearch),
         Command::new("files", "显示文件树", "files explorer xswjs", Vault, OpenFiles),
         Command::new("tags", "显示标签", "tags bq", Vault, OpenTags),
+        Command::new(
+            "link-preview-hover",
+            "链接预览：悬停",
+            "hover preview link ylxf",
+            Vault,
+            LinkPreviewHover,
+        ),
+        Command::new(
+            "link-preview-command",
+            "链接预览：按住 ⌘",
+            "command modifier preview link az",
+            Vault,
+            LinkPreviewCommand,
+        ),
+        Command::new("link-preview-off", "链接预览：关闭", "disable preview link gb", Vault, LinkPreviewOff),
         Command::new("sidebar", "折叠 / 展开左侧栏", "toggle sidebar zcl", Vault, ToggleSidebar),
         Command::new("panel", "折叠 / 展开右侧面板", "toggle panel ycmb", Vault, TogglePanel),
         Command::new("undo", "撤销", "undo cx", Editor, DocUndo),
@@ -286,6 +307,13 @@ pub fn init(cx: &mut App) {
     // 窗口里没人处理时的兜底
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 
+    sync_menus(crate::paths::LinkPreviewMode::Hover, cx);
+}
+
+/// 按当前预览设置重画菜单（勾选「悬停 / 按住 ⌘ / 关闭」里的一项）。
+pub fn sync_menus(preview: crate::paths::LinkPreviewMode, cx: &mut App) {
+    use crate::paths::LinkPreviewMode;
+    use aero_core::inline_format::Format;
     cx.set_menus(vec![
         Menu::new("Aero").items(vec![MenuItem::action("退出 Aero", Quit)]),
         Menu::new("文件").items(vec![
@@ -324,6 +352,12 @@ pub fn init(cx: &mut App) {
             MenuItem::action("标签", OpenTags),
             MenuItem::action("快速打开…", QuickOpen),
             MenuItem::action("命令面板…", CommandPalette),
+            MenuItem::separator(),
+            MenuItem::submenu(Menu::new("链接预览").items(vec![
+                MenuItem::action("悬停", LinkPreviewHover).checked(preview == LinkPreviewMode::Hover),
+                MenuItem::action("按住 ⌘", LinkPreviewCommand).checked(preview == LinkPreviewMode::Command),
+                MenuItem::action("关闭", LinkPreviewOff).checked(preview == LinkPreviewMode::Off),
+            ])),
             MenuItem::separator(),
             MenuItem::action("折叠 / 展开左侧栏", ToggleSidebar),
             MenuItem::action("折叠 / 展开右侧面板", TogglePanel),

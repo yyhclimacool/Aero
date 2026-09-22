@@ -53,6 +53,8 @@ use gpui_kit::*;
 
 use images_ui::ImageViewer;
 
+pub use link_preview::set_preview_mode;
+
 use crate::actions::{
     BlockDown, BlockUp, BlurEditor, ConvertBlock, CopySelectedBlocks, CutSelectedBlocks,
     DeleteSelectedBlocks, DocRedo, DocUndo, EditLink, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp,
@@ -2478,6 +2480,9 @@ impl Render for Editor {
                 this.cancel_link_preview(cx);
                 this.toolbar_scrolled(cx);
             }))
+            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
+                this.preview_modifiers(event.modifiers, cx);
+            }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.show_toolbar_now(cx)))
             .child(
                 // 左内边距多留 gutter 的宽度：块行向左伸出去画 `⠿ +`，正文仍是 720 宽
@@ -2510,7 +2515,7 @@ impl Render for Editor {
                     ),
             )
             .vertical_scrollbar(&self.scroll)
-            .children(self.render_link_preview(cx))
+            .children(self.render_link_preview(window, cx))
             .children(self.render_toolbar(cx))
             // 颜色菜单画在编辑器根上：块选中态没有控件可挂，位置由 `color_menu_position` 给
             .children(self.color_menu.is_some().then(|| self.render_color_menu(cx)))

@@ -55,6 +55,6 @@ cargo test --locked --offline -p aero-core -p aero-index -p aero-app
 
 - 地址直接在 Markdown 源码中编辑；没有单独的 URL 编辑弹窗或链接删除按钮。编辑已有地址时不自动用剪贴板覆盖；手动输入遵循普通 Markdown 语法。
 - 引用式链接 `[text][id]`、自动链接和图片地址不通过 `⌘K` 编辑；不修改共享引用定义。跨行和跨块选区不包裹。原生菜单视觉、真实系统输入法及大文档延迟尚未人工验收。
-- 自动配对与行内格式快捷键已实现，见 [自动配对验收](m2-pairs.md)、[行内格式验收](m2-inline-format.md)。front matter `aliases` 搜索见 [补全记录](m2-completion.md)；实际嵌入渲染、富文本预览与预览设置仍未实现。
+- 自动配对与行内格式快捷键已实现，见 [自动配对验收](m2-pairs.md)、[行内格式验收](m2-inline-format.md)。front matter `aliases` 搜索见 [补全记录](m2-completion.md)。富文本悬停预览与「悬停 / 按住 ⌘ / 关闭」见 [链接预览验收](m2-link-preview.md)。
 
 本轮未重新打包或替换已安装应用；未设置 `AERO_CORPUS_DIR`，自动化结果不代表个人真实语料已验收。

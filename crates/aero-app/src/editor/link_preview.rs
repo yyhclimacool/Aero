@@ -1,7 +1,22 @@
 use super::*;
+use crate::paths::LinkPreviewMode;
 use crate::search::SearchService;
 use aero_core::links::{Resolution, Resolver};
 use gpui_kit::base::text::{LinkStyle, LinkUnderline};
+
+/// 当前的链接预览设置。工作区从 `state.toml` 写入；编辑器悬停时读取。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreviewMode(pub LinkPreviewMode);
+
+impl gpui_kit::Global for PreviewMode {}
+
+pub fn preview_mode(cx: &App) -> LinkPreviewMode {
+    cx.try_global::<PreviewMode>().map(|mode| mode.0).unwrap_or_default()
+}
+
+pub fn set_preview_mode(mode: LinkPreviewMode, cx: &mut App) {
+    cx.set_global(PreviewMode(mode));
+}
 
 #[derive(Default)]
 pub(super) struct LinkPreview {
@@ -17,31 +32,105 @@ pub(super) struct LinkPreview {
     close_task: Option<Task<()>>,
     popup: Option<Popup>,
     in_popup: bool,
+    /// 最近一次见到的 ⌘ 状态。按住 ⌘ 才预览时，目录刷新不能在没按键时把浮层打开。
+    platform_down: bool,
 }
 
 struct Popup {
     title: String,
+    /// 笔记片段是 Markdown 源码（浮层按预览渲染）；错误、外部链接、歧义是纯文本。
     body: String,
+    rich: bool,
     bounds: Bounds<Pixels>,
 }
 
+const EXCERPT_CHARS: usize = 300;
+const PREVIEW_GAP: Pixels = px(8.);
+const PREVIEW_MAX_H: Pixels = px(320.);
+/// 标题、内边距和间距占掉的高度，剩下的给正文滚动区。
+const PREVIEW_CHROME: Pixels = px(56.);
+
+struct PreviewPlace {
+    origin: Point<Pixels>,
+    above: bool,
+    max_h: Pixels,
+    body_max: Pixels,
+}
+
+/// 浮层躲开链接本身，也躲开编辑光标那一行。哪一侧更空就放哪一侧，高度不超过那一侧的空隙，
+/// 这样贴边时不会被挤回来盖住正在看的文字。
+fn place_preview(
+    link: Bounds<Pixels>,
+    caret: Option<Bounds<Pixels>>,
+    viewport: Bounds<Pixels>,
+) -> PreviewPlace {
+    let below_limit = caret
+        .filter(|caret| caret.top() >= link.bottom())
+        .map_or(viewport.bottom(), |caret| viewport.bottom().min(caret.top() - PREVIEW_GAP));
+    let below = (below_limit - (link.bottom() + PREVIEW_GAP)).max(px(0.));
+    let above_limit = caret
+        .filter(|caret| caret.bottom() <= link.top())
+        .map_or(viewport.top(), |caret| viewport.top().max(caret.bottom() + PREVIEW_GAP));
+    let above = ((link.top() - PREVIEW_GAP) - above_limit).max(px(0.));
+    let (origin, above, room) = if below >= above {
+        (point(link.left(), link.bottom() + PREVIEW_GAP), false, below)
+    } else {
+        (point(link.left(), link.top() - PREVIEW_GAP), true, above)
+    };
+    let max_h = room.min(PREVIEW_MAX_H).max(px(1.));
+    let body_max = (max_h - PREVIEW_CHROME).max(px(1.));
+    PreviewPlace { origin, above, max_h, body_max }
+}
+
+/// 悬停预览要渲染的 Markdown。整篇只取大约前 300 个字符（按纯文本计，不切开一个字符）；
+/// 标题 / `^块` 取整个片段。front matter 不在叶子里，不会出现。
 fn excerpt(doc: &Document, fragment: Option<&str>) -> Result<String, String> {
     let range = fragment_range(doc, fragment)?;
-    let text = aero_core::index::indexable_leaves(doc)
+    let leaves: Vec<_> = aero_core::index::indexable_leaves(doc)
         .into_iter()
         .filter(|b| {
             let r = doc.range_of(b);
             r.start >= range.start && r.start < range.end
         })
-        .map(|b| aero_core::index::plain_text(&doc.slice(doc.content_range(b)).to_string(), &b.kind))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let text = text.trim();
-    Ok(if fragment.is_none_or(str::is_empty) { text.chars().take(300).collect() } else { text.to_owned() })
+        .collect();
+    let Some(first) = leaves.first() else { return Ok(String::new()) };
+    if fragment.is_some_and(|f| !f.is_empty()) {
+        return Ok(doc.slice(range).to_string().trim().to_owned());
+    }
+    // 从包含第一块的根块开始，这样 callout / 列表的标记还在，预览才能渲染成卡片而不是剥掉的正文。
+    let leaf_start = doc.range_of(first).start;
+    let start = doc
+        .blocks()
+        .roots
+        .iter()
+        .find_map(|root| {
+            let root_range = doc.range_of(root);
+            (root_range.start <= leaf_start && leaf_start < root_range.end).then_some(root_range.start)
+        })
+        .unwrap_or(leaf_start);
+    let mut chars = 0usize;
+    let mut end = start;
+    for block in &leaves {
+        if chars >= EXCERPT_CHARS {
+            break;
+        }
+        let content = doc.content_range(block);
+        let src = doc.slice(content.clone()).to_string();
+        let plain = aero_core::index::plain_text(&src, &block.kind);
+        let room = EXCERPT_CHARS - chars;
+        if plain.chars().count() > room {
+            let cut = src.char_indices().nth(room).map(|(i, _)| i).unwrap_or(src.len());
+            end = content.start + cut;
+            break;
+        }
+        chars += plain.chars().count();
+        end = doc.range_of(block).end;
+    }
+    Ok(doc.slice(start..end).to_string().trim().to_owned())
 }
 
 /// 链接 / 嵌入的片段在目标文档里的源码区间：`^id` 是那一块，`#标题` 是该章节（含子标题、
-/// 不越过同级），没有片段就是整篇。悬停预览取它的纯文本，嵌入取它的源码。
+/// 不越过同级），没有片段就是整篇。悬停预览渲染这段 Markdown，嵌入取它的源码。
 pub(super) fn fragment_range(doc: &Document, fragment: Option<&str>) -> Result<Range<usize>, String> {
     Ok(if let Some(id) = fragment.and_then(|f| f.strip_prefix('^')) {
         let id = aero_core::block_refs::resolve(doc, id)?;
@@ -192,6 +281,7 @@ impl Editor {
         if self.link_preview.hovered.as_ref() == Some(&key) {
             return;
         }
+        self.link_preview.platform_down = window.modifiers().platform;
         self.cancel_link_preview(cx);
         self.link_preview.window_subscriptions.get_or_insert_with(|| {
             [
@@ -204,6 +294,36 @@ impl Editor {
         self.schedule_link_preview(cx);
     }
 
+    pub(super) fn preview_modifiers(&mut self, modifiers: Modifiers, cx: &mut Context<Self>) {
+        self.link_preview.platform_down = modifiers.platform;
+        if preview_mode(cx) != LinkPreviewMode::Command || self.link_preview.hovered.is_none() {
+            return;
+        }
+        if modifiers.platform {
+            if self.link_preview.popup.is_none() && self.link_preview.task.is_none() {
+                self.schedule_link_preview(cx);
+            }
+        } else {
+            self.close_link_popup(cx);
+        }
+    }
+
+    pub(crate) fn preview_mode_changed(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.link_preview.platform_down = window.modifiers().platform;
+        match preview_mode(cx) {
+            LinkPreviewMode::Off => self.cancel_link_preview(cx),
+            LinkPreviewMode::Command if !self.link_preview.platform_down => self.close_link_popup(cx),
+            LinkPreviewMode::Command | LinkPreviewMode::Hover => {
+                if self.link_preview.hovered.is_some()
+                    && self.link_preview.popup.is_none()
+                    && self.link_preview.task.is_none()
+                {
+                    self.schedule_link_preview(cx);
+                }
+            }
+        }
+    }
+
     pub(super) fn validate_link_preview_scroll(&mut self, cx: &mut Context<Self>) {
         if self.link_preview.scroll_at_hover.is_some_and(|offset| offset != self.scroll.offset()) {
             self.cancel_link_preview(cx);
@@ -211,10 +331,17 @@ impl Editor {
     }
 
     fn schedule_link_preview(&mut self, cx: &mut Context<Self>) {
+        let delay = match preview_mode(cx) {
+            LinkPreviewMode::Hover => Duration::from_millis(500),
+            LinkPreviewMode::Command if self.link_preview.platform_down => Duration::ZERO,
+            LinkPreviewMode::Command | LinkPreviewMode::Off => return,
+        };
         self.link_preview.generation += 1;
         let generation = self.link_preview.generation;
         self.link_preview.task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(500)).await;
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
             let Ok(Some(task)) = this.update(cx, |this, cx| {
                 if this.link_preview.generation != generation {
                     return None;
@@ -226,7 +353,10 @@ impl Editor {
             };
             let popup = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.link_preview.generation == generation && this.link_preview.hovered.is_some() {
+                if this.link_preview.generation == generation
+                    && this.link_preview.hovered.is_some()
+                    && preview_mode(cx) != LinkPreviewMode::Off
+                {
                     this.link_preview.popup = Some(popup);
                     cx.notify();
                 }
@@ -262,7 +392,7 @@ impl Editor {
     fn load_link_preview(&self, url: SharedString, bounds: Bounds<Pixels>, cx: &App) -> Task<Popup> {
         let Some((target, fragment)) = aero_core::links::decode_note_url(&url) else {
             return cx.background_spawn(async move {
-                Popup { title: "外部链接".into(), body: url.to_string(), bounds }
+                Popup { title: "外部链接".into(), body: url.to_string(), rich: false, bounds }
             });
         };
         let resolution = if target.is_empty() {
@@ -271,34 +401,43 @@ impl Editor {
             resolver.resolve(&target, fragment.as_deref(), self.path.parent())
         } else {
             return cx.background_spawn(async move {
-                Popup { title: target, body: "正在读取笔记目录…".into(), bounds }
+                Popup { title: target, body: "正在读取笔记目录…".into(), rich: false, bounds }
             });
         };
         match resolution {
             Resolution::Resolved { path, fragment } if path == self.path => {
                 let title = self.title();
-                let body = excerpt(&self.doc, fragment.as_deref()).unwrap_or_else(|error| error);
-                cx.background_spawn(async move { Popup { title, body, bounds } })
+                let (body, rich) = match excerpt(&self.doc, fragment.as_deref()) {
+                    Ok(body) => (body, true),
+                    Err(error) => (error, false),
+                };
+                cx.background_spawn(async move { Popup { title, body, rich, bounds } })
             }
             Resolution::Resolved { path, fragment } => {
                 let vault = self.vault.clone();
                 cx.background_spawn(async move {
                     match vault.read(&path) {
-                        Ok((doc, _)) => Popup {
-                            title: doc.title_or(path.stem()),
-                            body: excerpt(&doc, fragment.as_deref()).unwrap_or_else(|error| error),
-                            bounds,
-                        },
+                        Ok((doc, _)) => {
+                            let title = doc.title_or(path.stem());
+                            let (body, rich) = match excerpt(&doc, fragment.as_deref()) {
+                                Ok(body) => (body, true),
+                                Err(error) => (error, false),
+                            };
+                            Popup { title, body, rich, bounds }
+                        }
                         Err(error) => Popup {
                             title: path.as_str().into(),
                             body: format!("无法读取笔记：{error}"),
+                            rich: false,
                             bounds,
                         },
                     }
                 })
             }
             Resolution::Unresolved => cx.background_spawn(async move {
-                Popup { title: target, body: "未解析链接：目标笔记不存在".into(), bounds }
+                Popup {
+                    title: target, body: "未解析链接：目标笔记不存在".into(), rich: false, bounds
+                }
             }),
             Resolution::Ambiguous { candidates } => cx.background_spawn(async move {
                 Popup {
@@ -307,6 +446,7 @@ impl Editor {
                         "请使用完整路径消歧：\n{}",
                         candidates.iter().map(VaultPath::as_str).collect::<Vec<_>>().join("\n")
                     ),
+                    rich: false,
                     bounds,
                 }
             }),
@@ -319,6 +459,17 @@ impl Editor {
         self.link_preview.close_task = None;
         self.link_preview.hovered = None;
         self.link_preview.scroll_at_hover = None;
+        self.link_preview.in_popup = false;
+        if self.link_preview.popup.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 关掉已经打开的浮层，但留下悬停目标：松开 ⌘ 之后再按还能打开。
+    fn close_link_popup(&mut self, cx: &mut Context<Self>) {
+        self.link_preview.generation += 1;
+        self.link_preview.task = None;
+        self.link_preview.close_task = None;
         self.link_preview.in_popup = false;
         if self.link_preview.popup.take().is_some() {
             cx.notify();
@@ -345,13 +496,64 @@ impl Editor {
         }
     }
 
-    pub(super) fn render_link_preview(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let popup = self.link_preview.popup.as_ref()?;
+    fn render_link_preview_body(
+        &self,
+        body: &str,
+        rich: bool,
+        max_h: Pixels,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let frame = div()
+            .id("link-preview-body")
+            .max_h(max_h)
+            .w_full()
+            .overflow_y_scroll()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
+        if rich && !body.is_empty() {
+            let style = self.text_view_style(cx).with_foreground(cx.theme().popover_foreground);
+            frame
+                .debug_selector(|| "link-preview-rich".into())
+                .child(preview::markdown(
+                    format!("link-preview-{}", cx.entity_id()).into(),
+                    aero_core::links::to_markdown(body).into(),
+                    style,
+                    0,
+                    self.preview.clone(),
+                    cx.entity(),
+                    BlockId(u64::MAX),
+                    0,
+                ))
+                .into_any_element()
+        } else {
+            frame
+                .debug_selector(|| "link-preview-plain".into())
+                .text_sm()
+                .line_height(relative(1.6))
+                .child(body.to_owned())
+                .into_any_element()
+        }
+    }
+
+    pub(super) fn render_link_preview(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
+        let (title, body, rich, bounds) = {
+            let popup = self.link_preview.popup.as_ref()?;
+            (popup.title.clone(), popup.body.clone(), popup.rich, popup.bounds)
+        };
+        let caret = self.focused.as_ref().and_then(|focused| {
+            let at = focused.textarea.read(cx).selected_range().start;
+            focused.textarea.read(cx).range_to_bounds(&(at..at))
+        });
+        let viewport = Bounds::new(point(px(8.), px(8.)), {
+            let window_size = window.viewport_size();
+            size((window_size.width - px(16.)).max(px(1.)), (window_size.height - px(16.)).max(px(1.)))
+        });
+        let place = place_preview(bounds, caret, viewport);
         let theme = cx.theme();
         Some(
             deferred(
                 anchored()
-                    .position(point(popup.bounds.left(), popup.bounds.bottom() + px(4.)))
+                    .anchor(if place.above { Anchor::BottomLeft } else { Anchor::TopLeft })
+                    .position(place.origin)
                     .snap_to_window_with_margin(px(8.))
                     .child(
                         v_flex()
@@ -360,6 +562,7 @@ impl Editor {
                             .occlude()
                             .w(px(360.))
                             .max_w_full()
+                            .max_h(place.max_h)
                             .p_3()
                             .gap_2()
                             .rounded(px(8.))
@@ -371,19 +574,8 @@ impl Editor {
                             .on_hover(cx.listener(|this, hovered, _, cx| this.hover_link_popup(*hovered, cx)))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(|_, _, cx| cx.stop_propagation())
-                            .child(
-                                div().text_sm().font_weight(FontWeight::SEMIBOLD).child(popup.title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .id("link-preview-body")
-                                    .max_h(px(280.))
-                                    .overflow_y_scroll()
-                                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                                    .text_sm()
-                                    .line_height(relative(1.6))
-                                    .child(popup.body.clone()),
-                            ),
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title))
+                            .child(self.render_link_preview_body(&body, rich, place.body_max, cx)),
                     ),
             )
             .into_any_element(),
@@ -764,6 +956,86 @@ mod tests {
         assert_eq!(vault.notes().unwrap().len(), 2);
     }
 
+    #[gpui_kit::test]
+    fn hover_preview_renders_the_target_as_markdown(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "见 [[other]]\n").unwrap();
+        std::fs::write(dir.path().join("other.md"), "> [!note] Hi\n> **inside**\n").unwrap();
+        let vault = Arc::new(aero_core::Vault::open(dir.path()).unwrap());
+        let path = aero_core::VaultPath::new("a.md").unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let (editor, visual) = cx.add_window_view(|_, cx| Editor::new(vault, path, doc, stamp, cx));
+        let bounds = Bounds::from_corners(point(px(20.), px(20.)), point(px(100.), px(45.)));
+        let url = aero_core::links::encode_note_url("other", None).into();
+        visual.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                e.install_test_resolver(&[("other.md", Some("Other"))], cx);
+                e.hover_link(&url, true, bounds, window, cx);
+            })
+        });
+        visual.run_until_parked();
+        visual.executor().advance_clock(Duration::from_millis(500));
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            let (body, rich) = {
+                let popup = editor.read(cx).link_preview.popup.as_ref().unwrap();
+                (popup.body.clone(), popup.rich)
+            };
+            assert!(body.contains("**inside**"), "{body}");
+            assert!(rich);
+            window.draw(cx).clear(cx);
+        });
+        assert!(visual.debug_bounds("link-preview-rich").is_some());
+        assert!(visual.debug_bounds("callout-title-Hi").is_some(), "浮层要按预览渲染 callout，而不是纯文本");
+    }
+
+    #[gpui_kit::test]
+    fn preview_off_stays_closed_and_command_waits_for_the_key(cx: &mut TestAppContext) {
+        use crate::paths::LinkPreviewMode;
+        use gpui_kit::Modifiers;
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "body\n").unwrap();
+        let vault = Arc::new(aero_core::Vault::open(dir.path()).unwrap());
+        let path = aero_core::VaultPath::new("a.md").unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let (editor, visual) = cx.add_window_view(|_, cx| Editor::new(vault, path, doc, stamp, cx));
+        let bounds = Bounds::from_corners(point(px(20.), px(20.)), point(px(100.), px(45.)));
+        let url = aero_core::links::encode_note_url("", None).into();
+        let held = Modifiers { platform: true, control: false, alt: false, shift: false, function: false };
+        let released =
+            Modifiers { platform: false, control: false, alt: false, shift: false, function: false };
+        visual.update(|_, cx| super::set_preview_mode(LinkPreviewMode::Off, cx));
+        visual.update(|window, cx| editor.update(cx, |e, cx| e.hover_link(&url, true, bounds, window, cx)));
+        visual.run_until_parked();
+        visual.executor().advance_clock(Duration::from_millis(500));
+        visual.run_until_parked();
+        visual.update(|_, cx| assert!(editor.read(cx).link_preview.popup.is_none(), "关闭时不出现浮层"));
+        visual.update(|window, cx| {
+            super::set_preview_mode(LinkPreviewMode::Command, cx);
+            editor.update(cx, |e, cx| {
+                e.hover_link(&url, false, bounds, window, cx);
+                e.hover_link(&url, true, bounds, window, cx);
+            });
+        });
+        visual.run_until_parked();
+        visual.executor().advance_clock(Duration::from_millis(500));
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            let focus = editor.read(cx).focus_handle.clone();
+            focus.focus(window, cx);
+            window.draw(cx).clear(cx);
+            assert!(editor.read(cx).link_preview.popup.is_none(), "没按 ⌘ 时不出现浮层");
+        });
+        visual.simulate_modifiers_change(held);
+        visual.run_until_parked();
+        visual.update(|_, cx| assert_eq!(editor.read(cx).link_preview.popup.as_ref().unwrap().body, "body"));
+        visual.simulate_modifiers_change(released);
+        visual.run_until_parked();
+        visual.update(|_, cx| assert!(editor.read(cx).link_preview.popup.is_none(), "松开 ⌘ 浮层消失"));
+    }
+
     #[test]
     fn note_excerpt_omits_front_matter_and_limits_unicode_characters() {
         let doc = Document::from_text(&format!(
@@ -807,5 +1079,32 @@ mod tests {
         let text = excerpt(&doc, Some("Nested")).unwrap();
         assert!(text.contains("inside"));
         assert!(!text.contains("outside"));
+    }
+
+    #[test]
+    fn preview_stays_off_the_link_and_the_caret_line() {
+        let viewport = Bounds::from_corners(point(px(0.), px(0.)), point(px(800.), px(600.)));
+        let low = Bounds::from_corners(point(px(40.), px(500.)), point(px(120.), px(520.)));
+        let flipped = super::place_preview(low, None, viewport);
+        assert!(flipped.above, "靠近窗口底部时应翻到链接上方");
+        assert!(flipped.origin.y <= low.top());
+        let link = Bounds::from_corners(point(px(40.), px(80.)), point(px(120.), px(100.)));
+        let caret = Bounds::from_corners(point(px(200.), px(500.)), point(px(202.), px(524.)));
+        let placed = super::place_preview(link, Some(caret), viewport);
+        assert!(!placed.above, "光标离链接还有空隙时，浮层留在链接下方");
+        assert!(placed.origin.y >= link.bottom(), "不能盖住链接那一行");
+        assert!(placed.origin.y + placed.max_h <= caret.top(), "不能盖住光标那一行");
+        let tight = Bounds::from_corners(point(px(40.), px(108.)), point(px(42.), px(132.)));
+        let flipped_off_caret = super::place_preview(link, Some(tight), viewport);
+        assert!(flipped_off_caret.above, "光标紧挨着链接时翻到上方，而不是盖住光标");
+        assert!(flipped_off_caret.origin.y <= link.top());
+    }
+
+    #[test]
+    fn excerpt_keeps_inline_markdown_for_the_preview_renderer() {
+        let doc = Document::from_text("see **粗** and ==亮==\n");
+        let text = excerpt(&doc, None).unwrap();
+        assert!(text.contains("**粗**"), "{text}");
+        assert!(text.contains("==亮=="), "{text}");
     }
 }
