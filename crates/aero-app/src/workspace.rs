@@ -3382,6 +3382,39 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn dropping_a_tree_note_onto_the_editor_inserts_a_link(cx: &mut TestAppContext) {
+        use gpui_kit::{Modifiers, MouseButton, point, px};
+        let (_dir, _data, workspace) = open(cx, Some("正文\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let body = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                workspace.read(cx).open.as_ref().unwrap().editor.as_ref().unwrap().read(cx).index_snapshot().1
+            })
+        };
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let from = cx.debug_bounds("file-tree-note:a.md").unwrap().center();
+        let onto = cx.debug_bounds("editor").unwrap().center();
+        let drag = |cx: &mut VisualTestContext, modifiers: Modifiers| {
+            cx.simulate_mouse_move(from, None, Modifiers::default());
+            cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+            cx.simulate_mouse_move(from + point(px(16.), px(0.)), MouseButton::Left, Modifiers::default());
+            cx.simulate_mouse_move(onto, MouseButton::Left, modifiers);
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_mouse_up(onto, MouseButton::Left, modifiers);
+            cx.run_until_parked();
+        };
+        drag(cx, Modifiers::default());
+        let text = body(cx);
+        assert!(text.contains("[[a]]"), "{text}");
+        assert!(!text.contains("![[a]]"), "{text}");
+        let mut alt = Modifiers::default();
+        alt.alt = true;
+        drag(cx, alt);
+        let text = body(cx);
+        assert!(text.contains("![[a]]"), "{text}");
+    }
+
+    #[gpui_kit::test]
     fn link_preview_setting_is_saved_and_restored(cx: &mut TestAppContext) {
         use crate::paths::LinkPreviewMode;
         let (_dir, data, workspace) = open(cx, Some("body\n"));

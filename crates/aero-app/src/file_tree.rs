@@ -37,14 +37,15 @@ struct RenameInput {
     _subscription: Subscription,
 }
 
+/// 文件树里拖出来的一项。编辑区接受笔记（插入链接），树内接受移动。
 #[derive(Clone)]
-struct DragEntry {
-    vault: String,
-    path: VaultPath,
-    directory: bool,
+pub(crate) struct TreeDrag {
+    pub(crate) vault: String,
+    pub(crate) path: VaultPath,
+    pub(crate) directory: bool,
 }
 
-impl DragEntry {
+impl TreeDrag {
     fn target(&self, vault: &str, directory: &str) -> Option<VaultPath> {
         if self.vault != vault
             || (self.directory
@@ -62,7 +63,7 @@ impl DragEntry {
     }
 }
 
-impl Render for DragEntry {
+impl Render for TreeDrag {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .px_3()
@@ -443,7 +444,7 @@ impl FileTree {
                 .child(Icon::new(IconName::Folder).size(px(14.)).text_color(muted))
                 .child(div().flex_1().truncate().child(name))
                 .on_drag(
-                    DragEntry {
+                    TreeDrag {
                         vault: self.vault.id().into(),
                         path: VaultPath::new(&path).expect("folder path"),
                         directory: true,
@@ -454,10 +455,10 @@ impl FileTree {
                     let vault = self.vault.id().to_owned();
                     let path = path.clone();
                     move |value, _, _| {
-                        value.downcast_ref::<DragEntry>().is_some_and(|d| d.target(&vault, &path).is_some())
+                        value.downcast_ref::<TreeDrag>().is_some_and(|d| d.target(&vault, &path).is_some())
                     }
                 })
-                .drag_over::<DragEntry>({
+                .drag_over::<TreeDrag>({
                     let vault = self.vault.id().to_owned();
                     let path = path.clone();
                     move |style, drag, _, _| {
@@ -466,7 +467,7 @@ impl FileTree {
                 })
                 .on_drop(cx.listener({
                     let path = path.clone();
-                    move |this, drag: &DragEntry, _, cx| {
+                    move |this, drag: &TreeDrag, _, cx| {
                         if let Some(to) = drag.target(this.vault.id(), &path) {
                             cx.emit(FileTreeEvent::Move { from: drag.path.clone(), to });
                         }
@@ -529,7 +530,7 @@ impl FileTree {
                         )
                     })
                     .on_drag(
-                        DragEntry { vault: self.vault.id().into(), path: path.clone(), directory: false },
+                        TreeDrag { vault: self.vault.id().into(), path: path.clone(), directory: false },
                         |drag, _, _, cx| cx.new(|_| drag.clone()),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| this.open(path.clone(), window, cx)))
@@ -578,7 +579,7 @@ impl FileTree {
                     // 双击用系统应用打开（只读，4.1）
                     .on_click(move |event, _, cx| {
                         if matches!(event, ClickEvent::Mouse(click) if click.down.click_count >= 2) {
-                            cx.open_url(&format!("file://{}", file.display()));
+                            cx.open_url(&crate::paths::file_url(&file));
                         }
                     })
                     .into_any_element()
@@ -653,10 +654,10 @@ impl Render for FileTree {
                     .can_drop({
                         let vault = self.vault.id().to_owned();
                         move |value, _, _| {
-                            value.downcast_ref::<DragEntry>().is_some_and(|d| d.target(&vault, "").is_some())
+                            value.downcast_ref::<TreeDrag>().is_some_and(|d| d.target(&vault, "").is_some())
                         }
                     })
-                    .drag_over::<DragEntry>({
+                    .drag_over::<TreeDrag>({
                         let vault = self.vault.id().to_owned();
                         move |style, drag, _, cx| {
                             if drag.target(&vault, "").is_some() {
@@ -666,7 +667,7 @@ impl Render for FileTree {
                             }
                         }
                     })
-                    .on_drop(cx.listener(|this, drag: &DragEntry, _, cx| {
+                    .on_drop(cx.listener(|this, drag: &TreeDrag, _, cx| {
                         if let Some(to) = drag.target(this.vault.id(), "") {
                             cx.emit(FileTreeEvent::Move { from: drag.path.clone(), to });
                         }
@@ -837,7 +838,7 @@ mod tests {
 
     #[test]
     fn tree_drop_rejects_cross_vault_and_noop_targets() {
-        let drag = super::DragEntry {
+        let drag = super::TreeDrag {
             vault: "one".into(),
             path: aero_core::VaultPath::new("dir/n.md").unwrap(),
             directory: false,

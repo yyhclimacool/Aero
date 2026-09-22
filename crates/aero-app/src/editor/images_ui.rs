@@ -5,10 +5,34 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use aero_core::Edit;
+use aero_core::{Edit, VaultPath};
 
 use crate::actions::{CloseImageViewer, PasteAttachment};
 use crate::render::{Attachment, RenderService, State};
+
+fn remote_scheme(url: &str) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else { return false };
+    matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https" | "mailto" | "ftp")
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
 
 /// 剪贴板位图的落地后缀；GPUI 在 macOS 上给的是 PNG / TIFF 等有限几种。
 fn image_extension(image: &gpui_kit::Image) -> &'static str {
@@ -89,10 +113,59 @@ impl super::Editor {
                 Err(error) => failures.push(error),
             }
         }
+        self.import_files(&files, &mut pieces, &mut failures, cx);
+        self.finish_import(pieces, failures, window, cx);
+    }
+
+    /// Finder 拖进编辑区：和 `⌘V` 的文件规则相同（`ui_design.md` 7.6 / 7.5）。
+    pub(super) fn drop_external_files(
+        &mut self,
+        paths: &gpui_kit::ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut pieces = Vec::new();
+        let mut failures = Vec::new();
+        self.import_files(paths.paths(), &mut pieces, &mut failures, cx);
+        self.finish_import(pieces, failures, window, cx);
+    }
+
+    /// 文件树拖进编辑区：插入 `[[笔记]]`；按住 ⌥ 插入 `![[笔记]]`。文件夹不接收。
+    pub(super) fn drop_tree_note(
+        &mut self,
+        drag: &crate::file_tree::TreeDrag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if drag.directory || drag.vault != self.vault.id() {
+            return;
+        }
+        let bare = drag.path.as_str().strip_suffix(".md").unwrap_or(drag.path.as_str());
+        let Some(target) = aero_core::links::escape_target(bare) else {
+            window.push_notification(
+                Notification::error(format!("笔记名 {bare} 无法写进链接")).title("插入链接"),
+                cx,
+            );
+            return;
+        };
+        let text = if window.modifiers().alt { format!("![[{target}]]") } else { format!("[[{target}]]") };
+        self.insert_at_cursor(&text, window, cx);
+    }
+
+    fn import_files(
+        &mut self,
+        files: &[std::path::PathBuf],
+        pieces: &mut Vec<String>,
+        failures: &mut Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
         for file in files {
+            if file.is_dir() {
+                continue;
+            }
             let name = file.file_name().map(|n| n.to_string_lossy().into_owned());
             let extension = file.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
-            match std::fs::read(&file) {
+            match std::fs::read(file) {
                 Ok(bytes) => match self.import_attachment(name.as_deref(), &extension, &bytes, cx) {
                     Ok(text) => pieces.push(text),
                     Err(error) => failures.push(error),
@@ -100,6 +173,15 @@ impl super::Editor {
                 Err(error) => failures.push(format!("{}：{error}", file.display())),
             }
         }
+    }
+
+    fn finish_import(
+        &mut self,
+        pieces: Vec<String>,
+        failures: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         for error in &failures {
             log::warn!("import attachment: {error}");
         }
@@ -151,6 +233,46 @@ impl super::Editor {
         let text = if self.focused.is_some() { text.to_owned() } else { format!("\n\n{text}\n") };
         let at = range.start + text.len();
         self.structural_edit(Edit::replace(range, text), at, window, cx);
+    }
+
+    /// 预览里点到的不是笔记链接：网页原样打开；相对路径按附件找真实文件，避免把 `notes.zip` 交给系统报 -50。
+    pub(super) fn open_external_link(&self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let url = url.trim();
+        if remote_scheme(url) {
+            cx.open_url(url);
+            return;
+        }
+        if let Some(path) = self.local_file(url) {
+            cx.open_url(&crate::paths::file_url(&path));
+            return;
+        }
+        if url.split_once(':').is_some_and(|(scheme, _)| scheme.bytes().all(|b| b.is_ascii_alphabetic())) {
+            cx.open_url(url);
+            return;
+        }
+        window.push_notification(Notification::error(format!("找不到文件 {url}")).title("打开文件"), cx);
+    }
+
+    fn local_file(&self, url: &str) -> Option<std::path::PathBuf> {
+        let target = url.trim().trim_matches(|c| c == '<' || c == '>');
+        let target = percent_decode(target);
+        let target = target.trim_start_matches("./");
+        if target.is_empty() || target.contains("..") {
+            return None;
+        }
+        let mut candidates = Vec::new();
+        if let Some(name) = std::path::Path::new(&target).file_name() {
+            if let Some(assets) = self.path.assets_dir() {
+                candidates.push(format!("{}/{}", assets.as_str(), name.to_string_lossy()));
+            }
+        }
+        let parent = self.path.parent();
+        candidates.push(if parent.is_empty() { target.to_owned() } else { format!("{parent}/{target}") });
+        candidates.into_iter().find_map(|rel| {
+            let path = VaultPath::new(&rel).ok()?;
+            let file = self.vault.fs_path(&path);
+            file.is_file().then_some(file)
+        })
     }
 
     /// 双击图片。

@@ -3512,6 +3512,54 @@ fn pasting_a_bitmap_imports_it_and_leaves_text_paste_alone(cx: &mut TestAppConte
     assert!(text(&editor, cx).contains("粘来的文字"), "{:?}", text(&editor, cx));
 }
 
+/// 点导入进来的普通文件链接，要打开 `.assets/` 里的真实文件，而不是把相对路径交给系统。
+#[gpui_kit::test]
+fn clicking_an_imported_file_link_opens_the_asset(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "[notes.zip](notes.zip)\n");
+    std::fs::create_dir_all(dir.path().join("a.assets")).unwrap();
+    std::fs::write(dir.path().join("a.assets/我的 notes.zip"), b"archive").unwrap();
+    let visual = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    visual.update(|window, cx| {
+        editor.update(cx, |e, cx| e.open_external_link("https://example.com", window, cx));
+    });
+    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+    visual.update(|window, cx| {
+        editor.update(cx, |e, cx| e.open_external_link("我的%20notes.zip", window, cx));
+    });
+    let url = cx.opened_url().unwrap();
+    assert!(url.starts_with("file:///"), "{url}");
+    assert!(url.contains("%20"), "{url}");
+    assert!(url.contains("notes.zip"), "{url}");
+    assert!(!url.contains('我') && !url.contains(' '), "{url}");
+}
+
+/// 拖到编辑区的文件和 `⌘V` 同一套规则：图片变嵌入，其他文件变链接（`ui_design.md` 7.6）。
+#[gpui_kit::test]
+fn dropping_files_onto_the_editor_imports_them(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "正文\n");
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("shot.png"), image_bytes(8, 8)).unwrap();
+    std::fs::write(outside.path().join("notes.zip"), b"archive").unwrap();
+    std::fs::create_dir(outside.path().join("跳过")).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let position = cx.debug_bounds("editor").unwrap().center();
+    let paths = gpui_kit::ExternalPaths(
+        [outside.path().join("shot.png"), outside.path().join("notes.zip"), outside.path().join("跳过")]
+            .into_iter()
+            .collect(),
+    );
+    cx.simulate_event(gpui_kit::FileDropEvent::Entered { position, paths });
+    cx.simulate_event(gpui_kit::FileDropEvent::Submit { position });
+    cx.run_until_parked();
+    let body = text(&editor, cx);
+    assert!(body.contains("![[shot.png]]"), "{body}");
+    assert!(body.contains("[notes.zip](notes.zip)"), "{body}");
+    assert!(!body.contains("跳过"), "文件夹不导入: {body}");
+    assert_eq!(std::fs::read(dir.path().join("a.assets/shot.png")).unwrap(), image_bytes(8, 8));
+    assert_eq!(std::fs::read(dir.path().join("a.assets/notes.zip")).unwrap(), b"archive");
+}
+
 /// Finder 里复制的文件：图片 / PDF 变嵌入，其他文件变普通链接，原名保留且不覆盖同名文件。
 #[gpui_kit::test]
 fn pasting_external_files_imports_them_with_their_names(cx: &mut TestAppContext) {

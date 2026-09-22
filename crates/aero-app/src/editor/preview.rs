@@ -139,10 +139,11 @@ pub(super) fn markdown(
                 }
             }
         })
-        .on_link_click(move |url, event, _window, cx| match link_click(url, event) {
+        .on_link_click(move |url, event, window, cx| match link_click(url, event) {
             LinkClick::Ignore => {}
-            // 外部链接保持默认行为：系统浏览器打开
-            LinkClick::External => cx.open_url(url),
+            LinkClick::External => {
+                editor.update(cx, |editor, cx| editor.open_external_link(url, window, cx));
+            }
             LinkClick::Note { target, fragment } => editor.update(cx, |_, cx| {
                 cx.emit(super::EditorEvent::LinkClicked { target, fragment });
             }),
@@ -506,9 +507,11 @@ fn highlight_html(
             )
             .style(style.clone())
             .selectable(false)
-            .on_link_click(move |url, event, _, cx| match link_click(url, event) {
+            .on_link_click(move |url, event, window, cx| match link_click(url, event) {
                 LinkClick::Ignore => {}
-                LinkClick::External => cx.open_url(url),
+                LinkClick::External => {
+                    editor.update(cx, |editor, cx| editor.open_external_link(url, window, cx));
+                }
                 LinkClick::Note { target, fragment } => editor.update(cx, |_, cx| {
                     cx.emit(super::EditorEvent::LinkClicked { target, fragment });
                 }),

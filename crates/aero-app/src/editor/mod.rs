@@ -2447,6 +2447,7 @@ impl Render for Editor {
 
         div()
             .id("editor")
+            .debug_selector(|| "editor".into())
             .key_context("Editor")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_block_up))
@@ -2473,6 +2474,20 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_copy_selected))
             .on_action(cx.listener(Self::on_cut_selected))
             .on_action(cx.listener(Self::on_paste_attachment))
+            .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, window, cx| {
+                this.drop_external_files(paths, window, cx);
+            }))
+            .on_drop(cx.listener(|this, drag: &crate::file_tree::TreeDrag, window, cx| {
+                this.drop_tree_note(drag, window, cx);
+            }))
+            .can_drop(|value, _, _| {
+                value.downcast_ref::<gpui_kit::ExternalPaths>().is_some()
+                    || value.downcast_ref::<crate::file_tree::TreeDrag>().is_some_and(|drag| !drag.directory)
+            })
+            .drag_over::<gpui_kit::ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().list_active))
+            .drag_over::<crate::file_tree::TreeDrag>(|style, drag, _, cx| {
+                if drag.directory { style } else { style.bg(cx.theme().list_active) }
+            })
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)

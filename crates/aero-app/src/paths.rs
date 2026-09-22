@@ -84,9 +84,32 @@ impl PersistedState {
     }
 }
 
+/// 本地文件的 `file://` URL。路径按字节百分号编码，斜杠保留，避免空格和中文让系统报 -50。
+pub fn file_url(path: &Path) -> String {
+    let mut url = String::from("file://");
+    for byte in path.to_string_lossy().bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                url.push(byte as char)
+            }
+            _ => url.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_url_encodes_spaces_and_keeps_slashes() {
+        let url = file_url(Path::new("/Users/a/我的 文件.zip"));
+        assert!(url.starts_with("file:///Users/a/"));
+        assert!(url.contains("%20"));
+        assert!(!url.contains(' '));
+        assert!(url.ends_with(".zip"));
+    }
 
     #[test]
     fn link_preview_mode_roundtrips_and_defaults_when_missing() {
