@@ -214,6 +214,7 @@ impl Workspace {
                     _subscriptions: vec![sub, search_sub, view_sub, watch_sub, backlinks_sub, images_sub],
                 });
                 self.error = None;
+                self.refresh_attachment_references(cx);
                 self.state.touch_vault(vault.root());
                 self.state.save(&self.data_dir);
                 // 默认打开最近修改的一篇；没有则停在空编辑区
@@ -229,6 +230,26 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    /// 后台扫一遍附件引用（读每篇笔记的正文），算完把报告交给文件树标"未引用"。
+    /// 打开 vault 与附件 / 目录变化后各算一次；只在笔记里加减引用不会立刻刷新计数。
+    fn refresh_attachment_references(&self, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        let (vault, tree) = (open.vault.clone(), open.tree.clone());
+        cx.spawn(async move |_, cx| {
+            let report = cx
+                .background_spawn(async move {
+                    aero_core::attachments::References::read(&vault)
+                        .map_err(|error| log::warn!("attachment references: {error}"))
+                        .ok()
+                })
+                .await;
+            if let Some(report) = report {
+                let _ = tree.update(cx, |tree, cx| tree.set_references(report, cx));
+            }
+        })
+        .detach();
     }
 
     fn on_open_vault(&mut self, _: &OpenVault, window: &mut Window, cx: &mut Context<Self>) {
@@ -1243,6 +1264,9 @@ impl Workspace {
         }
         // 附件变化只影响渲染缓存：外部换了图，打开中的笔记下一帧就重新渲染
         open.images.update(cx, |s, cx| s.invalidate(&batch.attachments, cx));
+        if !batch.attachments.is_empty() || batch.rescan {
+            self.refresh_attachment_references(cx);
+        }
         // 被嵌入的笔记变了：丢掉嵌入缓存重读，嵌入块跟着更新
         if let Some(editor) = &editor {
             let changed: Vec<VaultPath> = batch.changed.iter().chain(&batch.removed).cloned().collect();

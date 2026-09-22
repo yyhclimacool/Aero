@@ -138,14 +138,32 @@ impl Folder {
 
 #[derive(Clone, Debug)]
 enum Row {
-    Folder { path: String, name: String, depth: usize, expanded: bool },
-    Note { path: VaultPath, depth: usize },
+    Folder {
+        path: String,
+        name: String,
+        depth: usize,
+        expanded: bool,
+    },
+    Note {
+        path: VaultPath,
+        depth: usize,
+    },
+    /// `<note>.assets/` 里的附件；默认折叠，点笔记行上的 📎 展开（`ui_design.md` 4.1）
+    Attachment {
+        path: VaultPath,
+        depth: usize,
+    },
 }
 
 pub struct FileTree {
     vault: Arc<Vault>,
     root: Folder,
+    /// 展开的文件夹路径，以及展开了附件的笔记路径（笔记路径带 `.md`，不会与文件夹撞）
     expanded: HashSet<String>,
+    /// 笔记 → 它 `<note>.assets/` 下的附件
+    attachments: BTreeMap<VaultPath, Vec<VaultPath>>,
+    /// 引用计数报告（后台扫描得来）；没有就不显示"未引用"
+    references: Option<aero_core::attachments::References>,
     rows: Vec<Row>,
     row_sizes: Rc<Vec<Size<Pixels>>>,
     selected: Option<VaultPath>,
@@ -163,6 +181,8 @@ impl FileTree {
             vault,
             root: Folder::default(),
             expanded: HashSet::new(),
+            attachments: BTreeMap::new(),
+            references: None,
             rows: Vec::new(),
             row_sizes: Rc::new(Vec::new()),
             selected: None,
@@ -181,7 +201,7 @@ impl FileTree {
         this
     }
 
-    /// 重新枚举磁盘上的笔记和目录（包括空目录）。
+    /// 重新枚举磁盘上的笔记和目录（包括空目录）与每篇笔记的附件。
     pub fn rescan(&mut self) {
         match self.vault.notes().and_then(|notes| self.vault.folders().map(|folders| (notes, folders))) {
             Ok((notes, folders)) => {
@@ -190,7 +210,31 @@ impl FileTree {
             }
             Err(e) => self.error = Some(e.to_string()),
         }
+        // 附件只按后缀枚举、不读内容；枚举失败不影响笔记树
+        self.attachments.clear();
+        if let Ok(catalog) = aero_core::attachments::Catalog::read(&self.vault) {
+            for entry in catalog.entries {
+                if let Some(note) = owner_note(&entry.path) {
+                    self.attachments.entry(note).or_default().push(entry.path);
+                }
+            }
+        }
         self.rebuild_rows();
+    }
+
+    /// 后台扫出来的引用计数（工作区送进来）：用来标出没人引用的附件。
+    pub fn set_references(&mut self, references: aero_core::attachments::References, cx: &mut Context<Self>) {
+        self.references = Some(references);
+        cx.notify();
+    }
+
+    /// 笔记行上的 📎：展开 / 收起它的附件。
+    fn toggle_attachments(&mut self, note: &VaultPath, cx: &mut Context<Self>) {
+        if !self.expanded.remove(note.as_str()) {
+            self.expanded.insert(note.as_str().to_owned());
+        }
+        self.rebuild_rows();
+        cx.notify();
     }
 
     /// 树里是否有这篇笔记（上次 `rescan` 时磁盘上的、且没被忽略规则过滤掉）。
@@ -251,7 +295,13 @@ impl FileTree {
     }
 
     fn rebuild_rows(&mut self) {
-        fn walk(f: &Folder, depth: usize, expanded: &HashSet<String>, out: &mut Vec<Row>) {
+        fn walk(
+            f: &Folder,
+            depth: usize,
+            expanded: &HashSet<String>,
+            attachments: &BTreeMap<VaultPath, Vec<VaultPath>>,
+            out: &mut Vec<Row>,
+        ) {
             for sub in &f.folders {
                 let is_open = expanded.contains(&sub.path);
                 out.push(Row::Folder {
@@ -261,15 +311,20 @@ impl FileTree {
                     expanded: is_open,
                 });
                 if is_open {
-                    walk(sub, depth + 1, expanded, out);
+                    walk(sub, depth + 1, expanded, attachments, out);
                 }
             }
             for n in &f.notes {
                 out.push(Row::Note { path: n.clone(), depth });
+                if expanded.contains(n.as_str()) {
+                    for file in attachments.get(n).into_iter().flatten() {
+                        out.push(Row::Attachment { path: file.clone(), depth: depth + 1 });
+                    }
+                }
             }
         }
         let mut rows = Vec::new();
-        walk(&self.root, 0, &self.expanded, &mut rows);
+        walk(&self.root, 0, &self.expanded, &self.attachments, &mut rows);
         self.row_sizes = Rc::new(vec![size(px(200.), px(ROW_HEIGHT)); rows.len()]);
         self.rows = rows;
     }
@@ -348,10 +403,12 @@ impl FileTree {
         let muted = theme.muted_foreground;
         let hover = theme.list_hover;
         let active = theme.list_active;
+        let warning = theme.warning;
         let indent = |depth: usize| px(8. + depth as f32 * 14.);
         let row_path = match &self.rows[ix] {
             Row::Folder { path, .. } => path.as_str(),
-            Row::Note { path, .. } => path.as_str(),
+            // 附件不参与行内重命名（改名要连着引用一起改，见 11 节）
+            Row::Note { path, .. } | Row::Attachment { path, .. } => path.as_str(),
         };
         if let Some(edit) = self.rename_input.as_ref().filter(|edit| edit.path.as_str() == row_path) {
             return div()
@@ -448,6 +505,29 @@ impl FileTree {
                     .text_sm()
                     .child(Icon::new(IconName::FileText).size(px(14.)).text_color(muted))
                     .child(div().flex_1().truncate().child(path.stem().to_owned()))
+                    // 📎 与附件数：点它展开 / 收起附件，不打开笔记（4.1）
+                    .when_some(self.attachments.get(&path).map(Vec::len).filter(|n| *n > 0), |el, count| {
+                        let note = path.clone();
+                        el.child(
+                            div()
+                                .id(("clip", ix))
+                                .debug_selector({
+                                    let note = note.clone();
+                                    move || format!("file-tree-clip:{note}")
+                                })
+                                .px_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(muted)
+                                .hover(move |s| s.bg(hover))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_attachments(&note, cx);
+                                }))
+                                .child(format!("📎{count}")),
+                        )
+                    })
                     .on_drag(
                         DragEntry { vault: self.vault.id().into(), path: path.clone(), directory: false },
                         |drag, _, _, cx| cx.new(|_| drag.clone()),
@@ -463,8 +543,54 @@ impl FileTree {
                     })
                     .into_any_element()
             }
+            Row::Attachment { path, depth } => {
+                // 报告还没算出来时不显示"未引用"，免得把正常附件误标成孤儿
+                let unreferenced = self.references.as_ref().is_some_and(|r| r.count(&path) == 0);
+                let file = self.vault.fs_path(&path);
+                h_flex()
+                    .id(("attachment", ix))
+                    .debug_selector({
+                        let rel = path.as_str().to_owned();
+                        move || format!("file-tree-attachment:{rel}")
+                    })
+                    .h(px(ROW_HEIGHT))
+                    .pl(indent(depth) + px(32.))
+                    .pr_2()
+                    .gap_1()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(div().flex_1().truncate().child(path.file_name().to_owned()))
+                    .when(unreferenced, |el| {
+                        el.child(
+                            div()
+                                .debug_selector({
+                                    let rel = path.as_str().to_owned();
+                                    move || format!("file-tree-orphan:{rel}")
+                                })
+                                .text_color(warning)
+                                .child("未引用"),
+                        )
+                    })
+                    // 双击用系统应用打开（只读，4.1）
+                    .on_click(move |event, _, cx| {
+                        if matches!(event, ClickEvent::Mouse(click) if click.down.click_count >= 2) {
+                            cx.open_url(&format!("file://{}", file.display()));
+                        }
+                    })
+                    .into_any_element()
+            }
         }
     }
+}
+
+/// `notes/a.assets/x.png` → `notes/a.md`；不在某篇笔记附件目录里的附件返回 `None`。
+fn owner_note(path: &VaultPath) -> Option<VaultPath> {
+    let at = path.as_str().find(".assets/")?;
+    VaultPath::new(&format!("{}.md", &path.as_str()[..at])).ok()
 }
 
 impl Render for FileTree {
@@ -728,5 +854,65 @@ mod tests {
         cx.simulate_keystrokes("f2");
         draw(cx);
         assert!(cx.debug_bounds("file-tree-rename-input").is_some());
+    }
+
+    /// `<note>.assets/` 默认折叠：笔记行上显示 📎 与附件数，点开才列出来；
+    /// 后台算出的引用报告把没人引用的标成"未引用"。
+    #[gpui_kit::test]
+    fn attachments_fold_under_their_note_and_mark_unreferenced_ones(cx: &mut TestAppContext) {
+        let (dir, vault, tree) = setup(cx);
+        std::fs::create_dir_all(dir.path().join("source/a.assets")).unwrap();
+        std::fs::write(dir.path().join("source/a.assets/used.png"), b"png").unwrap();
+        std::fs::write(dir.path().join("source/a.assets/orphan.png"), b"png").unwrap();
+        std::fs::write(dir.path().join("source/a.md"), "# A\n\n![[used.png]]\n").unwrap();
+        // 附件目录本身不出现在树里
+        cx.update(|cx| {
+            tree.update(cx, |t, cx| {
+                t.rescan();
+                cx.notify();
+            })
+        });
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        draw(cx);
+        assert!(cx.debug_bounds("file-tree-folder:source/a.assets").is_none(), "附件目录不当文件夹显示");
+        assert!(cx.debug_bounds("file-tree-attachment:source/a.assets/used.png").is_none(), "默认折叠");
+        let clip = cx.debug_bounds("file-tree-clip:source/a.md").expect("笔记行应有 📎 徽标");
+
+        // 点 📎 展开：两个附件都列出来，且不会顺带打开笔记
+        cx.simulate_click(clip.center(), Modifiers::default());
+        draw(cx);
+        cx.update(|_, cx| assert_eq!(tree.read(cx).selected(), None, "点徽标不选中 / 不打开笔记"));
+        for name in ["used.png", "orphan.png"] {
+            let selector = format!("file-tree-attachment:source/a.assets/{name}");
+            assert!(
+                cx.update(|_, cx| tree.read(cx).rows.iter().any(|row| matches!(
+                    row,
+                    Row::Attachment { path, .. } if path.file_name() == name
+                ))),
+                "{selector} 应有附件行"
+            );
+        }
+        // 报告还没来时不标"未引用"
+        assert!(cx.debug_bounds("file-tree-orphan:source/a.assets/orphan.png").is_none());
+
+        let report = aero_core::attachments::References::read(&vault).unwrap();
+        cx.update(|_, cx| tree.update(cx, |t, cx| t.set_references(report, cx)));
+        draw(cx);
+        assert!(
+            cx.debug_bounds("file-tree-orphan:source/a.assets/orphan.png").is_some(),
+            "没人引用的附件要标出来"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-orphan:source/a.assets/used.png").is_none(),
+            "被引用的不该标未引用"
+        );
+
+        // 再点一次收起
+        let clip = cx.debug_bounds("file-tree-clip:source/a.md").unwrap();
+        cx.simulate_click(clip.center(), Modifiers::default());
+        draw(cx);
+        cx.update(|_, cx| {
+            assert!(!tree.read(cx).rows.iter().any(|row| matches!(row, Row::Attachment { .. })));
+        });
     }
 }

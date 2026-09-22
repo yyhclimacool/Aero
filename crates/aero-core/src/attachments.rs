@@ -147,6 +147,73 @@ fn resolution(paths: Vec<VaultPath>) -> Resolution {
     }
 }
 
+/// 附件引用报告（方案 5.4 / 10.2）：每个附件被引用几次，没人引用的就是孤儿。
+///
+/// 只数**实际生效**的引用：`![[附件]]` 嵌入、普通 Markdown 图片 / 链接、生效的引用式定义；
+/// 代码、数学、转义里的写法不算（与改名事务共用同一套扫描）。按出现次数计，与反链一致。
+#[derive(Debug, Default, Clone)]
+pub struct References {
+    counts: std::collections::BTreeMap<VaultPath, usize>,
+}
+
+impl References {
+    /// 扫描整库：枚举附件 + 读每篇笔记的正文。会读盘，放后台跑。
+    /// 个别笔记读不出来（权限、非 UTF-8）只跳过它，不让一篇坏文件毁掉整份报告。
+    pub fn read(vault: &Vault) -> Result<References, VaultError> {
+        let catalog = Catalog::read(vault)?;
+        let mut counts: std::collections::BTreeMap<_, _> =
+            catalog.entries.iter().map(|e| (e.path.clone(), 0)).collect();
+        for note in vault.notes()? {
+            let Ok((bytes, _)) = vault.read_bytes(&note) else { continue };
+            let Ok(text) = String::from_utf8(bytes) else { continue };
+            let embeds = links::scan_embeds(&text).into_iter().map(|e| e.target);
+            let markdown =
+                crate::markdown_links::destinations(&text).unwrap_or_default().into_iter().map(|d| d.url);
+            for target in embeds.chain(markdown) {
+                // 普通 Markdown 地址可能带锚点 / 查询，也可能写成 `../`
+                let target = target.split(['#', '?']).next().unwrap_or(&target);
+                let Some(target) = rebase(note.parent(), target) else { continue };
+                if let Resolution::Resolved { path, .. } = catalog.resolve(&target, &note) {
+                    *counts.entry(path).or_insert(0) += 1;
+                }
+            }
+        }
+        Ok(References { counts })
+    }
+
+    pub fn count(&self, path: &VaultPath) -> usize {
+        self.counts.get(path).copied().unwrap_or(0)
+    }
+
+    /// 一次都没被引用的附件，按路径排序。
+    pub fn orphans(&self) -> Vec<&VaultPath> {
+        self.counts.iter().filter(|(_, n)| **n == 0).map(|(p, _)| p).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+}
+
+/// 把 `./` 与 `../` 归到 vault 内的路径；越过根目录就当解析不了。
+/// 不带 `.` 段的目标原样返回，仍由 [`Catalog::resolve`] 按"本篇 `.assets/` → 同级 → 唯一文件名"解析。
+fn rebase(dir: &str, target: &str) -> Option<String> {
+    if !target.split('/').any(|seg| seg == "." || seg == "..") {
+        return Some(target.to_owned());
+    }
+    let mut segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    for segment in target.split('/') {
+        match segment {
+            "." | "" => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    Some(segments.join("/"))
+}
+
 /// 为一次导入分配附件路径（方案 5.4：附件放在 `<note>.assets/`）。
 /// 有原文件名就沿用（只取文件名、去掉危险字符），重名追加 `-2`、`-3`…；
 /// 剪贴板位图没有名字，用 ULID 后 8 位。分配到的路径此刻在磁盘上一定不存在。
@@ -298,6 +365,54 @@ mod tests {
         std::fs::remove_file(vault.fs_path(&c.entries[0].path)).unwrap();
         assert!(!available(&vault, &c.entries[0].path));
         assert!(!available(&vault, &path("note.assets")));
+    }
+
+    /// 引用计数与孤儿检测：嵌入、普通 Markdown 图片 / 链接、引用式定义都算，代码里的不算。
+    #[test]
+    fn attachment_references_count_real_uses_and_report_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        for file in [
+            "notes/a.assets/used.png",
+            "notes/a.assets/twice.png",
+            "notes/a.assets/orphan.png",
+            "assets/shared.png",
+            "assets/never.pdf",
+        ] {
+            let full = dir.path().join(file);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, b"bytes").unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join("notes")).unwrap();
+        std::fs::write(
+            dir.path().join("notes/a.md"),
+            // 嵌入、带宽度参数的嵌入、普通图片、引用式定义、相对路径，以及代码块里的假引用
+            "![[used.png]]\n\n![[twice.png|200]]\n\n![图](twice.png)\n\n![共享](../assets/shared.png)\n\n\
+             [def]: <used.png> \"标题\"\n\n见 [def]\n\n```\n![[orphan.png]]\n```\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("notes/b.md"), "别处引用 ![[shared.png]]\n").unwrap();
+
+        let report = References::read(&vault).unwrap();
+        let count = |p: &str| report.count(&path(p));
+        assert_eq!(count("notes/a.assets/used.png"), 2, "嵌入 + 生效的引用式定义");
+        assert_eq!(count("notes/a.assets/twice.png"), 2, "嵌入 + 普通图片");
+        assert_eq!(count("assets/shared.png"), 2, "相对路径 + 别处的唯一文件名");
+        assert_eq!(count("notes/a.assets/orphan.png"), 0, "代码块里的写法不算引用");
+        assert_eq!(
+            report.orphans().iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            ["assets/never.pdf", "notes/a.assets/orphan.png"]
+        );
+        assert_eq!(report.count(&path("notes/a.assets/不存在.png")), 0);
+        assert!(!report.is_empty());
+    }
+
+    #[test]
+    fn relative_targets_are_rebased_and_cannot_escape_the_vault() {
+        assert_eq!(rebase("notes", "../assets/x.png").as_deref(), Some("assets/x.png"));
+        assert_eq!(rebase("notes/deep", "./x.png").as_deref(), Some("notes/deep/x.png"));
+        assert_eq!(rebase("", "x.png").as_deref(), Some("x.png"), "没有 . 段就原样交给解析器");
+        assert_eq!(rebase("notes", "../../outside.png"), None);
     }
 
     /// 导入命名：沿用原名、重名不覆盖、无名用 ULID、危险字符不出 `.assets/`。
