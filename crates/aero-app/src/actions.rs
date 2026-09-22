@@ -100,8 +100,18 @@ actions!(
         PasteAttachment,
         /// `⌘⇧H`：把上次用过的颜色应用到选中的文字或选中的块（7.7）
         ApplyLastColor,
+        /// `⌘/`：打开颜色菜单（7.7）。块菜单（5.3）做出来之后它会变成菜单里的"颜色 ▸"
+        OpenColorMenu,
+        /// 颜色菜单里的 `Tab` / `Esc`
+        ConfirmColorMenu,
+        CloseColorMenu,
     ]
 );
+
+/// 颜色菜单里的方向键：`(dx, dy)`，见 `editor::color_menu::step`。
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = editor, no_json)]
+pub struct MoveColorMenu(pub i8, pub i8);
 
 /// `⌘⌥0–8` 转换块类型（`ui_design.md` 6 / 7.1）
 #[derive(Clone, Debug, PartialEq, Eq, Action)]
@@ -161,6 +171,7 @@ pub fn commands() -> Vec<Command> {
         Command::new("redo", "重做", "redo cz", Editor, DocRedo),
         Command::new("edit-link", "插入或编辑链接", "link url insert edit lj", Editor, EditLink),
         Command::new("color-last", "应用上次使用的颜色", "color last ysyd", Editor, ApplyLastColor),
+        Command::new("color-menu", "颜色…", "color palette ys tsb", Editor, OpenColorMenu),
         Command::new("quit", "退出 Aero", "quit exit tc", Global, Quit),
     ];
     use aero_core::inline_format::Format;
@@ -227,6 +238,19 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-s", FormatInline(Format::Strike), Some("Editor > Input")),
         // ⌘⇧H 应用上次用过的颜色（7.7）；没用过菜单时那就是黄色背景，与 `==` 同一条路
         KeyBinding::new("cmd-shift-h", ApplyLastColor, Some("Editor > Input")),
+        // ⌘/ 是块菜单的键位（14 节）；块菜单还没做，先直接打开它唯一做好的那一项——颜色
+        KeyBinding::new("cmd-/", OpenColorMenu, Some("Editor > Input")),
+        // 颜色菜单（7.7）：焦点在菜单的过滤输入框上，这些绑定比控件自己的同键绑定更晚注册，先于它们匹配
+        KeyBinding::new("up", MoveColorMenu(0, -1), Some("ColorMenu > Input")),
+        KeyBinding::new("down", MoveColorMenu(0, 1), Some("ColorMenu > Input")),
+        KeyBinding::new("left", MoveColorMenu(-1, 0), Some("ColorMenu > Input")),
+        KeyBinding::new("right", MoveColorMenu(1, 0), Some("ColorMenu > Input")),
+        // ⏎ 也要显式绑定：编辑器在 `Input` 上下文里把 enter 接成了拆块，那条绑定同样匹配菜单里的输入框
+        KeyBinding::new("enter", ConfirmColorMenu, Some("ColorMenu > Input")),
+        KeyBinding::new("tab", ConfirmColorMenu, Some("ColorMenu > Input")),
+        KeyBinding::new("escape", CloseColorMenu, Some("ColorMenu > Input")),
+        // ⌘/ 是开关：菜单开着时焦点在它自己的输入框上，外面那条绑定匹配不到这里
+        KeyBinding::new("cmd-/", CloseColorMenu, Some("ColorMenu > Input")),
         KeyBinding::new("cmd-z", DocUndo, Some("Input")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Input")),
         // 编辑态里 ⇧↑↓ 越过块边界时升级为块选中；否则 propagate 给控件扩展字符选区
@@ -252,6 +276,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-c", CopySelectedBlocks, Some("Editor")),
         KeyBinding::new("cmd-x", CutSelectedBlocks, Some("Editor")),
         KeyBinding::new("cmd-shift-h", ApplyLastColor, Some("Editor")),
+        KeyBinding::new("cmd-/", OpenColorMenu, Some("Editor")),
     ]);
     cx.bind_keys((0..=8u8).map(|n| KeyBinding::new(&format!("cmd-alt-{n}"), ConvertBlock(n), Some("Input"))));
 
@@ -287,6 +312,7 @@ pub fn init(cx: &mut App) {
             MenuItem::action("行内代码", FormatInline(Format::Code)),
             MenuItem::action("删除线", FormatInline(Format::Strike)),
             MenuItem::action("黄色高亮", FormatInline(Format::Highlight)),
+            MenuItem::action("颜色…", OpenColorMenu),
             MenuItem::action("上次使用的颜色", ApplyLastColor),
         ]),
         Menu::new("视图").items(vec![

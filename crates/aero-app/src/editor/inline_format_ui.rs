@@ -7,7 +7,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.format_inline(action.0, window, cx) {
+        if !self.editing_with_keyboard(window, cx) || !self.format_inline(action.0, window, cx) {
             cx.propagate();
         }
     }
@@ -19,14 +19,10 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(f) = &self.focused else { return false };
-        if self.title_edit.is_some()
-            || !f.textarea.focus_handle(cx).is_focused(window)
-            || self.input_composing(window, cx)
-        {
+        if self.focused.is_none() || self.title_edit.is_some() {
             return false;
         }
-        let f = self.focused.as_ref().unwrap();
+        let f = self.focused.as_ref().expect("已确认在编辑态");
         let selected = f.textarea.read(cx).selected_range();
         let selected = f.range.start + selected.start..f.range.start + selected.end;
         let Some(plan) = aero_core::inline_format::plan(&self.doc.to_string(), selected, format) else {

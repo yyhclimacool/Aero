@@ -308,6 +308,134 @@ fn block_colors_cover_every_selected_block_in_one_undo_group(cx: &mut TestAppCon
     assert_eq!(text(&editor, cx), source);
 }
 
+fn color_menu_open(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> bool {
+    cx.update(|_, cx| editor.read(cx).color_menu.is_some())
+}
+
+/// 打开颜色菜单：画一帧，让焦点真的落到菜单的过滤输入框上（键盘事件按上一帧的树派发）。
+fn open_color_menu(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
+    cx.simulate_keystrokes("cmd-/");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert!(color_menu_open(editor, cx), "颜色菜单没打开");
+}
+
+/// 颜色菜单（7.7）：`⌘/` 打开，输入过滤，⏎ 应用到选中的文字，再打开时当前颜色有选中标记。
+#[gpui_kit::test]
+fn color_menu_filters_and_applies_to_the_selection(cx: &mut TestAppContext) {
+    let source = "正文 中文😀 后文\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "中文😀", cx);
+    open_color_menu(&editor, cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        // 两组 + 默认，一共 20 项；默认选中第一项
+        assert_eq!(e.color_menu_names().len(), 20);
+        assert_eq!(e.color_menu_selected().as_deref(), Some("默认颜色"));
+        assert_eq!(e.color_menu_current(), [None, None]);
+    });
+    // ⌘/ 是开关：再按一次关掉
+    cx.simulate_keystrokes("cmd-/");
+    assert!(!color_menu_open(&editor, cx), "⌘/ 再按一次关掉菜单");
+    open_color_menu(&editor, cx);
+    // 直接输入过滤：中文命中两组的蓝
+    cx.simulate_input("蓝");
+    cx.update(|_, cx| {
+        assert_eq!(editor.read(cx).color_menu_names(), ["蓝色", "蓝色背景"]);
+        assert_eq!(editor.read(cx).color_menu_selected().as_deref(), Some("蓝色"));
+    });
+    // ↓ 换行（过滤后两组各一行），⏎ 应用
+    cx.simulate_keystrokes("down");
+    cx.update(|_, cx| assert_eq!(editor.read(cx).color_menu_selected().as_deref(), Some("蓝色背景")));
+    cx.simulate_keystrokes("up enter");
+    assert!(!color_menu_open(&editor, cx), "确认后菜单关掉");
+    assert_eq!(text(&editor, cx), "正文 [中文😀]{.blue} 后文\n");
+    assert_eq!(selected_inline_text(&editor, cx), "中文😀", "焦点与选区回到正文");
+    // 记住了这次的选择：⌘⇧H 接着用它
+    cx.update(|_, cx| {
+        let last = crate::colors::last(cx);
+        assert_eq!((last.slot, last.color), (aero_core::colors::Slot::Text, "blue"));
+    });
+    // 再打开：当前颜色带选中标记；Esc 关掉且不改文档
+    open_color_menu(&editor, cx);
+    cx.update(|_, cx| {
+        assert_eq!(editor.read(cx).color_menu_current(), [Some("blue".into()), None]);
+    });
+    cx.simulate_keystrokes("escape");
+    assert!(!color_menu_open(&editor, cx));
+    assert_eq!(text(&editor, cx), "正文 [中文😀]{.blue} 后文\n");
+    assert!(cx.update(|_, cx| editor.read(cx).is_editing()), "Esc 只关菜单，还在编辑态");
+}
+
+/// 编辑态没有选区时菜单改当前块；块选中态一次改选中的每一块（7.7）。
+#[gpui_kit::test]
+fn color_menu_colors_blocks_when_no_text_is_selected(cx: &mut TestAppContext) {
+    let source = "第一段\n\n第二段\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    open_color_menu(&editor, cx);
+    cx.simulate_input("bg");
+    cx.update(|_, cx| {
+        // "bg" 整组命中背景色
+        assert_eq!(editor.read(cx).color_menu_names().len(), 10);
+        assert_eq!(editor.read(cx).color_menu_selected().as_deref(), Some("默认背景"));
+    });
+    // → 走到灰色背景再确认
+    cx.simulate_keystrokes("right enter");
+    assert_eq!(text(&editor, cx), "第一段 {.bg-gray}\n\n第二段\n");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let f = e.focused.as_ref().expect("还在编辑态");
+        assert_eq!(f.textarea.read(cx).value(), "第一段", "块属性是尾部标记，文本框里看不到");
+    });
+    // 已经是这个颜色：再打开时它带选中标记
+    open_color_menu(&editor, cx);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).color_menu_current(), [None, Some("gray".into())]));
+    cx.simulate_keystrokes("escape");
+    // 块选中态：两块一起上色，一次撤销退掉
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.select_blocks(0, 1, window, cx);
+        })
+    });
+    open_color_menu(&editor, cx);
+    cx.simulate_input("红色");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "第一段 {.bg-gray .red}\n\n第二段 {.red}\n");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).selected_blocks()), Some(0..2), "选区还在");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "第一段 {.bg-gray}\n\n第二段\n");
+}
+
+/// `/` 菜单里的颜色（7.1）：`/颜色` 开菜单，`/蓝色背景` 直接给当前块上色。
+#[gpui_kit::test]
+fn slash_colors_hit_directly_or_open_the_menu(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "段落\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("end");
+    cx.simulate_input(" /蓝色背景");
+    cx.update(|_, cx| {
+        let m = editor.read(cx).slash.as_ref().expect("菜单开着");
+        assert_eq!(m.matches.len(), 1, "颜色是直接命中");
+    });
+    cx.simulate_keystrokes("enter");
+    // 命令本身删掉，属性写到块末
+    assert_eq!(text(&editor, cx), "段落 {.bg-blue}\n");
+    assert!(!color_menu_open(&editor, cx));
+    // `/颜色` 打开菜单
+    cx.simulate_input(" /颜色");
+    cx.simulate_keystrokes("enter");
+    assert!(color_menu_open(&editor, cx), "/颜色 打开颜色菜单");
+    assert_eq!(text(&editor, cx), "段落 {.bg-blue}\n", "命令文字不留在文档里");
+    cx.update(|_, cx| assert_eq!(editor.read(cx).color_menu_current(), [None, Some("blue".into())]));
+    cx.simulate_keystrokes("escape");
+    assert!(!color_menu_open(&editor, cx));
+}
+
 /// 行内颜色（7.7）：`⌘⇧H` 用上次的颜色包住选区，选区保持在原文字上，预览里上色。
 #[gpui_kit::test]
 fn inline_color_wraps_the_selection_and_paints_it_in_preview(cx: &mut TestAppContext) {
@@ -2275,7 +2403,10 @@ fn slash_menu_converts_block(cx: &mut TestAppContext) {
     let selected_label = |cx: &mut VisualTestContext| {
         cx.update(|_, cx| {
             let m = editor.read(cx).slash.as_ref().expect("menu open");
-            super::slash::ITEMS[m.matches[m.selected]].label
+            match m.matches[m.selected] {
+                super::slash::Match::Item(ix) => super::slash::ITEMS[ix].label.to_owned(),
+                super::slash::Match::Color(ix) => super::color_menu::full_name(ix),
+            }
         })
     };
 

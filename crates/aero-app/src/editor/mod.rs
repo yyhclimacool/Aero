@@ -11,6 +11,7 @@
 
 mod backlinks_ui;
 mod block_refs_ui;
+mod color_menu;
 mod colors_ui;
 mod embeds_ui;
 mod highlight_ui;
@@ -33,8 +34,10 @@ mod units;
 mod wiki;
 mod wiki_ui;
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -147,8 +150,8 @@ struct SlashMenu {
     /// 所在编辑区间的起点：删命令时最多把它前面的空格吃到这里
     block_start: usize,
     query: String,
-    /// 过滤后的条目（`slash::ITEMS` 下标）
-    matches: Vec<usize>,
+    /// 过滤后的候选（固定条目或 7.7 的颜色）
+    matches: Vec<slash::Match>,
     selected: usize,
 }
 
@@ -229,6 +232,10 @@ pub struct Editor {
     picker_open: bool,
     title_edit: Option<TitleEdit>,
     slash: Option<SlashMenu>,
+    /// 颜色菜单（7.7）；开着时焦点在它的过滤输入框上
+    color_menu: Option<colors_ui::ColorMenu>,
+    /// 块选中态里"选区头"那一块的矩形，每帧更新；颜色菜单靠它定位
+    head_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     wiki: Option<wiki::Menu>,
     wiki_generation: u64,
     tag_menu: Option<tags::Menu>,
@@ -298,6 +305,8 @@ impl Editor {
             picker_open: false,
             title_edit: None,
             slash: None,
+            color_menu: None,
+            head_bounds: Rc::default(),
             wiki: None,
             wiki_generation: 0,
             tag_menu: None,
@@ -329,12 +338,15 @@ impl Editor {
         if open {
             self.cancel_link_preview(cx);
             self.slash = None;
+            self.color_menu = None;
             self.wiki = None;
             self.tag_menu = None;
         } else {
             // 同帧恢复再转移焦点可能不触发 Blur，下一帧按命令执行后的实际焦点收尾。
+            // 命令自己打开了弹层（颜色菜单）时焦点在弹层上，不算失焦。
             cx.on_next_frame(window, |this, window, cx| {
                 if !this.picker_open
+                    && this.color_menu.is_none()
                     && this
                         .focused
                         .as_ref()
@@ -777,6 +789,7 @@ impl Editor {
     fn exit_edit(&mut self, cx: &mut Context<Self>) {
         self.cancel_link_preview(cx);
         self.slash = None;
+        self.color_menu = None;
         self.wiki = None;
         self.tag_menu = None;
         if self.focused.take().is_some() {
@@ -796,6 +809,9 @@ impl Editor {
         }
         if self.input_composing(window, cx) {
             cx.propagate();
+            return;
+        }
+        if self.close_color_menu(window, cx) {
             return;
         }
         if self.tag_menu.take().is_some() || self.wiki.take().is_some() {
@@ -1027,8 +1043,8 @@ impl Editor {
             InputEvent::Change => self.on_change(window, cx),
             // ⏎ 由 SplitBlock 动作截获（见 actions.rs）；⇧⏎ 软换行由控件自己插入，随后的 Change 已经写回
             InputEvent::PressEnter { .. } | InputEvent::Focus => {}
-            // 弹层暂借焦点，保留控件和选区供命令执行，但仍按失焦规则保存。
-            InputEvent::Blur if self.picker_open => self.save_now(cx),
+            // 弹层（命令面板、颜色菜单）暂借焦点，保留控件和选区供命令执行，但仍按失焦规则保存。
+            InputEvent::Blur if self.picker_open || self.color_menu.is_some() => self.save_now(cx),
             InputEvent::Blur => self.exit_edit(cx),
         }
     }
@@ -1099,16 +1115,18 @@ impl Editor {
         }
     }
 
-    /// 确认菜单条目：删掉 `/query`，再把所在块转换成目标类型（或插入日期）。两步合成一个撤销组。
+    /// 确认菜单条目：删掉 `/query`，再把所在块转换成目标类型（或插入日期、上色）。合成一个撤销组。
     fn slash_confirm(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = self.slash.take() else { return };
-        let Some(&item_ix) = index.or(Some(menu.selected)).and_then(|i| menu.matches.get(i)) else { return };
-        let action = slash::ITEMS[item_ix].action;
-        // 命令前面的空格（"hello /h" 里的那个）一起删掉，但不越过编辑区间起点
-        let mut start = menu.anchor;
-        while start > menu.block_start && self.doc.slice(start - 1..start) == " " {
-            start -= 1;
-        }
+        let Some(&hit) = index.or(Some(menu.selected)).and_then(|i| menu.matches.get(i)) else { return };
+        let action = match hit {
+            slash::Match::Item(ix) => slash::ITEMS[ix].action,
+            slash::Match::Color(ix) => SlashAction::Color(ix),
+        };
+        // 命令前面的空格（"hello /h" 里的那个）一起删掉，但不越过编辑区间起点。
+        // 按字符串裁而不是逐字节回退：`/` 前面可能是多字节字符（"段落 /红色"），按字节切会切在半个字上
+        let before = self.doc.slice(menu.block_start..menu.anchor).to_string();
+        let start = menu.anchor - (before.len() - before.trim_end_matches(' ').len());
         let command = start..menu.anchor + 1 + menu.query.len();
         match action {
             SlashAction::InsertDate => {
@@ -1124,6 +1142,17 @@ impl Editor {
                 self.focused = None;
                 self.after_doc_change(cx);
                 self.convert_at(command.start, target, true, window, cx);
+            }
+            // `/颜色` 与 `/红色`：先把命令本身删掉，再开菜单 / 直接给这一块上色
+            SlashAction::OpenColors | SlashAction::Color(_) => {
+                self.structural_edit(Edit::delete(command.clone()), command.start, window, cx);
+                match action {
+                    SlashAction::OpenColors => {
+                        self.open_color_menu(window, cx);
+                    }
+                    SlashAction::Color(ix) => self.apply_menu_color(ix, cx),
+                    _ => unreachable!("只有颜色两种"),
+                }
             }
         }
     }
@@ -1944,6 +1973,12 @@ impl Editor {
         self.focused.is_some()
     }
 
+    /// 块选区里"头"那一块（⇧↑↓ 动的那一端）。
+    fn selection_head(&self) -> Option<BlockId> {
+        let sel = self.selection?;
+        self.units.get(sel.head).map(|u| u.id)
+    }
+
     /// 这个块（作为编辑单位）在块选区里。
     fn is_selected_block(&self, id: BlockId) -> bool {
         let Some(sel) = self.selection else { return false };
@@ -2015,21 +2050,32 @@ impl Editor {
                 b.origin + point(px(0.), b.size.height + px(4.))
             }
         };
+        let dark = theme.mode.is_dark();
         let rows: Vec<AnyElement> = menu
             .matches
             .iter()
             .enumerate()
-            .map(|(i, &item_ix)| {
-                let item = &slash::ITEMS[item_ix];
+            .map(|(i, &hit)| {
+                // 颜色候选（7.7）用真实颜色画的 `A` 代替快捷键提示
+                let (label, hint, sample): (SharedString, SharedString, Option<AnyElement>) = match hit {
+                    slash::Match::Item(ix) => {
+                        (slash::ITEMS[ix].label.into(), slash::ITEMS[ix].hint.into(), None)
+                    }
+                    slash::Match::Color(ix) => (
+                        color_menu::full_name(ix).into(),
+                        "".into(),
+                        Some(Self::color_swatch(ix, dark, cx).into_any_element()),
+                    ),
+                };
                 let active = i == menu.selected;
                 h_flex()
                     .id(("slash-item", i))
                     .w_full()
                     .h(px(28.))
                     .px_2()
+                    .gap_2()
                     .rounded(px(4.))
                     .items_center()
-                    .justify_between()
                     .when(active, |el| el.bg(theme.list_active))
                     .hover(|el| el.bg(theme.list_hover))
                     .on_mouse_down(
@@ -2038,8 +2084,11 @@ impl Editor {
                             this.slash_confirm(Some(i), window, cx);
                         }),
                     )
-                    .child(div().text_size(px(13.)).child(item.label))
-                    .child(div().text_size(px(11.)).text_color(theme.muted_foreground).child(item.hint))
+                    .children(sample)
+                    .child(div().flex_1().min_w_0().text_size(px(13.)).child(label))
+                    .child(
+                        div().flex_none().text_size(px(11.)).text_color(theme.muted_foreground).child(hint),
+                    )
                     .into_any_element()
             })
             .collect();
@@ -2335,6 +2384,17 @@ impl Editor {
         } else {
             body
         };
+        // 选区头这一块每帧记下自己的矩形：块选中态里颜色菜单要贴在它下面
+        let body: AnyElement = if self.selection_head() == Some(id) {
+            let cell = self.head_bounds.clone();
+            div()
+                .w_full()
+                .on_children_prepainted(move |bounds, _, _| cell.set(bounds.first().copied()))
+                .child(body)
+                .into_any_element()
+        } else {
+            body
+        };
         let unit = div()
             .id(("unit", id.0))
             .debug_selector(|| format!("unit-{}", id.0))
@@ -2386,6 +2446,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_edit_link))
             .on_action(cx.listener(Self::on_format_inline))
             .on_action(cx.listener(Self::on_apply_last_color))
+            .on_action(cx.listener(Self::on_open_color_menu))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_blur_editor))
             .on_action(cx.listener(Self::on_select_up))
@@ -2433,6 +2494,8 @@ impl Render for Editor {
             )
             .vertical_scrollbar(&self.scroll)
             .children(self.render_link_preview(cx))
+            // 颜色菜单画在编辑器根上：块选中态没有控件可挂，位置由 `color_menu_position` 给
+            .children(self.color_menu.is_some().then(|| self.render_color_menu(cx)))
             .children(self.render_image_viewer(window, cx))
     }
 }

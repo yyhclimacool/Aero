@@ -1,8 +1,10 @@
 //! `/` 块菜单（`ui_design.md` 7.1）的数据部分：条目、触发判定、过滤。纯函数，UI 在 `editor/mod.rs`。
 //!
-//! M1a 的最小集合：文本、标题 1/2/3、无序 / 有序 / 任务列表、引用、代码块、分割线、今天日期。
-//! callout / 数学 / mermaid / 表格 / 图片 / 嵌入 / 属性 / 颜色随对应里程碑加入。
+//! M1a 的最小集合：文本、标题 1/2/3、无序 / 有序 / 任务列表、引用、代码块、分割线、今天日期；
+//! M2 加上颜色（`/颜色` 开菜单，`/红色`、`/蓝色背景` 直接命中，见 7.7）。
+//! callout / 数学 / mermaid / 表格 / 图片 / 嵌入 / 属性随对应里程碑加入。
 
+use super::color_menu;
 use super::ops::BlockType;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,6 +12,19 @@ pub enum SlashAction {
     Convert(BlockType),
     /// 在触发位置插入 `YYYY-MM-DD`
     InsertDate,
+    /// 打开颜色菜单（7.7）
+    OpenColors,
+    /// 直接给当前块上色：`color_menu` 的条目编号
+    Color(usize),
+}
+
+/// 菜单里的一条候选。颜色是按查询即时生成的，不在 [`ITEMS`] 里。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Match {
+    /// [`ITEMS`] 下标
+    Item(usize),
+    /// `color_menu` 的条目编号
+    Color(usize),
 }
 
 pub struct SlashItem {
@@ -83,6 +98,12 @@ pub const ITEMS: &[SlashItem] = &[
         action: SlashAction::Convert(BlockType::Divider),
     },
     SlashItem {
+        label: "颜色",
+        hint: "⌘/",
+        keywords: &["color", "ys", "palette"],
+        action: SlashAction::OpenColors,
+    },
+    SlashItem {
         label: "今天日期",
         hint: "YYYY-MM-DD",
         keywords: &["date", "today", "jtrq", "rq"],
@@ -103,21 +124,27 @@ pub fn trigger(text: &str, cursor: usize) -> Option<(usize, &str)> {
     at_start.then_some((slash, query))
 }
 
-/// 按查询过滤条目，返回 `ITEMS` 下标；空查询返回全部。
+/// 按查询过滤，空查询返回全部固定条目。
 /// 匹配规则：标签包含查询，或任一别名以查询开头（都不区分大小写）。
-pub fn filter(query: &str) -> Vec<usize> {
+///
+/// 颜色（7.7 的 20 项）只在输入了东西之后参与匹配：`/红色`、`/蓝色背景` 是"直接命中"，
+/// 不该把默认菜单刷满；想挑颜色走 `/颜色` 开菜单。
+pub fn filter(query: &str) -> Vec<Match> {
     let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return (0..ITEMS.len()).collect();
-    }
-    ITEMS
+    let items = ITEMS
         .iter()
         .enumerate()
         .filter(|(_, item)| {
-            item.label.to_lowercase().contains(&q) || item.keywords.iter().any(|k| k.starts_with(&q))
+            q.is_empty()
+                || item.label.to_lowercase().contains(&q)
+                || item.keywords.iter().any(|k| k.starts_with(&q))
         })
-        .map(|(i, _)| i)
-        .collect()
+        .map(|(i, _)| Match::Item(i));
+    let colors = match q.is_empty() {
+        true => Vec::new(),
+        false => color_menu::filter(&q).into_iter().map(Match::Color).collect(),
+    };
+    items.chain(colors).collect()
 }
 
 #[cfg(test)]
@@ -138,14 +165,45 @@ mod tests {
         assert_eq!(trigger("no slash", 8), None);
     }
 
+    /// 只取固定条目的标签，颜色候选另外断言。
+    fn labels(query: &str) -> Vec<&'static str> {
+        filter(query)
+            .into_iter()
+            .filter_map(|m| match m {
+                Match::Item(i) => Some(ITEMS[i].label),
+                Match::Color(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn filter_by_label_or_alias() {
         assert_eq!(filter("").len(), ITEMS.len());
-        let code = filter("co");
-        assert_eq!(code.len(), 1);
-        assert_eq!(ITEMS[code[0]].label, "代码块");
-        assert_eq!(filter("标题").len(), 3);
-        assert_eq!(ITEMS[filter("H2")[0]].label, "标题 2");
+        // "co" 同时是 code 与 color 的前缀
+        assert_eq!(labels("co"), ["代码块", "颜色"]);
+        assert_eq!(labels("dmk"), ["代码块"]);
+        assert_eq!(labels("标题").len(), 3);
+        assert_eq!(labels("H2"), ["标题 2"]);
         assert!(filter("zzz").is_empty());
+    }
+
+    /// 颜色是"直接命中"：输入了才出现，`/颜色` 仍然是开菜单那一条（7.1 / 7.7）。
+    #[test]
+    fn colors_join_the_menu_only_once_something_is_typed() {
+        assert!(filter("").iter().all(|m| matches!(m, Match::Item(_))));
+        assert_eq!(labels("颜色"), ["颜色"]);
+        let blue = filter("蓝色背景");
+        assert_eq!(blue.len(), 1);
+        let Match::Color(ix) = blue[0] else { panic!("{blue:?}") };
+        assert_eq!(color_menu::full_name(ix), "蓝色背景");
+        // `/红色` 命中文字色那一项；块类型条目不受影响
+        let red: Vec<String> = filter("红色")
+            .into_iter()
+            .filter_map(|m| match m {
+                Match::Color(ix) => Some(color_menu::full_name(ix)),
+                Match::Item(_) => None,
+            })
+            .collect();
+        assert_eq!(red, ["红色", "红色背景"]);
     }
 }

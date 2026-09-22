@@ -102,6 +102,27 @@ pub fn block_edit(src: &str, block: Range<usize>, slot: Slot, color: Option<&str
     Some(Edit::replace(block, out))
 }
 
+/// 选区当前承载的颜色（菜单画选中标记、工具条显示按下态都要读它）。
+///
+/// 承载者与 [`inline_edit`] 认的是同一批：`[文本]{...}`、紧跟选区的 `{...}`，
+/// 以及等价于黄色背景的 `==文本==`。
+pub fn inline_color(src: &str, selection: Range<usize>, slot: Slot) -> Option<String> {
+    let selected = src.get(selection.clone())?;
+    if selected.is_empty() {
+        return None;
+    }
+    if slot == Slot::Background
+        && src[..selection.start].ends_with("==")
+        && src[selection.end..].starts_with("==")
+    {
+        return Some("yellow".to_owned());
+    }
+    let bracketed = src[..selection.start].ends_with('[') && src[selection.end..].starts_with("]{");
+    let brace = if bracketed { selection.end + 1 } else { selection.end };
+    let (attrs, _) = attrs_at(src, brace)?;
+    slot.color_of(&attrs).map(str::to_owned)
+}
+
 /// 行内颜色的写回方式。
 pub enum Inline {
     Edit(Edit),
@@ -205,7 +226,7 @@ fn render(attrs: &Attrs) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Inline, PALETTE, Slot, block_color, block_edit, inline_edit};
+    use super::{Inline, PALETTE, Slot, block_color, block_edit, inline_color, inline_edit};
     use crate::Document;
 
     /// 在文档上真正应用一次块上色，返回改完的源码。
@@ -301,6 +322,27 @@ mod tests {
         let source = "第一行\n第二行\n";
         assert!(inline_edit(source, 0..source.len(), Slot::Text, Some("red")).is_none());
         assert!(inline_edit("前 文字\n", 1..2, Slot::Text, Some("red")).is_none());
+    }
+
+    /// 读回选区上的颜色：菜单用它画选中标记。
+    #[test]
+    fn inline_colors_are_read_back_from_their_carrier() {
+        let color = |src: &str, needle: &str, slot| {
+            let at = src.find(needle).expect(needle);
+            inline_color(src, at..at + needle.len(), slot)
+        };
+        let stacked = "前 [文字]{.red .bg-blue} 后\n";
+        assert_eq!(color(stacked, "文字", Slot::Text).as_deref(), Some("red"));
+        assert_eq!(color(stacked, "文字", Slot::Background).as_deref(), Some("blue"));
+        // 属性挂在元素后的形态
+        assert_eq!(color("前 **粗**{.pink} 后\n", "**粗**", Slot::Text).as_deref(), Some("pink"));
+        // `==文本==` 就是黄色背景
+        assert_eq!(color("前 ==高亮== 后\n", "高亮", Slot::Background).as_deref(), Some("yellow"));
+        assert_eq!(color("前 ==高亮== 后\n", "高亮", Slot::Text), None);
+        // 没有承载者、未知类名、空选区都读不出颜色
+        assert_eq!(color("前 文字 后\n", "文字", Slot::Text), None);
+        assert_eq!(color("前 [文字]{.custom} 后\n", "文字", Slot::Text), None);
+        assert_eq!(inline_color("文字\n", 0..0, Slot::Text), None);
     }
 
     #[test]
