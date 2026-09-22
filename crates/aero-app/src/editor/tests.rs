@@ -3206,3 +3206,69 @@ fn backspace_deletes_a_selected_image_block_after_multibyte_text(cx: &mut TestAp
     assert_eq!(text(&editor, cx), "上一段中文。\n");
     assert!(dir.path().join("a.assets/photo.png").is_file(), "删除嵌入不删附件文件");
 }
+
+/// 笔记 / 章节 / 块嵌入：只读渲染目标源码，来源变化跟着更新，自嵌套不会转不出来。
+#[gpui_kit::test]
+fn note_embeds_render_their_target_and_follow_changes(cx: &mut TestAppContext) {
+    use super::embeds_ui::EmbedView;
+    let body = "![[b]]\n\n![[b#二]]\n\n![[b#^k]]\n\n![[缺失的笔记]]\n\n![[a]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, body);
+    std::fs::write(
+        dir.path().join("b.md"),
+        "---\ntitle: 乙\n---\n\n# 一\n\n**甲正文**\n\n## 二\n\n二正文 ^k\n",
+    )
+    .unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+        editor.update(cx, |e, cx| {
+            e.install_test_resolver(&[("a.md", None), ("b.md", Some("乙"))], cx);
+        });
+    });
+    settle(cx);
+
+    // 四处嵌入各自渲染成带左竖线的容器（自嵌套的 a 也在，只是不再往下递归）
+    for selector in ["embed-b", "embed-b#二", "embed-b#^k", "embed-缺失的笔记", "embed-a"] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} 应有嵌入容器");
+    }
+    assert!(cx.debug_bounds("embed-error").is_some(), "解析不到的嵌入显示源码 + 错误");
+
+    cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        // 整篇：去掉 front matter，标题取目标笔记的 title
+        let EmbedView::Ready { title, source, .. } = editor.embed_view("b", None) else {
+            panic!("整篇嵌入应就绪")
+        };
+        assert_eq!(title, "乙");
+        assert!(source.starts_with("# 一") && source.contains("**甲正文**"), "{source:?}");
+        assert!(!source.contains("title: 乙"), "front matter 不带进来");
+        // 章节与块：只取对应片段
+        let EmbedView::Ready { source, .. } = editor.embed_view("b", Some("二")) else {
+            panic!("章节嵌入应就绪")
+        };
+        assert!(source.starts_with("## 二") && !source.contains("甲正文"), "{source:?}");
+        let EmbedView::Ready { source, .. } = editor.embed_view("b", Some("^k")) else {
+            panic!("块嵌入应就绪")
+        };
+        assert_eq!(source, "二正文 ^k");
+        // 同篇嵌入用未保存的文档，不读盘
+        assert!(matches!(editor.embed_view("a", None), EmbedView::Ready { .. }));
+        assert!(matches!(editor.embed_view("缺失的笔记", None), EmbedView::Failed(_)));
+    });
+
+    // 来源笔记改了：失效后重读，嵌入跟着变
+    std::fs::write(dir.path().join("b.md"), "# 一\n\n改过的正文\n").unwrap();
+    cx.update(|_, cx| {
+        let changed = [aero_core::VaultPath::new("b.md").unwrap()];
+        editor.update(cx, |e, cx| e.invalidate_embeds(&changed, cx));
+    });
+    settle(cx);
+    cx.update(|_, cx| {
+        let EmbedView::Ready { source, .. } = editor.read(cx).embed_view("b", None) else {
+            panic!("重读后应就绪")
+        };
+        assert!(source.contains("改过的正文"), "{source:?}");
+        // 片段没了：变成错误而不是拿旧内容糊弄
+        assert!(matches!(editor.read(cx).embed_view("b", Some("^k")), EmbedView::Failed(_)));
+    });
+}

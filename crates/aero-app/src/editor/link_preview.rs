@@ -77,18 +77,7 @@ pub(super) fn fragment_range(doc: &Document, fragment: Option<&str>) -> Result<R
         doc.range_of(block).start..end
     } else {
         0..doc.len()
-    };
-    let text = aero_core::index::indexable_leaves(doc)
-        .into_iter()
-        .filter(|b| {
-            let r = doc.range_of(b);
-            r.start >= range.start && r.start < range.end
-        })
-        .map(|b| aero_core::index::plain_text(&doc.slice(doc.content_range(b)).to_string(), &b.kind))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let text = text.trim();
-    Ok(if fragment.is_none_or(str::is_empty) { text.chars().take(300).collect() } else { text.to_owned() })
+    })
 }
 
 impl Editor {
@@ -100,6 +89,8 @@ impl Editor {
     }
 
     fn refresh_link_resolver(&mut self, service: &Entity<SearchService>, cx: &mut Context<Self>) {
+        // 目录一变，之前"解析不到"的嵌入可能就能解析了
+        self.refresh_embeds(cx);
         let hovered = self.link_preview.hovered.clone();
         let scroll_at_hover = self.link_preview.scroll_at_hover;
         self.cancel_link_preview(cx);
@@ -241,6 +232,31 @@ impl Editor {
                 }
             });
         }));
+    }
+
+    /// 嵌入用的目标解析：与悬停预览、点击跳转同一套解析器与优先级。
+    /// 笔记目录还没读进来时返回 `None`——那是"稍等"，不是"找不到"。
+    pub(super) fn resolve_link_target(&self, target: &str, fragment: Option<&str>) -> Option<Resolution> {
+        if target.is_empty() {
+            return Some(Resolution::Resolved {
+                path: self.path.clone(),
+                fragment: fragment.map(str::to_owned),
+            });
+        }
+        let resolver = self.link_preview.resolver.as_ref()?;
+        Some(resolver.resolve(target, fragment, self.path.parent()))
+    }
+
+    /// 测试用：直接装一个笔记目录解析器，不必起真索引。
+    #[cfg(test)]
+    pub(super) fn install_test_resolver(&mut self, notes: &[(&str, Option<&str>)], cx: &mut Context<Self>) {
+        let mut resolver = Resolver::new();
+        for (path, title) in notes {
+            resolver.insert(VaultPath::new(path).unwrap(), *title, &[]);
+        }
+        self.link_preview.resolver = Some(resolver);
+        self.refresh_embeds(cx);
+        cx.notify();
     }
 
     fn load_link_preview(&self, url: SharedString, bounds: Bounds<Pixels>, cx: &App) -> Task<Popup> {

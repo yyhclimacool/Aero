@@ -46,8 +46,12 @@ pub(super) fn markdown(
     state: Entity<PreviewState>,
     editor: Entity<super::Editor>,
     block: aero_core::BlockId,
+    depth: u8,
 ) -> TextView {
     let block_editor = editor.clone();
+    let embed_editor = editor.clone();
+    let embed_style = style.clone();
+    let embed_id = id.clone();
     let highlight_editor = editor.clone();
     let highlight_style = style.clone();
     let highlight_id = id.clone();
@@ -74,6 +78,22 @@ pub(super) fn markdown(
             render_image(id, embed, &image_style, &image_editor, block, window, cx)
         })
         .markdown_block_parser(|node, cx| {
+            if !matches!(node, markdown_ast::Node::Paragraph(_)) {
+                return None;
+            }
+            let source = cx.node_source(node)?;
+            let embed = note_embed(source)?;
+            Some(
+                MarkdownNode::new("note-embed", (node.position()?.start.offset, embed))
+                    .markdown(source.to_owned()),
+            )
+        })
+        .markdown_block_renderer("note-embed", move |node, _, cx| {
+            let (offset, embed) = node.data::<(usize, NoteEmbed)>().expect("note embed parser data");
+            let id: SharedString = format!("{embed_id}-embed-{offset}").into();
+            render_note_embed(id, embed, &embed_style, &embed_editor, block, depth, cx)
+        })
+        .markdown_block_parser(|node, cx| {
             if !matches!(node, markdown_ast::Node::Blockquote(_)) {
                 return None;
             }
@@ -87,7 +107,7 @@ pub(super) fn markdown(
         .markdown_block_renderer("callout", move |node, _, cx| {
             let callout = node.data::<Callout>().expect("callout parser data");
             let id: SharedString = format!("{id}-callout-{}", callout.offset).into();
-            render_callout(id, callout, style.clone(), reveal, &state, &block_editor, block, cx)
+            render_callout(id, callout, style.clone(), reveal, &state, &block_editor, block, depth, cx)
         })
         .markdown_block_parser(|node, cx| {
             if !matches!(
@@ -158,6 +178,142 @@ fn image_embed(source: &str) -> Option<ImageEmbed> {
         width: embed.parameter.as_deref().and_then(|p| p.trim().parse().ok()),
         source: trimmed.to_owned(),
     })
+}
+
+/// 笔记 / 章节 / 块嵌入（`ui_design.md` 5.6）：`![[笔记]]`、`![[笔记#章节]]`、`![[笔记#^块]]`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NoteEmbed {
+    target: String,
+    fragment: Option<String>,
+    source: String,
+}
+
+/// 嵌入里还能再嵌入，但只渲染一层：再深就显示源码，免得互相嵌入转不出来。
+const EMBED_DEPTH: u8 = 1;
+
+/// 整段只有一个笔记嵌入时才渲染内容；附件交给图片渲染器，PDF 暂时保持源码。
+fn note_embed(source: &str) -> Option<NoteEmbed> {
+    let trimmed = source.trim();
+    let embeds = aero_core::links::scan_embeds(trimmed);
+    let [embed] = embeds.as_slice() else { return None };
+    if embed.range != (0..trimmed.len()) || aero_core::attachments::Kind::for_path(&embed.target).is_some() {
+        return None;
+    }
+    Some(NoteEmbed {
+        target: embed.target.clone(),
+        fragment: embed.fragment.clone(),
+        source: trimmed.to_owned(),
+    })
+}
+
+/// 只读渲染：左侧竖线 + 来源标题，内容用同一套渲染器画（嵌入里的表格、callout、图片都照常）。
+fn render_note_embed(
+    id: SharedString,
+    embed: &NoteEmbed,
+    style: &TextViewStyle,
+    editor: &Entity<super::Editor>,
+    block: aero_core::BlockId,
+    depth: u8,
+    cx: &mut App,
+) -> AnyElement {
+    use super::embeds_ui::EmbedView;
+
+    let theme = cx.theme();
+    let selector = {
+        let (target, fragment) = (embed.target.clone(), embed.fragment.clone());
+        move || match &fragment {
+            Some(f) => format!("embed-{target}#{f}"),
+            None => format!("embed-{target}"),
+        }
+    };
+    let view = editor.read(cx).embed_view(&embed.target, embed.fragment.as_deref());
+    let body: AnyElement = match view {
+        EmbedView::Loading => {
+            div().text_xs().text_color(theme.muted_foreground).child("正在载入…").into_any_element()
+        }
+        EmbedView::Failed(error) => v_flex()
+            .gap_1()
+            .child(embed_source(format!("{id}-source").into(), &embed.source, cx))
+            .child(
+                div()
+                    .debug_selector(|| "embed-error".to_owned())
+                    .text_xs()
+                    .text_color(theme.danger)
+                    .child(error),
+            )
+            .into_any_element(),
+        EmbedView::Ready { path, fragment, title, source } => {
+            let click = {
+                let (editor, target, fragment) = (editor.clone(), embed.target.clone(), fragment.clone());
+                move |event: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    if event.is_right_click() {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    // 与点 wikilink 同一条路：工作区负责打开并定位
+                    editor.update(cx, |_, cx| {
+                        cx.emit(super::EditorEvent::LinkClicked {
+                            target: target.clone(),
+                            fragment: fragment.clone(),
+                        });
+                    });
+                }
+            };
+            let label = match &fragment {
+                Some(f) if !f.is_empty() => format!("{title} › {f}"),
+                _ => title,
+            };
+            let _ = path;
+            let content: AnyElement = if depth < EMBED_DEPTH {
+                markdown(
+                    format!("{id}-body").into(),
+                    aero_core::links::to_markdown(&source).into(),
+                    style.clone(),
+                    0,
+                    editor.read(cx).preview.clone(),
+                    editor.clone(),
+                    block,
+                    depth + 1,
+                )
+                .into_any_element()
+            } else {
+                embed_source(format!("{id}-nested").into(), &source, cx).into_any_element()
+            };
+            v_flex()
+                .id(id.clone())
+                .gap_1()
+                .cursor_pointer()
+                .on_click(click)
+                .child(div().text_xs().text_color(theme.muted_foreground).child(label))
+                .child(content)
+                .into_any_element()
+        }
+    };
+    div()
+        .w_full()
+        .pb(rems(0.5))
+        .child(
+            v_flex()
+                .debug_selector(selector)
+                .w_full()
+                .min_w_0()
+                .border_l_3()
+                .border_color(theme.border)
+                .pl_3()
+                .child(body),
+        )
+        .into_any_element()
+}
+
+/// 渲染不了就显示源码：内容永不丢失。
+fn embed_source(id: SharedString, source: &str, cx: &App) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w_full()
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(px(13.))
+        .text_color(cx.theme().muted_foreground)
+        .child(source.to_owned())
 }
 
 /// 位图 / 占位 / 源码 + 错误 + 重试（9.9 的统一表现）；渲染永远不改文件。
@@ -519,6 +675,7 @@ fn render_callout(
     state: &Entity<PreviewState>,
     editor: &Entity<super::Editor>,
     block: aero_core::BlockId,
+    depth: u8,
     cx: &mut App,
 ) -> AnyElement {
     let (label, icon, color) = appearance(&callout.kind, cx);
@@ -612,6 +769,7 @@ fn render_callout(
                     state.clone(),
                     editor.clone(),
                     block,
+                    depth,
                 ),
             ))
         })

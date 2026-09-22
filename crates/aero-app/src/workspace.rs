@@ -1243,6 +1243,11 @@ impl Workspace {
         }
         // 附件变化只影响渲染缓存：外部换了图，打开中的笔记下一帧就重新渲染
         open.images.update(cx, |s, cx| s.invalidate(&batch.attachments, cx));
+        // 被嵌入的笔记变了：丢掉嵌入缓存重读，嵌入块跟着更新
+        if let Some(editor) = &editor {
+            let changed: Vec<VaultPath> = batch.changed.iter().chain(&batch.removed).cloned().collect();
+            editor.update(cx, |e, cx| e.invalidate_embeds(&changed, cx));
+        }
         let touched: Vec<VaultPath> =
             batch.changed.iter().chain(&batch.removed).filter(|p| !mine(p)).cloned().collect();
         open.search.update(cx, |s, cx| {

@@ -11,6 +11,7 @@
 
 mod backlinks_ui;
 mod block_refs_ui;
+mod embeds_ui;
 mod highlight_ui;
 mod images_ui;
 mod inline_format_ui;
@@ -210,6 +211,8 @@ pub struct Editor {
     link_preview: link_preview::LinkPreview,
     backlinks: Option<Entity<crate::backlinks::BacklinksView>>,
     backlinks_subscription: Option<Subscription>,
+    /// 嵌入内容缓存（`![[笔记]]` / `#章节` / `^块`）
+    embeds: embeds_ui::Embeds,
     /// 重内容渲染服务（9.9）；没连上时图片按源码显示
     images: Option<Entity<crate::render::RenderService>>,
     images_subscription: Option<Subscription>,
@@ -280,6 +283,7 @@ impl Editor {
             link_preview: link_preview::LinkPreview::default(),
             backlinks: None,
             backlinks_subscription: None,
+            embeds: embeds_ui::Embeds::default(),
             images: None,
             images_subscription: None,
             viewer: None,
@@ -1184,6 +1188,7 @@ impl Editor {
         self.doc.reparse();
         self.update_local_link_names();
         self.units = units::units(&self.doc);
+        self.refresh_embeds(cx);
         if let Some(f) = self.focused.as_mut() {
             f.id = unit_at(&self.units, f.range.start)
                 .filter(|&ix| self.units[ix].range.start == f.range.start)
@@ -1601,6 +1606,7 @@ impl Editor {
         self.update_local_link_names();
         self.stamp = stamp;
         self.units = units::units(&self.doc);
+        self.refresh_embeds(cx);
         self.clamp_selection();
         self.preview.update(cx, |state, _| *state = preview::PreviewState::default());
         self.dirty = false;
@@ -2280,6 +2286,7 @@ impl Editor {
                     self.preview.clone(),
                     cx.entity(),
                     id,
+                    0,
                 )
                 .into_any_element()
             }
