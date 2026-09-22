@@ -12,6 +12,7 @@
 mod backlinks_ui;
 mod block_refs_ui;
 mod highlight_ui;
+mod images_ui;
 mod inline_format_ui;
 mod inline_links_ui;
 mod link_preview;
@@ -42,6 +43,8 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+
+use images_ui::ImageViewer;
 
 use crate::actions::{
     BlockDown, BlockUp, BlurEditor, ConvertBlock, CopySelectedBlocks, CutSelectedBlocks,
@@ -207,6 +210,11 @@ pub struct Editor {
     link_preview: link_preview::LinkPreview,
     backlinks: Option<Entity<crate::backlinks::BacklinksView>>,
     backlinks_subscription: Option<Subscription>,
+    /// 重内容渲染服务（9.9）；没连上时图片按源码显示
+    images: Option<Entity<crate::render::RenderService>>,
+    images_subscription: Option<Subscription>,
+    /// 全屏看图：双击图片打开，`Space` / `Esc` / 点击关闭
+    viewer: Option<ImageViewer>,
     focused: Option<Focused>,
     /// 块选中态；与 `focused` 互斥
     selection: Option<BlockSelection>,
@@ -272,6 +280,9 @@ impl Editor {
             link_preview: link_preview::LinkPreview::default(),
             backlinks: None,
             backlinks_subscription: None,
+            images: None,
+            images_subscription: None,
+            viewer: None,
             focused: None,
             selection: None,
             picker_open: false,
@@ -770,6 +781,9 @@ impl Editor {
     /// （`ui_design.md` 6："Esc 两段式退出"）。光标在没有块的空位上时直接回浏览态。
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_link_preview(cx);
+        if self.close_image_viewer(window, cx) {
+            return;
+        }
         if self.input_composing(window, cx) {
             cx.propagate();
             return;
@@ -795,6 +809,9 @@ impl Editor {
     /// 块选中态里的 Esc（或程序化的 `BlurEditor`）：回浏览态。没什么可退的就 propagate。
     fn on_blur_editor(&mut self, _: &BlurEditor, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_link_preview(cx);
+        if self.close_image_viewer(window, cx) {
+            return;
+        }
         let busy = self.title_edit.is_some()
             || self.slash.is_some()
             || self.focused.is_some()
@@ -2262,6 +2279,7 @@ impl Editor {
                     reveal,
                     self.preview.clone(),
                     cx.entity(),
+                    id,
                 )
                 .into_any_element()
             }
@@ -2299,7 +2317,7 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.validate_link_preview_scroll(cx);
         let (foreground, muted) = (cx.theme().foreground, cx.theme().muted_foreground);
         let roots = self.doc.blocks().roots.clone();
@@ -2331,6 +2349,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_delete_selected))
             .on_action(cx.listener(Self::on_copy_selected))
             .on_action(cx.listener(Self::on_cut_selected))
+            .on_action(cx.listener(Self::on_paste_attachment))
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
@@ -2367,6 +2386,7 @@ impl Render for Editor {
             )
             .vertical_scrollbar(&self.scroll)
             .children(self.render_link_preview(cx))
+            .children(self.render_image_viewer(window, cx))
     }
 }
 

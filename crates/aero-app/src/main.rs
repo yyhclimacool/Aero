@@ -15,6 +15,7 @@ mod editor;
 mod file_tree;
 mod paths;
 mod quick_open;
+mod render;
 mod search;
 mod search_view;
 mod trash;

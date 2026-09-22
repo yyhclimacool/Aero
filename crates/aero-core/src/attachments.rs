@@ -42,6 +42,20 @@ impl Catalog {
         Self { entries }
     }
 
+    /// 单个文件的增删（导入、保存、外部改动），不为一次变化重走整库。
+    /// 非附件后缀一律忽略；重复插入不会产生第二条。
+    pub fn update(&mut self, path: &VaultPath, exists: bool) {
+        let Some(kind) = Kind::for_path(path.as_str()) else { return };
+        match (self.entries.binary_search_by(|e| e.path.cmp(path)), exists) {
+            (Ok(_), true) => {}
+            (Ok(at), false) => {
+                self.entries.remove(at);
+            }
+            (Err(at), true) => self.entries.insert(at, Entry { path: path.clone(), kind }),
+            (Err(_), false) => {}
+        }
+    }
+
     /// 与笔记枚举相同的忽略规则，但进入 `.assets`；不跟随符号链接。
     pub fn read(vault: &Vault) -> Result<Self, VaultError> {
         let mut walk = ignore::WalkBuilder::new(vault.root());
@@ -133,6 +147,43 @@ fn resolution(paths: Vec<VaultPath>) -> Resolution {
     }
 }
 
+/// 为一次导入分配附件路径（方案 5.4：附件放在 `<note>.assets/`）。
+/// 有原文件名就沿用（只取文件名、去掉危险字符），重名追加 `-2`、`-3`…；
+/// 剪贴板位图没有名字，用 ULID 后 8 位。分配到的路径此刻在磁盘上一定不存在。
+pub fn import_path(
+    vault: &Vault,
+    note: &VaultPath,
+    name: Option<&str>,
+    extension: &str,
+) -> Option<VaultPath> {
+    let dir = note.assets_dir()?;
+    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    let extension: String = extension.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if extension.is_empty() {
+        return None;
+    }
+    let stem = name.and_then(safe_stem).unwrap_or_else(|| {
+        let ulid = ulid::Ulid::generate().to_string();
+        ulid[ulid.len() - 8..].to_ascii_lowercase()
+    });
+    (1..100).find_map(|n| {
+        let file = if n == 1 { format!("{stem}.{extension}") } else { format!("{stem}-{n}.{extension}") };
+        let path = VaultPath::new(&format!("{dir}/{file}")).ok()?;
+        // 用 symlink_metadata：符号链接占位也算占用，导入不会顺着它写到 vault 外
+        std::fs::symlink_metadata(vault.fs_path(&path)).is_err().then_some(path)
+    })
+}
+
+/// 取文件名主干：丢掉目录、扩展名与首尾的点 / 空白；只剩空串就当作没名字。
+fn safe_stem(name: &str) -> Option<String> {
+    let name = name.rsplit(['/', '\\']).next()?;
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let cleaned: String =
+        stem.chars().map(|c| if c.is_control() || "/\\:|?*<>\"[]^#".contains(c) { '-' } else { c }).collect();
+    let cleaned = cleaned.trim().trim_matches('.').trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 /// 确认前检查文件仍存在且位于 vault 内；不把符号链接或目录当成候选文件。
 pub fn available(vault: &Vault, path: &VaultPath) -> bool {
     let file = vault.fs_path(path);
@@ -193,6 +244,29 @@ mod tests {
         assert!(catalog(&["a|b.png"]).target(0, &source).is_none());
     }
 
+    /// 导入一张图、删掉一张图都只动一条记录，解析结果跟着变，不用重扫整库。
+    #[test]
+    fn attachment_catalog_updates_single_entries_and_ignores_other_files() {
+        let source = path("notes/a.md");
+        let mut c = catalog(&["notes/a.assets/old.png"]);
+        c.update(&path("notes/a.assets/new.png"), true);
+        c.update(&path("notes/a.assets/new.png"), true);
+        c.update(&path("notes/a.md"), true);
+        c.update(&path("notes/a.assets/note.txt"), true);
+        assert_eq!(
+            c.entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            ["notes/a.assets/new.png", "notes/a.assets/old.png"]
+        );
+        assert_eq!(
+            c.resolve("new.png", &source),
+            Resolution::Resolved { path: path("notes/a.assets/new.png"), fragment: None }
+        );
+        c.update(&path("notes/a.assets/old.png"), false);
+        c.update(&path("notes/a.assets/missing.png"), false);
+        assert_eq!(c.entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["notes/a.assets/new.png"]);
+        assert_eq!(c.resolve("old.png", &source), Resolution::Unresolved);
+    }
+
     #[test]
     fn attachment_catalog_reads_assets_but_obeys_hidden_and_ignore_rules() {
         let dir = tempfile::tempdir().unwrap();
@@ -224,6 +298,31 @@ mod tests {
         std::fs::remove_file(vault.fs_path(&c.entries[0].path)).unwrap();
         assert!(!available(&vault, &c.entries[0].path));
         assert!(!available(&vault, &path("note.assets")));
+    }
+
+    /// 导入命名：沿用原名、重名不覆盖、无名用 ULID、危险字符不出 `.assets/`。
+    #[test]
+    fn attachment_import_paths_keep_names_and_never_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let note = path("notes/a.md");
+        let import = |name: Option<&str>, ext: &str| import_path(&vault, &note, name, ext).unwrap();
+        assert_eq!(import(Some("photo.JPG"), "jpg").as_str(), "notes/a.assets/photo.jpg");
+        // 原名带路径 / 危险字符：只取文件名，分隔符与 wikilink 会歧义的字符替换掉
+        assert_eq!(import(Some("/tmp/sub/图 1.png"), ".PNG").as_str(), "notes/a.assets/图 1.png");
+        assert_eq!(import(Some("a[b]|c.png"), "png").as_str(), "notes/a.assets/a-b--c.png");
+        // 重名不覆盖
+        std::fs::create_dir_all(dir.path().join("notes/a.assets")).unwrap();
+        std::fs::write(dir.path().join("notes/a.assets/photo.jpg"), b"existing").unwrap();
+        assert_eq!(import(Some("photo.jpg"), "jpg").as_str(), "notes/a.assets/photo-2.jpg");
+        // 没有名字（剪贴板位图）：ULID 后 8 位
+        let generated = import(None, "png");
+        let name = generated.file_name();
+        assert!(name.ends_with(".png") && name.len() == 12, "{name}");
+        assert_ne!(import(None, "png").as_str(), generated.as_str(), "两次导入不同名");
+        // 扩展名不合法、以及不能有附件目录的路径
+        assert!(import_path(&vault, &note, None, "").is_none());
+        assert!(import_path(&vault, &path("notes"), None, "png").is_none());
     }
 
     #[cfg(unix)]

@@ -26,7 +26,24 @@ struct Popup {
 }
 
 fn excerpt(doc: &Document, fragment: Option<&str>) -> Result<String, String> {
-    let range = if let Some(id) = fragment.and_then(|f| f.strip_prefix('^')) {
+    let range = fragment_range(doc, fragment)?;
+    let text = aero_core::index::indexable_leaves(doc)
+        .into_iter()
+        .filter(|b| {
+            let r = doc.range_of(b);
+            r.start >= range.start && r.start < range.end
+        })
+        .map(|b| aero_core::index::plain_text(&doc.slice(doc.content_range(b)).to_string(), &b.kind))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let text = text.trim();
+    Ok(if fragment.is_none_or(str::is_empty) { text.chars().take(300).collect() } else { text.to_owned() })
+}
+
+/// 链接 / 嵌入的片段在目标文档里的源码区间：`^id` 是那一块，`#标题` 是该章节（含子标题、
+/// 不越过同级），没有片段就是整篇。悬停预览取它的纯文本，嵌入取它的源码。
+pub(super) fn fragment_range(doc: &Document, fragment: Option<&str>) -> Result<Range<usize>, String> {
+    Ok(if let Some(id) = fragment.and_then(|f| f.strip_prefix('^')) {
         let id = aero_core::block_refs::resolve(doc, id)?;
         let block = doc.blocks().iter().find(|(_, b)| b.id == id).unwrap().1;
         doc.range_of(block)

@@ -31,12 +31,14 @@ pub const POLL: Duration = Duration::from_millis(250);
 pub struct Batch {
     pub changed: Vec<VaultPath>,
     pub removed: Vec<VaultPath>,
+    /// 动过的附件（图片 / PDF，含 `*.assets/` 里的）：渲染缓存据此失效，不影响文件树
+    pub attachments: Vec<VaultPath>,
     pub rescan: bool,
 }
 
 impl Batch {
     pub fn is_empty(&self) -> bool {
-        self.changed.is_empty() && self.removed.is_empty() && !self.rescan
+        self.changed.is_empty() && self.removed.is_empty() && self.attachments.is_empty() && !self.rescan
     }
 }
 
@@ -119,9 +121,11 @@ impl Roots {
 enum Interest {
     /// 一篇笔记
     Note(VaultPath),
+    /// 一个附件（图片 / PDF）：只影响渲染缓存
+    Attachment(VaultPath),
     /// 目录或别的文件：文件树可能要重扫
     Other,
-    /// 隐藏路径、附件目录内、vault 之外：不关心
+    /// 隐藏路径、附件目录里的非附件文件、vault 之外：不关心
     Ignored,
 }
 
@@ -135,12 +139,13 @@ fn interest(roots: &Roots, path: &Path) -> Interest {
     if components.iter().any(|c| c.starts_with('.')) {
         return Interest::Ignored;
     }
-    // `x.assets/` 目录里的东西不关心；目录本身的出现 / 消失也不影响树（树不显示它）
-    if components.iter().any(|c| c.ends_with(".assets")) {
-        return Interest::Ignored;
-    }
+    let in_assets = components.iter().any(|c| c.ends_with(".assets"));
     match VaultPath::new(rel) {
-        Ok(p) if p.is_note() => Interest::Note(p),
+        Ok(p) if p.is_note() && !in_assets => Interest::Note(p),
+        // 附件按后缀认，`x.assets/` 里的也要认：渲染缓存靠它失效
+        Ok(p) if aero_core::attachments::Kind::for_path(p.as_str()).is_some() => Interest::Attachment(p),
+        // `x.assets/` 里的其他东西不关心；目录本身的出现 / 消失也不影响树（树不显示它）
+        Ok(_) if in_assets => Interest::Ignored,
         Ok(_) => Interest::Other,
         Err(_) => Interest::Ignored,
     }
@@ -181,6 +186,7 @@ impl Accumulator {
 fn classify<'a>(roots: &Roots, paths: impl Iterator<Item = &'a Path>, mut rescan: bool) -> Batch {
     let mut changed = Vec::new();
     let mut removed = Vec::new();
+    let mut attachments = Vec::new();
     for path in paths {
         match interest(roots, path) {
             Interest::Note(note) => {
@@ -190,11 +196,13 @@ fn classify<'a>(roots: &Roots, paths: impl Iterator<Item = &'a Path>, mut rescan
                     removed.push(note);
                 }
             }
+            // 新增 / 改动 / 删除都只是"要重新渲染"，存在性由渲染服务自己判断
+            Interest::Attachment(file) => attachments.push(file),
             Interest::Other => rescan = true,
             Interest::Ignored => {}
         }
     }
-    Batch { changed, removed, rescan }
+    Batch { changed, removed, attachments, rescan }
 }
 
 fn debounce_loop(

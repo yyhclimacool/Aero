@@ -43,6 +43,8 @@ struct VaultSession {
     search: Entity<SearchService>,
     search_view: Entity<SearchView>,
     backlinks: Entity<BacklinksView>,
+    /// 重内容渲染服务（9.9）：图片等按需渲染，缓存落在应用数据目录
+    images: Entity<crate::render::RenderService>,
     /// vault 目录的文件监听；起不来时编辑器退回轮询、索引只在启动时对齐
     _watcher: Entity<VaultWatcher>,
     /// 本次会话里打开过的笔记，最近的在前（快速打开的"最近优先"）
@@ -183,6 +185,10 @@ impl Workspace {
                             }
                         }
                     });
+                // 渲染缓存按 vault 分目录，和索引一样可以随时删掉重建
+                let cache_dir = self.data_dir.join("cache").join(vault.id());
+                let images = cx.new(|_| crate::render::RenderService::new(vault.clone(), cache_dir));
+                let images_sub = cx.observe(&images, |_, _, cx| cx.notify());
                 let watcher = cx.new(|cx| VaultWatcher::new(vault.clone(), cx));
                 if let Some(err) = watcher.read(cx).error.clone() {
                     // 监听起不来时编辑器退回 2 s 轮询、索引只在启动时对齐；告诉用户一声，别静默变慢
@@ -202,9 +208,10 @@ impl Workspace {
                     search,
                     search_view,
                     backlinks,
+                    images,
                     _watcher: watcher,
                     recent: Vec::new(),
-                    _subscriptions: vec![sub, search_sub, view_sub, watch_sub, backlinks_sub],
+                    _subscriptions: vec![sub, search_sub, view_sub, watch_sub, backlinks_sub, images_sub],
                 });
                 self.error = None;
                 self.state.touch_vault(vault.root());
@@ -321,7 +328,10 @@ impl Workspace {
             Ok((doc, stamp)) => {
                 let vault = open.vault.clone();
                 let editor = cx.new(|cx| Editor::new(vault, path.clone(), doc, stamp, cx));
-                editor.update(cx, |e, cx| e.connect_link_preview(open.search.clone(), cx));
+                editor.update(cx, |e, cx| {
+                    e.connect_link_preview(open.search.clone(), cx);
+                    e.connect_images(open.images.clone(), cx);
+                });
                 let sub = self.subscribe_editor(&editor, window, cx);
                 let Some(open) = self.open.as_mut() else { return };
                 open.editor_sub = Some(sub);
@@ -1231,6 +1241,8 @@ impl Workspace {
             // 编辑器自己处理：重载 / 冲突副本 / 已删除，并通过事件把索引带上
             editor.update(cx, |e, cx| e.check_external(cx));
         }
+        // 附件变化只影响渲染缓存：外部换了图，打开中的笔记下一帧就重新渲染
+        open.images.update(cx, |s, cx| s.invalidate(&batch.attachments, cx));
         let touched: Vec<VaultPath> =
             batch.changed.iter().chain(&batch.removed).filter(|p| !mine(p)).cloned().collect();
         open.search.update(cx, |s, cx| {
@@ -1779,9 +1791,12 @@ mod tests {
                 let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
                 let backlinks = cx.new(|cx| BacklinksView::new(search.clone(), cx));
                 backlinks.update(cx, |v, cx| v.set_note(Some(VaultPath::new("a.md").unwrap()), cx));
+                let images =
+                    cx.new(|_| crate::render::RenderService::new(vault.clone(), data.path().join("cache")));
                 editor.update(cx, |e, cx| {
                     e.connect_link_preview(search.clone(), cx);
                     e.connect_backlinks(backlinks.clone(), cx);
+                    e.connect_images(images.clone(), cx);
                 });
                 let watcher = cx.new(|cx| VaultWatcher::new(vault.clone(), cx));
                 VaultSession {
@@ -1792,6 +1807,7 @@ mod tests {
                     search,
                     search_view,
                     backlinks,
+                    images,
                     _watcher: watcher,
                     recent: vec![],
                     _subscriptions: vec![],
@@ -2065,7 +2081,12 @@ mod tests {
         // 外部新建 b.md
         std::fs::write(dir.path().join("b.md"), "bravo anchor\n").unwrap();
         let b = VaultPath::new("b.md").unwrap();
-        let batch = crate::watch::Batch { changed: vec![b.clone()], removed: vec![], rescan: false };
+        let batch = crate::watch::Batch {
+            changed: vec![b.clone()],
+            removed: vec![],
+            attachments: vec![],
+            rescan: false,
+        };
         workspace.update_in(cx, |w, window, cx| w.on_vault_changed(&batch, window, cx));
         cx.update(|_, cx| assert!(tree.read(cx).contains(&b)));
         wait_until(cx, |cx| hit_paths(cx, &search, "anchor").len() == 2);
@@ -2078,7 +2099,12 @@ mod tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(5))
             .unwrap();
-        let batch = crate::watch::Batch { changed: vec![a.clone()], removed: vec![], rescan: false };
+        let batch = crate::watch::Batch {
+            changed: vec![a.clone()],
+            removed: vec![],
+            attachments: vec![],
+            rescan: false,
+        };
         workspace.update_in(cx, |w, window, cx| w.on_vault_changed(&batch, window, cx));
         cx.run_until_parked();
         cx.update(|_, cx| {
@@ -2090,7 +2116,12 @@ mod tests {
 
         // 外部删了打开中的 a.md：编辑器进入已删除态，树里没了，索引里也没了
         std::fs::remove_file(&file).unwrap();
-        let batch = crate::watch::Batch { changed: vec![], removed: vec![a.clone()], rescan: false };
+        let batch = crate::watch::Batch {
+            changed: vec![],
+            removed: vec![a.clone()],
+            attachments: vec![],
+            rescan: false,
+        };
         workspace.update_in(cx, |w, window, cx| w.on_vault_changed(&batch, window, cx));
         cx.run_until_parked();
         cx.update(|_, cx| {

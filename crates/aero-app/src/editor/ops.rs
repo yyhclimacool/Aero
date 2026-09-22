@@ -177,7 +177,9 @@ pub fn delete_units(doc: &Document, units: &[Unit], first: usize, last: usize) -
         end += 1;
     }
     if end == text.len() {
-        while start >= 2 && &text[start - 2..start] == "\n\n" {
+        // 按前缀判断而不是 `text[start - 2..start]`：`start` 是字符边界，但它前面两个字节
+        // 可能落在一个多字节字符（如 `。`）中间，直接切片会 panic。
+        while start >= 2 && text[..start].ends_with("\n\n") {
             start -= 1;
         }
     }
@@ -699,6 +701,13 @@ mod tests {
         let us = units(&doc);
         doc.edit(delete_units(&doc, &us, 0, 0)).unwrap();
         assert_eq!(doc.to_string(), "para\n");
+        // 删最后一块、且前一行以多字节字符结尾：收空行不能按字节切片（曾 panic 在 `。` 中间）
+        for before in ["中文。", "图 🎨", "ascii"] {
+            let mut doc = Document::from_text(&format!("{before}\n\n![[x.png]]\n"));
+            let us = units(&doc);
+            doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+            assert_eq!(doc.to_string(), format!("{before}\n"), "{before}");
+        }
     }
 
     #[test]

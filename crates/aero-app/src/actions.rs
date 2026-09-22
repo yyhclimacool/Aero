@@ -94,6 +94,10 @@ actions!(
         /// ⌘C / ⌘X：把选中的块作为 Markdown 源码复制 / 剪切
         CopySelectedBlocks,
         CutSelectedBlocks,
+        /// 全屏看图里的 `Space` / `Esc`：关闭浮层（只在 `ImageViewer` 上下文里绑定，不影响正文输入）
+        CloseImageViewer,
+        /// `⌘V`：剪贴板里是位图 / 文件就导入到 `<note>.assets/`；是文字就交还给文本控件
+        PasteAttachment,
     ]
 );
 
@@ -229,6 +233,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-z", DocUndo, Some("Editor")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Editor")),
         KeyBinding::new("escape", BlurEditor, Some("Editor")),
+        KeyBinding::new("escape", CloseImageViewer, Some("ImageViewer")),
+        KeyBinding::new("space", CloseImageViewer, Some("ImageViewer")),
+        // 比文本控件自己的 cmd-v 更具体：先看剪贴板里有没有图片 / 文件，没有就 propagate 回去按文字粘贴
+        KeyBinding::new("cmd-v", PasteAttachment, Some("Editor > Input")),
+        KeyBinding::new("cmd-v", PasteAttachment, Some("Editor")),
         KeyBinding::new("up", SelectBlockUp, Some("Editor")),
         KeyBinding::new("down", SelectBlockDown, Some("Editor")),
         KeyBinding::new("shift-up", ExtendBlockUp, Some("Editor")),

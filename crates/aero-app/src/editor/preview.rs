@@ -45,14 +45,34 @@ pub(super) fn markdown(
     reveal: u64,
     state: Entity<PreviewState>,
     editor: Entity<super::Editor>,
+    block: aero_core::BlockId,
 ) -> TextView {
     let block_editor = editor.clone();
     let highlight_editor = editor.clone();
     let highlight_style = style.clone();
     let highlight_id = id.clone();
+    let image_editor = editor.clone();
+    let image_style = style.clone();
+    let image_id = id.clone();
     with_links(TextView::markdown(id.clone(), text), &editor)
         .style(style.clone())
         .selectable(false)
+        .markdown_block_parser(|node, cx| {
+            if !matches!(node, markdown_ast::Node::Paragraph(_)) {
+                return None;
+            }
+            let source = cx.node_source(node)?;
+            let embed = image_embed(source)?;
+            Some(
+                MarkdownNode::new("image", (node.position()?.start.offset, embed))
+                    .markdown(source.to_owned()),
+            )
+        })
+        .markdown_block_renderer("image", move |node, window, cx| {
+            let (offset, embed) = node.data::<(usize, ImageEmbed)>().expect("image parser data");
+            let id: SharedString = format!("{image_id}-image-{offset}").into();
+            render_image(id, embed, &image_style, &image_editor, block, window, cx)
+        })
         .markdown_block_parser(|node, cx| {
             if !matches!(node, markdown_ast::Node::Blockquote(_)) {
                 return None;
@@ -67,7 +87,7 @@ pub(super) fn markdown(
         .markdown_block_renderer("callout", move |node, _, cx| {
             let callout = node.data::<Callout>().expect("callout parser data");
             let id: SharedString = format!("{id}-callout-{}", callout.offset).into();
-            render_callout(id, callout, style.clone(), reveal, &state, &block_editor, cx)
+            render_callout(id, callout, style.clone(), reveal, &state, &block_editor, block, cx)
         })
         .markdown_block_parser(|node, cx| {
             if !matches!(
@@ -108,6 +128,192 @@ pub(super) fn markdown(
             }),
         })
         .w_full()
+}
+
+/// 图片嵌入块（`ui_design.md` 5.6）：`![[x.png]]` / `![[x.png|400]]`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ImageEmbed {
+    target: String,
+    /// `|400` 的显示宽度；`|小` 之类的非数字参数忽略，按默认宽度显示
+    width: Option<u32>,
+    source: String,
+}
+
+/// 正文列宽内的默认显示宽度（正文列 720，两侧留白）。
+const IMAGE_WIDTH: u32 = 680;
+
+/// 整段只有一个图片嵌入时才当图片块渲染；与文字混排的嵌入仍按源码显示。
+fn image_embed(source: &str) -> Option<ImageEmbed> {
+    let trimmed = source.trim();
+    let embeds = aero_core::links::scan_embeds(trimmed);
+    let [embed] = embeds.as_slice() else { return None };
+    if embed.range != (0..trimmed.len()) || embed.fragment.is_some() {
+        return None;
+    }
+    if aero_core::attachments::Kind::for_path(&embed.target) != Some(aero_core::attachments::Kind::Image) {
+        return None;
+    }
+    Some(ImageEmbed {
+        target: embed.target.clone(),
+        width: embed.parameter.as_deref().and_then(|p| p.trim().parse().ok()),
+        source: trimmed.to_owned(),
+    })
+}
+
+/// 位图 / 占位 / 源码 + 错误 + 重试（9.9 的统一表现）；渲染永远不改文件。
+fn render_image(
+    id: SharedString,
+    embed: &ImageEmbed,
+    style: &TextViewStyle,
+    editor: &Entity<super::Editor>,
+    block: aero_core::BlockId,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    use crate::render::{Attachment, State};
+
+    let (source, service) = {
+        let editor = editor.read(cx);
+        (editor.path.clone(), editor.images.clone())
+    };
+    // 没接渲染服务（无 vault 的测试上下文）时退回源码，不是错误
+    let Some(service) = service else { return image_source(id, embed, style, cx) };
+    let width = embed.width.unwrap_or(IMAGE_WIDTH).clamp(24, 4096);
+    let scale = window.scale_factor();
+    let state = service.update(cx, |service, cx| match service.attachment(&embed.target, &source, cx) {
+        Attachment::Loading => State::Pending { pixels: None },
+        Attachment::Found(file) => service.image(file, width, scale, cx),
+        Attachment::Missing => State::Failed(format!("找不到附件 {}", embed.target).into()),
+        Attachment::Ambiguous => {
+            State::Failed(format!("有多个同名附件 {}，请写出所在目录", embed.target).into())
+        }
+    });
+    let selector = {
+        let target = embed.target.clone();
+        move || format!("image-{target}")
+    };
+    let placeholder_selector = {
+        let target = embed.target.clone();
+        move || format!("image-placeholder-{target}")
+    };
+    match state {
+        State::Ready { image, pixels } => {
+            // 原图比目标窄时按自然宽度显示，不放大
+            let logical = (pixels.width as f32 / scale).min(width as f32);
+            let height = logical * pixels.height as f32 / pixels.width as f32;
+            let click = image_click(editor, block, embed.target.clone());
+            div()
+                .w_full()
+                .pb(rems(0.5))
+                .child(
+                    div()
+                        .id(id.clone())
+                        .debug_selector(selector)
+                        .w(px(logical))
+                        .h(px(height))
+                        .max_w_full()
+                        // 窗口窄时裁掉而不是压扁
+                        .overflow_hidden()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .on_click(click)
+                        .child(img(ImageSource::Render(image)).w(px(logical)).h(px(height))),
+                )
+                .into_any_element()
+        }
+        // 首帧占位用上次已知比例，渲染完成后替换，列表不抖动
+        State::Pending { pixels } => {
+            let logical = (width as f32).min(IMAGE_WIDTH as f32);
+            let ratio = pixels.map_or(0.5625, |p| p.height as f32 / p.width.max(1) as f32);
+            div()
+                .w_full()
+                .pb(rems(0.5))
+                .child(
+                    div()
+                        .debug_selector(placeholder_selector)
+                        .w(px(logical))
+                        .h(px(logical * ratio))
+                        .max_w_full()
+                        .rounded(px(6.))
+                        .bg(cx.theme().muted),
+                )
+                .into_any_element()
+        }
+        State::Failed(error) => {
+            let service = service.clone();
+            v_flex()
+                .w_full()
+                .gap_1()
+                .pb(rems(0.5))
+                .child(image_source(format!("{id}-source").into(), embed, style, cx))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .debug_selector(|| "image-error".to_owned())
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(error),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "image-retry".to_owned())
+                                // 不让点击冒泡成"进编辑态"：那会把整块换成源码输入框
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(Button::new("image-retry").ghost().xsmall().label("重试").on_click(
+                                    move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        service.update(cx, |service, cx| service.retry(cx));
+                                    },
+                                )),
+                        ),
+                )
+                .into_any_element()
+        }
+    }
+}
+
+/// 单击选中这一块（要改 `|宽度` 就按 ⏎ 进编辑态），双击全屏看图。
+fn image_click(
+    editor: &Entity<super::Editor>,
+    block: aero_core::BlockId,
+    target: String,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let editor = editor.clone();
+    move |event: &ClickEvent, window, cx| {
+        if event.is_right_click() {
+            return;
+        }
+        let double = matches!(event, ClickEvent::Mouse(click) if click.down.click_count >= 2);
+        cx.stop_propagation();
+        let target = target.clone();
+        editor.update(cx, |editor, cx| {
+            if double {
+                editor.open_image_viewer(target, window, cx);
+            } else {
+                editor.select_block_by_id(block, window, cx);
+            }
+        });
+    }
+}
+
+/// 渲染不了就显示源码：内容永不丢失，也不写回文件。
+fn image_source(id: SharedString, embed: &ImageEmbed, style: &TextViewStyle, cx: &App) -> AnyElement {
+    let _ = style;
+    div()
+        .id(id)
+        .debug_selector({
+            let target = embed.target.clone();
+            move || format!("image-source-{target}")
+        })
+        .w_full()
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(px(13.))
+        .text_color(cx.theme().muted_foreground)
+        .child(embed.source.clone())
+        .into_any_element()
 }
 
 fn with_links(view: TextView, editor: &Entity<super::Editor>) -> TextView {
@@ -312,6 +518,7 @@ fn render_callout(
     reveal: u64,
     state: &Entity<PreviewState>,
     editor: &Entity<super::Editor>,
+    block: aero_core::BlockId,
     cx: &mut App,
 ) -> AnyElement {
     let (label, icon, color) = appearance(&callout.kind, cx);
@@ -404,6 +611,7 @@ fn render_callout(
                     reveal,
                     state.clone(),
                     editor.clone(),
+                    block,
                 ),
             ))
         })

@@ -39,6 +39,54 @@ fn open(cx: &mut TestAppContext, body: &str) -> (tempfile::TempDir, Arc<Vault>, 
     (dir, vault, path, editor)
 }
 
+/// 带渲染服务的编辑器：图片块要有服务才画位图，没有就退回源码。
+fn open_with_images(
+    cx: &mut TestAppContext,
+    body: &str,
+) -> (tempfile::TempDir, tempfile::TempDir, Arc<Vault>, Entity<Editor>) {
+    let (dir, vault, _, editor) = open(cx, body);
+    let cache = tempfile::tempdir().unwrap();
+    let (v, c) = (vault.clone(), cache.path().to_path_buf());
+    cx.update(|cx| {
+        let service = cx.new(|_| crate::render::RenderService::new(v, c));
+        editor.update(cx, |e, cx| e.connect_images(service, cx));
+    });
+    (dir, cache, vault, editor)
+}
+
+/// 纯色 PNG，宽高可控。
+fn image_bytes(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(width, height, image::Rgba([20, 40, 60, 255]));
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .unwrap();
+    out
+}
+
+fn write_attachment(dir: &tempfile::TempDir, rel: &str, width: u32, height: u32) {
+    let path = dir.path().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, image_bytes(width, height)).unwrap();
+}
+
+/// 渲染要好几跳：绘制才会排队（枚举附件 → 解析 → 渲染），后台完成后又要重绘。
+fn settle(cx: &mut VisualTestContext) {
+    for _ in 0..4 {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+}
+
+fn double_click(cx: &mut VisualTestContext, position: gpui_kit::Point<gpui_kit::Pixels>) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent};
+    for click_count in [1, 2] {
+        let (position, modifiers, button) = (position, Modifiers::default(), MouseButton::Left);
+        cx.simulate_event(MouseDownEvent { position, modifiers, button, click_count, first_mouse: false });
+        cx.simulate_event(MouseUpEvent { position, modifiers, button, click_count });
+    }
+}
+
 fn wiki_catalog(editor: &Entity<Editor>, recent: &[&str], cx: &mut VisualTestContext) {
     cx.update(|_, cx| {
         editor.update(cx, |e, cx| {
@@ -2985,4 +3033,176 @@ fn reveal_heading_jumps_and_ignores_missing(cx: &mut TestAppContext) {
         assert!(cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_heading(fragment, cx))), "{fragment:?}");
         assert_eq!(cx.update(|_, cx| editor.read(cx).highlighted_block()), Some(ids[2]));
     }
+}
+
+/// 图片嵌入：占位 → 位图；`|宽度` 生效；与文字混排的嵌入仍是源码。
+#[gpui_kit::test]
+fn image_embeds_render_as_bitmaps_and_honour_the_width_parameter(cx: &mut TestAppContext) {
+    let body = "![[wide.png]]\n\n![[thumb.png|120]]\n\n前面 ![[wide.png]] 后面\n\n![[missing.png]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, body);
+    write_attachment(&dir, "a.assets/wide.png", 600, 300);
+    write_attachment(&dir, "a.assets/thumb.png", 600, 300);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+        window.draw(cx).clear(cx);
+    });
+    // 附件目录与首次渲染都在后台：先画占位，不阻塞 UI
+    assert!(cx.debug_bounds("image-placeholder-wide.png").is_some(), "首帧先占住版面");
+    assert!(cx.debug_bounds("image-wide.png").is_none(), "这一帧还没有位图");
+    settle(cx);
+    let bounds = cx.debug_bounds("image-wide.png").expect("渲染完成后应有位图");
+    assert!(cx.debug_bounds("image-placeholder-wide.png").is_none(), "占位应被替换");
+    // 600×300 的图按默认列宽显示：等比，且不放大到超过原始宽度
+    assert!(f32::from(bounds.size.width) <= 600., "不放大: {:?}", bounds.size);
+    let ratio = f32::from(bounds.size.height) / f32::from(bounds.size.width);
+    assert!((ratio - 0.5).abs() < 0.02, "应保持 2:1: {:?}", bounds.size);
+    // `|120`：按参数宽度显示，同样等比
+    let thumb = cx.debug_bounds("image-thumb.png").expect("带宽度参数的图也要渲染");
+    assert!((f32::from(thumb.size.width) - 120.).abs() < 1., "应按 |120 显示: {:?}", thumb.size);
+    assert!((f32::from(thumb.size.height) - 60.).abs() < 1., "应保持 2:1: {:?}", thumb.size);
+    assert!(f32::from(bounds.size.width) > f32::from(thumb.size.width), "默认宽度应更大");
+    // 与文字混排的嵌入不画图，保持源码
+    assert!(cx.debug_bounds("image-source-missing.png").is_some(), "找不到附件时显示源码");
+    assert!(cx.debug_bounds("image-error").is_some(), "并给出一行错误");
+    assert!(cx.debug_bounds("image-retry").is_some(), "以及重试入口");
+}
+
+/// 附件是后来才放进来的：点「重试」就能出图，不用重开笔记。
+#[gpui_kit::test]
+fn image_failures_recover_after_retry(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "![[later.png]]\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+    let retry = cx.debug_bounds("image-retry").expect("附件不存在时有重试按钮");
+    write_attachment(&dir, "a.assets/later.png", 200, 100);
+    cx.simulate_click(retry.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("image-later.png").is_some(), "重试后应渲染出图片");
+    assert!(cx.debug_bounds("image-error").is_none(), "错误提示应消失");
+}
+
+/// 单击图片选中所在块（不进编辑态，图片不会被源码顶掉）；双击全屏看图，`Esc` / `Space` 关掉。
+#[gpui_kit::test]
+fn clicking_an_image_selects_its_block_and_double_click_opens_the_viewer(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "![[photo.png]]\n");
+    write_attachment(&dir, "a.assets/photo.png", 400, 200);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+    let image = cx.debug_bounds("image-photo.png").unwrap();
+    cx.simulate_click(image.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        assert!(editor.focused.is_none(), "单击不进编辑态");
+        assert!(editor.selection.is_some(), "单击选中这一块");
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("image-photo.png").is_some(), "选中后图片仍在");
+
+    // 双击：全屏看图
+    let image = cx.debug_bounds("image-photo.png").unwrap();
+    double_click(cx, image.center());
+    settle(cx);
+    assert!(cx.debug_bounds("image-viewer").is_some(), "双击应打开全屏看图");
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    assert!(cx.debug_bounds("image-viewer").is_none(), "Esc 关闭看图");
+    // Space 也能关（只在看图浮层的键位上下文里绑定）
+    let image = cx.debug_bounds("image-photo.png").unwrap().center();
+    double_click(cx, image);
+    settle(cx);
+    assert!(cx.debug_bounds("image-viewer").is_some());
+    cx.simulate_keystrokes("space");
+    settle(cx);
+    assert!(cx.debug_bounds("image-viewer").is_none(), "Space 关闭看图");
+}
+
+/// 粘贴位图：写进 `<note>.assets/`、插入嵌入、单步撤销；纯文字粘贴仍走文本控件。
+#[gpui_kit::test]
+fn pasting_a_bitmap_imports_it_and_leaves_text_paste_alone(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        let image = gpui_kit::Image { format: gpui_kit::ImageFormat::Png, bytes: image_bytes(40, 20), id: 1 };
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_image(&image));
+    });
+    cx.simulate_keystrokes("cmd-v");
+    cx.run_until_parked();
+    let body = text(&editor, cx);
+    let name = body
+        .split_once("![[")
+        .and_then(|(_, rest)| rest.split_once("]]"))
+        .map(|(name, _)| name.to_owned())
+        .expect(&format!("粘贴应插入图片嵌入，实际是 {body:?}"));
+    assert!(name.ends_with(".png"), "{name}");
+    let file = dir.path().join("a.assets").join(&name);
+    assert_eq!(std::fs::read(&file).unwrap(), image_bytes(40, 20), "原始字节写进 .assets/");
+    // 一步撤销回到粘贴前：文件留着（磁盘写入不参与撤销），源码回退
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "正文\n");
+    assert!(file.is_file());
+
+    // 剪贴板是文字：交还给文本控件，正常插入
+    cx.update(|_, cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("粘来的文字".into())));
+    cx.simulate_keystrokes("cmd-v");
+    cx.run_until_parked();
+    assert!(text(&editor, cx).contains("粘来的文字"), "{:?}", text(&editor, cx));
+}
+
+/// Finder 里复制的文件：图片 / PDF 变嵌入，其他文件变普通链接，原名保留且不覆盖同名文件。
+#[gpui_kit::test]
+fn pasting_external_files_imports_them_with_their_names(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "正文\n");
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("图 1.png"), image_bytes(10, 10)).unwrap();
+    std::fs::write(outside.path().join("notes.zip"), b"archive").unwrap();
+    std::fs::create_dir_all(dir.path().join("a.assets")).unwrap();
+    std::fs::write(dir.path().join("a.assets/图 1.png"), b"already here").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        let paths = gpui_kit::ExternalPaths(
+            [outside.path().join("图 1.png"), outside.path().join("notes.zip")].into_iter().collect(),
+        );
+        cx.write_to_clipboard(gpui_kit::ClipboardItem {
+            entries: vec![gpui_kit::ClipboardEntry::ExternalPaths(paths)],
+        });
+    });
+    cx.simulate_keystrokes("cmd-v");
+    cx.run_until_parked();
+    let body = text(&editor, cx);
+    assert!(body.contains("![[图 1-2.png]]"), "同名不覆盖，改名导入: {body:?}");
+    assert!(body.contains("[notes.zip](notes.zip)"), "非附件类型插普通链接: {body:?}");
+    assert_eq!(std::fs::read(dir.path().join("a.assets/图 1.png")).unwrap(), b"already here");
+    assert_eq!(std::fs::read(dir.path().join("a.assets/图 1-2.png")).unwrap(), image_bytes(10, 10));
+    assert_eq!(std::fs::read(dir.path().join("a.assets/notes.zip")).unwrap(), b"archive");
+}
+
+/// 用户路径：点图选中 → `⌫` 删除。曾在"删末块时收掉前面的空行"处按字节切片，
+/// 上一行以中文结尾就 panic（`ops::delete_units`）。附件本身留在磁盘上。
+#[gpui_kit::test]
+fn backspace_deletes_a_selected_image_block_after_multibyte_text(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "上一段中文。\n\n![[photo.png]]\n");
+    write_attachment(&dir, "a.assets/photo.png", 80, 40);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+    let image = cx.debug_bounds("image-photo.png").expect("图片应已渲染");
+    cx.simulate_click(image.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "上一段中文。\n");
+    assert!(dir.path().join("a.assets/photo.png").is_file(), "删除嵌入不删附件文件");
 }
