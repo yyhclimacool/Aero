@@ -221,15 +221,123 @@ fn highlight_source_wraps_by_row_and_does_not_paint_code(cx: &mut TestAppContext
     });
 }
 
-fn highlight_quads(cx: &mut VisualTestContext) -> Vec<gpui_kit::Quad> {
+/// 这一帧里用某个颜色铺过的矩形（块底色、行内背景、选中态都是 quad）。
+fn quads_of(cx: &mut VisualTestContext, color: gpui_kit::Hsla) -> Vec<gpui_kit::Quad> {
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
-        window
-            .painted_quads()
-            .into_iter()
-            .filter(|q| q.background.as_solid() == Some(super::highlight_ui::color(cx)))
-            .collect()
+        window.painted_quads().into_iter().filter(|q| q.background.as_solid() == Some(color)).collect()
     })
+}
+
+fn highlight_quads(cx: &mut VisualTestContext) -> Vec<gpui_kit::Quad> {
+    let color = cx.update(|_, cx| super::highlight_ui::color(cx));
+    quads_of(cx, color)
+}
+
+/// 调色板颜色在当前主题下的色值（测试窗口是浅色主题）。
+fn content_color(slot: aero_core::colors::Slot, color: &str) -> gpui_kit::Hsla {
+    crate::colors::token(slot, color, false).expect("调色板里有这个颜色")
+}
+
+/// 块颜色（6.3.10 / 7.7）：`⌘⇧H` 在块选中态写到块末，预览里铺满块矩形。
+#[gpui_kit::test]
+fn block_color_is_written_at_the_block_end_and_painted_in_preview(cx: &mut TestAppContext) {
+    let source = "正文\n\n第二段\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    // 没用过颜色菜单时「上次使用的颜色」是黄色背景
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let id = e.units[0].id;
+            e.select_block_by_id(id, window, cx);
+        })
+    });
+    cx.simulate_keystrokes("cmd-shift-h");
+    assert_eq!(text(&editor, cx), "正文 {.bg-yellow}\n\n第二段\n");
+    // 已经是这个颜色：不产生第二次编辑
+    cx.simulate_keystrokes("cmd-shift-h");
+    assert_eq!(text(&editor, cx), "正文 {.bg-yellow}\n\n第二段\n");
+    // 块选中态的底色压过块颜色；退回浏览态才看到块自己的底色
+    cx.simulate_keystrokes("escape");
+    let quads = quads_of(cx, content_color(aero_core::colors::Slot::Background, "yellow"));
+    assert_eq!(quads.len(), 1, "只有上色的那一块有底色");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+    assert!(quads_of(cx, content_color(aero_core::colors::Slot::Background, "yellow")).is_empty());
+}
+
+/// 多块选中时对每一块各写一次，一个撤销组；文字色走另一组，与背景色叠加。
+#[gpui_kit::test]
+fn block_colors_cover_every_selected_block_in_one_undo_group(cx: &mut TestAppContext) {
+    let source = "第一段\n\n# 标题\n\n- 列表项\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let id = e.units[0].id;
+            e.select_block_by_id(id, window, cx);
+        })
+    });
+    cx.simulate_keystrokes("shift-down shift-down");
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| e.apply_color(aero_core::colors::Slot::Text, Some("red"), window, cx))
+    });
+    // 标题与 Pandoc 一致；列表项的属性挂在它的正文段落上（6.3.10）
+    let red = "第一段 {.red}\n\n# 标题 {.red}\n\n- 列表项 {.red}\n";
+    assert_eq!(text(&editor, cx), red);
+    // 另一组颜色叠加，不覆盖文字色
+    cx.update(|window, cx| {
+        editor
+            .update(cx, |e, cx| e.apply_color(aero_core::colors::Slot::Background, Some("blue"), window, cx))
+    });
+    let stacked = "第一段 {.red .bg-blue}\n\n# 标题 {.red .bg-blue}\n\n- 列表项 {.red .bg-blue}\n";
+    assert_eq!(text(&editor, cx), stacked);
+    // 一次撤销退掉整组
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), red);
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+    // 「默认」去掉这一组：重做回 `{.red}`，再把三块一起去色
+    cx.simulate_keystrokes("cmd-shift-z");
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.select_blocks(0, 2, window, cx);
+            e.apply_color(aero_core::colors::Slot::Text, None, window, cx)
+        })
+    });
+    assert_eq!(text(&editor, cx), source);
+}
+
+/// 行内颜色（7.7）：`⌘⇧H` 用上次的颜色包住选区，选区保持在原文字上，预览里上色。
+#[gpui_kit::test]
+fn inline_color_wraps_the_selection_and_paints_it_in_preview(cx: &mut TestAppContext) {
+    let source = "正文 中文😀 后文\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|_, cx| crate::colors::remember(aero_core::colors::Slot::Background, "blue", cx));
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "中文😀", cx);
+    cx.simulate_keystrokes("cmd-shift-h");
+    assert_eq!(text(&editor, cx), "正文 [中文😀]{.bg-blue} 后文\n");
+    assert_eq!(selected_inline_text(&editor, cx), "中文😀", "选区还在原来那段文字上");
+    // 预览里 `[文本]{...}` 的标记不显示，颜色画成行内背景
+    cx.simulate_keystrokes("escape");
+    let blue = content_color(aero_core::colors::Slot::Background, "blue");
+    assert!(!quads_of(cx, blue).is_empty(), "预览要给行内背景上色");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+    assert!(quads_of(cx, blue).is_empty());
+    // 文字色是前景色，不铺底色（换一组颜色时不能画成背景）
+    cx.update(|_, cx| crate::colors::remember(aero_core::colors::Slot::Text, "red", cx));
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "中文😀", cx);
+    cx.simulate_keystrokes("cmd-shift-h");
+    assert_eq!(text(&editor, cx), "正文 [中文😀]{.red} 后文\n");
+    cx.simulate_keystrokes("escape");
+    assert!(
+        quads_of(cx, content_color(aero_core::colors::Slot::Text, "red")).is_empty(),
+        "文字色不该画成底色"
+    );
 }
 
 #[gpui_kit::test]

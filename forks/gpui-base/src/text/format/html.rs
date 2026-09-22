@@ -126,6 +126,28 @@ fn mark_color(attrs: &RefCell<Vec<html5ever::Attribute>>) -> Option<Hsla> {
         .and_then(|v| parse_mark_color(v.trim()))
 }
 
+/// The mark a `<span>` carries: `color` paints the text, `background-color`
+/// highlights it the same way `<mark>` does. A span with neither only groups
+/// its children, so it gets no mark at all.
+fn span_mark(attrs: &RefCell<Vec<html5ever::Attribute>>) -> Option<TextMark> {
+    let styles = style_attrs(attrs);
+    let color = styles.get("color").and_then(|v| parse_mark_color(v.trim()));
+    let background = styles
+        .get("background-color")
+        .and_then(|v| parse_mark_color(v.trim()));
+    if color.is_none() && background.is_none() {
+        return None;
+    }
+    let mut mark = TextMark::default();
+    if let Some(color) = color {
+        mark = mark.color(color);
+    }
+    if let Some(background) = background {
+        mark = mark.highlight(background);
+    }
+    Some(mark)
+}
+
 fn parse_mark_color(value: &str) -> Option<Hsla> {
     if value.starts_with('#') {
         return gpui::Rgba::try_from(value).ok().map(Into::into);
@@ -367,6 +389,10 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &Rc<Node>) {
                     paragraph,
                     Some(TextMark::default().highlight(color)),
                 );
+            }
+            local_name!("span") => {
+                let mark = span_mark(attrs);
+                merge_children_with_mark(node, paragraph, mark);
             }
             local_name!("a") => {
                 let link_mark = LinkMark {

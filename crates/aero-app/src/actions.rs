@@ -98,6 +98,8 @@ actions!(
         CloseImageViewer,
         /// `⌘V`：剪贴板里是位图 / 文件就导入到 `<note>.assets/`；是文字就交还给文本控件
         PasteAttachment,
+        /// `⌘⇧H`：把上次用过的颜色应用到选中的文字或选中的块（7.7）
+        ApplyLastColor,
     ]
 );
 
@@ -158,6 +160,7 @@ pub fn commands() -> Vec<Command> {
         Command::new("undo", "撤销", "undo cx", Editor, DocUndo),
         Command::new("redo", "重做", "redo cz", Editor, DocRedo),
         Command::new("edit-link", "插入或编辑链接", "link url insert edit lj", Editor, EditLink),
+        Command::new("color-last", "应用上次使用的颜色", "color last ysyd", Editor, ApplyLastColor),
         Command::new("quit", "退出 Aero", "quit exit tc", Global, Quit),
     ];
     use aero_core::inline_format::Format;
@@ -222,7 +225,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-i", FormatInline(Format::Italic), Some("Editor > Input")),
         KeyBinding::new("cmd-e", FormatInline(Format::Code), Some("Editor > Input")),
         KeyBinding::new("cmd-shift-s", FormatInline(Format::Strike), Some("Editor > Input")),
-        KeyBinding::new("cmd-shift-h", FormatInline(Format::Highlight), Some("Editor > Input")),
+        // ⌘⇧H 应用上次用过的颜色（7.7）；没用过菜单时那就是黄色背景，与 `==` 同一条路
+        KeyBinding::new("cmd-shift-h", ApplyLastColor, Some("Editor > Input")),
         KeyBinding::new("cmd-z", DocUndo, Some("Input")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Input")),
         // 编辑态里 ⇧↑↓ 越过块边界时升级为块选中；否则 propagate 给控件扩展字符选区
@@ -247,6 +251,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("delete", DeleteSelectedBlocks, Some("Editor")),
         KeyBinding::new("cmd-c", CopySelectedBlocks, Some("Editor")),
         KeyBinding::new("cmd-x", CutSelectedBlocks, Some("Editor")),
+        KeyBinding::new("cmd-shift-h", ApplyLastColor, Some("Editor")),
     ]);
     cx.bind_keys((0..=8u8).map(|n| KeyBinding::new(&format!("cmd-alt-{n}"), ConvertBlock(n), Some("Input"))));
 
@@ -282,6 +287,7 @@ pub fn init(cx: &mut App) {
             MenuItem::action("行内代码", FormatInline(Format::Code)),
             MenuItem::action("删除线", FormatInline(Format::Strike)),
             MenuItem::action("黄色高亮", FormatInline(Format::Highlight)),
+            MenuItem::action("上次使用的颜色", ApplyLastColor),
         ]),
         Menu::new("视图").items(vec![
             MenuItem::action("文件", OpenFiles),

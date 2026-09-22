@@ -16,6 +16,7 @@ pub mod anchors;
 pub mod attachments;
 pub mod block;
 pub mod block_refs;
+pub mod colors;
 pub mod document;
 pub mod headings;
 pub mod highlight;

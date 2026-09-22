@@ -364,6 +364,10 @@ pub struct TextMark {
     ///
     /// `None` means the text is not highlighted.
     pub highlight: Option<Hsla>,
+    /// Foreground color from a `<span style="color: …">`.
+    ///
+    /// `None` means the text keeps the body color.
+    pub color: Option<Hsla>,
     pub link: Option<LinkMark>,
 }
 
@@ -399,6 +403,12 @@ impl TextMark {
         self
     }
 
+    /// Paint the text in the given foreground color.
+    pub fn color(mut self, color: Hsla) -> Self {
+        self.color = Some(color);
+        self
+    }
+
     pub fn link(mut self, link: impl Into<LinkMark>) -> Self {
         self.link = Some(link.into());
         self
@@ -412,6 +422,9 @@ impl TextMark {
         self.code |= other.code;
         if other.highlight.is_some() {
             self.highlight = other.highlight;
+        }
+        if other.color.is_some() {
+            self.color = other.color;
         }
         if let Some(link) = other.link {
             self.link = Some(link);
@@ -1294,6 +1307,9 @@ fn mark_highlight(mark: &TextMark, node_cx: &NodeContext, cx: &App) -> InlineHig
     if let Some(color) = mark.highlight {
         highlight.background_color = Some(color);
     }
+    if let Some(color) = mark.color {
+        highlight.color = Some(color);
+    }
     InlineHighlight { style: highlight, font_family, font_size_scale: mark.code.then_some(0.875) }
 }
 
@@ -1417,7 +1433,8 @@ impl Paragraph {
                     let mut highlight = mark_highlight(style, node_cx, cx);
 
                     if let Some(mut link_mark) = style.link.clone() {
-                        highlight.style.color = Some(node_cx.style.link());
+                        // An explicit `<span style="color: …">` wins over the link color.
+                        highlight.style.color = Some(style.color.unwrap_or_else(|| node_cx.style.link()));
                         highlight.style.underline =
                             Some(gpui::UnderlineStyle { thickness: gpui::px(1.), ..Default::default() });
 
@@ -1506,7 +1523,8 @@ impl Paragraph {
                     let mut highlight = mark_highlight(style, node_cx, cx);
 
                     if let Some(mut link_mark) = style.link.clone() {
-                        highlight.style.color = Some(node_cx.style.link());
+                        // An explicit `<span style="color: …">` wins over the link color.
+                        highlight.style.color = Some(style.color.unwrap_or_else(|| node_cx.style.link()));
                         highlight.style.underline =
                             Some(gpui::UnderlineStyle { thickness: gpui::px(1.), ..Default::default() });
 

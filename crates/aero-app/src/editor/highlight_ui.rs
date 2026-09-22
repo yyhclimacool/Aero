@@ -1,16 +1,12 @@
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use gpui_kit::base::input::TextareaState;
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-pub(super) fn color_hex(cx: &App) -> &'static str {
-    if cx.theme().mode.is_dark() { "#66551c" } else { "#fef08a" }
-}
-
+/// `==` 的底色就是 13.3 的 `content.bg.yellow`（见 7.7：黄色背景是它唯一的专用语法）。
 pub(super) fn color(cx: &App) -> Hsla {
-    if cx.theme().mode.is_dark() { rgb(0x66551c).into() } else { rgb(0xfef08a).into() }
+    crate::colors::highlight(cx)
 }
 
 #[derive(Default)]

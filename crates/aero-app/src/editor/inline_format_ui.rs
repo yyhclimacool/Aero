@@ -7,22 +7,30 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(f) = &self.focused else {
+        if !self.format_inline(action.0, window, cx) {
             cx.propagate();
-            return;
-        };
+        }
+    }
+
+    /// 给选中的文字加 / 去一种行内格式。返回是否由编辑器处理（否则这次按键交还给文本控件）。
+    pub(super) fn format_inline(
+        &mut self,
+        format: aero_core::inline_format::Format,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(f) = &self.focused else { return false };
         if self.title_edit.is_some()
             || !f.textarea.focus_handle(cx).is_focused(window)
             || self.input_composing(window, cx)
         {
-            cx.propagate();
-            return;
+            return false;
         }
         let f = self.focused.as_ref().unwrap();
         let selected = f.textarea.read(cx).selected_range();
         let selected = f.range.start + selected.start..f.range.start + selected.end;
-        let Some(plan) = aero_core::inline_format::plan(&self.doc.to_string(), selected, action.0) else {
-            return;
+        let Some(plan) = aero_core::inline_format::plan(&self.doc.to_string(), selected, format) else {
+            return true;
         };
         self.slash = None;
         self.wiki = None;
@@ -37,5 +45,6 @@ impl Editor {
             f.textarea.update(cx, |ta, cx| ta.set_selected_range(selected, cx));
         }
         cx.notify();
+        true
     }
 }

@@ -490,7 +490,7 @@ fn highlight_html(
     window: &Window,
     cx: &App,
 ) -> Div {
-    let color = super::highlight_ui::color_hex(cx);
+    let dark = cx.theme().mode.is_dark();
     let line_height = window.text_style().line_height_in_pixels(window.rem_size());
     v_flex().w_full().items_start().children(lines.iter().enumerate().map(|(ix, html)| {
         let editor = editor.clone();
@@ -499,7 +499,8 @@ fn highlight_html(
             with_links(
                 TextView::html(
                     SharedString::from(format!("{id}-line-{ix}")),
-                    html.replace("<mark>", &format!("<mark color=\"{color}\">")),
+                    // core 只写颜色类名，色值按 13.3 的 `content.*` 令牌在这里换上
+                    crate::colors::paint_html(html, dark),
                 ),
                 &editor,
             )

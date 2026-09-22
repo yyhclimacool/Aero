@@ -11,6 +11,7 @@
 
 mod backlinks_ui;
 mod block_refs_ui;
+mod colors_ui;
 mod embeds_ui;
 mod highlight_ui;
 mod images_ui;
@@ -53,6 +54,7 @@ use crate::actions::{
     DeleteSelectedBlocks, DocRedo, DocUndo, EditLink, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp,
     FormatInline, LinkAlias, MenuConfirm, SelectBlockDown, SelectBlockUp, SplitBlock,
 };
+use crate::colors::Paint;
 use ops::{BlockType, Plan};
 use slash::SlashAction;
 use text_ops::*;
@@ -2074,7 +2076,7 @@ impl Editor {
                 out.push(self.render_textarea(None, cx));
                 pending = None;
             }
-            if let Some(el) = self.render_block(b, 0, cx) {
+            if let Some(el) = self.render_block(b, 0, None, cx) {
                 out.push(el);
             }
         }
@@ -2084,7 +2086,16 @@ impl Editor {
         out
     }
 
-    fn render_block(&self, b: &Block, depth: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// 块颜色作用于整块及其子块（6.3.10）：背景在最外层那个块上铺一次，文字色往下传，
+    /// `inherited` 就是祖先块的文字色，本块自己的属性优先。
+    fn render_block(
+        &self,
+        b: &Block,
+        depth: usize,
+        inherited: Option<Hsla>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let paint = crate::colors::of(&b.attrs, cx).inherit(inherited);
         match &b.kind {
             BlockKind::Marker => None,
             BlockKind::List { ordered, start } => {
@@ -2094,19 +2105,32 @@ impl Editor {
                     .iter()
                     .enumerate()
                     .map(|(i, item)| {
-                        self.render_list_item(item, ordered.then_some(*start + i as u32), depth, cx)
+                        let number = ordered.then_some(*start + i as u32);
+                        self.render_list_item(item, number, depth, paint.text, cx)
                     })
                     .collect();
-                Some(v_flex().w_full().gap(px(4.)).children(els).into_any_element())
+                Some(Self::painted(v_flex().w_full().gap(px(4.)).children(els), paint).into_any_element())
             }
-            BlockKind::ListItem { .. } => Some(self.render_list_item(b, None, depth, cx)),
-            k if units::is_atomic(k) => self.render_unit(b, depth, cx),
+            // 列表项自己的颜色由 `render_list_item` 画：它要把标记列也包进背景里
+            BlockKind::ListItem { .. } => Some(self.render_list_item(b, None, depth, inherited, cx)),
+            k if units::is_atomic(k) => self.render_unit(b, depth, paint, cx),
             _ => {
                 let els: Vec<AnyElement> =
-                    b.children.iter().filter_map(|c| self.render_block(c, depth, cx)).collect();
-                Some(v_flex().w_full().gap(px(8.)).children(els).into_any_element())
+                    b.children.iter().filter_map(|c| self.render_block(c, depth, paint.text, cx)).collect();
+                Some(Self::painted(v_flex().w_full().gap(px(8.)).children(els), paint).into_any_element())
             }
         }
+    }
+
+    /// 块颜色的画法（7.7）：背景铺满块矩形、左右各多 8 px；子块继承同一段文字色。
+    fn painted<E: Styled>(mut el: E, paint: Paint) -> E {
+        if let Some(bg) = paint.background {
+            el = el.bg(bg).rounded(px(6.)).mx(px(-8.)).px(px(8.));
+        }
+        if let Some(color) = paint.text {
+            el = el.text_color(color);
+        }
+        el
     }
 
     fn render_list_item(
@@ -2114,8 +2138,10 @@ impl Editor {
         item: &Block,
         number: Option<u32>,
         depth: usize,
+        inherited: Option<Hsla>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let paint = crate::colors::of(&item.attrs, cx).inherit(inherited);
         let theme = cx.theme();
         let content: Vec<&Block> = item.children.iter().filter(|c| c.kind != BlockKind::Marker).collect();
         let task = match item.kind {
@@ -2163,14 +2189,11 @@ impl Editor {
             self.with_gutter(id, depth + 1, body, cx)
         } else {
             let els: Vec<AnyElement> =
-                content.iter().filter_map(|c| self.render_block(c, depth + 1, cx)).collect();
+                content.iter().filter_map(|c| self.render_block(c, depth + 1, paint.text, cx)).collect();
             v_flex().w_full().gap(px(4.)).children(els).into_any_element()
         };
 
-        h_flex()
-            .w_full()
-            .items_start()
-            .gap(px(4.))
+        Self::painted(h_flex().w_full().items_start().gap(px(4.)), paint)
             .child(div().flex_none().w(px(24.)).text_center().child(marker))
             .child(div().flex_1().min_w_0().child(body))
             .into_any_element()
@@ -2240,11 +2263,19 @@ impl Editor {
     }
 
     /// 一个编辑单位：聚焦则画控件，否则渲染。
-    fn render_unit(&self, b: &Block, depth: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_unit(
+        &self,
+        b: &Block,
+        depth: usize,
+        paint: Paint,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let range = self.doc.content_range(b);
         if self.is_focused_block(b.id) {
-            let textarea = self.render_textarea(Some(&b.kind), cx);
-            return Some(self.with_gutter(b.id, depth, textarea, cx));
+            // 源码态也保持块颜色：属性列表本身是尾部标记，文本框里看不到它
+            let textarea =
+                Self::painted(div().w_full(), paint).child(self.render_textarea(Some(&b.kind), cx));
+            return Some(self.with_gutter(b.id, depth, textarea.into_any_element(), cx));
         }
         if self.is_covered(&range) {
             return None;
@@ -2283,22 +2314,20 @@ impl Editor {
                 // TextView 的解析状态按元素 id 缓存；带上编辑器实体 id，切换笔记后不会复用上一篇的状态
                 let view_id = SharedString::from(format!("blk-{}-{}", cx.entity_id(), id.0));
                 let reveal = if self.highlight == Some(id) { self.reveal_generation } else { 0 };
-                preview::markdown(
-                    view_id,
-                    rendered,
-                    self.text_view_style(cx),
-                    reveal,
-                    self.preview.clone(),
-                    cx.entity(),
-                    id,
-                    0,
-                )
-                .into_any_element()
+                // TextView 自带正文色，块颜色要写进它的样式，容器上的 text_color 进不去
+                let style = self.text_view_style(cx);
+                let style = match paint.text {
+                    Some(color) => style.with_foreground(color),
+                    None => style,
+                };
+                preview::markdown(view_id, rendered, style, reveal, self.preview.clone(), cx.entity(), id, 0)
+                    .into_any_element()
             }
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });
         let highlighted = self.highlight == Some(id);
         let selected = self.is_selected_block(id);
+        let transient = highlighted || selected;
         let (accent, selection) = (theme.accent, theme.selection);
         // 定位中的块：多套一层拿子元素布局（`on_children_prepainted` 只在无状态 div 上有）
         let body: AnyElement = if self.reveal == Some(id) {
@@ -2313,6 +2342,10 @@ impl Editor {
             .min_h(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT))
             .when(is_heading, |el| el.pt_2())
             .cursor_text()
+            // 定位高亮与块选中是临时状态，背景压过块颜色；块的文字色照常
+            .map(|el| {
+                Self::painted(el, Paint { background: paint.background.filter(|_| !transient), ..paint })
+            })
             .when(highlighted, |el| el.bg(accent).rounded(px(6.)).mx(px(-8.)).px(px(8.)))
             .when(selected && !highlighted, |el| Self::selected_style(el, selection))
             .on_click(focus)
@@ -2352,6 +2385,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_link_alias))
             .on_action(cx.listener(Self::on_edit_link))
             .on_action(cx.listener(Self::on_format_inline))
+            .on_action(cx.listener(Self::on_apply_last_color))
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_blur_editor))
             .on_action(cx.listener(Self::on_select_up))

@@ -15,7 +15,7 @@
 //!
 //! 本模块只产出字节区间，不接触 Rope / Anchor；`Document` 负责把区间变成 anchor。
 
-mod markers;
+pub(crate) mod markers;
 
 pub use markers::callout_header;
 
@@ -307,7 +307,17 @@ impl<'t> Cx<'t> {
             NodeValue::Paragraph => {
                 return Some(self.paragraph(node, range));
             }
-            NodeValue::Heading(h) => self.leaf(BlockKind::Heading { level: h.level }, range, attrs),
+            NodeValue::Heading(h) => {
+                let mut b = self.leaf(BlockKind::Heading { level: h.level }, range.clone(), attrs);
+                // comrak 把 header attributes 收进 ast.attrs，但 sourcepos 仍含 `{...}`。
+                // 与段落的块末属性一样记成 suffix：编辑和渲染都不再出现这一段源码。
+                let src = &self.text[range];
+                let t = markers::strip_trailing(src);
+                if !b.attrs.is_empty() && t.attrs.is_some() && t.id.is_none() {
+                    b.suffix_len = (src.len() - t.content_len) as u32;
+                }
+                b
+            }
             NodeValue::CodeBlock(cb) => {
                 let kind = if cb.fenced {
                     BlockKind::CodeFence { info: strip_info_attrs(&cb.info).to_owned() }
@@ -503,6 +513,8 @@ mod tests {
         assert_eq!(b[0].kind, BlockKind::FrontMatter);
         assert_eq!(b[1].kind, BlockKind::Heading { level: 1 });
         assert_eq!(b[1].attrs.classes, ["red"]);
+        // 标题的块末属性与段落一样算尾部标记，正文里看不到它
+        assert_eq!(&text[b[1].range.start..b[1].range.end - b[1].suffix_len as usize], "# H1");
         assert_eq!(b[2].kind, BlockKind::Paragraph);
         assert_eq!(b[3].kind, BlockKind::List { ordered: false, start: 1 });
         assert_eq!(b[3].children[0].kind, BlockKind::ListItem { task: None });

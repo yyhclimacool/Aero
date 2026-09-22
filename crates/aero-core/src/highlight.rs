@@ -1,5 +1,9 @@
-//! `==...==` 的显示适配。源码始终保留 Markdown，HTML 仅供原生富文本预览。
+//! `==...==` 与行内属性列表（6.3.10）的显示适配。源码始终保留 Markdown，HTML 仅供原生富文本预览。
+//!
+//! 颜色的具体色值是主题的事，这里只把承载颜色的类名写进 `<span class="red bg-blue">`，
+//! 调用方按 13.3 的 `content.*` 令牌换成实际颜色。
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use comrak::{
@@ -8,7 +12,7 @@ use comrak::{
     parse_document,
 };
 
-use crate::{inline_links::SourceMap, parse};
+use crate::{colors, inline_links::SourceMap, parse};
 
 /// 高亮正文的源字节范围；使用与编辑 / 索引相同的解析器排除代码、转义、URL 等。
 pub fn ranges(src: &str) -> Vec<Range<usize>> {
@@ -43,22 +47,39 @@ pub struct Cell {
     pub text: String,
 }
 
+/// 块的富文本 HTML。只有块里真的有 `==` 或行内属性列表时才返回，否则调用方按普通 Markdown 渲染。
 pub fn preview(src: &str, range: Range<usize>) -> Option<Preview> {
-    if !src.get(range.clone())?.contains("==") {
+    let text = src.get(range.clone())?;
+    if !text.contains("==") && !text.contains('{') {
         return None;
     }
-    let arena = Arena::new();
     let mut options = parse::comrak_options();
     options.render.sourcepos = false;
+    // 第一遍：这个块要不要富文本渲染，以及行内属性挂在哪些文字上
+    let carriers = {
+        let arena = Arena::new();
+        let root = parse_document(&arena, src, &options);
+        let node = block_node(root, src, &range)?;
+        let carriers = carriers(src, &range, node);
+        if carriers.is_empty() && !node.descendants().any(|n| matches!(n.data().value, NodeValue::Highlight))
+        {
+            return None;
+        }
+        carriers
+    };
+    // 属性列表本身不进渲染：先换成哨兵，重新解析，最后在 HTML 上换成 `<span class>`。
+    // 哨兵用私有使用区字符，Markdown 不解析它、HTML 也不转义它。
+    let (source, range) = match carriers.is_empty() {
+        true => (Cow::Borrowed(src), range),
+        false => {
+            let (rewritten, range) = rewrite(src, &range, &carriers);
+            (Cow::Owned(rewritten), range)
+        }
+    };
+    let src = source.as_ref();
+    let arena = Arena::new();
     let root = parse_document(&arena, src, &options);
-    let positions = SourceMap::new(src);
-    let node = root.descendants().find(|node| {
-        matches!(node.data().value, NodeValue::Paragraph | NodeValue::Heading(_) | NodeValue::Table(_))
-            && positions.range(node) == Some(range.clone())
-    })?;
-    if !node.descendants().any(|n| matches!(n.data().value, NodeValue::Highlight)) {
-        return None;
-    }
+    let node = block_node(root, src, &range)?;
     for child in node.descendants() {
         let mut data = child.data_mut();
         if let NodeValue::HtmlInline(raw) = &data.value
@@ -68,7 +89,7 @@ pub fn preview(src: &str, range: Range<usize>) -> Option<Preview> {
         }
     }
     let html = |node| {
-        split_lines(node, &arena)
+        let mut lines = split_lines(node, &arena)
             .into_iter()
             .map(|line| {
                 if matches!(line.data().value, NodeValue::TableCell) {
@@ -78,7 +99,9 @@ pub fn preview(src: &str, range: Range<usize>) -> Option<Preview> {
                 comrak::format_html(line, &options, &mut html).ok()?;
                 Some(html)
             })
-            .collect::<Option<Vec<_>>>()
+            .collect::<Option<Vec<_>>>()?;
+        paint(&mut lines, &carriers);
+        Some(lines)
     };
     if let NodeValue::Table(table) = &node.data().value {
         let alignments = table
@@ -96,7 +119,7 @@ pub fn preview(src: &str, range: Range<usize>) -> Option<Preview> {
                 row.children()
                     .map(|cell| {
                         let content = html(cell)?;
-                        let text = cell
+                        let text: String = cell
                             .descendants()
                             .filter_map(|child| match &child.data().value {
                                 NodeValue::Text(text) => Some(text.to_string()),
@@ -105,6 +128,8 @@ pub fn preview(src: &str, range: Range<usize>) -> Option<Preview> {
                                 _ => None,
                             })
                             .collect();
+                        // 列宽按可见文字量，哨兵不是文字
+                        let text = text.replace(is_sentinel, "");
                         Some(Cell { html: content, text })
                     })
                     .collect::<Option<Vec<_>>>()
@@ -113,6 +138,247 @@ pub fn preview(src: &str, range: Range<usize>) -> Option<Preview> {
         return Some(Preview::Table { alignments, rows });
     }
     Some(Preview::Html(html(node)?))
+}
+
+/// 块在 AST 里的节点。渲染的单位与 `preview` 的调用方一致：段落、标题、表格。
+fn block_node<'a>(root: &'a AstNode<'a>, src: &str, range: &Range<usize>) -> Option<&'a AstNode<'a>> {
+    let positions = SourceMap::new(src);
+    root.descendants().find(|node| {
+        matches!(node.data().value, NodeValue::Paragraph | NodeValue::Heading(_) | NodeValue::Table(_))
+            && positions.range(node).as_ref() == Some(range)
+    })
+}
+
+/// 哨兵：私有使用区字符，Markdown 不解析、HTML 不转义。第 i 处的开标签是 `OPEN + i`，闭标签固定。
+const OPEN: char = '\u{E000}';
+const CLOSE: char = '\u{E0FF}';
+/// 一个块里最多处理的承载者数量（哨兵一处一个字符），超出的不上色，内容照常渲染。
+const MAX_CARRIERS: usize = 0xFF;
+
+fn is_sentinel(c: char) -> bool {
+    (OPEN..=CLOSE).contains(&c)
+}
+
+/// 一处行内属性列表（6.3.10）：`[文本]{...}`，或紧跟行内元素的 `{...}`。
+struct Carrier {
+    /// 上色的正文
+    content: Range<usize>,
+    /// 渲染时要隐藏的两段标记：`[`（元素形式为空区间）与 `]{...}` / `{...}`
+    before: Range<usize>,
+    after: Range<usize>,
+    /// 调色板里的类名（`red` / `bg-blue`），空表示这一处不上色，只隐藏标记
+    classes: String,
+}
+
+/// 一个块里的行内属性承载者，按出现顺序。代码、数学、HTML 里的 `{...}` 不算属性列表。
+fn carriers<'a>(src: &str, range: &Range<usize>, block: &'a AstNode<'a>) -> Vec<Carrier> {
+    // 正文里自带私有使用区字符时不上色：那些字符正是改写用的哨兵，混在一起会画出错位的 span
+    if src.get(range.clone()).is_none_or(|text| text.contains(is_sentinel)) {
+        return Vec::new();
+    }
+    let positions = SourceMap::new(src);
+    let mut protected: Vec<Range<usize>> = Vec::new();
+    let mut out: Vec<Carrier> = Vec::new();
+    for node in block.descendants() {
+        let data = node.data();
+        let Some(node_range) = positions.range(node) else { continue };
+        // 行内代码 / 链接的属性列表 comrak 自己解析掉了，节点区间含 `{...}`，正文要去掉这一段
+        let attrs = data
+            .attrs
+            .as_ref()
+            .and_then(|_| src.get(node_range.clone())?.rfind('{'))
+            .map(|at| node_range.start + at)
+            .filter(|&at| colors::attrs_at(src, at).is_some_and(|(_, end)| end == node_range.end));
+        let content = node_range.start..attrs.unwrap_or(node_range.end);
+        if matches!(
+            data.value,
+            NodeValue::Code(_)
+                | NodeValue::CodeBlock(_)
+                | NodeValue::Math(_)
+                | NodeValue::HtmlInline(_)
+                | NodeValue::HtmlBlock(_)
+                | NodeValue::WikiLink(_)
+        ) {
+            protected.push(content.clone());
+        }
+        if !is_inline_element(&data.value) {
+            continue;
+        }
+        // 元素形式：属性紧跟行内元素之后（`**粗**{.blue}`），或已经被 comrak 收进节点（`` `码`{.red} ``、链接）
+        let after = content.end;
+        if let Some((list, end)) = colors::attrs_at(src, after) {
+            out.push(Carrier {
+                content: content.clone(),
+                before: content.start..content.start,
+                after: after..end,
+                classes: classes(&list),
+            });
+        }
+    }
+    // `[文本]{...}` 形式：`]` 紧跟属性列表，向前找配对的 `[`
+    let Some(text) = src.get(range.clone()) else { return out };
+    for (at, _) in text.match_indices(']') {
+        let close = range.start + at;
+        if escaped(src, close) {
+            continue;
+        }
+        let Some((list, end)) = colors::attrs_at(src, close + 1) else { continue };
+        let Some(open) = bracket_start(src, close, range.start) else { continue };
+        if open + 1 == close {
+            continue;
+        }
+        out.push(Carrier {
+            content: open + 1..close,
+            before: open..open + 1,
+            after: close..end,
+            classes: classes(&list),
+        });
+    }
+    out.retain(|c| !protected.iter().any(|p| overlaps(p, &c.before) || overlaps(p, &c.after)));
+    out.sort_by_key(|c| (c.content.start, std::cmp::Reverse(c.content.end)));
+    // 同一段 `{...}` 可能被两种形式同时认出（引用式链接的 `[文本]{.red}` 既是 `[ ]` 又是链接元素）：
+    // 只留最外面那一处，改写用的标记区间之间不能重叠。外层先出现，靠 sort 的顺序留下。
+    let mut kept: Vec<Carrier> = Vec::with_capacity(out.len());
+    for c in out {
+        let clash = kept
+            .iter()
+            .any(|k| [&k.before, &k.after].iter().any(|k| overlaps(k, &c.before) || overlaps(k, &c.after)));
+        if !clash {
+            kept.push(c);
+        }
+    }
+    kept.truncate(MAX_CARRIERS);
+    kept
+}
+
+/// 能承载属性列表的行内元素（6.3.10：强调、代码、链接、`==高亮==` 等）。
+fn is_inline_element(value: &NodeValue) -> bool {
+    matches!(
+        value,
+        NodeValue::Strong
+            | NodeValue::Emph
+            | NodeValue::Strikethrough
+            | NodeValue::Highlight
+            | NodeValue::Underline
+            | NodeValue::Superscript
+            | NodeValue::Subscript
+            | NodeValue::Code(_)
+            | NodeValue::Link(_)
+            | NodeValue::Image(_)
+            | NodeValue::Math(_)
+            | NodeValue::WikiLink(_)
+    )
+}
+
+/// 属性列表里归我们管的类名，按 `文字 背景` 的顺序拼成 `class` 属性的值。
+fn classes(attrs: &crate::block::Attrs) -> String {
+    let mut out = Vec::new();
+    for slot in [colors::Slot::Text, colors::Slot::Background] {
+        if let Some(color) = slot.color_of(attrs) {
+            out.push(slot.class(color));
+        }
+    }
+    out.join(" ")
+}
+
+/// `close` 处 `]` 配对的 `[` 的位置（同一块内、未转义、允许嵌套）。
+fn bracket_start(src: &str, close: usize, limit: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, ch) in src[limit..close].char_indices().rev() {
+        let at = limit + at;
+        if !matches!(ch, '[' | ']') || escaped(src, at) {
+            continue;
+        }
+        if ch == ']' {
+            depth += 1;
+        } else if depth == 0 {
+            return Some(at);
+        } else {
+            depth -= 1;
+        }
+    }
+    None
+}
+
+fn escaped(src: &str, at: usize) -> bool {
+    src[..at].chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+}
+
+fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+/// 把属性列表的标记换成哨兵，返回改写后的源码与块的新区间。
+fn rewrite(src: &str, range: &Range<usize>, carriers: &[Carrier]) -> (String, Range<usize>) {
+    let mut marks: Vec<(Range<usize>, String)> = Vec::with_capacity(carriers.len() * 2);
+    for (ix, c) in carriers.iter().enumerate() {
+        let open = char::from_u32(OPEN as u32 + ix as u32).expect("私有使用区");
+        marks.push((c.before.clone(), open.to_string()));
+        marks.push((c.after.clone(), CLOSE.to_string()));
+    }
+    marks.sort_by_key(|(r, _)| r.start);
+    let mut out = String::with_capacity(src.len() + marks.len() * 3);
+    let mut at = 0;
+    let mut delta = 0isize;
+    for (r, text) in marks {
+        // 区间重叠本不该发生（`carriers` 已经去重）；真遇上就跳过这一处，不拿 panic 赌
+        if r.start < at {
+            continue;
+        }
+        out.push_str(&src[at..r.start]);
+        out.push_str(&text);
+        delta += text.len() as isize - r.len() as isize;
+        at = r.end;
+    }
+    out.push_str(&src[at..]);
+    let end = (range.end as isize + delta) as usize;
+    (out, range.start..end)
+}
+
+/// 把哨兵换回 `<span class="...">`。span 跨硬换行时每行各自开合，HTML 才是配对的。
+fn paint(lines: &mut [String], carriers: &[Carrier]) {
+    if carriers.is_empty() {
+        return;
+    }
+    let tag = |ix: usize| match carriers.get(ix) {
+        Some(c) if !c.classes.is_empty() => format!("<span class=\"{}\">", c.classes),
+        _ => String::new(),
+    };
+    let end_tag = |ix: usize| match carriers.get(ix) {
+        Some(c) if !c.classes.is_empty() => "</span>",
+        _ => "",
+    };
+    let mut carried: Vec<usize> = Vec::new();
+    for line in lines {
+        let mut open = carried.clone();
+        let mut out = String::with_capacity(line.len() + 32);
+        // 上一行没闭合的 span 接着开，插在 `<p>` 之类的块级开标签之后
+        let head = if carried.is_empty() { 0 } else { line.find('>').map_or(0, |i| i + 1) };
+        out.push_str(&line[..head]);
+        out.extend(carried.iter().map(|&ix| tag(ix)));
+        let mut rest = &line[head..];
+        while let Some(at) = rest.find(is_sentinel) {
+            out.push_str(&rest[..at]);
+            let ch = rest[at..].chars().next().expect("哨兵");
+            rest = &rest[at + ch.len_utf8()..];
+            if ch == CLOSE {
+                if let Some(ix) = open.pop() {
+                    out.push_str(end_tag(ix));
+                }
+            } else {
+                let ix = ch as u32 - OPEN as u32;
+                out.push_str(&tag(ix as usize));
+                open.push(ix as usize);
+            }
+        }
+        // 行尾仍开着的 span 在块级闭标签之前收掉，下一行再打开
+        let tail = rest.rfind('<').unwrap_or(rest.len());
+        out.push_str(&rest[..tail]);
+        out.extend(open.iter().rev().map(|&ix| end_tag(ix)));
+        out.push_str(&rest[tail..]);
+        carried = open;
+        *line = out;
+    }
 }
 
 // TextView 吞掉嵌套 br；按硬换行拆分并复制祖先，保留每行的强调和链接。
@@ -135,6 +401,58 @@ fn split_lines<'a>(node: &'a AstNode<'a>, arena: &'a Arena<'a>) -> Vec<&'a AstNo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 行内属性（6.3.10）上色：标记不进渲染，颜色类名交给主题换成 `content.*` 色值。
+    #[test]
+    fn inline_attributes_become_color_spans_and_hide_their_markers() {
+        let html = |src: &str| match preview(src, 0..src.len()) {
+            Some(Preview::Html(html)) => html,
+            other => panic!("{src}: {}", other.is_some()),
+        };
+        // `[文本]{...}`：包裹的括号与属性列表都不显示
+        assert_eq!(html("前 [文字]{.red} 后"), ["<p>前 <span class=\"red\">文字</span> 后</p>\n"]);
+        // 文字色与背景色叠加，顺序固定为「文字 背景」
+        assert_eq!(
+            html("前 [文字]{.bg-blue .red} 后"),
+            ["<p>前 <span class=\"red bg-blue\">文字</span> 后</p>\n"]
+        );
+        // 属性紧跟行内元素：强调、行内代码、链接、`==` 都能承载
+        for (src, expected) in [
+            ("**粗**{.blue}", "<span class=\"blue\"><strong>粗</strong></span>"),
+            ("`码`{.red}", "<span class=\"red\"><code>码</code></span>"),
+            ("[链接](aero://note/a){.red}", "<span class=\"red\"><a href=\"aero://note/a\">链接</a></span>"),
+            ("==高亮=={.red}", "<span class=\"red\"><mark>高亮</mark></span>"),
+            (
+                "[外 [内]{.red} 文]{.bg-blue}",
+                "<span class=\"bg-blue\">外 <span class=\"red\">内</span> 文</span>",
+            ),
+        ] {
+            assert!(html(src)[0].contains(expected), "{src}: {:?}", html(src));
+        }
+        // 调色板外的类名不上色，但标记同样不显示（与块属性一致）
+        assert_eq!(html("[文字]{.custom}"), ["<p>文字</p>\n"]);
+        // 跨硬换行的 span 每行各自开合，HTML 始终配对
+        assert_eq!(
+            html("[a  \nb]{.red}"),
+            ["<p><span class=\"red\">a</span></p>\n", "<p><span class=\"red\">b</span></p>\n"]
+        );
+        assert_eq!(html("# [标题]{.red}"), ["<h1><span class=\"red\">标题</span></h1>\n"]);
+        // 表格单元格里的颜色照常，列宽用的文字不含哨兵
+        let table = "| h |\n|---|\n| [格]{.red} |";
+        let Some(Preview::Table { rows, .. }) = preview(table, 0..table.len()) else { panic!("{table}") };
+        assert_eq!(rows[1][0].html, ["<p><span class=\"red\">格</span></p>\n"]);
+        assert_eq!(rows[1][0].text, "格");
+        // 代码、数学、转义里的 `{...}` 不是属性列表；普通花括号也不是
+        for src in ["`[文字]{.red}`", "$[文字]{.red}$", "\\[文字]{.red}", "f(x) = {1, 2}", "[文字]{}"]
+        {
+            assert!(preview(src, 0..src.len()).is_none(), "{src}");
+        }
+        // 引用式链接的 `[文本]{...}` 既是 `[ ]` 又是链接元素，只能算一处（改写区间不许重叠）
+        let reference = "[文字]{.red}\n\n[文字]: https://example.com\n";
+        let block = parse::parse(reference).blocks[0].range.clone();
+        let Some(Preview::Html(html)) = preview(reference, block) else { panic!("{reference}") };
+        assert_eq!(html, ["<p><span class=\"red\"><a href=\"https://example.com\">文字</a></span></p>\n"]);
+    }
 
     #[test]
     fn highlight_hard_breaks_keep_nested_styles_links_and_html_isolation() {

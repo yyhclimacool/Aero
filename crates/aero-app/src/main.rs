@@ -10,6 +10,7 @@
 mod actions;
 mod backlinks;
 mod branding;
+mod colors;
 mod demo_vault;
 mod editor;
 mod file_tree;
