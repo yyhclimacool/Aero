@@ -10,6 +10,7 @@
 mod actions;
 mod backlinks;
 mod branding;
+mod cli;
 mod colors;
 mod demo_vault;
 mod editor;
@@ -63,8 +64,12 @@ fn init_logger() {
 fn main() {
     init_logger();
 
-    // `aero <vault 目录>` 直接打开；无参数启动停在库选择页，示例库是那里的一个入口。
-    let initial_vault: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // 子命令走 CLI（方案 13.1）。无参数，或第一个参数是库目录，才启动图形界面。
+    if cli::wants_cli(&args) {
+        std::process::exit(cli::run(&args));
+    }
+    let initial_vault: Option<PathBuf> = args.first().map(PathBuf::from);
 
     gpui_kit::application().with_assets(branding::AppAssets).run(move |cx| {
         gpui_kit::init(cx);

@@ -17,7 +17,10 @@ aero-index.workspace = true
 gpui-kit.workspace = true
 # 应用数据目录下的 state.toml（最近 vault、面板状态）
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
+# 命令行（方案 13.1）。图形界面仍是无参数或直接给库路径时启动
+clap = { version = "4", features = ["derive"] }
 # 日志门面；输出到 stderr 的极简 logger 在 main.rs 里（`AERO_LOG=debug`）
 log = "0.4"
 # 图片解码 / 缩放（渲染服务，方案 9.9）。特性集与 GPUI 已启用的一致，不额外引入编解码器

@@ -626,6 +626,15 @@ impl Indexer {
     }
 
     /// 给预览点击用的解析表：已索引的笔记（带标题）加上磁盘上还没索引到的（刚新建、全量同步进行中）。
+    /// 把命令行里的笔记参数解析成路径：内部 `note_id`、相对路径、唯一文件名、标题或别名。
+    pub fn resolve_note(&mut self, target: &str) -> Result<Resolution, IndexerError> {
+        let target = target.trim();
+        if let Some(row) = self.meta.all_notes()?.into_iter().find(|row| row.note_id == target) {
+            return Ok(Resolution::Resolved { path: VaultPath::new(&row.path)?, fragment: None });
+        }
+        Ok(self.link_resolver()?.resolve(target, None, ""))
+    }
+
     pub fn link_resolver(&mut self) -> Result<Resolver, IndexerError> {
         let mut resolver = self.universe()?.resolver.clone();
         for path in self.vault.notes()? {
