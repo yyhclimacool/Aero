@@ -2239,40 +2239,49 @@ fn title_edit_renames_or_edits_front_matter(cx: &mut TestAppContext) {
     assert_eq!(renames.borrow().len(), 1);
 }
 
-/// 有 front matter `title:` 时，标题提交改的是文档里的值（必要时加引号），不重命名文件。
 #[gpui_kit::test]
-fn title_edit_with_front_matter_edits_document(cx: &mut TestAppContext) {
-    let (dir, _vault, _path, editor) = open(cx, "---\ntitle: 旧题\ntags: [x]\n---\n\nbody\n");
+fn title_edit_waits_for_transaction_before_changing_document(cx: &mut TestAppContext) {
+    let source = "---\ntitle: Old\n---\nbody\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
-    cx.update(|_, cx| assert_eq!(editor.read(cx).title(), "旧题"));
-
     cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
     cx.run_until_parked();
-    cx.simulate_input("新题");
+    cx.simulate_input("New");
     cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "---\ntitle: 新题\ntags: [x]\n---\n\nbody\n");
-    cx.update(|_, cx| assert_eq!(editor.read(cx).title(), "新题"));
+    assert_eq!(
+        text(&editor, cx),
+        source,
+        "the workspace must confirm and commit title and incoming links together"
+    );
+}
 
-    // 含冒号的值加引号；再改回去时引号一并替换
-    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
-    cx.run_until_parked();
-    cx.simulate_input("a: b");
-    cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "---\ntitle: \"a: b\"\ntags: [x]\n---\n\nbody\n");
-    cx.update(|_, cx| assert_eq!(editor.read(cx).title(), "a: b"));
-    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
-    cx.run_until_parked();
-    cx.simulate_input("plain");
-    cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "---\ntitle: plain\ntags: [x]\n---\n\nbody\n");
-
-    // 改标题也走自动保存
+#[gpui_kit::test]
+fn title_edit_with_front_matter_requests_transaction(cx: &mut TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+    let source = "---\ntitle: 旧题\ntags: [x]\n---\n\nbody\n";
+    let (dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    cx.update(|_, cx| {
+        let sink = requests.clone();
+        cx.subscribe(&editor, move |_, event, _| {
+            if let super::EditorEvent::RetitleRequested(title) = event {
+                sink.borrow_mut().push(title.clone());
+            }
+        })
+        .detach();
+    });
+    for title in ["新题", "a: b", "plain"] {
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input(title);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(requests.borrow().last().map(String::as_str), Some(title));
+        assert_eq!(text(&editor, cx), source);
+    }
     cx.executor().advance_clock(Duration::from_millis(600));
     cx.run_until_parked();
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
-        "---\ntitle: plain\ntags: [x]\n---\n\nbody\n"
-    );
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
 }
 
 /// 点击浏览态的块：先进入编辑态（光标在块尾），两帧后把点击重放给控件，光标落到点击处。

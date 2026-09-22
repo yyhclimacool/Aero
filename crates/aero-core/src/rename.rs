@@ -28,6 +28,9 @@ pub struct RenamePlan {
     vault: Vault,
     from: VaultPath,
     to: VaultPath,
+    directory: bool,
+    files: Vec<VaultPath>,
+    folders: Vec<VaultPath>,
     observed: Vec<(VaultPath, FileStamp)>,
     changes: Vec<Change>,
     links_changed: usize,
@@ -36,43 +39,79 @@ pub struct RenamePlan {
 pub struct RenameReport {
     pub from: VaultPath,
     pub to: VaultPath,
+    pub directory: bool,
     /// 已修改链接文本的笔记（含重命名后的自身路径）。
     pub updated: Vec<VaultPath>,
     pub links_changed: usize,
 }
 
 impl RenamePlan {
-    /// 当前入口仅重命名同一目录下的 `.md` 笔记；跨目录移动需另处理所有出链及附件引用。
-    pub fn prepare(vault: &Vault, from: VaultPath, to: VaultPath) -> Result<Self, RenameError> {
-        if from == to || from.parent() != to.parent() || !from.is_note() || !to.is_note() {
-            return Err(RenameError::Invalid("请选择同一目录下不同的 Markdown 文件名".into()));
+    pub fn prepare_title(vault: &Vault, path: VaultPath, title: String) -> Result<Self, RenameError> {
+        if title.trim().is_empty() || title.chars().any(char::is_control) {
+            return Err(RenameError::Invalid("标题不能为空或包含控制字符".into()));
         }
-        vault.validate_rename(&from, &to)?;
+        Self::prepare_inner(vault, path.clone(), path, Some(title.trim()))
+    }
+
+    pub fn prepare(vault: &Vault, from: VaultPath, to: VaultPath) -> Result<Self, RenameError> {
+        Self::prepare_inner(vault, from, to, None)
+    }
+
+    fn prepare_inner(
+        vault: &Vault,
+        from: VaultPath,
+        to: VaultPath,
+        new_title: Option<&str>,
+    ) -> Result<Self, RenameError> {
+        if new_title.is_none() {
+            vault.validate_rename(&from, &to)?;
+        } else {
+            vault.validate_local_path(&from)?;
+        }
+        let directory = vault.fs_path(&from).is_dir();
+        if (from == to && new_title.is_none())
+            || (directory && new_title.is_some())
+            || (!directory && (!from.is_note() || !to.is_note()))
+            || to.as_str().split('/').any(|part| part.starts_with('.') || part.ends_with(".assets"))
+        {
+            return Err(RenameError::Invalid("请选择不同的笔记路径或文件夹，不能移入隐藏或附件目录".into()));
+        }
         let paths = vault.notes()?;
-        if !paths.contains(&from) {
+        if !directory && !paths.contains(&from) {
             return Err(RenameError::Invalid("被忽略的笔记不能参与全库链接更新".into()));
         }
+        let files = file_catalog(vault)?;
+        let folders = vault.folders()?;
+        if directory && !folders.contains(&from) {
+            return Err(RenameError::Invalid("被忽略的目录不能移动".into()));
+        }
         let mut before = Resolver::new();
+        let mut after = Resolver::new();
         let mut observed = Vec::with_capacity(paths.len());
-        let mut title = None;
-        let mut aliases = Vec::new();
-        // 先建完整解析表，避免扫描顺序把同名笔记误认成唯一目标。
         for path in paths {
             let (bytes, stamp) = vault.read_bytes(&path)?;
             let doc =
                 Document::from_bytes(&bytes).map_err(|_| VaultError::Utf8 { path: vault.fs_path(&path) })?;
-            let note_title = doc.front_matter_title().map(|(_, title)| title);
-            let note_aliases = doc.front_matter_aliases();
-            before.insert(path.clone(), note_title.as_deref(), &note_aliases);
-            if path == from {
-                title = note_title;
-                aliases = note_aliases;
-            }
+            let title = doc.front_matter_title().map(|(_, title)| title);
+            let aliases = doc.front_matter_aliases();
+            before.insert(path.clone(), title.as_deref(), &aliases);
+            let after_title = if path == from { new_title.or(title.as_deref()) } else { title.as_deref() };
+            after.insert(relocated(&path, &from, &to, directory), after_title, &aliases);
             observed.push((path, stamp));
         }
-        let mut after = before.clone();
-        after.remove(&from);
-        after.insert(to.clone(), title.as_deref(), &aliases);
+        let after_files = files.iter().map(|p| relocated(p, &from, &to, directory)).collect::<Vec<_>>();
+        let context = RewriteContext {
+            from: &from,
+            to: &to,
+            directory,
+            new_title,
+            before: &before,
+            after: &after,
+            files: &files,
+            after_files: &after_files,
+            attachments: crate::attachments::Catalog::new(files.clone()),
+            after_attachments: crate::attachments::Catalog::new(after_files.clone()),
+        };
         let mut changes = Vec::new();
         let mut links_changed = 0;
         for (path, stamp) in &observed {
@@ -80,17 +119,32 @@ impl RenamePlan {
             if current.hash != stamp.hash {
                 return Err(RenameError::Changed(path.to_string()));
             }
-            let (rewritten, count) = rewrite(&bytes, path, &from, &to, &before, &after)?;
-            if count > 0 || path == &from {
+            let (mut rewritten, count) = context.rewrite(&bytes, path)?;
+            if path == &from
+                && let Some(title) = new_title
+            {
+                rewritten = retitled(&rewritten, title)?;
+            }
+            if count > 0 || relocated(path, &from, &to, directory) != *path || rewritten != bytes {
                 changes.push(Change { path: path.clone(), before: bytes, after: rewritten });
                 links_changed += count;
             }
         }
-        Ok(Self { vault: vault.clone(), from, to, observed, changes, links_changed })
+        Ok(Self {
+            vault: vault.clone(),
+            from,
+            to,
+            directory,
+            files,
+            folders,
+            observed,
+            changes,
+            links_changed,
+        })
     }
 
     pub fn other_files_changed(&self) -> usize {
-        self.changes.iter().filter(|c| c.path != self.from).count()
+        self.changes.iter().filter(|c| c.path != self.from && c.before != c.after).count()
     }
 
     pub fn execute(self) -> Result<RenameReport, RenameError> {
@@ -98,14 +152,23 @@ impl RenamePlan {
     }
 
     fn validate(&self) -> Result<(), RenameError> {
-        self.vault.validate_rename(&self.from, &self.to)?;
+        if self.from != self.to {
+            self.vault.validate_rename(&self.from, &self.to)?;
+        } else {
+            self.vault.validate_local_path(&self.from)?;
+        }
         let paths: Vec<_> = self.observed.iter().map(|(p, _)| p.clone()).collect();
-        if self.vault.notes()? != paths {
-            return Err(RenameError::Changed("笔记列表".into()));
+        self.vault.validate_local_path(&VaultPath::new(".aero")?)?;
+        if self.vault.notes()? != paths
+            || file_catalog(&self.vault)? != self.files
+            || self.vault.folders()? != self.folders
+        {
+            return Err(RenameError::Changed("笔记或附件列表".into()));
         }
         // 名字或标题可能改变解析结果；未改写笔记也检查元数据。
         for (path, stamp) in &self.observed {
-            if self.vault.stat(path)? != (stamp.mtime, stamp.size) {
+            self.vault.validate_local_path(path)?;
+            if self.vault.read_bytes(path)?.1.hash != stamp.hash {
                 return Err(RenameError::Changed(path.to_string()));
             }
         }
@@ -118,7 +181,7 @@ impl RenamePlan {
     }
 
     fn actual_path(&self, change: &Change) -> VaultPath {
-        if change.path == self.from { self.to.clone() } else { change.path.clone() }
+        relocated(&change.path, &self.from, &self.to, self.directory)
     }
 
     fn execute_with(
@@ -162,14 +225,37 @@ impl RenamePlan {
         let mut renamed = false;
         let mut written = Vec::new();
         let result = (|| {
-            self.vault.rename(&self.from, &self.to)?;
-            renamed = true;
+            if self.from != self.to {
+                self.vault.rename(&self.from, &self.to)?;
+                renamed = true;
+                let mut expected: Vec<_> = self
+                    .observed
+                    .iter()
+                    .map(|(path, _)| relocated(path, &self.from, &self.to, self.directory))
+                    .collect();
+                expected.sort();
+                let mut expected_files: Vec<_> = self
+                    .files
+                    .iter()
+                    .map(|path| relocated(path, &self.from, &self.to, self.directory))
+                    .collect();
+                expected_files.sort();
+                if self.vault.notes()? != expected
+                    || file_catalog(&self.vault)? != expected_files
+                    || (self.directory && !self.vault.folders()?.contains(&self.to))
+                {
+                    return Err(RenameError::Invalid(
+                        "目标目录的忽略规则改变了笔记可见性，已停止移动".into(),
+                    ));
+                }
+            }
             for (i, change) in self.changes.iter().enumerate() {
                 if change.before == change.after {
                     continue;
                 }
                 let path = self.actual_path(change);
                 before_write(&path)?;
+                self.vault.validate_local_path(&path)?;
                 if self.vault.read_bytes(&path)?.0 != change.before {
                     return Err(RenameError::Changed(path.to_string()));
                 }
@@ -181,13 +267,14 @@ impl RenamePlan {
         })();
         if let Err(error) = result {
             let mut failures = Vec::new();
-            if !renamed && self.vault.exists(&self.to) {
+            if self.from != self.to && !renamed && self.vault.exists(&self.to) {
                 failures.push("新路径仍然存在，请检查新旧笔记及附件目录".into());
             }
             for &i in written.iter().rev() {
                 let change = &self.changes[i];
                 let path = self.actual_path(change);
                 let restored = (|| {
+                    self.vault.validate_local_path(&path)?;
                     let (bytes, _) = self.vault.read_bytes(&path)?;
                     if bytes == change.before {
                         return Ok(());
@@ -218,7 +305,13 @@ impl RenamePlan {
         let updated =
             self.changes.iter().filter(|c| c.before != c.after).map(|c| self.actual_path(c)).collect();
         let _ = std::fs::remove_dir_all(recovery);
-        Ok(RenameReport { from: self.from, to: self.to, updated, links_changed: self.links_changed })
+        Ok(RenameReport {
+            from: self.from,
+            to: self.to,
+            directory: self.directory,
+            updated,
+            links_changed: self.links_changed,
+        })
     }
 }
 
@@ -236,9 +329,13 @@ fn replacement(
     let extension = target.to_ascii_lowercase().ends_with(".md");
     let name = if extension { to.file_name() } else { to.stem() };
     let qualified = if extension { to.as_str() } else { to.as_str().strip_suffix(".md").unwrap() };
-    let preferred =
-        target.rsplit_once('/').map_or_else(|| name.to_owned(), |(prefix, _)| format!("{prefix}/{name}"));
-    for candidate in [preferred, name.to_owned(), qualified.to_owned(), to.to_string()] {
+    let preferred = name.to_owned();
+    let candidates = if target.contains('/') {
+        [qualified.to_owned(), relative_path(dir, qualified), name.to_owned(), to.to_string()]
+    } else {
+        [preferred, name.to_owned(), qualified.to_owned(), to.to_string()]
+    };
+    for candidate in candidates {
         if !(embed && crate::attachments::Kind::for_path(&candidate).is_some())
             && resolves_to(after, &candidate, dir, to)
             && let Some(escaped) = links::escape_target(&candidate)
@@ -253,40 +350,260 @@ fn replacement(
     Err(RenameError::Invalid(format!("无法从 {dir}/ 写出不歧义的链接到 {to}，请换一个文件名")))
 }
 
-fn rewrite(
-    bytes: &[u8],
-    source: &VaultPath,
-    from: &VaultPath,
-    to: &VaultPath,
-    before: &Resolver,
-    after: &Resolver,
-) -> Result<(Vec<u8>, usize), RenameError> {
-    // 直接在原始字节上补丁，保留 BOM、混合换行、末尾换行和未知语法。
+fn retitled(bytes: &[u8], title: &str) -> Result<Vec<u8>, RenameError> {
+    let doc = Document::from_bytes(bytes).map_err(|e| RenameError::Invalid(e.to_string()))?;
+    if doc.front_matter_title().is_none() {
+        return Err(RenameError::Invalid("笔记没有可编辑的 front matter title".into()));
+    }
     let bom = if bytes.starts_with(b"\xEF\xBB\xBF") { 3 } else { 0 };
-    let text = std::str::from_utf8(&bytes[bom..])
-        .map_err(|_| RenameError::Invalid(format!("{source}: 非 UTF-8")))?;
-    let mut edits = Vec::new();
-    for span in links::scan_for_rename(text) {
-        let embed = span.range.start > 0 && text.as_bytes()[span.range.start - 1] == b'!';
-        // 图片 / PDF 后缀属于附件命名空间；同名笔记必须带 `.md`。
-        if (embed && crate::attachments::Kind::for_path(&span.target).is_some())
-            || !resolves_to(before, &span.target, source.parent(), from)
-            || resolves_to(after, &span.target, source.parent(), to)
-        {
-            continue;
+    let text = std::str::from_utf8(&bytes[bom..]).expect("document is UTF-8");
+    let (mut range, _) = crate::document::front_matter_title(text).expect("title checked above");
+    if range.start > 0 && matches!(text.as_bytes()[range.start - 1], b'"' | b'\'') {
+        range.start -= 1;
+        range.end += 1;
+    }
+    let escaped = format!("\"{}\"", title.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut result = bytes.to_vec();
+    result.splice(bom + range.start..bom + range.end, escaped.bytes());
+    if Document::from_bytes(&result).ok().and_then(|d| d.front_matter_title()).map(|(_, t)| t).as_deref()
+        != Some(title)
+    {
+        return Err(RenameError::Invalid("无法无损写入标题".into()));
+    }
+    Ok(result)
+}
+
+fn relocated(path: &VaultPath, from: &VaultPath, to: &VaultPath, directory: bool) -> VaultPath {
+    if path == from {
+        return to.clone();
+    }
+    let roots =
+        if directory { Some((from.clone(), to.clone())) } else { from.assets_dir().zip(to.assets_dir()) };
+    if let Some((old, new)) = roots
+        && let Some(rest) = path.as_str().strip_prefix(&format!("{old}/"))
+    {
+        return VaultPath::new(&format!("{new}/{rest}")).expect("mapped vault path");
+    }
+    path.clone()
+}
+
+fn file_catalog(vault: &Vault) -> Result<Vec<VaultPath>, RenameError> {
+    let mut walk = ignore::WalkBuilder::new(vault.root());
+    walk.hidden(true).git_ignore(true).require_git(false).follow_links(false);
+    let ignore = vault.root().join(".aero/ignore");
+    if ignore.is_file()
+        && let Some(error) = walk.add_ignore(ignore)
+    {
+        return Err(RenameError::Invalid(error.to_string()));
+    }
+    let mut files = Vec::new();
+    for entry in walk.build() {
+        let entry = entry.map_err(|e| RenameError::Invalid(e.to_string()))?;
+        if entry.file_type().is_some_and(|t| t.is_file()) {
+            files.push(VaultPath::from_fs(vault.root(), entry.path())?);
         }
-        let range = links::target_range(text, &span);
-        edits.push((
-            bom + range.start..bom + range.end,
-            replacement(&span.target, source.parent(), to, after, embed)?,
-        ));
     }
-    let count = edits.len();
-    let mut out = bytes.to_vec();
-    for (range, replacement) in edits.into_iter().rev() {
-        out.splice(range, replacement.bytes());
+    files.sort();
+    Ok(files)
+}
+
+struct RewriteContext<'a> {
+    from: &'a VaultPath,
+    to: &'a VaultPath,
+    directory: bool,
+    new_title: Option<&'a str>,
+    before: &'a Resolver,
+    after: &'a Resolver,
+    files: &'a [VaultPath],
+    after_files: &'a [VaultPath],
+    attachments: crate::attachments::Catalog,
+    after_attachments: crate::attachments::Catalog,
+}
+
+impl RewriteContext<'_> {
+    fn rewrite(&self, bytes: &[u8], source: &VaultPath) -> Result<(Vec<u8>, usize), RenameError> {
+        let bom = if bytes.starts_with(b"\xEF\xBB\xBF") { 3 } else { 0 };
+        let text = std::str::from_utf8(&bytes[bom..])
+            .map_err(|_| RenameError::Invalid(format!("{source}: 非 UTF-8")))?;
+        let new_source = relocated(source, self.from, self.to, self.directory);
+        let mut edits = Vec::new();
+        for span in links::scan_for_rename(text) {
+            if span.target.is_empty() {
+                continue;
+            }
+            let embed = span.range.start > 0 && text.as_bytes()[span.range.start - 1] == b'!';
+            let attachment = embed && crate::attachments::Kind::for_path(&span.target).is_some();
+            let resolved = if attachment {
+                self.attachments.resolve(&span.target, source)
+            } else {
+                self.before.resolve(&span.target, None, source.parent())
+            };
+            let Resolution::Resolved { path, .. } = resolved else { continue };
+            let desired = relocated(&path, self.from, self.to, self.directory);
+            let replacement = if attachment {
+                if matches!(self.after_attachments.resolve(&span.target, &new_source), Resolution::Resolved { path, .. } if path == desired)
+                {
+                    continue;
+                }
+                let relative = relative_path(new_source.parent(), desired.as_str());
+                let mut candidates = vec![relative, desired.to_string(), desired.file_name().into()];
+                if !span.target.contains('/') {
+                    candidates.reverse();
+                }
+                candidates.into_iter().find_map(|candidate| {
+                    if matches!(self.after_attachments.resolve(&candidate, &new_source), Resolution::Resolved { path, .. } if path == desired) {
+                        links::escape_target(&candidate)
+                    } else { None }
+                }).ok_or_else(|| RenameError::Invalid(format!("无法写出附件链接：{desired}")))?
+            } else {
+                let explicit_path_moved = span.target.contains('/')
+                    && resolve_note_path(&span.target, source.parent(), self.files).as_ref() == Some(&path)
+                    && resolve_note_path(&span.target, new_source.parent(), self.after_files).as_ref()
+                        != Some(&desired);
+                if !explicit_path_moved
+                    && resolves_to(self.after, &span.target, new_source.parent(), &desired)
+                {
+                    continue;
+                }
+                if desired == *self.from
+                    && let Some(title) = self.new_title
+                    && !(embed && crate::attachments::Kind::for_path(title).is_some())
+                    && resolves_to(self.after, title, new_source.parent(), &desired)
+                    && let Some(escaped) = links::escape_target(title)
+                {
+                    escaped
+                } else {
+                    replacement(&span.target, new_source.parent(), &desired, self.after, embed)?
+                }
+            };
+            let range = links::target_range(text, &span);
+            edits.push((bom + range.start..bom + range.end, replacement));
+        }
+        for destination in crate::markdown_links::destinations(text).map_err(RenameError::Invalid)? {
+            let url = &destination.url;
+            if url.is_empty()
+                || url.starts_with(['#', '?'])
+                || url.starts_with("//")
+                || url::Url::parse(url).is_ok()
+            {
+                continue;
+            }
+            let split = url.find(['#', '?']).unwrap_or(url.len());
+            let Some(decoded) = decode_path(&url[..split]) else { continue };
+            let Some(path) = resolve_file(&decoded, source.parent(), self.files) else { continue };
+            let desired = relocated(&path, self.from, self.to, self.directory);
+            if resolve_file(&decoded, new_source.parent(), self.after_files).as_ref() == Some(&desired) {
+                continue;
+            }
+            let raw = &text[destination.range.clone()];
+            let suffix = if split == url.len() {
+                ""
+            } else {
+                raw.char_indices().filter(|(_, ch)| matches!(ch, '#' | '?' | '&' | '\\'))
+                    .map(|(at, _)| &raw[at..])
+                    .find(|suffix| {
+                        let probe = format!("[x](<x{suffix}>)");
+                        let arena = comrak::Arena::new();
+                        let root = comrak::parse_document(&arena, &probe, &crate::parse::comrak_options());
+                        root.descendants().any(|node| matches!(&node.data().value, comrak::nodes::NodeValue::Link(link) if link.url == format!("x{}", &url[split..])))
+                    }).ok_or_else(|| RenameError::Invalid(format!("无法保留链接片段：{raw}")))?
+            };
+            let mut target = if decoded.starts_with('/') {
+                format!("/{desired}")
+            } else {
+                relative_path(new_source.parent(), desired.as_str())
+            };
+            if decoded.starts_with("./") && !target.starts_with('.') {
+                target = format!("./{target}");
+            }
+            if resolve_file(&target, new_source.parent(), self.after_files).as_ref() != Some(&desired) {
+                return Err(RenameError::Invalid(format!("无法写出链接到 {desired}")));
+            }
+            let replacement = format!("{}{suffix}", encode_path(&target));
+            edits.push((bom + destination.range.start..bom + destination.range.end, replacement));
+        }
+        edits.sort_by_key(|(range, _)| range.start);
+        if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+            return Err(RenameError::Invalid(format!("链接源区间重叠：{source}")));
+        }
+        let count = edits.len();
+        let mut out = bytes.to_vec();
+        for (range, replacement) in edits.into_iter().rev() {
+            out.splice(range, replacement.bytes());
+        }
+        Ok((out, count))
     }
-    Ok((out, count))
+}
+
+fn relative_path(directory: &str, target: &str) -> String {
+    let base: Vec<_> = directory.split('/').filter(|s| !s.is_empty()).collect();
+    let parts: Vec<_> = target.split('/').collect();
+    let common = base.iter().zip(&parts).take_while(|(a, b)| a == b).count();
+    std::iter::repeat_n("..", base.len() - common)
+        .chain(parts[common..].iter().copied())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn resolve_note_path(target: &str, directory: &str, files: &[VaultPath]) -> Option<VaultPath> {
+    for dir in [directory, ""] {
+        for candidate in [target.to_owned(), format!("{target}.md")] {
+            if let Some(path) = resolve_file(&candidate, dir, files).filter(VaultPath::is_note) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_file(target: &str, directory: &str, files: &[VaultPath]) -> Option<VaultPath> {
+    let mut parts: Vec<&str> = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        directory.split('/').filter(|s| !s.is_empty()).collect()
+    };
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part if part.contains('\\') || part.chars().any(char::is_control) => return None,
+            part => parts.push(part),
+        }
+    }
+    let normalized = parts.join("/");
+    let mut matches = files.iter().filter(|p| p.as_str().to_lowercase() == normalized.to_lowercase());
+    let found = matches.next()?.clone();
+    matches.next().is_none().then_some(found)
+}
+
+fn decode_path(path: &str) -> Option<String> {
+    let mut out = Vec::new();
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let hi = (bytes.next()? as char).to_digit(16)?;
+            let lo = (bytes.next()? as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+        } else {
+            out.push(byte);
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn encode_path(path: &str) -> String {
+    let mut encoded = String::new();
+    for ch in path.chars() {
+        if ch.is_ascii() && (!ch.is_ascii_alphanumeric() && !"/-._~".contains(ch)) {
+            use std::fmt::Write;
+            write!(encoded, "%{:02X}", ch as u8).expect("string write");
+        } else {
+            encoded.push(ch);
+        }
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -306,6 +623,221 @@ mod tests {
         }
         let vault = Vault::open(dir.path()).unwrap();
         (dir, vault)
+    }
+
+    #[test]
+    fn move_refuses_ignored_destination_and_stale_directory_contents() {
+        let (dir, vault) = setup(&[("group/a.md", "body\n"), (".gitignore", "ignored/\n")]);
+        std::fs::create_dir(dir.path().join("ignored")).unwrap();
+        let result =
+            RenamePlan::prepare(&vault, path("group"), path("ignored/group")).and_then(RenamePlan::execute);
+        assert!(result.is_err());
+        assert!(dir.path().join("group/a.md").is_file());
+        let plan = RenamePlan::prepare(&vault, path("group"), path("new")).unwrap();
+        std::fs::create_dir(dir.path().join("group/new-empty")).unwrap();
+        assert!(plan.execute().is_err(), "changed directories must invalidate the plan");
+    }
+
+    #[test]
+    fn rename_preserves_entity_encoded_fragment_and_query() {
+        let source = "[a](old.md&#35;Heading) [b](old.md?x=1&amp;y=2#part)\n";
+        let (dir, vault) = setup(&[("old.md", "body\n"), ("source.md", source)]);
+        RenamePlan::prepare(&vault, path("old.md"), path("new.md")).unwrap().execute().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("source.md")).unwrap(),
+            source.replace("old.md", "new.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_refuses_symlinked_recovery_directory_and_changed_link_source() {
+        use std::os::unix::fs::symlink;
+        let (dir, vault) = setup(&[("a.md", "body\n"), ("b.md", "[[a]]\n")]);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::rename(dir.path().join(".aero"), dir.path().join("parked-config")).unwrap();
+        symlink(outside.path(), dir.path().join(".aero")).unwrap();
+        assert!(
+            RenamePlan::prepare(&vault, path("a.md"), path("new.md")).and_then(RenamePlan::execute).is_err()
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn move_preserves_absolute_parent_and_encoded_paths_and_only_counts_rewrites() {
+        let (dir, vault) = setup(&[
+            ("group/a.md", "[root](/target.md#p) [outside](../target.md)\n"),
+            ("group/b.md", "unchanged\n"),
+            ("target.md", "[back](group/a.md?raw=1)\n"),
+        ]);
+        let plan = RenamePlan::prepare(&vault, path("group"), path("moved")).unwrap();
+        assert_eq!(plan.other_files_changed(), 1, "unchanged moved files do not count as link rewrites");
+        plan.execute().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("moved/a.md")).unwrap(),
+            "[root](/target.md#p) [outside](../target.md)\n"
+        );
+    }
+
+    #[test]
+    fn move_refuses_newly_ignored_attachment_paths() {
+        let (dir, vault) =
+            setup(&[("a.md", "![image](a.assets/x.png)\n"), (".gitignore", "dest/*.assets/\n")]);
+        std::fs::create_dir(dir.path().join("dest")).unwrap();
+        std::fs::create_dir(dir.path().join("a.assets")).unwrap();
+        std::fs::write(dir.path().join("a.assets/x.png"), b"image").unwrap();
+        assert!(
+            RenamePlan::prepare(&vault, path("a.md"), path("dest/a.md"))
+                .and_then(RenamePlan::execute)
+                .is_err()
+        );
+        assert!(dir.path().join("a.assets/x.png").exists());
+        assert!(dir.path().join("a.md").exists());
+    }
+
+    #[test]
+    fn move_empty_directory_cannot_disappear_into_ignored_tree() {
+        let (dir, vault) = setup(&[(".gitignore", "ignored/\n")]);
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        std::fs::create_dir(dir.path().join("ignored")).unwrap();
+        assert!(
+            RenamePlan::prepare(&vault, path("empty"), path("ignored/empty"))
+                .and_then(RenamePlan::execute)
+                .is_err()
+        );
+        assert!(dir.path().join("empty").is_dir());
+    }
+
+    #[test]
+    fn retitle_does_not_turn_note_embeds_into_attachment_embeds() {
+        let (dir, vault) = setup(&[("note.md", "---\ntitle: Old\n---\nbody\n"), ("source.md", "![[Old]]\n")]);
+        std::fs::write(dir.path().join("Photo.png"), b"image").unwrap();
+        RenamePlan::prepare_title(&vault, path("note.md"), "Photo.png".into()).unwrap().execute().unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("source.md")).unwrap(), "![[note]]\n");
+    }
+
+    #[test]
+    fn retitle_updates_only_lost_title_targets_and_preserves_yaml_bytes() {
+        let original = "\u{feff}---\r\ntitle: 'Old title' # keep\r\naliases: [Stable]\ncustom: untouched\r\n---\r\n\r\nbody\n";
+        let source = "[[Old title#Heading|label]] ![[Old title#^id]] [[Stable]] [[note]] [md](note.md)\n";
+        let (dir, vault) = setup(&[("note.md", original), ("source.md", source)]);
+        RenamePlan::prepare_title(&vault, path("note.md"), "New title".into()).unwrap().execute().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.md")).unwrap(),
+            original.replace("'Old title'", "\"New title\"")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("source.md")).unwrap(),
+            source.replace("Old title", "New title")
+        );
+        assert!(!dir.path().join("New title.md").exists());
+    }
+
+    #[test]
+    fn retitle_collision_uses_safe_path_and_rolls_back_title_on_failure() {
+        let (dir, vault) = setup(&[
+            ("note.md", "---\ntitle: Old title\n---\nbody\n"),
+            ("other.md", "---\ntitle: New title\n---\n"),
+            ("source.md", "[[Old title]]\n"),
+        ]);
+        let plan = RenamePlan::prepare_title(&vault, path("note.md"), "New title".into()).unwrap();
+        let result = plan.execute_with(|p| {
+            if p.as_str() == "source.md" {
+                Err(RenameError::Invalid("simulated failure".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(RenameError::Commit { .. })));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.md")).unwrap(),
+            "---\ntitle: Old title\n---\nbody\n"
+        );
+        RenamePlan::prepare_title(&vault, path("note.md"), "New title".into()).unwrap().execute().unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("source.md")).unwrap(), "[[note]]\n");
+    }
+
+    #[test]
+    fn move_note_rebases_incoming_outgoing_and_attachment_paths() {
+        let original = "\u{feff}[[peer]] [peer](peer.md#part) ![image](A.assets/x%20y.png)\r\n![[A.assets/x y.png|240]]\n";
+        let (dir, vault) = setup(&[
+            ("old/A.md", original),
+            ("old/peer.md", "old peer\n"),
+            ("dest/peer.md", "different peer\n"),
+            (
+                "source.md",
+                "[note](old/A.md#part \"title\") ![image](old/A.assets/x%20y.png) [[old/A#part|alias]]\n",
+            ),
+        ]);
+        std::fs::create_dir(dir.path().join("old/A.assets")).unwrap();
+        std::fs::write(dir.path().join("old/A.assets/x y.png"), b"image").unwrap();
+        RenamePlan::prepare(&vault, path("old/A.md"), path("dest/B.md")).unwrap().execute().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dest/B.md")).unwrap(),
+            "\u{feff}[[old/peer]] [peer](../old/peer.md#part) ![image](B.assets/x%20y.png)\r\n![[B.assets/x y.png|240]]\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("source.md")).unwrap(),
+            "[note](dest/B.md#part \"title\") ![image](dest/B.assets/x%20y.png) [[dest/B#part|alias]]\n"
+        );
+        assert!(dir.path().join("dest/B.assets/x y.png").is_file());
+        assert!(!dir.path().join("old/A.md").exists());
+    }
+
+    #[test]
+    fn move_directory_preserves_internal_paths_and_rebases_external_paths() {
+        let (dir, vault) = setup(&[
+            ("group/a.md", "[b](b.md) [outside](../outside.md) [[group/b]]\n"),
+            ("group/b.md", "body\n"),
+            ("outside.md", "[a](group/a.md) [[group/b]]\n"),
+        ]);
+        std::fs::create_dir_all(dir.path().join("dest")).unwrap();
+        std::fs::create_dir_all(dir.path().join("group/empty")).unwrap();
+        std::fs::write(dir.path().join("group/blob.bin"), b"unchanged").unwrap();
+        RenamePlan::prepare(&vault, path("group"), path("dest/moved")).unwrap().execute().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dest/moved/a.md")).unwrap(),
+            "[b](b.md) [outside](../../outside.md) [[dest/moved/b]]\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("outside.md")).unwrap(),
+            "[a](dest/moved/a.md) [[dest/moved/b]]\n"
+        );
+        assert_eq!(std::fs::read(dir.path().join("dest/moved/blob.bin")).unwrap(), b"unchanged");
+        assert!(dir.path().join("dest/moved/empty").is_dir());
+        assert!(!dir.path().join("group").exists());
+    }
+
+    #[test]
+    fn rename_markdown_links_preserve_labels_titles_and_unrelated_bytes() {
+        let source = "\u{feff}[中文](old.md#标题 \"留着\") ![图片](old.assets/photo.png)\r\n[ref][n]\n\n[n]: <old.md#part> 'title'\r\n\n`[no](old.md)` [remote](https://example.com/old.md) [missing](missing.md)\n";
+        let (dir, vault) = setup(&[("old.md", "body\n"), ("source.md", source)]);
+        std::fs::create_dir(dir.path().join("old.assets")).unwrap();
+        std::fs::write(dir.path().join("old.assets/photo.png"), b"photo").unwrap();
+        RenamePlan::prepare(&vault, path("old.md"), path("new.md")).unwrap().execute().unwrap();
+        let expected = source
+            .replace("(old.md#", "(new.md#")
+            .replace("(old.assets/", "(new.assets/")
+            .replace("<old.md#", "<new.md#");
+        assert_eq!(std::fs::read(dir.path().join("source.md")).unwrap(), expected.as_bytes());
+    }
+
+    #[test]
+    fn directory_move_rolls_back_all_rewrites_and_preserves_external_changes() {
+        let (dir, vault) =
+            setup(&[("group/a.md", "[b](../b.md)\n"), ("b.md", "[[group/a]]\n"), ("c.md", "[[group/a]]\n")]);
+        let plan = RenamePlan::prepare(&vault, path("group"), path("moved")).unwrap();
+        let result = plan.execute_with(|p| {
+            if p.as_str() == "c.md" {
+                std::fs::write(dir.path().join("b.md"), "external\n").unwrap();
+                return Err(RenameError::Invalid("simulated failure".into()));
+            }
+            Ok(())
+        });
+        assert!(matches!(result, Err(RenameError::Commit { .. })));
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.md")).unwrap(), "external\n");
+        assert!(dir.path().join("group/a.md").is_file());
+        assert!(!dir.path().join("moved").exists());
     }
 
     #[test]

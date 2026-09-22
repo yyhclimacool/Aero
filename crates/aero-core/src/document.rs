@@ -137,7 +137,7 @@ impl Document {
         self.text.slice(self.range_of(b)).to_string()
     }
 
-    /// front matter 里 `title:` 的值：在文档中的字节区间（不含引号）与去引号后的文本。
+    /// front matter `title:` 的源码字节区间（不含引号）及解码后的单行文本。
     /// 只认最常见的写法（顶层 `title: xxx`，可带单 / 双引号）；别的形式当作没有 title。
     pub fn front_matter_title(&self) -> Option<(Range<usize>, String)> {
         let fm = self.blocks.roots.first().filter(|b| b.kind == BlockKind::FrontMatter)?;
@@ -543,13 +543,40 @@ pub fn front_matter_title(src: &str) -> Option<(Range<usize>, String)> {
         let Some(rest) = body.strip_prefix("title:") else { continue };
         let value_start = start + "title:".len() + (rest.len() - rest.trim_start().len());
         let value = rest.trim();
-        let value_end = value_start + value.len();
-        let (range, text) = match value.as_bytes() {
-            [q @ (b'"' | b'\''), .., last] if *last == *q && value.len() >= 2 => {
-                (value_start + 1..value_end - 1, value[1..value.len() - 1].to_owned())
+        if value.is_empty() || value.starts_with('#') {
+            return Some((value_start..value_start, String::new()));
+        }
+        let quoted = matches!(value.as_bytes()[0], b'"' | b'\'');
+        let end = if quoted {
+            let quote = value.as_bytes()[0];
+            let mut i = 1;
+            loop {
+                let ch = *value.as_bytes().get(i)?;
+                if ch == b'\\' && quote == b'"' {
+                    i += 2;
+                } else if ch == quote {
+                    if quote == b'\'' && value.as_bytes().get(i + 1) == Some(&quote) {
+                        i += 2;
+                    } else {
+                        break i + 1;
+                    }
+                } else {
+                    i += 1;
+                }
             }
-            _ => (value_start..value_end, value.to_owned()),
+        } else {
+            value
+                .char_indices()
+                .find(|(i, c)| *c == '#' && value[..*i].ends_with(char::is_whitespace))
+                .map_or(value.len(), |(i, _)| value[..i].trim_end().len())
         };
+        let trailing = value[end..].trim();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return None;
+        }
+        let text = serde_saphyr::from_str::<String>(&value[..end]).ok()?;
+        let range =
+            if quoted { value_start + 1..value_start + end - 1 } else { value_start..value_start + end };
         return Some((range, text));
     }
     None
@@ -586,6 +613,19 @@ mod tests {
             ["aliases: [body]\n", "body\n\n---\naliases: [body]\n---\n", "---\naliases: [unclosed]\n"]
         {
             assert!(Document::from_text(source).front_matter_aliases().is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn front_matter_title_decodes_yaml_and_excludes_trailing_comments() {
+        for (src, raw, expected) in [
+            ("---\ntitle: 'Sam''s note' # keep\n---", "Sam''s note", "Sam's note"),
+            ("---\ntitle: \"a\\\"b\\\\c\" # keep\n---", "a\\\"b\\\\c", "a\"b\\c"),
+            ("---\ntitle: New title # keep\n---", "New title", "New title"),
+        ] {
+            let (range, title) = front_matter_title(src).unwrap();
+            assert_eq!(&src[range], raw);
+            assert_eq!(title, expected);
         }
     }
 

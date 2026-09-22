@@ -83,6 +83,7 @@ pub enum EditorEvent {
     Deleted,
     /// 用户在标题处输入了新文件名（不含 `.md`）：真正的重命名由工作区做，文件树与路径要一起变
     RenameRequested(String),
+    RetitleRequested(String),
     /// 横幅上的"打开副本"
     OpenRequested(VaultPath),
     /// 预览里点了 wikilink：已解码的目标与可选片段（`target` 为空 = 同篇锚点 `[[#h]]`），工作区负责解析与打开
@@ -413,30 +414,10 @@ impl Editor {
         if new.is_empty() || new == self.title() {
             return;
         }
-        match self.front_matter_title() {
-            Some((range, _)) => {
-                // 值里有 YAML 特殊字符时加引号
-                let needs_quote = new.contains([':', '#', '"', '\''])
-                    || new.starts_with(['[', '{', '&', '*', '!', '|', '>', '%', '@', '`']);
-                let text = if needs_quote {
-                    format!("\"{}\"", new.replace('\\', "\\\\").replace('"', "\\\""))
-                } else {
-                    new
-                };
-                // 引号内的区间已去掉引号；带引号写回时把原引号一并替换
-                let (range, text) =
-                    match self.doc.slice(range.start.saturating_sub(1)..range.start).to_string().as_str() {
-                        "\"" | "'" => (range.start - 1..range.end + 1, text),
-                        _ => (range, text),
-                    };
-                if let Err(err) = self.doc.edit(Edit::replace(range, text)) {
-                    log::error!("title edit rejected: {err}");
-                    return;
-                }
-                self.last_edit_at = None;
-                self.after_doc_change(cx);
-            }
-            None => cx.emit(EditorEvent::RenameRequested(new)),
+        if self.front_matter_title().is_some() {
+            cx.emit(EditorEvent::RetitleRequested(new));
+        } else {
+            cx.emit(EditorEvent::RenameRequested(new));
         }
     }
 
@@ -1879,11 +1860,13 @@ impl Editor {
             Some(edit) => base.w_full().child(Input::new(&edit.input)).into_any_element(),
             None => base
                 .id("title")
+                .debug_selector(|| "editor-title".into())
                 .cursor_text()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| this.start_title_edit(window, cx)),
-                )
+                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                    if !event.is_right_click() {
+                        this.start_title_edit(window, cx);
+                    }
+                }))
                 .child(self.title())
                 .into_any_element(),
         }

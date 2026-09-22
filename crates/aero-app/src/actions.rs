@@ -194,6 +194,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-d", OpenDaily, None),
         KeyBinding::new("cmd-s", SaveNow, None),
         KeyBinding::new("cmd-backspace", DeleteNote, Some("FileTree")),
+        KeyBinding::new("f2", crate::file_tree::RenameSelection, Some("FileTree")),
         KeyBinding::new("cmd-shift-f", OpenSearch, None),
         KeyBinding::new("cmd-shift-e", OpenFiles, None),
         KeyBinding::new("cmd-p", QuickOpen, None),

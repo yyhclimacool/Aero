@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import mmap
 import os
 from pathlib import Path
 import plistlib
@@ -60,6 +61,18 @@ class BundleTests(unittest.TestCase):
     def test_relocated_bundle_signature(self):
         result = subprocess.run(["codesign", "--verify", "--deep", "--strict", self.app], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_embedded_demo_vault_matches_the_repository(self):
+        """示例库随可执行文件分发：每个 .dmg 带的都是仓库里当前的六篇示例。"""
+        notes = sorted((ROOT / "assets/demo-vault").rglob("*.md"))
+        self.assertEqual(len(notes), 6, "demo vault must ship six notes")
+        with (self.contents / "MacOS/aero").open("rb") as executable:
+            image = mmap.mmap(executable.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            for note in notes:
+                self.assertNotEqual(image.find(note.read_bytes()), -1, f"{note.name} is not embedded")
+        finally:
+            image.close()
 
     def test_branding_and_metadata(self):
         with (self.contents / "Info.plist").open("rb") as file:
