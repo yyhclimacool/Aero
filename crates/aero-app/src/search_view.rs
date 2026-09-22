@@ -98,6 +98,15 @@ impl SearchView {
         });
     }
 
+    /// 标签树点进来：立刻搜，不等 150 ms 防抖。
+    pub fn search_tag(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let query = format!("tag:#{tag}");
+        self.input.update(cx, |s, cx| s.set_value(&query, window, cx));
+        self.debounce = None;
+        self.run_search(cx);
+        self.focus(window, cx);
+    }
+
     /// 最近一次真正发出的查询。
     #[cfg(test)]
     pub fn query(&self) -> &str {

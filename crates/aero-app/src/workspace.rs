@@ -27,6 +27,7 @@ use crate::paths::{PersistedState, display_path};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::search::{Phase, SearchService};
 use crate::search_view::{SearchView, SearchViewEvent};
+use crate::tags_view::{TagsView, TagsViewEvent};
 use crate::watch::{Batch, VaultWatcher, WatchEvent};
 
 const SIDEBAR_WIDTH: f32 = 260.;
@@ -42,6 +43,7 @@ struct VaultSession {
     /// 全文索引（后台）；状态栏显示进度，搜索视图查询它
     search: Entity<SearchService>,
     search_view: Entity<SearchView>,
+    tags_view: Entity<TagsView>,
     backlinks: Entity<BacklinksView>,
     /// 重内容渲染服务（9.9）：图片等按需渲染，缓存落在应用数据目录
     images: Entity<crate::render::RenderService>,
@@ -52,11 +54,12 @@ struct VaultSession {
     _subscriptions: Vec<Subscription>,
 }
 
-/// 左侧栏当前视图（`ui_design.md` 2.1：文件 / 搜索 / 标签；标签视图 M2）
+/// 左侧栏当前视图（`ui_design.md` 2.1：文件 / 搜索 / 标签）
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarTab {
     Files,
     Search,
+    Tags,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -170,6 +173,7 @@ impl Workspace {
                 let search = cx.new(|cx| SearchService::new(vault.clone(), index_dir, cx));
                 let search_sub = cx.observe(&search, |_, _, cx| cx.notify());
                 let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
+                let tags_view = cx.new(|cx| TagsView::new(search.clone(), vault.clone(), cx));
                 let backlinks = cx.new(|cx| BacklinksView::new(search.clone(), cx));
                 let backlinks_sub = self.subscribe_backlinks(&backlinks, window, cx);
                 let view_sub =
@@ -184,6 +188,10 @@ impl Workspace {
                                 this.focus_handle.focus(window, cx);
                             }
                         }
+                    });
+                let tags_sub =
+                    cx.subscribe_in(&tags_view, window, |this, _, event, window, cx| match event {
+                        TagsViewEvent::Search(tag) => this.search_tag(tag, window, cx),
                     });
                 // 渲染缓存按 vault 分目录，和索引一样可以随时删掉重建
                 let cache_dir = self.data_dir.join("cache").join(vault.id());
@@ -207,11 +215,20 @@ impl Workspace {
                     editor_sub: None,
                     search,
                     search_view,
+                    tags_view,
                     backlinks,
                     images,
                     _watcher: watcher,
                     recent: Vec::new(),
-                    _subscriptions: vec![sub, search_sub, view_sub, watch_sub, backlinks_sub, images_sub],
+                    _subscriptions: vec![
+                        sub,
+                        search_sub,
+                        view_sub,
+                        tags_sub,
+                        watch_sub,
+                        backlinks_sub,
+                        images_sub,
+                    ],
                 });
                 self.error = None;
                 self.refresh_attachment_references(cx);
@@ -821,6 +838,28 @@ impl Workspace {
         cx.notify();
     }
 
+    fn on_open_tags(&mut self, _: &OpenTags, _window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_tab = SidebarTab::Tags;
+        if !self.sidebar_visible {
+            self.sidebar_visible = true;
+            self.state.sidebar_visible = Some(true);
+            self.state.save(&self.data_dir);
+        }
+        cx.notify();
+    }
+
+    fn search_tag(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        self.sidebar_tab = SidebarTab::Search;
+        if !self.sidebar_visible {
+            self.sidebar_visible = true;
+            self.state.sidebar_visible = Some(true);
+            self.state.save(&self.data_dir);
+        }
+        open.search_view.update(cx, |v, cx| v.search_tag(tag, window, cx));
+        cx.notify();
+    }
+
     fn on_new_note(&mut self, _: &NewNote, window: &mut Window, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_ref() else { return };
         let vault = open.vault.clone();
@@ -1393,6 +1432,7 @@ impl Workspace {
         let body: AnyElement = match tab {
             SidebarTab::Files => open.tree.clone().into_any_element(),
             SidebarTab::Search => open.search_view.clone().into_any_element(),
+            SidebarTab::Tags => open.tags_view.clone().into_any_element(),
         };
         v_flex()
             .size_full()
@@ -1424,11 +1464,15 @@ impl Workspace {
                         .selected_index(match tab {
                             SidebarTab::Files => 0,
                             SidebarTab::Search => 1,
+                            SidebarTab::Tags => 2,
                         })
-                        .children(["文件", "搜索"])
+                        .children(["文件", "搜索", "标签"])
                         .on_click(|ix, window, cx| {
-                            let action: Box<dyn Action> =
-                                if *ix == 0 { Box::new(OpenFiles) } else { Box::new(OpenSearch) };
+                            let action: Box<dyn Action> = match *ix {
+                                0 => Box::new(OpenFiles),
+                                1 => Box::new(OpenSearch),
+                                _ => Box::new(OpenTags),
+                            };
                             window.dispatch_action(action, cx);
                         }),
                 ),
@@ -1675,6 +1719,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_save_now))
             .on_action(cx.listener(Self::on_open_search))
             .on_action(cx.listener(Self::on_open_files))
+            .on_action(cx.listener(Self::on_open_tags))
             .on_action(cx.listener(Self::on_quick_open))
             .on_action(cx.listener(Self::on_command_palette))
             .on_action(cx.listener(Self::on_toggle_sidebar))
@@ -1794,6 +1839,7 @@ mod tests {
     use crate::paths::PersistedState;
     use crate::search::SearchService;
     use crate::search_view::SearchView;
+    use crate::tags_view::TagsView;
     use crate::watch::VaultWatcher;
 
     fn open(
@@ -1818,6 +1864,7 @@ mod tests {
                 let tree = cx.new(|cx| FileTree::new(vault.clone(), cx));
                 let search = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
                 let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
+                let tags_view = cx.new(|cx| TagsView::new(search.clone(), vault.clone(), cx));
                 let backlinks = cx.new(|cx| BacklinksView::new(search.clone(), cx));
                 backlinks.update(cx, |v, cx| v.set_note(Some(VaultPath::new("a.md").unwrap()), cx));
                 let images =
@@ -1835,6 +1882,7 @@ mod tests {
                     editor_sub: None,
                     search,
                     search_view,
+                    tags_view,
                     backlinks,
                     images,
                     _watcher: watcher,
@@ -1878,8 +1926,74 @@ mod tests {
                 let sub = w.subscribe_backlinks(&view, window, cx);
                 w.open.as_mut().unwrap()._subscriptions.push(sub);
             }
+            if let Some(view) = w.open.as_ref().map(|o| o.tags_view.clone()) {
+                let sub = cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+                    crate::tags_view::TagsViewEvent::Search(tag) => this.search_tag(tag, window, cx),
+                });
+                w.open.as_mut().unwrap()._subscriptions.push(sub);
+            }
         });
         (dir, data, workspace)
+    }
+
+    /// 标签侧栏（4.3）：分级树带计数，点击切到搜索并执行 `tag:#…`，父标签含子标签。
+    #[gpui_kit::test]
+    fn tag_sidebar_nests_and_clicks_through_to_search(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("hello #rust\n"));
+        std::fs::write(dir.path().join("b.md"), "tools #rust/cli\n").unwrap();
+        std::fs::write(dir.path().join("c.md"), "笔记 #中文\n").unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let (search, tags) = cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.search.clone(), open.tags_view.clone())
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        cx.update(|_, cx| {
+            search.update(cx, |s, cx| {
+                s.note_changed(VaultPath::new("b.md").unwrap(), cx);
+                s.note_changed(VaultPath::new("c.md").unwrap(), cx);
+            });
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let labels = tags.read(cx).labels();
+                labels.iter().any(|(p, c, _)| p == "rust" && *c >= 2)
+                    && labels.iter().any(|(p, _, d)| p == "rust/cli" && *d == 1)
+                    && labels.iter().any(|(p, _, _)| p == "中文")
+            })
+        });
+        workspace.update_in(cx, |w, window, cx| w.on_open_tags(&crate::actions::OpenTags, window, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("tags-tree").is_some());
+        assert!(cx.debug_bounds("tag-row:rust/cli").is_some());
+        let row = cx.debug_bounds("tag-row:rust/cli").unwrap();
+        cx.simulate_click(row.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            assert_eq!(workspace.read(cx).sidebar_tab, SidebarTab::Search);
+            let view = open.search_view.read(cx);
+            assert_eq!(view.query(), "tag:#rust/cli");
+            assert_eq!(view.hits().len(), 1);
+            assert_eq!(view.hits()[0].path.as_str(), "b.md");
+        });
+        workspace.update_in(cx, |w, window, cx| w.on_open_tags(&crate::actions::OpenTags, window, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let parent = cx.debug_bounds("tag-row:rust").unwrap();
+        cx.simulate_click(parent.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = workspace.read(cx).open.as_ref().unwrap().search_view.read(cx);
+            assert_eq!(view.query(), "tag:#rust");
+            let mut paths: Vec<_> = view.hits().iter().map(|h| h.path.as_str()).collect();
+            paths.sort();
+            assert_eq!(paths, ["a.md", "b.md"]);
+        });
+        cx.update(|_, cx| search.read(cx).close_blocking());
     }
 
     /// 索引线程是真线程：真实等待直到条件成立（最多 20 s）。

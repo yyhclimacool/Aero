@@ -284,6 +284,34 @@ impl SearchService {
         })
     }
 
+    /// 侧栏标签树用的全库目录：索引空闲时读 `note_tags`，否则扫磁盘。不排除当前笔记。
+    pub fn vault_tags(&self, vault: Arc<Vault>, cx: &App) -> Task<Result<Vec<aero_index::TagCount>, String>> {
+        let indexer = self.indexer.clone();
+        let shared = self.shared.clone();
+        let through = self.submitted_writes;
+        cx.background_spawn(async move {
+            shared.wait_for_writes(through, false).await;
+            if shared.phase.load(Ordering::Acquire) == PHASE_IDLE {
+                let guard = indexer.lock().unwrap();
+                if let Some(ix) = guard.as_ref() {
+                    return ix.tag_counts(None).map_err(|e| e.to_string());
+                }
+            }
+            let mut counts = std::collections::BTreeMap::<String, u64>::new();
+            for path in vault.notes().map_err(|e| e.to_string())? {
+                let doc = match vault.read(&path) {
+                    Ok((doc, _)) => doc,
+                    Err(_) if !vault.exists(&path) => continue,
+                    Err(err) => return Err(err.to_string()),
+                };
+                for tag in aero_core::index::tags_for_note(&doc) {
+                    *counts.entry(tag).or_default() += 1;
+                }
+            }
+            Ok(counts.into_iter().map(|(tag, note_count)| aero_index::TagCount { tag, note_count }).collect())
+        })
+    }
+
     /// 预览点 wikilink 用的解析表：已索引笔记（含 front matter 标题与别名）加尚未索引的文件。
     /// 引擎不可用时在后台读取文档，保留标题与别名匹配。
     pub fn link_resolver(&self, vault: Arc<Vault>, cx: &App) -> Task<Resolver> {

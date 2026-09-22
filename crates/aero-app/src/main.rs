@@ -19,6 +19,8 @@ mod quick_open;
 mod render;
 mod search;
 mod search_view;
+mod tag_tree;
+mod tags_view;
 mod trash;
 mod watch;
 mod workspace;

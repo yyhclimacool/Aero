@@ -29,6 +29,8 @@ actions!(
         OpenSearch,
         /// ⌘⇧E：左侧栏切回文件视图
         OpenFiles,
+        /// 左侧栏切到标签视图（`ui_design.md` 4.3）
+        OpenTags,
         /// ⌘P：快速打开（3.2）
         QuickOpen,
         CommandPalette,
@@ -165,6 +167,7 @@ pub fn commands() -> Vec<Command> {
         Command::new("quick-open", "快速打开笔记…", "quick open ksdk", Vault, QuickOpen),
         Command::new("search", "全文搜索", "search find qwss", Vault, OpenSearch),
         Command::new("files", "显示文件树", "files explorer xswjs", Vault, OpenFiles),
+        Command::new("tags", "显示标签", "tags bq", Vault, OpenTags),
         Command::new("sidebar", "折叠 / 展开左侧栏", "toggle sidebar zcl", Vault, ToggleSidebar),
         Command::new("panel", "折叠 / 展开右侧面板", "toggle panel ycmb", Vault, TogglePanel),
         Command::new("undo", "撤销", "undo cx", Editor, DocUndo),
@@ -318,6 +321,7 @@ pub fn init(cx: &mut App) {
         Menu::new("视图").items(vec![
             MenuItem::action("文件", OpenFiles),
             MenuItem::action("搜索", OpenSearch),
+            MenuItem::action("标签", OpenTags),
             MenuItem::action("快速打开…", QuickOpen),
             MenuItem::action("命令面板…", CommandPalette),
             MenuItem::separator(),
