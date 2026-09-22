@@ -26,6 +26,12 @@ image = "0.25"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # vault 文件监听（macOS FSEvents；方案 12）。与 GPUI 用的是同一个版本
 notify = "7"
+# 数学公式渲染（RaTeX，方案 6.5）：解析 → 排版（带主题色）→ 位图。`ratex` 本体是占位包，不用它
+ratex-parser = "0.1.14"
+ratex-layout = "0.1.14"
+ratex-types = "0.1.14"
+# embed-fonts：内嵌 KaTeX 字体，运行时不依赖 font_dir，打进 .app 即可用
+ratex-render = { version = "0.1.14", features = ["embed-fonts"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # GPUI 当前没有设置 macOS 应用图标的 API；复用它已依赖的 AppKit 绑定。

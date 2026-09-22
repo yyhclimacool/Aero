@@ -27,12 +27,41 @@ use image::{Frame, RgbaImage};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
     Image,
+    Math,
 }
 
 impl Kind {
     fn dir(self) -> &'static str {
         match self {
             Kind::Image => "images",
+            Kind::Math => "math",
+        }
+    }
+}
+
+/// 渲染的"源"：vault 里的文件，或一段现算的源码（公式）。
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Source {
+    /// 图片等附件：磁盘缓存按文件内容指纹命中
+    File(VaultPath),
+    /// 数学公式：磁盘缓存按源码 + 行间 / 行内 + 颜色指纹命中
+    Formula { latex: String, display: bool, color: u32 },
+}
+
+impl Source {
+    fn file(&self) -> Option<&VaultPath> {
+        match self {
+            Source::File(path) => Some(path),
+            Source::Formula { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::File(path) => write!(f, "{path}"),
+            Source::Formula { latex, .. } => write!(f, "${latex}$"),
         }
     }
 }
@@ -41,9 +70,9 @@ impl Kind {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Request {
     pub kind: Kind,
-    pub source: VaultPath,
-    /// 目标显示宽度（逻辑像素）
-    pub width: u32,
+    pub source: Source,
+    /// 图片是目标显示宽度，数学是字号；都按逻辑像素
+    pub size: u32,
     /// HiDPI 倍率 ×100；缓存键不用浮点
     pub scale: u32,
 }
@@ -62,16 +91,17 @@ pub enum State {
     Failed(SharedString),
 }
 
-/// 渲染器接口（9.9）：服务只认字节和目标宽度，不认识具体格式。
+/// 渲染器接口（9.9）：服务负责缓存、占位、失败回退，渲染器只管把源变成位图。
 trait Renderer {
-    fn rasterize(&self, bytes: &[u8], target: u32) -> Result<RgbaImage, String>;
+    /// `bytes` 是源内容（图片文件的字节 / 公式的 UTF-8），`device` 是算好的设备像素尺寸。
+    fn rasterize(&self, request: &Request, bytes: &[u8], device: u32) -> Result<RgbaImage, String>;
 }
 
 struct Images;
 
 impl Renderer for Images {
     /// 只等比缩小、不放大：原图比目标窄时保持原尺寸，由元素按自然宽度显示。
-    fn rasterize(&self, bytes: &[u8], target: u32) -> Result<RgbaImage, String> {
+    fn rasterize(&self, _: &Request, bytes: &[u8], target: u32) -> Result<RgbaImage, String> {
         let decoded = image::load_from_memory(bytes).map_err(|e| readable(&e.to_string()))?;
         let (width, height) = (decoded.width(), decoded.height());
         if width == 0 || height == 0 {
@@ -95,9 +125,44 @@ fn readable(error: &str) -> String {
     }
 }
 
+/// 数学公式（方案 6.5）：LaTeX → AST → 排版（带主题色）→ 位图。
+/// 颜色在排版阶段给定，所以不需要单色 SVG + alpha 蒙版那条路。
+struct Math;
+
+impl Renderer for Math {
+    fn rasterize(&self, request: &Request, bytes: &[u8], device: u32) -> Result<RgbaImage, String> {
+        use ratex_layout::{LayoutOptions, layout, to_display_list};
+        use ratex_types::{Color, MathStyle};
+
+        let Source::Formula { display, color, .. } = &request.source else {
+            return Err("数学渲染器只接受公式".into());
+        };
+        let latex = std::str::from_utf8(bytes).map_err(|_| "公式不是有效的 UTF-8".to_owned())?;
+        let ast = ratex_parser::parse(latex).map_err(|e| format!("公式语法错误：{e}"))?;
+        let style = if *display { MathStyle::Display } else { MathStyle::Text };
+        let [r, g, b, a] = color.to_be_bytes().map(|c| f32::from(c) / 255.);
+        let options = LayoutOptions::default().with_style(style).with_color(Color::new(r, g, b, a));
+        let list = to_display_list(&layout(&ast, &options));
+        let png = ratex_render::render_to_png(
+            &list,
+            &ratex_render::RenderOptions {
+                font_size: device as f32,
+                padding: 2.,
+                // 背景透明：公式贴在正文里，跟着主题走
+                background_color: Color::new(0., 0., 0., 0.),
+                font_dir: String::new(),
+                device_pixel_ratio: 1.,
+            },
+        )
+        .map_err(|e| format!("公式渲染失败：{e}"))?;
+        image::load_from_memory(&png).map(|image| image.to_rgba8()).map_err(|e| readable(&e.to_string()))
+    }
+}
+
 fn renderer(kind: Kind) -> &'static dyn Renderer {
     match kind {
         Kind::Image => &Images,
+        Kind::Math => &Math,
     }
 }
 
@@ -115,8 +180,8 @@ pub struct RenderService {
     vault: Arc<Vault>,
     cache: PathBuf,
     entries: HashMap<Request, Entry>,
-    /// 上次渲染出的像素尺寸，占位用；同一文件换宽度时也不用从零等
-    pixels: HashMap<VaultPath, Size<u32>>,
+    /// 上次渲染出的像素尺寸，占位用；同一源换尺寸时也不用从零等
+    pixels: HashMap<Source, Size<u32>>,
     /// 附件目录：与 `![[` 补全同一套解析规则，保证插进去的写法渲染时也能解析
     catalog: Option<aero_core::attachments::Catalog>,
     catalog_task: Option<Task<()>>,
@@ -178,7 +243,31 @@ impl RenderService {
     /// 取一张图。没有就排队渲染并先返回占位，渲染完成后 `notify` 触发重绘。
     pub fn image(&mut self, source: VaultPath, width: u32, scale: f32, cx: &mut Context<Self>) -> State {
         let scale = (scale.max(0.5) * 100.).round() as u32;
-        self.state(Request { kind: Kind::Image, source, width: width.max(1), scale }, cx)
+        let request = Request { kind: Kind::Image, source: Source::File(source), size: width.max(1), scale };
+        self.state(request, cx)
+    }
+
+    /// 取一条公式的位图。`em` 是字号、`color` 是主题前景色，都进缓存键——主题一换就重新排版。
+    pub fn math(
+        &mut self,
+        latex: &str,
+        display: bool,
+        em: f32,
+        scale: f32,
+        color: Hsla,
+        cx: &mut Context<Self>,
+    ) -> State {
+        let rgba = color.to_rgb();
+        let channel = |c: f32| (c.clamp(0., 1.) * 255.).round() as u32;
+        let packed = (channel(rgba.r) << 24) | (channel(rgba.g) << 16) | (channel(rgba.b) << 8) | 255;
+        let source = Source::Formula { latex: latex.to_owned(), display, color: packed };
+        let request = Request {
+            kind: Kind::Math,
+            source,
+            size: (em.max(6.).round() as u32).min(200),
+            scale: (scale.max(0.5) * 100.).round() as u32,
+        };
+        self.state(request, cx)
     }
 
     fn state(&mut self, request: Request, cx: &mut Context<Self>) -> State {
@@ -231,10 +320,12 @@ impl RenderService {
         if paths.is_empty() {
             return;
         }
-        self.entries
-            .retain(|request, entry| !paths.contains(&request.source) && !matches!(entry, Entry::Failed(_)));
+        self.entries.retain(|request, entry| {
+            !request.source.file().is_some_and(|file| paths.contains(file))
+                && !matches!(entry, Entry::Failed(_))
+        });
         for path in paths {
-            self.pixels.remove(path);
+            self.pixels.remove(&Source::File(path.clone()));
             if let Some(catalog) = &mut self.catalog {
                 catalog.update(path, aero_core::attachments::available(&self.vault, path));
             }
@@ -265,21 +356,31 @@ enum Origin {
 
 /// 磁盘缓存文件：内容指纹 + 目标宽度 + 倍率。主题相关的渲染（数学）之后在这里加主题段。
 fn cache_file(cache: &Path, request: &Request, hash: u64) -> PathBuf {
-    cache.join(request.kind.dir()).join(format!("{hash:016x}-w{}@{}.png", request.width, request.scale))
+    cache.join(request.kind.dir()).join(format!("{hash:016x}-w{}@{}.png", request.size, request.scale))
 }
 
 /// 磁盘缓存命中就只解码缓存；否则渲染原文件并写回缓存。缓存写失败只影响下次的速度，不影响这次显示。
 fn produce(vault: &Vault, cache: &Path, request: &Request) -> Result<Produced, String> {
-    let (bytes, stamp) = vault.read_bytes(&request.source).map_err(|e| e.to_string())?;
-    let file = cache_file(cache, request, stamp.hash);
+    let (bytes, hash) = match &request.source {
+        Source::File(path) => {
+            let (bytes, stamp) = vault.read_bytes(path).map_err(|e| e.to_string())?;
+            (bytes, stamp.hash)
+        }
+        // 公式没有磁盘文件：指纹取源码 + 行间 / 行内 + 颜色
+        Source::Formula { latex, display, color } => {
+            let key = format!("{latex}\u{1}{display}\u{1}{color}");
+            (latex.clone().into_bytes(), aero_core::hash_bytes(key.as_bytes()))
+        }
+    };
+    let file = cache_file(cache, request, hash);
     // 缓存被截断 / 手工改过不能让图打不开：当作未命中重新渲染。
     if let Ok(cached) = std::fs::read(&file)
         && let Ok(rgba) = image::load_from_memory(&cached).map(|image| image.to_rgba8())
     {
         return Ok(produced(rgba, Origin::Disk));
     }
-    let target = u32::try_from(u64::from(request.width) * u64::from(request.scale) / 100).unwrap_or(u32::MAX);
-    let rgba = renderer(request.kind).rasterize(&bytes, target.max(1))?;
+    let device = u32::try_from(u64::from(request.size) * u64::from(request.scale) / 100).unwrap_or(u32::MAX);
+    let rgba = renderer(request.kind).rasterize(request, &bytes, device.max(1))?;
     if let Err(error) = write_cache(&file, &rgba) {
         log::warn!("render cache {}: {error}", file.display());
     }
@@ -316,8 +417,8 @@ fn write_cache(file: &Path, rgba: &RgbaImage) -> Result<(), String> {
 mod tests {
     // 不能 `use super::*`：它会把 GPUI 的 `test` 属性宏带进作用域，遮住标准 `#[test]`
     use super::{
-        Attachment, Images, Kind, Origin, RenderService, Renderer as _, Request, State, cache_file, produce,
-        produced,
+        Attachment, Images, Kind, Math, Origin, RenderService, Renderer as _, Request, Source, State,
+        cache_file, produce, produced,
     };
     use aero_core::{Vault, VaultPath};
     use gpui_kit::{AppContext as _, size};
@@ -343,26 +444,36 @@ mod tests {
         (dir, vault, path)
     }
 
-    fn req(source: &VaultPath, width: u32, scale: u32) -> Request {
-        Request { kind: Kind::Image, source: source.clone(), width, scale }
+    fn req(source: &VaultPath, size: u32, scale: u32) -> Request {
+        Request { kind: Kind::Image, source: Source::File(source.clone()), size, scale }
+    }
+
+    fn formula(latex: &str, display: bool, size: u32) -> Request {
+        let source = Source::Formula { latex: latex.to_owned(), display, color: 0x1122_33ff };
+        Request { kind: Kind::Math, source, size, scale: 100 }
     }
 
     #[test]
     fn rasterize_scales_down_to_device_pixels_and_never_upscales() {
-        let wide = Images.rasterize(&png(1000, 400, [1, 2, 3, 255]), 300).unwrap();
+        let request = req(&VaultPath::new("a.png").unwrap(), 300, 100);
+        let wide = Images.rasterize(&request, &png(1000, 400, [1, 2, 3, 255]), 300).unwrap();
         assert_eq!((wide.width(), wide.height()), (300, 120));
-        let small = Images.rasterize(&png(80, 40, [1, 2, 3, 255]), 300).unwrap();
+        let small = Images.rasterize(&request, &png(80, 40, [1, 2, 3, 255]), 300).unwrap();
         assert_eq!((small.width(), small.height()), (80, 40));
         // 极端比例仍至少 1 像素高，不会变成 0 尺寸纹理
-        let strip = Images.rasterize(&png(1000, 1, [1, 2, 3, 255]), 10).unwrap();
+        let strip = Images.rasterize(&request, &png(1000, 1, [1, 2, 3, 255]), 10).unwrap();
         assert_eq!((strip.width(), strip.height()), (10, 1));
     }
 
     #[test]
     fn rasterize_reports_unreadable_images_in_chinese() {
-        let error = Images.rasterize(b"not an image at all", 100).unwrap_err();
+        let request = req(&VaultPath::new("a.png").unwrap(), 100, 100);
+        let error = Images.rasterize(&request, b"not an image at all", 100).unwrap_err();
         assert!(error.starts_with("图片"), "{error}");
-        assert!(Images.rasterize(&png(4, 4, [0, 0, 0, 0])[..20], 100).is_err(), "截断的 PNG 必须报错");
+        assert!(
+            Images.rasterize(&request, &png(4, 4, [0, 0, 0, 0])[..20], 100).is_err(),
+            "截断的 PNG 必须报错"
+        );
     }
 
     /// 首次渲染写磁盘缓存，之后只解码缓存；缓存坏了要能自愈。
@@ -425,6 +536,45 @@ mod tests {
         let produced = produced(rgba, Origin::Rendered);
         assert_eq!(produced.pixels, size(2, 2));
         assert_eq!(produced.frame.buffer().as_raw()[..4], [30, 20, 10, 255]);
+    }
+
+    /// 公式：排版 + 光栅化在同一条流水线上，颜色与行间 / 行内进缓存键，语法错误落到失败表现。
+    #[test]
+    fn math_rasterizes_formulas_and_reports_syntax_errors() {
+        let request = formula("x^2 + \\sqrt{y}", true, 16);
+        let rgba = Math.rasterize(&request, b"x^2 + \\sqrt{y}", 32).unwrap();
+        assert!(rgba.width() > 8 && rgba.height() > 8, "应有可见的排版结果: {:?}", rgba.dimensions());
+        // 背景透明、笔画带上了指定颜色（0x112233）
+        assert!(rgba.pixels().any(|p| p.0[3] == 0), "背景应透明");
+        let ink = rgba.pixels().filter(|p| p.0[3] > 200).count();
+        assert!(ink > 0, "应有不透明的笔画像素");
+        // 语法错误不 panic，报中文
+        let bad = formula("\\frac{", true, 16);
+        let error = Math.rasterize(&bad, b"\\frac{", 32).unwrap_err();
+        assert!(error.starts_with("公式"), "{error}");
+        // 图片渲染器不接受公式源，反之亦然
+        assert!(Math.rasterize(&req(&VaultPath::new("a.png").unwrap(), 10, 100), b"x", 16).is_err());
+    }
+
+    /// 公式没有磁盘文件：磁盘缓存按源码 + 行间 / 行内 + 颜色的指纹命中。
+    #[test]
+    fn math_disk_cache_is_keyed_by_formula_style_and_color() {
+        let (_dir, vault, _) = vault_with(b"unused", "a.png");
+        let cache = tempfile::tempdir().unwrap();
+        let display = formula("a^2", true, 16);
+        let first = produce(&vault, cache.path(), &display).unwrap();
+        assert_eq!(first.origin, Origin::Rendered);
+        assert_eq!(produce(&vault, cache.path(), &display).unwrap().origin, Origin::Disk);
+        // 行内样式、换颜色都是不同的缓存项
+        let inline = formula("a^2", false, 16);
+        assert_eq!(produce(&vault, cache.path(), &inline).unwrap().origin, Origin::Rendered);
+        let Source::Formula { latex, display: d, .. } = &display.source else { unreachable!() };
+        let other_color = Request {
+            source: Source::Formula { latex: latex.clone(), display: *d, color: 0xffff_ffff },
+            ..display.clone()
+        };
+        assert_eq!(produce(&vault, cache.path(), &other_color).unwrap().origin, Origin::Rendered);
+        assert_eq!(std::fs::read_dir(cache.path().join("math")).unwrap().count(), 3);
     }
 
     #[gpui_kit::test]

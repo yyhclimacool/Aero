@@ -3272,3 +3272,30 @@ fn note_embeds_render_their_target_and_follow_changes(cx: &mut TestAppContext) {
         assert!(matches!(editor.read(cx).embed_view("b", Some("^k")), EmbedView::Failed(_)));
     });
 }
+
+/// `$$…$$` 块渲染成位图；语法错误显示源码 + 错误，内容不丢。
+#[gpui_kit::test]
+fn math_blocks_render_as_bitmaps_and_fall_back_to_source(cx: &mut TestAppContext) {
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, "$$\n\\int_0^1 x\\,dx\n$$\n\n正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+        window.draw(cx).clear(cx);
+    });
+    assert!(cx.debug_bounds("math-placeholder").is_some(), "首帧先占位");
+    settle(cx);
+    let bounds = cx.debug_bounds("math-block").expect("公式应渲染成位图");
+    assert!(f32::from(bounds.size.height) > 4., "位图要有高度: {:?}", bounds.size);
+    assert!(cx.debug_bounds("math-error").is_none());
+
+    // 换成写坏的公式：源码 + 错误
+    let (_dir, _cache, _vault, broken) = open_with_images(cx, "$$\n\\frac{\n$$\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[1], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(broken.clone(), window, cx));
+    });
+    settle(cx);
+    assert!(cx.debug_bounds("math-source").is_some(), "渲染不了要显示源码");
+    assert!(cx.debug_bounds("math-error").is_some(), "并给出错误");
+    assert!(cx.debug_bounds("math-block").is_none());
+}

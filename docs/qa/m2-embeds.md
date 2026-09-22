@@ -70,4 +70,6 @@ git diff --check
 
 新增回归：core 的 `attachment_references_count_real_uses_and_report_orphans`（嵌入 + 图片 + 引用式定义 + 相对路径各计一次，代码块里的不算，孤儿列表按路径排序）与 `relative_targets_are_rebased_and_cannot_escape_the_vault`；app 的 `attachments_fold_under_their_note_and_mark_unreferenced_ones`（附件目录不当文件夹、默认折叠、点 📎 展开 / 收起、报告到位后才标未引用）。全量 **468 项通过**（app 246、链接绘制集成 17、core 149、往返 5、index 50、反链计数集成 1）。
 
+**「未引用」不等于可以安全删除**，因此目前不提供按孤儿批量删除的入口。会算出假 0 的情况：同名附件造成目标歧义时两个都不计数（`Ambiguous` 不计）；读不出来的笔记（权限、非 UTF-8）被整篇跳过，它的引用全部丢失；被 `.gitignore` / `.aero/ignore` 或隐藏目录排除的笔记不在枚举范围；内联 HTML 的 `<img src>` 不算（扫描只认 Markdown 的 Link / Image 节点）；百分号编码的地址解析不到同一个文件；vault 外部（导出站点、别的库）的引用无从得知。加上报告不是实时刷新，刚写下的引用可能还没算进去。将来要做删除入口，前提是：删前实时重扫、把歧义 / 读不出显式报成「不确定」而不是 0、删除走系统废纸篓、批量操作先列清单确认。
+
 仍未实现：视图菜单的「显示附件目录」开关（`*.assets/` 作为普通文件夹展示）、附件的 vault 内改名 / 删除入口、把引用计数写进索引（现在是按需全库扫描，不落 SQLite）、`.assets/` 里非图片 / PDF 的其他文件不进树。📎 徽标目前常显而不是悬停才显。

@@ -161,7 +161,9 @@ fn line_starts(text: &str) -> Vec<usize> {
     v
 }
 
-pub(crate) fn hash_bytes(b: &[u8]) -> u64 {
+/// 内容指纹（xxh3-64），与 [`crate::FileStamp::hash`] 同一个函数。
+/// 跨进程、跨版本稳定，可以用作磁盘缓存键。
+pub fn hash_bytes(b: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(b)
 }
 

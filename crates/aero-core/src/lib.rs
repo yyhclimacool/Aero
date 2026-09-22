@@ -34,7 +34,7 @@ pub use anchors::{Anchor, Bias, MarkerTable};
 pub use block::{Attrs, Block, BlockId, BlockKind, BlockTree, CalloutKind, Fold};
 pub use document::{Document, Snapshot};
 pub use index::{FtsQuery, FullTextIndex, Hit, IndexBlock, IndexError, VectorIndex, VectorItem};
-pub use parse::{ParseOutput, ParseReport, ParsedBlock, parse};
+pub use parse::{ParseOutput, ParseReport, ParsedBlock, hash_bytes, parse};
 pub use text::{Edit, EditError, LineEnding, Rope, RopeSlice, SourceText};
 pub use vault::{FileStamp, Vault, VaultError, VaultPath};
 

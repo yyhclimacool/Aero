@@ -17,6 +17,7 @@ mod images_ui;
 mod inline_format_ui;
 mod inline_links_ui;
 mod link_preview;
+mod math_ui;
 mod ops;
 mod pairs;
 mod pairs_ui;
@@ -218,6 +219,8 @@ pub struct Editor {
     images_subscription: Option<Subscription>,
     /// 全屏看图：双击图片打开，`Space` / `Esc` / 点击关闭
     viewer: Option<ImageViewer>,
+    /// 上一帧的 HiDPI 倍率：图片 / 公式按它算设备像素（渲染块时拿不到 `Window`）
+    scale: f32,
     focused: Option<Focused>,
     /// 块选中态；与 `focused` 互斥
     selection: Option<BlockSelection>,
@@ -287,6 +290,7 @@ impl Editor {
             images: None,
             images_subscription: None,
             viewer: None,
+            scale: 1.,
             focused: None,
             selection: None,
             picker_open: false,
@@ -2245,7 +2249,7 @@ impl Editor {
         if self.is_covered(&range) {
             return None;
         }
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
         let text: SharedString = self.doc.slice(range).to_string().into();
         let id = b.id;
         // 用 click 而不是 mouse down 进编辑态：预览里的链接在 mouse up 时才触发并 stop_propagation，
@@ -2259,6 +2263,7 @@ impl Editor {
 
         let body: AnyElement = match &b.kind {
             BlockKind::ThematicBreak => div().w_full().h(px(1.)).my_3().bg(theme.border).into_any_element(),
+            BlockKind::MathBlock => self.render_math_block(&text, cx),
             BlockKind::FrontMatter | BlockKind::HtmlBlock | BlockKind::Raw => div()
                 .w_full()
                 .font_family(theme.mono_font_family.clone())
@@ -2326,6 +2331,7 @@ impl Focusable for Editor {
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.validate_link_preview_scroll(cx);
+        self.scale = window.scale_factor();
         let (foreground, muted) = (cx.theme().foreground, cx.theme().muted_foreground);
         let roots = self.doc.blocks().roots.clone();
         let blocks = self.render_blocks(&roots, cx);
