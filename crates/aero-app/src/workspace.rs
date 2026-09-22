@@ -23,7 +23,7 @@ use crate::backlinks::{BacklinkOpened, BacklinksView};
 use crate::branding;
 use crate::editor::{Editor, EditorEvent, SaveState};
 use crate::file_tree::{FileTree, FileTreeEvent, unique_note_name};
-use crate::paths::{PersistedState, app_data_dir, display_path};
+use crate::paths::{PersistedState, display_path};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::search::{Phase, SearchService};
 use crate::search_view::{SearchView, SearchViewEvent};
@@ -64,6 +64,8 @@ enum ContextTab {
 }
 
 pub struct Workspace {
+    /// 应用数据目录：状态文件、索引缓存与默认示例库都在这里
+    data_dir: PathBuf,
     state: PersistedState,
     open: Option<VaultSession>,
     /// ⌘P 弹层
@@ -92,8 +94,13 @@ enum LinkAction {
 }
 
 impl Workspace {
-    pub fn new(initial_vault: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let state = PersistedState::load();
+    pub fn new(
+        initial_vault: Option<PathBuf>,
+        data_dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let state = PersistedState::load(&data_dir);
         let workspace = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             workspace.update(cx, |this, cx| this.flush_before_leaving(window, cx)).unwrap_or(true)
@@ -111,6 +118,7 @@ impl Workspace {
             }
         });
         let mut this = Workspace {
+            data_dir,
             quick_open: None,
             picker_focus: None,
             recent_commands: Vec::new(),
@@ -129,9 +137,14 @@ impl Workspace {
         };
         this.focus_handle.focus(window, cx);
 
-        let target = initial_vault.or_else(|| this.state.recent_vaults.first().cloned());
-        if let Some(root) = target {
-            this.open_vault(&root, window, cx);
+        // 显式路径优先；否则恢复最近打开且还在的库（11 节）。都没有就停在库选择页，示例库由用户自己选。
+        match initial_vault {
+            Some(root) => this.open_vault(&root, window, cx),
+            None => {
+                if let Some(root) = this.state.recent_vaults.iter().find(|p| p.is_dir()).cloned() {
+                    this.open_recent(root, window, cx);
+                }
+            }
         }
         this
     }
@@ -146,14 +159,13 @@ impl Workspace {
             Ok(vault) => {
                 let vault = Arc::new(vault);
                 let tree = cx.new(|cx| FileTree::new(vault.clone(), cx));
-                let sub = cx.subscribe_in(&tree, window, |this, _, event, window, cx| match event {
-                    FileTreeEvent::Open(path) => this.open_note(path.clone(), window, cx),
-                });
+                let sub = self.subscribe_tree(&tree, window, cx);
                 // 新 vault 打得开才离开旧的：落盘并同步关掉旧索引句柄（再打开同一个 vault 时锁才能拿到），
                 // 然后丢掉上一个会话
                 self.flush_all(cx);
                 self.open = None;
-                let search = cx.new(|cx| SearchService::new(vault.clone(), app_data_dir().join("index"), cx));
+                let index_dir = self.data_dir.join("index");
+                let search = cx.new(|cx| SearchService::new(vault.clone(), index_dir, cx));
                 let search_sub = cx.observe(&search, |_, _, cx| cx.notify());
                 let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
                 let backlinks = cx.new(|cx| BacklinksView::new(search.clone(), cx));
@@ -196,7 +208,7 @@ impl Workspace {
                 });
                 self.error = None;
                 self.state.touch_vault(vault.root());
-                self.state.save();
+                self.state.save(&self.data_dir);
                 // 默认打开最近修改的一篇；没有则停在空编辑区
                 if let Some(path) = most_recent_note(&vault) {
                     self.open_note(path, window, cx);
@@ -206,7 +218,7 @@ impl Workspace {
             Err(err) => {
                 self.error = Some(format!("无法打开 {}：{err}", display_path(root)));
                 self.state.forget_vault(root);
-                self.state.save();
+                self.state.save(&self.data_dir);
             }
         }
         cx.notify();
@@ -257,7 +269,40 @@ impl Workspace {
     }
 
     fn open_recent(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_vault(&root, window, cx);
+        if self.is_demo_vault(&root) {
+            self.open_demo_vault(window, cx);
+        } else {
+            self.open_vault(&root, window, cx);
+        }
+    }
+
+    /// 库选择页的示例库入口：先把内嵌示例交付到应用数据目录（已存在则更新未被改动的那些），
+    /// 再打开并停在欢迎页。用户每次从这里进来都会看到当前版本的示例。
+    fn open_demo_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::demo_vault::prepare(&self.data_dir) {
+            Ok(root) => {
+                self.open_vault(&root, window, cx);
+                let welcome = VaultPath::new(crate::demo_vault::WELCOME).expect("bundled welcome path");
+                if self.open.as_ref().is_some_and(|open| open.vault.exists(&welcome)) {
+                    self.open_note(welcome, window, cx);
+                }
+            }
+            Err(error) => {
+                self.error = Some(format!("无法准备示例库：{error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// 最近列表里的示例库也走示例库入口，否则更新过的示例会被旧副本挡住。
+    /// 最近列表存的是规范化过的路径，所以两边都按实际目录比。
+    fn is_demo_vault(&self, root: &Path) -> bool {
+        let demo = crate::demo_vault::root(&self.data_dir);
+        root == demo
+            || std::fs::canonicalize(root)
+                .ok()
+                .zip(std::fs::canonicalize(&demo).ok())
+                .is_some_and(|(a, b)| a == b)
     }
 
     // ---- 笔记 ----
@@ -320,6 +365,23 @@ impl Workspace {
     }
 
     /// 编辑器事件 → 工作区动作（索引、文件树、横幅上的请求）。
+    fn subscribe_tree(
+        &mut self,
+        tree: &Entity<FileTree>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(tree, window, |this, _, event, window, cx| match event {
+            FileTreeEvent::Open(path) => {
+                this.open_note(path.clone(), window, cx);
+                if let Some(open) = &this.open {
+                    open.tree.update(cx, |t, cx| t.focus(window, cx));
+                }
+            }
+            FileTreeEvent::Move { from, to } => this.move_entry(from.clone(), to.clone(), window, cx),
+        })
+    }
+
     fn subscribe_editor(
         &mut self,
         editor: &Entity<Editor>,
@@ -343,6 +405,7 @@ impl Workspace {
             EditorEvent::PathsTouched(paths) => this.on_editor_touched_paths(editor, paths.clone(), cx),
             EditorEvent::Deleted => this.on_editor_deleted(editor, cx),
             EditorEvent::RenameRequested(name) => this.rename_current(name.clone(), window, cx),
+            EditorEvent::RetitleRequested(title) => this.retitle_current(title.clone(), window, cx),
             EditorEvent::OpenRequested(path) => this.open_note(path.clone(), window, cx),
             EditorEvent::LinkClicked { target, fragment } => {
                 this.on_link_clicked(target.clone(), fragment.clone(), window, cx)
@@ -711,7 +774,7 @@ impl Workspace {
         if !self.sidebar_visible {
             self.sidebar_visible = true;
             self.state.sidebar_visible = Some(true);
-            self.state.save();
+            self.state.save(&self.data_dir);
         }
         open.search_view.update(cx, |v, cx| v.focus(window, cx));
         cx.notify();
@@ -722,7 +785,7 @@ impl Workspace {
         if !self.sidebar_visible {
             self.sidebar_visible = true;
             self.state.sidebar_visible = Some(true);
-            self.state.save();
+            self.state.save(&self.data_dir);
         }
         cx.notify();
     }
@@ -788,6 +851,9 @@ impl Workspace {
     /// ⌘⌫ / 文件菜单：树里选中的笔记，没有则是打开中的那篇。
     fn on_delete_note(&mut self, _: &DeleteNote, window: &mut Window, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_ref() else { return };
+        if open.tree.read(cx).selected_folder().is_some() {
+            return;
+        }
         let target = open
             .tree
             .read(cx)
@@ -863,30 +929,54 @@ impl Workspace {
         }
     }
 
-    /// 后台准备全库链接改写计划；提交时校验当前编辑器仍是保存过的版本。
+    fn move_entry(&mut self, from: VaultPath, to: VaultPath, window: &mut Window, cx: &mut Context<Self>) {
+        if from != to {
+            self.change_name(from, to, None, window, cx);
+        }
+    }
+
+    fn retitle_current(&mut self, title: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.open.as_ref().and_then(|o| o.editor.as_ref()) else { return };
+        let path = editor.read(cx).path().clone();
+        self.change_name(path.clone(), path, Some(title), window, cx);
+    }
+
     fn rename_current(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.open.as_ref().and_then(|o| o.editor.as_ref()) else { return };
+        let old = editor.read(cx).path().clone();
+        match note_path_in(old.parent(), &name) {
+            Ok(target) => self.move_entry(old, target, window, cx),
+            Err(msg) => window.push_notification(Notification::error(msg).title("重命名"), cx),
+        }
+    }
+
+    fn change_name(
+        &mut self,
+        old: VaultPath,
+        target: VaultPath,
+        title: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.flush_before_leaving(window, cx) {
             return;
         }
         let Some(open) = self.open.as_ref() else { return };
-        let Some(editor) = open.editor.clone() else { return };
-        let old = editor.read(cx).path().clone();
-        let target = match note_path_in(old.parent(), &name) {
-            Ok(p) => p,
-            Err(msg) => {
-                window.push_notification(Notification::error(msg).title("重命名"), cx);
-                return;
-            }
-        };
-        if target == old {
-            return;
-        }
+        let editor = open.editor.clone();
+        let snapshot = editor.as_ref().map(|e| e.read(cx).index_snapshot());
         let vault = open.vault.clone();
-        let hash = editor.read(cx).index_snapshot().2.hash;
+        let vault_id = vault.id().to_owned();
+        let directory = vault.fs_path(&old).is_dir();
+        let description =
+            title.as_ref().map_or_else(|| format!("{old} → {target}"), |title| format!("标题 → {title}"));
         self.rename_pending = true;
         let (from, to) = (old.clone(), target.clone());
-        let prepare =
-            cx.background_spawn(async move { aero_core::rename::RenamePlan::prepare(&vault, from, to) });
+        let prepare = cx.background_spawn(async move {
+            match title {
+                Some(title) => aero_core::rename::RenamePlan::prepare_title(&vault, from, title),
+                None => aero_core::rename::RenamePlan::prepare(&vault, from, to),
+            }
+        });
         cx.spawn_in(window, async move |this, cx| {
             let plan = match prepare.await {
                 Ok(plan) => plan,
@@ -931,10 +1021,14 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.rename_pending = false;
                 let Some(open) = this.open.as_mut() else { return };
-                if open.editor.as_ref() != Some(&editor)
-                    || editor.read(cx).path() != &old
-                    || editor.read(cx).index_snapshot().2.hash != hash
-                    || !matches!(editor.read(cx).save_state(), SaveState::Clean | SaveState::Saved(_))
+                if open.vault.id() != vault_id
+                    || open.editor != editor
+                    || editor.as_ref().zip(snapshot.as_ref()).is_some_and(|(editor, (path, _, stamp))| {
+                        let editor = editor.read(cx);
+                        editor.path() != path
+                            || editor.index_snapshot().2.hash != stamp.hash
+                            || !matches!(editor.save_state(), SaveState::Clean | SaveState::Saved(_))
+                    })
                 {
                     window.push_notification(
                         Notification::warning("笔记在准备期间已变化，重命名已取消，请保存后重试。"),
@@ -945,39 +1039,45 @@ impl Workspace {
                 // 提交与编辑器换路径在同一次 UI 回调内完成，文件监听/自动保存不会在两者之间插入。
                 match plan.execute() {
                     Ok(report) => {
-                        let message = format!(
-                            "已重命名为 {}，更新 {} 处链接。",
-                            target.file_name(),
-                            report.links_changed
-                        );
+                        let message = format!("已完成 {description}，更新 {} 处链接。", report.links_changed);
                         open.search.update(cx, |s, cx| s.notes_renamed(report, cx));
-                        editor.update(cx, |e, cx| {
-                            e.set_path(target.clone(), cx);
-                            e.check_external(cx);
-                        });
+                        if let Some(editor) = &editor {
+                            editor.update(cx, |e, cx| {
+                                let mapped = moved_path(e.path(), &old, &target, directory);
+                                if e.path() != &mapped {
+                                    e.set_path(mapped, cx);
+                                }
+                                e.check_external(cx);
+                            });
+                        }
                         for recent in &mut open.recent {
-                            if *recent == old {
-                                *recent = target.clone();
-                            }
+                            *recent = moved_path(recent, &old, &target, directory);
                         }
                         window.push_notification(Notification::info(message).title("重命名"), cx);
                     }
                     Err(error) => {
                         // 回滚被外部改动阻止时仍跟随存活的文件，错误中带有恢复副本路径。
-                        if !open.vault.exists(&old) && open.vault.exists(&target) {
-                            editor.update(cx, |e, cx| e.set_path(target.clone(), cx));
+                        if let Some(editor) = &editor {
+                            editor.update(cx, |e, cx| {
+                                let mapped = moved_path(e.path(), &old, &target, directory);
+                                if !open.vault.exists(e.path()) && open.vault.exists(&mapped) {
+                                    e.set_path(mapped, cx);
+                                }
+                                e.check_external(cx);
+                            });
                         }
-                        editor.update(cx, |e, cx| e.check_external(cx));
                         open.search.update(cx, |s, cx| s.resync(cx));
                         window.push_notification(Notification::error(error.to_string()).title("重命名"), cx);
                     }
                 }
-                let current = editor.read(cx).path().clone();
-                open.backlinks.update(cx, |v, cx| v.set_note(Some(current.clone()), cx));
-                editor.update(cx, |e, cx| e.connect_backlinks(open.backlinks.clone(), cx));
+                let current = editor.as_ref().map(|e| e.read(cx).path().clone());
+                open.backlinks.update(cx, |v, cx| v.set_note(current.clone(), cx));
+                if let Some(editor) = &editor {
+                    editor.update(cx, |e, cx| e.connect_backlinks(open.backlinks.clone(), cx));
+                }
                 open.tree.update(cx, |t, cx| {
                     t.rescan();
-                    t.select(Some(current), cx);
+                    t.select(current, cx);
                 });
                 cx.notify();
             });
@@ -1145,14 +1245,14 @@ impl Workspace {
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_visible = !self.sidebar_visible;
         self.state.sidebar_visible = Some(self.sidebar_visible);
-        self.state.save();
+        self.state.save(&self.data_dir);
         cx.notify();
     }
 
     fn on_toggle_panel(&mut self, _: &TogglePanel, _window: &mut Window, cx: &mut Context<Self>) {
         self.panel_visible = !self.panel_visible;
         self.state.panel_visible = Some(self.panel_visible);
-        self.state.save();
+        self.state.save(&self.data_dir);
         cx.notify();
     }
 
@@ -1202,7 +1302,7 @@ impl Workspace {
                 .child(div().text_2xl().font_weight(FontWeight::SEMIBOLD).child("Aero"))
                 .child(
                     div().text_sm().text_color(muted).child(
-                        "一个 vault 就是一个普通文件夹，里面的 Markdown 文件就是你的笔记。选择一个开始。",
+                        "一个 vault 就是一个普通文件夹，里面的 Markdown 文件就是你的笔记。选择一个开始，或先看看示例。",
                     ),
                 )
                 .child(
@@ -1221,6 +1321,18 @@ impl Workspace {
                                 .icon(IconName::FolderPlus)
                                 .label("新建 Vault…")
                                 .on_click(|_, window, cx| window.dispatch_action(Box::new(NewVault), cx)),
+                        )
+                        .child(
+                            div().debug_selector(|| "first-run-demo-vault".into()).child(
+                                Button::new("demo-vault")
+                                    .outline()
+                                    .icon(IconName::Lightbulb)
+                                    .label("查看示例库")
+                                    .tooltip("六篇内置示例笔记，随程序更新")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_demo_vault(window, cx)
+                                    })),
+                            ),
                         ),
                 )
                 .when_some(self.error.clone(), |el, err| {
@@ -1559,6 +1671,16 @@ impl Render for Workspace {
 
 /// 最近修改的笔记，作为打开 vault 时的默认文档。
 /// `dir/<name>.md`；名字不能为空、不能含路径分隔符或以 `.` 开头。
+fn moved_path(path: &VaultPath, from: &VaultPath, to: &VaultPath, directory: bool) -> VaultPath {
+    if path == from {
+        return to.clone();
+    }
+    if directory && let Some(rest) = path.as_str().strip_prefix(&format!("{from}/")) {
+        return VaultPath::new(&format!("{to}/{rest}")).expect("mapped vault path");
+    }
+    path.clone()
+}
+
 fn note_path_in(dir: &str, name: &str) -> Result<VaultPath, String> {
     let name = name.trim();
     if name.is_empty() {
@@ -1678,6 +1800,7 @@ mod tests {
             let focus_handle = cx.focus_handle();
             focus_handle.focus(window, cx);
             Workspace {
+                data_dir: data.path().to_path_buf(),
                 state: PersistedState::default(),
                 open,
                 quick_open: None,
@@ -1702,6 +1825,10 @@ mod tests {
                 let sub = w.subscribe_editor(&editor, window, cx);
                 w.open.as_mut().unwrap().editor_sub = Some(sub);
             }
+            if let Some(tree) = w.open.as_ref().map(|o| o.tree.clone()) {
+                let sub = w.subscribe_tree(&tree, window, cx);
+                w.open.as_mut().unwrap()._subscriptions.push(sub);
+            }
             if let Some(view) = w.open.as_ref().map(|o| o.backlinks.clone()) {
                 let sub = w.subscribe_backlinks(&view, window, cx);
                 w.open.as_mut().unwrap()._subscriptions.push(sub);
@@ -1721,6 +1848,148 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "condition not met within 20 s");
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
+    }
+
+    /// 没有可恢复的库时停在库选择页，示例库要用户自己点；点了才准备并停在欢迎页。
+    #[gpui_kit::test]
+    fn startup_stays_on_the_library_chooser_until_the_demo_vault_is_picked(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let data = tempfile::tempdir().unwrap();
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(None, data.path().to_path_buf(), window, cx));
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(workspace.read(cx).open.is_none(), "启动不打开任何库");
+            window.draw(cx).clear(cx);
+        });
+        assert!(!data.path().join("demo-vault").exists(), "没点就不写示例库");
+
+        let button = cx.debug_bounds("first-run-demo-vault").expect("库选择页有示例库入口");
+        cx.simulate_click(button.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        let demo = data.path().join("demo-vault").canonicalize().unwrap();
+        cx.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.error, None);
+            let open = this.open.as_ref().unwrap();
+            assert_eq!(open.vault.root(), demo);
+            assert_eq!(open.vault.notes().unwrap().len(), 6);
+            assert_eq!(open.editor.as_ref().unwrap().read(cx).path().as_str(), crate::demo_vault::WELCOME);
+            open.search.read(cx).close_blocking();
+        });
+        // 示例库进了最近列表：「关闭 Vault」后从那里回来也走示例库入口，能拿到更新过的示例。
+        assert_eq!(PersistedState::load(data.path()).recent_vaults, vec![demo.clone()]);
+        cx.update(|_, cx| assert!(workspace.read(cx).is_demo_vault(&demo)));
+    }
+
+    /// 无参数启动恢复最近打开且还在的库；路径已经不在的条目跳过，不弹错误。
+    #[gpui_kit::test]
+    fn startup_restores_the_most_recent_vault_and_skips_stale_entries(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let data = tempfile::tempdir().unwrap();
+        let mine = tempfile::tempdir().unwrap();
+        std::fs::write(mine.path().join("mine.md"), "我的笔记\n").unwrap();
+        let recents = vec![data.path().join("已经删掉的库"), mine.path().to_path_buf()];
+        PersistedState { recent_vaults: recents, ..Default::default() }.save(data.path());
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(None, data.path().to_path_buf(), window, cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.error, None);
+            let open = this.open.as_ref().unwrap();
+            assert_eq!(open.vault.root(), mine.path().canonicalize().unwrap());
+            assert_eq!(open.editor.as_ref().unwrap().read(cx).path().as_str(), "mine.md");
+            open.search.read(cx).close_blocking();
+        });
+        assert!(!data.path().join("demo-vault").exists());
+    }
+
+    /// 最近打开的是示例库时同样走示例库入口：会交付这一版的示例，并停在欢迎页而不是最近改过的那篇。
+    #[gpui_kit::test]
+    fn startup_restoring_the_demo_vault_goes_through_the_demo_entry(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let data = tempfile::tempdir().unwrap();
+        let root = crate::demo_vault::prepare(data.path()).unwrap();
+        std::fs::write(root.join("项目/项目清单.md"), "我改过的清单\n").unwrap();
+        PersistedState { recent_vaults: vec![root.clone()], ..Default::default() }.save(data.path());
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(None, data.path().to_path_buf(), window, cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            assert_eq!(open.vault.root(), root.canonicalize().unwrap());
+            assert_eq!(open.editor.as_ref().unwrap().read(cx).path().as_str(), crate::demo_vault::WELCOME);
+            open.search.read(cx).close_blocking();
+        });
+        assert_eq!(std::fs::read_to_string(root.join("项目/项目清单.md")).unwrap(), "我改过的清单\n");
+    }
+
+    /// 命令行给了路径就不碰示例库，也不去恢复最近打开的库。
+    #[gpui_kit::test]
+    fn startup_with_an_explicit_path_skips_the_demo_vault(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let recent = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mine.md"), "我的笔记\n").unwrap();
+        let recents = vec![recent.path().to_path_buf()];
+        PersistedState { recent_vaults: recents, ..Default::default() }.save(data.path());
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            Workspace::new(Some(dir.path().to_path_buf()), data.path().to_path_buf(), window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            assert_eq!(open.vault.root(), dir.path().canonicalize().unwrap());
+            assert_eq!(open.editor.as_ref().unwrap().read(cx).path().as_str(), "mine.md");
+            open.search.read(cx).close_blocking();
+        });
+        assert!(!data.path().join("demo-vault").exists());
+    }
+
+    /// 示例库准备失败不是静默降级：库选择页给出原因，占位的文件保持原样。
+    #[gpui_kit::test]
+    fn picking_an_unusable_demo_vault_reports_it_on_the_chooser(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(data.path().join("demo-vault"), "not a directory").unwrap();
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::new(None, data.path().to_path_buf(), window, cx));
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            window.draw(cx).clear(cx);
+        });
+        let button = cx.debug_bounds("first-run-demo-vault").unwrap();
+        cx.simulate_click(button.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            let this = workspace.read(cx);
+            assert!(this.open.is_none());
+            assert!(this.error.as_deref().unwrap().starts_with("无法准备示例库"), "{:?}", this.error);
+        });
+        assert_eq!(std::fs::read_to_string(data.path().join("demo-vault")).unwrap(), "not a directory");
     }
 
     #[gpui_kit::test]
@@ -2465,6 +2734,137 @@ mod tests {
             );
         }
         cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn move_directory_updates_open_editor_links_index_and_future_saves(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("[target](group/target.md)\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace.read(cx).open.as_ref().unwrap().search.read(cx).phase()
+                    == crate::search::Phase::Idle
+            })
+        });
+        std::fs::create_dir_all(dir.path().join("group/empty")).unwrap();
+        std::fs::create_dir(dir.path().join("dest")).unwrap();
+        std::fs::write(dir.path().join("group/target.md"), "movingunique\n\n[back](../a.md)\n").unwrap();
+        workspace.update_in(cx, |w, window, cx| {
+            w.open_note(VaultPath::new("group/target.md").unwrap(), window, cx)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.move_entry(VaultPath::new("group").unwrap(), VaultPath::new("dest/moved").unwrap(), window, cx)
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));
+        let (editor, search) = cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.editor.clone().unwrap(), open.search.clone())
+        });
+        assert_eq!(editor.read_with(cx, |e, _| e.path().as_str().to_owned()), "dest/moved/target.md");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
+            "[target](dest/moved/target.md)\n"
+        );
+        assert!(dir.path().join("dest/moved/empty").is_dir());
+        editor.update_in(cx, |e, window, cx| e.start_writing(window, cx));
+        cx.run_until_parked();
+        cx.simulate_input("added");
+        cx.simulate_keystrokes("cmd-s");
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| !matches!(editor.read(cx).save_state(), crate::editor::SaveState::Saving))
+        });
+        assert!(!dir.path().join("group/target.md").exists());
+        wait_until(cx, |cx| cx.update(|_, cx| matches!(search.read(cx).phase(), crate::search::Phase::Idle)));
+        let task = cx.update(|_, cx| search.read(cx).search("movingunique".into(), 10, cx));
+        let hits = cx.foreground_executor().block_on(task).unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit.path.as_str() == "dest/moved/target.md"));
+        assert!(std::fs::read_to_string(dir.path().join("dest/moved/target.md")).unwrap().contains("added"));
+        cx.update(|_, cx| search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn file_tree_drag_and_f2_move_files_through_workspace(cx: &mut TestAppContext) {
+        use gpui_kit::{Modifiers, MouseButton, point, px};
+        let (dir, _data, workspace) = open(cx, Some("body\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace.read(cx).open.as_ref().unwrap().search.read(cx).phase()
+                    == crate::search::Phase::Idle
+            })
+        });
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let tree = workspace.read(cx).open.as_ref().unwrap().tree.clone();
+            tree.update(cx, |t, cx| {
+                t.rescan();
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+        let from = cx.debug_bounds("file-tree-note:a.md").unwrap().center();
+        let to = cx.debug_bounds("file-tree-folder:empty").unwrap().center();
+        cx.simulate_mouse_move(from, None, Modifiers::default());
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(from + point(px(10.), px(0.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));
+        assert!(dir.path().join("empty/a.md").is_file());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let note = cx.debug_bounds("file-tree-note:empty/a.md").unwrap();
+        cx.simulate_click(note.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        cx.simulate_input("renamed");
+        cx.simulate_keystrokes("enter");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));
+        assert!(dir.path().join("empty/renamed.md").is_file());
+        assert!(!dir.path().join("empty/a.md").exists());
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn retitle_transaction_updates_incoming_links_without_renaming_file(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("---\ntitle: Old title\n---\nbody\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace.read(cx).open.as_ref().unwrap().search.read(cx).phase()
+                    == crate::search::Phase::Idle
+            })
+        });
+        std::fs::write(dir.path().join("b.md"), "[[Old title]] [path](a.md)\n").unwrap();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let title = cx.debug_bounds("editor-title").unwrap();
+        cx.simulate_click(title.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_input("New title");
+        cx.simulate_keystrokes("enter");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            let editor = open.editor.as_ref().unwrap().read(cx);
+            assert_eq!(editor.title(), "New title");
+            assert_eq!(editor.path().as_str(), "a.md");
+            open.search.read(cx).close_blocking();
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.md")).unwrap(), "[[New title]] [path](a.md)\n");
+        assert!(!dir.path().join("New title.md").exists());
     }
 
     #[gpui_kit::test]

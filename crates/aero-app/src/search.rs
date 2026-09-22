@@ -330,6 +330,16 @@ impl SearchService {
     pub fn notes_renamed(&mut self, report: aero_core::rename::RenameReport, cx: &mut Context<Self>) {
         // 启动同步可能仍持有旧文件列表；在队列内等它结束，后续 Reloaded 保存不能插队。
         self.run(cx, true, move |ix| {
+            if report.directory {
+                let sync = ix.sync_all(|_, _| {});
+                return if sync.errors.is_empty() { Ok(true) } else { Err(sync.errors.join("; ")) };
+            }
+            if report.from == report.to {
+                for path in &report.updated {
+                    ix.refresh_note(path).map_err(|e| e.to_string())?;
+                }
+                return Ok(true);
+            }
             let mut errors = Vec::new();
             if let Err(rename_error) = ix.rename_note(&report.from, &report.to) {
                 // A later queued rename may already have moved the intermediate file on disk.
@@ -858,6 +868,38 @@ mod tests {
         assert_eq!(hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(), ["c.md"]);
         let task = cx.update(|cx| service.read(cx).backlinks(VaultPath::new("c.md").unwrap(), None, 10, cx));
         assert_eq!(cx.foreground_executor().block_on(task).unwrap().total, 1);
+        cx.update(|cx| service.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn directory_move_waits_for_startup_and_rebuilds_paths_and_backlinks(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("group")).unwrap();
+        std::fs::write(dir.path().join("group/a.md"), "movedunique\n").unwrap();
+        std::fs::write(dir.path().join("source.md"), "[[group/a]]\n").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        let report = aero_core::rename::RenamePlan::prepare(
+            &vault,
+            VaultPath::new("group").unwrap(),
+            VaultPath::new("moved").unwrap(),
+        )
+        .unwrap()
+        .execute()
+        .unwrap();
+        set_phase(&service, super::PHASE_SYNCING, cx);
+        service.update(cx, |s, cx| s.notes_renamed(report, cx));
+        let query = cx.update(|cx| service.read(cx).search("movedunique".into(), 10, cx));
+        cx.run_until_parked();
+        assert!(!query.is_ready());
+        set_phase(&service, super::PHASE_IDLE, cx);
+        let hits = cx.foreground_executor().block_on(query).unwrap();
+        assert_eq!(hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), ["moved/a.md"]);
+        let query =
+            cx.update(|cx| service.read(cx).backlinks(VaultPath::new("moved/a.md").unwrap(), None, 10, cx));
+        assert_eq!(cx.foreground_executor().block_on(query).unwrap().total, 1);
         cx.update(|cx| service.read(cx).close_blocking());
     }
 

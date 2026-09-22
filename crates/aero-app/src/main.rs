@@ -10,6 +10,7 @@
 mod actions;
 mod backlinks;
 mod branding;
+mod demo_vault;
 mod editor;
 mod file_tree;
 mod paths;
@@ -58,7 +59,7 @@ fn init_logger() {
 fn main() {
     init_logger();
 
-    // `aero <vault 目录>` 直接打开；否则进入首次运行页 / 最近的 vault
+    // `aero <vault 目录>` 直接打开；无参数启动停在库选择页，示例库是那里的一个入口。
     let initial_vault: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
 
     gpui_kit::application().with_assets(branding::AppAssets).run(move |cx| {
@@ -82,7 +83,7 @@ fn main() {
 
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(initial_vault, window, cx));
+                let workspace = cx.new(|cx| Workspace::new(initial_vault, paths::app_data_dir(), window, cx));
                 cx.new(|cx| Root::new(workspace, window, cx))
             })
             .expect("failed to open window");

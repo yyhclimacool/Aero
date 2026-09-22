@@ -198,6 +198,27 @@ impl Vault {
         Ok(out)
     }
 
+    pub fn folders(&self) -> Result<Vec<VaultPath>, VaultError> {
+        let mut walk = ignore::WalkBuilder::new(&self.root);
+        walk.hidden(true).git_ignore(true).require_git(false).follow_links(false);
+        let custom = self.root.join(".aero/ignore");
+        if custom.is_file()
+            && let Some(error) = walk.add_ignore(custom)
+        {
+            return Err(VaultError::Walk(error.to_string()));
+        }
+        walk.filter_entry(|e| !e.file_name().to_str().is_some_and(|name| name.ends_with(".assets")));
+        let mut folders = Vec::new();
+        for entry in walk.build() {
+            let entry = entry.map_err(|e| VaultError::Walk(e.to_string()))?;
+            if entry.depth() > 0 && entry.file_type().is_some_and(|t| t.is_dir()) {
+                folders.push(VaultPath::from_fs(&self.root, entry.path())?);
+            }
+        }
+        folders.sort();
+        Ok(folders)
+    }
+
     pub fn read_bytes(&self, p: &VaultPath) -> Result<(Vec<u8>, FileStamp), VaultError> {
         let path = self.fs_path(p);
         let bytes = fs::read(&path).map_err(io_err(&path))?;
@@ -267,6 +288,9 @@ impl Vault {
         if let Some(dir) = dst.parent() {
             fs::create_dir_all(dir).map_err(io_err(dir))?;
         }
+        if fs::symlink_metadata(&src).map_err(io_err(&src))?.is_dir() {
+            return rename_exclusive(&src, &dst).map_err(io_err(&dst));
+        }
         // create-only 发布新路径，目标在预检后被创建也不会被覆盖。
         fs::hard_link(&src, &dst).map_err(io_err(&dst))?;
         let assets = from
@@ -275,14 +299,14 @@ impl Vault {
             .map(|(a, b)| (self.fs_path(&a), self.fs_path(&b)))
             .filter(|(a, _)| a.is_dir());
         if let Some((a, b)) = &assets {
-            if let Err(error) = fs::rename(a, b) {
+            if let Err(error) = rename_exclusive(a, b) {
                 let _ = fs::remove_file(&dst);
                 return Err(io_err(a)(error));
             }
         }
         if let Err(error) = fs::remove_file(&src) {
             if let Some((a, b)) = assets {
-                fs::rename(&b, &a).map_err(io_err(&b))?;
+                rename_exclusive(&b, &a).map_err(io_err(&b))?;
             }
             fs::remove_file(&dst).map_err(io_err(&dst))?;
             return Err(io_err(&src)(error));
@@ -291,16 +315,27 @@ impl Vault {
     }
 
     pub(crate) fn validate_rename(&self, from: &VaultPath, to: &VaultPath) -> Result<(), VaultError> {
+        self.validate_local_path(from)?;
+        self.validate_local_path(to)?;
         let source = self.fs_path(from);
         let meta = fs::symlink_metadata(&source).map_err(io_err(&source))?;
-        if !meta.is_file() {
+        if (!meta.is_file() && !meta.is_dir())
+            || (meta.is_dir() && to.as_str().starts_with(&format!("{from}/")))
+        {
             return Err(VaultError::InvalidPath(from.to_string()));
         }
         let mut destinations = vec![to.clone()];
-        if let Some((a, b)) = from.assets_dir().zip(to.assets_dir())
-            && self.fs_path(&a).exists()
+        if meta.is_file()
+            && let Some((a, b)) = from.assets_dir().zip(to.assets_dir())
         {
-            destinations.push(b);
+            self.validate_local_path(&a)?;
+            if let Ok(meta) = fs::symlink_metadata(self.fs_path(&a)) {
+                if !meta.is_dir() {
+                    return Err(VaultError::InvalidPath(a.to_string()));
+                }
+                self.validate_local_path(&b)?;
+                destinations.push(b);
+            }
         }
         for destination in destinations {
             let path = self.fs_path(&destination);
@@ -313,9 +348,64 @@ impl Vault {
         Ok(())
     }
 
+    pub(crate) fn validate_local_path(&self, path: &VaultPath) -> Result<(), VaultError> {
+        let mut current = self.root.clone();
+        for part in path.as_str().split('/') {
+            current.push(part);
+            match fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(VaultError::InvalidPath(path.to_string()));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(io_err(&current)(e)),
+            }
+        }
+        Ok(())
+    }
+
     /// 笔记是否已存在（用于重命名前的校验与生成不冲突的名字）。
     pub fn exists(&self, p: &VaultPath) -> bool {
         self.fs_path(p).exists()
+    }
+}
+
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::ffi::{CString, c_char, c_int};
+        use std::os::unix::ffi::OsStrExt;
+        let from = CString::new(from.as_os_str().as_bytes())?;
+        let to = CString::new(to.as_os_str().as_bytes())?;
+        #[cfg(target_os = "macos")]
+        unsafe extern "C" {
+            fn renamex_np(from: *const c_char, to: *const c_char, flags: u32) -> c_int;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe extern "C" {
+            fn renameat2(
+                from_dir: c_int,
+                from: *const c_char,
+                to_dir: c_int,
+                to: *const c_char,
+                flags: u32,
+            ) -> c_int;
+        }
+        // RENAME_EXCL / RENAME_NOREPLACE refuses even a concurrently created empty directory.
+        #[cfg(target_os = "macos")]
+        let result = unsafe { renamex_np(from.as_ptr(), to.as_ptr(), 0x4) };
+        #[cfg(target_os = "linux")]
+        let result = unsafe { renameat2(-100, from.as_ptr(), -100, to.as_ptr(), 1) };
+        if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        fs::rename(from, to)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (from, to);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "exclusive directory rename is unsupported"))
     }
 }
 
@@ -454,6 +544,61 @@ mod tests {
         assert!(root.join("sub/b.assets/img.png").is_file());
         assert!(v.exists(&b));
         assert!(!v.exists(&a));
+    }
+
+    #[test]
+    fn folders_include_empty_directories_and_obey_ignore_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        for folder in ["empty/nested", "with-note", "note.assets/child", ".hidden", "ignored/sub"] {
+            fs::create_dir_all(dir.path().join(folder)).unwrap();
+        }
+        fs::write(dir.path().join("with-note/n.md"), b"body").unwrap();
+        fs::write(dir.path().join(".gitignore"), b"ignored/\n").unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        assert_eq!(
+            vault.folders().unwrap().iter().map(VaultPath::as_str).collect::<Vec<_>>(),
+            ["empty", "empty/nested", "with-note"]
+        );
+    }
+
+    #[test]
+    fn rename_directory_keeps_empty_children_and_refuses_subtree_or_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("folder/empty")).unwrap();
+        fs::write(dir.path().join("folder/n.md"), b"note").unwrap();
+        fs::create_dir(dir.path().join("taken")).unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let from = VaultPath::new("folder").unwrap();
+        assert!(vault.rename(&from, &VaultPath::new("folder/child").unwrap()).is_err());
+        assert!(vault.rename(&from, &VaultPath::new("taken").unwrap()).is_err());
+        vault.rename(&from, &VaultPath::new("moved").unwrap()).unwrap();
+        assert!(dir.path().join("moved/empty").is_dir());
+        assert_eq!(fs::read(dir.path().join("moved/n.md")).unwrap(), b"note");
+        assert!(!dir.path().join("folder").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_refuses_symbolic_source_and_destination_ancestors() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("n.md"), b"outside").unwrap();
+        fs::write(dir.path().join("n.md"), b"inside").unwrap();
+        symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        assert!(
+            vault
+                .rename(&VaultPath::new("escape/n.md").unwrap(), &VaultPath::new("moved.md").unwrap())
+                .is_err()
+        );
+        assert!(
+            vault
+                .rename(&VaultPath::new("n.md").unwrap(), &VaultPath::new("escape/new.md").unwrap())
+                .is_err()
+        );
+        assert_eq!(fs::read(outside.path().join("n.md")).unwrap(), b"outside");
+        assert!(!outside.path().join("new.md").exists());
     }
 
     #[test]

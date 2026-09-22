@@ -1,6 +1,6 @@
 //! 应用数据目录（方案 5.3）与应用级持久状态。
 //!
-//! 这里只放"丢了也不心疼"的东西：最近打开的 vault、面板折叠状态。索引在 M1b 起也落在这个目录下。
+//! 保存应用状态、可重建索引与可编辑示例库；demo-vault 中的用户修改不是缓存。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,19 +39,20 @@ pub struct PersistedState {
 }
 
 impl PersistedState {
-    fn file() -> PathBuf {
-        app_data_dir().join("state.toml")
+    fn file(data_dir: &Path) -> PathBuf {
+        data_dir.join("state.toml")
     }
 
-    pub fn load() -> Self {
-        fs::read_to_string(Self::file()).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()
+    pub fn load(data_dir: &Path) -> Self {
+        fs::read_to_string(Self::file(data_dir))
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
-    pub fn save(&self) {
-        let path = Self::file();
-        if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
+    pub fn save(&self, data_dir: &Path) {
+        let path = Self::file(data_dir);
+        let _ = fs::create_dir_all(data_dir);
         if let Ok(body) = toml::to_string(self) {
             let _ = fs::write(&path, body);
         }
