@@ -199,6 +199,10 @@ pub(super) fn is_image_embed(source: &str) -> bool {
     image_embed(source).is_some()
 }
 
+pub(super) fn is_note_embed(source: &str) -> bool {
+    note_embed(source).is_some()
+}
+
 /// 笔记 / 章节 / 块嵌入（`ui_design.md` 5.6）：`![[笔记]]`、`![[笔记#章节]]`、`![[笔记#^块]]`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NoteEmbed {
@@ -698,7 +702,7 @@ pub(super) fn link_click(url: &str, event: &ClickEvent) -> LinkClick {
     }
 }
 
-fn appearance(kind: &CalloutKind, cx: &App) -> (&'static str, IconName, Hsla) {
+pub(super) fn appearance(kind: &CalloutKind, cx: &App) -> (&'static str, IconName, Hsla) {
     let theme = cx.theme();
     match kind {
         CalloutKind::Note | CalloutKind::Other(_) => ("Note", IconName::Info, theme.info),

@@ -123,11 +123,60 @@ fn select_inline_text(editor: &Entity<Editor>, text: &str, cx: &mut VisualTestCo
     cx.run_until_parked();
 }
 
+/// 聚焦文档里 `text` 所在的那一段（表格里就是那一格），并选中它。
+fn focus_text(editor: &Entity<Editor>, text: &str, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let at = e.doc.to_string().find(text).expect("text in document");
+            e.focus_at(at, None, window, cx);
+        })
+    });
+    cx.run_until_parked();
+    select_inline_text(editor, text, cx);
+}
+
 fn selected_inline_text(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
     cx.update(|_, cx| {
         let ta = editor.read(cx).focused.as_ref().unwrap().textarea.read(cx);
         ta.value()[ta.selected_range()].to_owned()
     })
+}
+
+/// 聚焦块默认藏起成对标记，源码仍留在文本框里（9.1）。
+#[gpui_kit::test]
+fn focused_block_hides_inline_markers(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "say **bold** please\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|_, cx| {
+        let ta = editor.read(cx).focused.as_ref().unwrap().textarea.clone();
+        let text = ta.read(cx).value().to_string();
+        assert_eq!(text, "say **bold** please");
+        let star = text.find("**").unwrap();
+        let word = text.find("bold").unwrap();
+        let stars = ta.read(cx).range_to_bounds(&(star..star + 2)).expect("marker bounds");
+        let bold = ta.read(cx).range_to_bounds(&(word..word + 4)).expect("word bounds");
+        assert!(stars.size.width < gpui_kit::px(1.), "markers collapse");
+        assert!(bold.size.width > gpui_kit::px(8.));
+    });
+}
+
+/// 段首打完 `- ` 后，控件里只剩列表项正文。
+#[gpui_kit::test]
+fn typing_a_bullet_marker_promotes_the_paragraph(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "hello\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        let ta = editor.read(cx).focused.as_ref().unwrap().textarea.clone();
+        ta.update(cx, |ta, cx| ta.set_selected_range(0..0, cx));
+    });
+    cx.simulate_input("- ");
+    assert_eq!(text(&editor, cx), "- hello\n");
+    cx.update(|_, cx| {
+        assert_eq!(editor.read(cx).focused.as_ref().unwrap().textarea.read(cx).value(), "hello");
+    });
 }
 
 #[gpui_kit::test]
@@ -170,49 +219,44 @@ fn backlinks_connect_with_an_existing_selection(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn highlight_color_is_painted_in_source_and_removed_by_toggle(cx: &mut TestAppContext) {
+fn highlight_color_is_painted_while_editing_and_removed_by_toggle(cx: &mut TestAppContext) {
     let (_dir, _vault, _path, editor) = open(cx, "正文 中文😀 后文\n");
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
     focus_unit(&editor, 0, cx);
     select_inline_text(&editor, "中文😀", cx);
     cx.simulate_keystrokes("cmd-shift-h");
+    let quads = highlight_quads(cx);
+    assert!(!quads.is_empty(), "editing paints the highlight background, not ==");
     cx.update(|window, cx| {
-        window.draw(cx).clear(cx);
-        let focused = editor.read(cx).focused.as_ref().unwrap();
-        let painted = focused.highlight.painted();
-        assert!(!painted.is_empty(), "source mode must paint a background, not only insert ==");
-        let ta = focused.textarea.read(cx);
+        let ta = editor.read(cx).focused.as_ref().unwrap().textarea.read(cx);
+        let marks = ta.value().find("==").unwrap();
+        let hidden = ta.range_to_bounds(&(marks..marks + 2)).unwrap();
+        assert!(hidden.size.width.abs() < gpui_kit::px(0.5), "== is not drawn");
         let at = ta.value().find("中文😀").unwrap();
-        assert_eq!(painted[0].left(), ta.range_to_bounds(&(at..at)).unwrap().left());
-        assert!(painted.iter().all(|r| r.size.width > gpui_kit::px(0.) && r.size.height > gpui_kit::px(0.)));
+        let left = ta.range_to_bounds(&(at..at)).unwrap().scale(window.scale_factor()).left();
+        assert!((quads[0].bounds.left().0 - left.0).abs() < 1.5, "{:?} vs {left:?}", quads[0].bounds);
+        assert!(quads.iter().all(|q| q.bounds.size.width.0 > 0. && q.bounds.size.height.0 > 0.));
     });
     cx.simulate_keystrokes("cmd-shift-h");
-    cx.update(|window, cx| {
-        window.draw(cx).clear(cx);
-        assert!(editor.read(cx).focused.as_ref().unwrap().highlight.painted().is_empty());
-    });
+    assert!(highlight_quads(cx).is_empty());
     assert_eq!(text(&editor, cx), "正文 中文😀 后文\n");
     cx.simulate_keystrokes("cmd-z");
-    cx.update(|window, cx| {
-        window.draw(cx).clear(cx);
-        assert!(!editor.read(cx).focused.as_ref().unwrap().highlight.painted().is_empty());
-    });
+    assert!(!highlight_quads(cx).is_empty());
 }
 
 #[gpui_kit::test]
-fn highlight_source_wraps_by_row_and_does_not_paint_code(cx: &mut TestAppContext) {
+fn highlight_wraps_by_row_and_code_source_paints_none(cx: &mut TestAppContext) {
     let source = format!("=={}==\n\n```md\n==code==\n```\n", "中文文字 ".repeat(300).trim_end());
     assert_eq!(aero_core::highlight::ranges(&source).len(), 1, "fixture must contain a parsed highlight");
     let (_dir, _vault, _path, editor) = open(cx, &source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
     focus_unit(&editor, 0, cx);
+    let quads = highlight_quads(cx);
+    assert!(quads.len() > 1, "wrapped highlight paints every visual row");
     cx.update(|window, cx| {
-        window.draw(cx).clear(cx);
         let f = editor.read(cx).focused.as_ref().unwrap();
-        let rows = f.highlight.painted();
-        assert!(rows.len() > 1, "wrapped highlight must have one rectangle per visual row");
-        let bounds = f.textarea.read(cx).text_bounds().unwrap();
-        assert!(rows.iter().all(|r| r.size.width <= bounds.size.width));
+        let bounds = f.textarea.read(cx).text_bounds().unwrap().scale(window.scale_factor());
+        assert!(quads.iter().all(|q| q.bounds.size.width <= bounds.size.width));
     });
     focus_unit(&editor, 1, cx);
     cx.update(|window, cx| {
@@ -916,8 +960,8 @@ fn highlight_wrapped_table_cells_reserve_height_before_next_row(cx: &mut TestApp
         let quads = highlight_quads(cx);
         assert!(quads.len() > 3, "fixture must wrap in the table cells");
         let scale = cx.update(|window, _| window.scale_factor());
-        let cell = cx.debug_bounds("highlight-cell-1-0").unwrap().scale(scale);
-        let next = cx.debug_bounds("highlight-cell-2-0").unwrap().scale(scale);
+        let cell = cx.debug_bounds("table-cell-1-0").unwrap().scale(scale);
+        let next = cx.debug_bounds("table-cell-2-0").unwrap().scale(scale);
         for quad in quads {
             assert!(
                 quad.bounds.bottom() <= cell.bottom(),
@@ -1137,9 +1181,8 @@ fn auto_pairs_nested_callouts_and_tables_preserve_structure(cx: &mut TestAppCont
     let source = "> [!note]\n> 正文\n\n| A | B |\n| --- | --- |\n| 中文 | 末 |\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
-    for (ix, label) in [(0, "正文"), (1, "中文")] {
-        focus_unit(&editor, ix, cx);
-        select_inline_text(&editor, label, cx);
+    for label in ["正文", "中文"] {
+        focus_text(&editor, label, cx);
         cx.simulate_keystrokes("right");
         cx.simulate_input(" ((文");
         cx.simulate_keystrokes("backspace");
@@ -1228,8 +1271,7 @@ fn inline_link_existing_addresses_keep_titles_callouts_and_table_pipes(cx: &mut 
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
     for (ix, label, url) in [(0, "中文", "https://old.example/a b"), (1, "中\\|文", "https://old.example")]
     {
-        focus_unit(&editor, ix, cx);
-        select_inline_text(&editor, label, cx);
+        focus_text(&editor, label, cx);
         let before = text(&editor, cx);
         cx.simulate_keystrokes("cmd-k");
         assert_eq!(text(&editor, cx), before);
@@ -2417,9 +2459,10 @@ fn nested_callouts_keep_independent_folds_and_atomic_source_editing(cx: &mut Tes
     cx.update(|_, cx| {
         let e = editor.read(cx);
         assert_eq!(e.units.len(), 1);
-        let f = e.focused.as_ref().expect("clicking nested content edits the outer source unit");
+        let f = e.focused.as_ref().expect("clicking nested content edits the callout body source");
         assert!(f.enter_newline);
-        assert_eq!(f.textarea.read(cx).value(), source.trim_end());
+        let body = &source[source.find('\n').unwrap() + 1..];
+        assert_eq!(f.textarea.read(cx).value(), body.trim_end(), "the title stays a title");
     });
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
@@ -2490,12 +2533,13 @@ fn table_preview_enables_horizontal_overflow(cx: &mut TestAppContext) {
         assert_eq!(style.table().overflow.x, Some(gpui_kit::Overflow::Scroll));
         assert_eq!(style.table_head().text.font_weight, Some(gpui_kit::FontWeight::SEMIBOLD));
     });
+    // 表格按格编辑：键盘进来落在一格里，控件里只有这一格的文字
     focus_unit(&editor, 0, cx);
     cx.update(|_, cx| {
         let e = editor.read(cx);
         let f = e.focused.as_ref().unwrap();
-        assert!(f.enter_newline);
-        assert_eq!(f.textarea.read(cx).value(), source.trim_end());
+        assert!(!f.enter_newline);
+        assert_eq!(f.textarea.read(cx).value(), "42");
     });
     cx.simulate_keystrokes("escape");
     assert_eq!(text(&editor, cx), source);
@@ -2630,9 +2674,16 @@ fn shift_enter_soft_breaks_and_code_fence_enter_inserts_newline(cx: &mut TestApp
         assert_eq!(e.units.len(), 2, "软换行后仍是两个单位");
     });
 
-    // 代码块：⏎ 只是换行。控件内的 ↑↓ 依赖像素布局，无头环境下不可靠，这里用 ← 回到 `x` 之后
+    // 代码块：⏎ 只是换行。控件里只有围栏之间的代码，聚焦时光标就在 `x` 之后
     focus_unit(&editor, 1, cx);
-    cx.simulate_keystrokes("left left left left");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(
+            e.focused.as_ref().unwrap().textarea.read(cx).value(),
+            "x",
+            "fences are not in the text area"
+        );
+    });
     cx.simulate_keystrokes("enter");
     cx.simulate_input("y");
     assert_eq!(text(&editor, cx), "ab\nz\n\n```\nx\ny\n```\n");
@@ -2839,13 +2890,12 @@ fn title_edit_with_front_matter_requests_transaction(cx: &mut TestAppContext) {
     assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
 }
 
-/// 点击浏览态的块：先进入编辑态（光标在块尾），两帧后把点击重放给控件，光标落到点击处。
+/// 点击浏览态的块：画这一块的就是文本控件，按下的那一刻光标就落在点击处，不等下一帧。
 #[gpui_kit::test]
 fn click_positions_cursor_in_block(cx: &mut TestAppContext) {
     let (_dir, _vault, _path, editor) = open(cx, "hello\n\nworld\n");
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
     let draw = |cx: &mut VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
-    let next_frame = |cx: &mut VisualTestContext| cx.update(|window, cx| window.simulate_next_frame(cx));
     let cursor = |cx: &mut VisualTestContext| {
         cx.update(|_, cx| editor.read(cx).focused.as_ref().map(|f| f.textarea.read(cx).cursor()))
     };
@@ -2855,15 +2905,7 @@ fn click_positions_cursor_in_block(cx: &mut TestAppContext) {
     // 点在第一块最左边、垂直居中
     let at = gpui_kit::point(bounds.origin.x + gpui_kit::px(2.), bounds.origin.y + bounds.size.height / 2.);
     cx.simulate_click(at, gpui_kit::Modifiers::default());
-    // 进入编辑态，光标暂时在块尾
-    assert_eq!(cursor(cx), Some(5));
-
-    // 第一帧：回调只是再排一帧；绘制让控件有了布局；第二帧：重放点击
-    assert_eq!(next_frame(cx), 1);
-    draw(cx);
-    assert_eq!(next_frame(cx), 1);
-    cx.run_until_parked();
-    assert_eq!(cursor(cx), Some(0), "cursor follows the click to the start of the block");
+    assert_eq!(cursor(cx), Some(0), "cursor lands where the click is, in the same event");
     cx.simulate_input("X");
     assert_eq!(text(&editor, cx), "Xhello\n\nworld\n");
 
@@ -2873,9 +2915,6 @@ fn click_positions_cursor_in_block(cx: &mut TestAppContext) {
     let bounds = cx.debug_bounds("unit-2").expect("second block is laid out");
     let at = gpui_kit::point(bounds.right() - gpui_kit::px(2.), bounds.origin.y + bounds.size.height / 2.);
     cx.simulate_click(at, gpui_kit::Modifiers::default());
-    next_frame(cx);
-    draw(cx);
-    next_frame(cx);
     cx.run_until_parked();
     cx.simulate_input("!");
     assert_eq!(text(&editor, cx), "Xhello\n\nworld!\n");
@@ -3894,22 +3933,94 @@ fn inline_math_renders_inside_a_paragraph(cx: &mut TestAppContext) {
         window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
     });
     settle(cx);
-    assert!(cx.debug_bounds("math-inline-0").is_some(), "行内公式应渲染成位图");
+    let inline = cx.debug_bounds("math-inline-0").expect("行内公式应渲染成位图");
     assert!(cx.debug_bounds("math-inline-1").is_none(), "代码里的 $ 不是公式");
+    cx.simulate_click(inline.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("math-editor").is_some(), "点公式位图在弹窗里改");
+    let again = cx.debug_bounds("math-inline-0").expect("行内位图还在原来的段落里");
+    assert!((again.origin.y - inline.origin.y).abs() < gpui_kit::px(1.));
+
+    // 点文字只编辑公式外面的字，源码不进段落。
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    focus_unit(&editor, 0, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("math-inline-0").is_some(), "点文字后公式仍是位图");
+    let prose = cx.debug_bounds("math-text").expect("公式旁边的文字要留在版面上");
+    assert!(f32::from(prose.size.width) > 8., "文字不能被挤成 0 宽: {:?}", prose.size);
+    assert!(f32::from(prose.size.height) > 8., "文字不能被挤成 0 高: {:?}", prose.size);
+    cx.update(|_, cx| {
+        let value = editor.read(cx).focused.as_ref().unwrap().textarea.read(cx).value().to_string();
+        assert!(!value.contains('$'), "段落文本框里不能出现公式源码: {value}");
+        assert!(!value.contains("E=mc^2"), "段落文本框里不能出现公式源码: {value}");
+        assert!(value.contains('能') || value.contains('恒'), "文本框里应仍是公式外面的字: {value}");
+    });
 }
 
-/// 编辑公式块时源码下面仍有实时预览；公式放在横向滚动里。
+/// 点进标题、段落、引用或列表时，其它块的位置不能变。
+#[gpui_kit::test]
+fn focusing_a_block_keeps_the_following_block_in_place(cx: &mut TestAppContext) {
+    use gpui_kit::{Bounds, Pixels, px, size};
+    let source = "# 标题一\n\n这是一段很长的正文，用来看点击之后会不会跳。这是一段很长的正文，用来看点击之后会不会跳。这是一段很长的正文，用来看点击之后会不会跳。这是一段很长的正文，用来看点击之后会不会跳。\n\n## 小标题\n\n> 引用一行\n\n- 列表项\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(1280.), px(900.)));
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+    let ids: Vec<u64> = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id.0).collect());
+    let bounds = |cx: &mut VisualTestContext, id: u64| -> Option<Bounds<Pixels>> {
+        let selector: &'static str = Box::leak(format!("unit-{id}").into_boxed_str());
+        cx.debug_bounds(selector)
+    };
+    let before: Vec<_> = ids.iter().map(|id| bounds(cx, *id).expect("unit")).collect();
+    for ix in 0..ids.len() {
+        focus_unit(&editor, ix, cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (i, id) in ids.iter().enumerate() {
+            if i == ix {
+                continue;
+            }
+            let after = bounds(cx, *id).expect("unit");
+            assert!(
+                (after.origin.y - before[i].origin.y).abs() < px(1.),
+                "聚焦第 {ix} 块后，第 {i} 块从 {:?} 跳到了 {:?}",
+                before[i].origin.y,
+                after.origin.y
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+}
+
+/// 编辑公式时正文里仍是原来的位图，源码在弹窗里，后面的段落不挪位。
 #[gpui_kit::test]
 fn editing_a_math_block_keeps_a_live_preview(cx: &mut TestAppContext) {
-    let (_dir, _cache, _vault, editor) = open_with_images(cx, "$$\n\\int_0^1 x\\,dx\n$$\n");
+    use gpui_kit::px;
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, "$$\n\\int_0^1 x\\,dx\n$$\n\n后面的段落\n");
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
     cx.update(|window, cx| {
         window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
     });
     settle(cx);
-    assert!(cx.debug_bounds("math-scroll").is_some(), "公式块可以横向滚动");
+    let formula = cx.debug_bounds("math-block").expect("公式应渲染成位图");
+    let ids: Vec<u64> = cx.update(|_, cx| editor.read(cx).units.iter().map(|unit| unit.id.0).collect());
+    let next_selector: &'static str = Box::leak(format!("unit-{}", ids[1]).into_boxed_str());
+    let next = cx.debug_bounds(next_selector).expect("公式后面的段落");
     focus_unit(&editor, 0, cx);
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(cx.update(|_, cx| editor.read(cx).is_editing()), "应进入源码态");
-    assert!(cx.debug_bounds("math-block").is_some(), "源码态下面仍有实时预览");
+    assert!(cx.update(|_, cx| editor.read(cx).is_editing()), "应进入编辑");
+    assert!(cx.debug_bounds("math-editor").is_some(), "源码在弹窗里");
+    let again = cx.debug_bounds("math-block").expect("文档里仍是位图");
+    assert!((again.origin.y - formula.origin.y).abs() < px(1.), "公式垂直位置不变");
+    assert!((again.size.height - formula.size.height).abs() < px(1.), "公式高度不变");
+    let next_again = cx.debug_bounds(next_selector).expect("段落还在");
+    assert!((next_again.origin.y - next.origin.y).abs() < px(1.), "后面的段落不能因为弹窗而挪动");
+    cx.simulate_input("+1");
+    assert!(text(&editor, cx).contains("+1"), "弹窗里的修改写回公式");
 }

@@ -69,8 +69,11 @@ impl super::Editor {
     pub(super) fn render_with_inline_math(
         &self,
         text: &str,
+        base: usize,
+        block: aero_core::BlockId,
         style: TextViewStyle,
         view_id: SharedString,
+        editing: Option<std::ops::Range<usize>>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let formulas = aero_core::highlight::inline_formulas(text);
@@ -85,22 +88,140 @@ impl super::Editor {
         let mut at = 0usize;
         for (ix, formula) in formulas.iter().enumerate() {
             if formula.range.start > at {
-                parts.push(inline_text(
-                    format!("{view_id}-t-{ix}").into(),
+                parts.push(self.inline_text_piece(
                     &text[at..formula.range.start],
+                    base + at..base + formula.range.start,
+                    block,
                     style.clone(),
+                    format!("{view_id}-t-{ix}").into(),
+                    editing.clone(),
+                    cx,
                 ));
             }
             let state = service
                 .update(cx, |service, cx| service.math(&formula.latex, false, em, scale, foreground, cx));
-            parts.push(inline_math_part(ix, &formula.latex, state, scale, em, cx));
+            let range = base + formula.range.start..base + formula.range.end;
+            let hit_range = range.clone();
+            let record_range = range.clone();
+            let editor = cx.weak_entity();
+            parts.push(
+                div()
+                    .on_children_prepainted(move |bounds, _, cx| {
+                        if let Some(bounds) = bounds.first().copied() {
+                            let _ = editor.update(cx, |this, _| {
+                                this.inline_math_hits.push((block, record_range.clone(), bounds));
+                            });
+                        }
+                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("math-inline-hit-{ix}")))
+                            .flex_none()
+                            .cursor_text()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_math_popup(hit_range.clone(), Some(block), window, cx);
+                                }),
+                            )
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                if event.is_right_click() {
+                                    return;
+                                }
+                                cx.stop_propagation();
+                                this.open_math_popup(range.clone(), Some(block), window, cx);
+                            }))
+                            .child(inline_math_part(ix, &formula.latex, state, scale, em, cx)),
+                    )
+                    .into_any_element(),
+            );
             at = formula.range.end;
         }
         if at < text.len() {
-            parts.push(inline_text(format!("{view_id}-t-end").into(), &text[at..], style));
+            parts.push(self.inline_text_piece(
+                &text[at..],
+                base + at..base + text.len(),
+                block,
+                style,
+                format!("{view_id}-t-end").into(),
+                editing,
+                cx,
+            ));
         }
-        Some(div().w_full().flex().flex_wrap().items_center().gap_1().children(parts).into_any_element())
+        Some(div().w_full().flex().flex_wrap().items_start().gap_1().children(parts).into_any_element())
     }
+
+    /// 公式两侧的文字。正在编辑的那一段用文本框，其余保持预览，避免把 `$…$` 源码画出来。
+    fn inline_text_piece(
+        &self,
+        text: &str,
+        abs: std::ops::Range<usize>,
+        block: aero_core::BlockId,
+        style: TextViewStyle,
+        view_id: SharedString,
+        editing: Option<std::ops::Range<usize>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if editing.as_ref() == Some(&abs) {
+            // 文本框默认是宽高 100%。父级没有确定宽度时会变成 0。
+            // 高度交给文本框自己按行数长，不要用字数去估，估矮了会把行尾的字切到下一行。
+            return div()
+                .w_full()
+                .text_size(px(super::BODY_FONT_SIZE))
+                .line_height(relative(super::BODY_LINE_HEIGHT))
+                .debug_selector(|| "math-text".into())
+                .child(gpui_kit::base::input::Textarea::new(&self.focused.as_ref().unwrap().textarea))
+                .into_any_element();
+        }
+        let range = abs.clone();
+        let wide = text.chars().count() as f32 * super::BODY_FONT_SIZE > super::COLUMN_WIDTH * 0.85;
+        div()
+            .id(view_id.clone())
+            .when(wide, |el| el.w_full())
+            .when(!wide, |el| el.flex_none())
+            .debug_selector(|| "math-text".into())
+            .cursor_text()
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if event.is_right_click() {
+                    return;
+                }
+                cx.stop_propagation();
+                let len = range.end.saturating_sub(range.start);
+                this.focus_range(range.clone(), Some(block), false, len, window, cx);
+            }))
+            .child(inline_text(view_id, text, style))
+            .into_any_element()
+    }
+}
+
+/// 光标所在的、公式以外的文字区间（相对 `text`）。光标在公式里时，取它前面最近的一段文字。
+pub(super) fn text_span_for_cursor(text: &str, cursor: usize) -> Option<std::ops::Range<usize>> {
+    let formulas = aero_core::highlight::inline_formulas(text);
+    if formulas.is_empty() {
+        return Some(0..text.len());
+    }
+    let mut spans = Vec::new();
+    let mut at = 0usize;
+    for formula in &formulas {
+        spans.push(at..formula.range.start);
+        at = formula.range.end;
+    }
+    spans.push(at..text.len());
+    if let Some(span) =
+        spans.iter().find(|span| span.start <= cursor && cursor < span.end && !span.is_empty())
+    {
+        return Some(span.clone());
+    }
+    spans.into_iter().rev().find(|span| !span.is_empty() && span.end <= cursor)
+}
+
+/// 光标严格落在 `$…$` 内部（不含两端定界符的外侧）时，返回这段源码区间。
+pub(super) fn inline_formula_containing(text: &str, cursor: usize) -> Option<std::ops::Range<usize>> {
+    aero_core::highlight::inline_formulas(text)
+        .into_iter()
+        .find(|formula| formula.range.start < cursor && cursor < formula.range.end)
+        .map(|formula| formula.range)
 }
 
 /// 去掉 `$$` 定界符，留下公式本身。
@@ -124,8 +245,10 @@ fn math_source(source: &str, cx: &App) -> AnyElement {
 }
 
 fn inline_text(id: SharedString, text: &str, style: TextViewStyle) -> AnyElement {
+    let wide = text.chars().count() as f32 * super::BODY_FONT_SIZE > super::COLUMN_WIDTH * 0.85;
     div()
-        .flex_none()
+        .when(wide, |el| el.w_full())
+        .when(!wide, |el| el.flex_none())
         .child(
             TextView::markdown(id, aero_core::links::to_markdown(text))
                 .style(style.with_paragraph_gap(rems(0.)))

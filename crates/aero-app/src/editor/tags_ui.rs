@@ -2,6 +2,9 @@ use super::*;
 
 impl Editor {
     fn tag_trigger(&self, cx: &App) -> Option<aero_core::tags::Completion> {
+        if self.editing_code() {
+            return None;
+        }
         let f = self.focused.as_ref()?;
         let ta = f.textarea.read(cx);
         if !ta.selected_range().is_empty() {

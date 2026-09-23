@@ -19,13 +19,17 @@ mod highlight_ui;
 mod images_ui;
 mod inline_format_ui;
 mod inline_links_ui;
+#[cfg(test)]
+mod layout_tests;
 mod link_preview;
 mod math_ui;
 mod ops;
 mod pairs;
 mod pairs_ui;
+mod presenter;
 mod preview;
 mod slash;
+mod table;
 mod tags;
 mod tags_ui;
 #[cfg(test)]
@@ -37,6 +41,7 @@ mod wiki;
 mod wiki_ui;
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
@@ -44,9 +49,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aero_core::{Block, BlockId, BlockKind, Document, Edit, FileStamp, Vault, VaultError, VaultPath};
-use gpui_kit::base::input::{Backspace, Escape, Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::base::input::{
+    Backspace, Delete, Escape, Input, InputEvent, InputState, Textarea, TextareaState,
+};
 use gpui_kit::base::text::TextViewStyle;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
@@ -55,6 +62,20 @@ use gpui_kit::*;
 use images_ui::ImageViewer;
 
 pub use link_preview::set_preview_mode;
+
+/// 「聚焦时显示源码」（9.1）。关掉时聚焦块隐藏标记；工作区从 `state.toml` 写入。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FocusSource(pub bool);
+
+impl gpui_kit::Global for FocusSource {}
+
+pub fn focus_shows_source(cx: &App) -> bool {
+    cx.try_global::<FocusSource>().map(|mode| mode.0).unwrap_or(false)
+}
+
+pub fn set_focus_shows_source(on: bool, cx: &mut App) {
+    cx.set_global(FocusSource(on));
+}
 
 use crate::actions::{
     BlockDown, BlockUp, BlurEditor, ConvertBlock, CopySelectedBlocks, CutSelectedBlocks,
@@ -201,6 +222,8 @@ struct Focused {
     id: Option<BlockId>,
     /// Enter 直接换行（代码块等）还是拆块
     enter_newline: bool,
+    /// 公式源码在弹窗里改，文档流里仍是渲染结果。
+    math_popup: bool,
     textarea: Entity<TextareaState>,
     pairs: pairs::State,
     highlight: highlight_ui::SourceHighlight,
@@ -244,6 +267,24 @@ pub struct Editor {
     block_drop: Option<block_menu::BlockDropHint>,
     dragging_block: bool,
     unit_bounds: Vec<(BlockId, Bounds<Pixels>)>,
+    /// 上一帧行内公式的点击区域（块、源码区间、窗口坐标）。
+    inline_math_hits: Vec<(BlockId, Range<usize>, Bounds<Pixels>)>,
+    /// 这一篇暂时整篇显示源码（9.1「查看源码」）。不写入笔记。
+    note_source: bool,
+    /// 单独打开源码的块。
+    source_blocks: HashSet<BlockId>,
+    /// 文字类块的控件，浏览与编辑共用（见 `presenter`）
+    presenters: std::collections::HashMap<presenter::Key, presenter::Presenter>,
+    /// 在没编辑的文字里按下的链接，松开时还在它上面才打开
+    pending_link: Option<(presenter::Key, String)>,
+    hovered_link: Option<(presenter::Key, SharedString, Bounds<Pixels>)>,
+    /// 可折叠 callout 的展开状态（块 id → 是否展开），只在界面上，不写进笔记
+    callout_folds: std::collections::HashMap<BlockId, bool>,
+    /// 上一帧每张表表头各格的矩形（拖列宽、冻结列宽用）
+    table_layout: Rc<std::cell::RefCell<std::collections::HashMap<BlockId, Vec<Bounds<Pixels>>>>>,
+    table_resize: Option<table::ResizeState>,
+    /// 正在编辑的那张表的列宽比例：打字时列宽不跟着内容伸缩
+    table_frozen: Option<(BlockId, Vec<f32>)>,
     /// 选区浮动工具条（5.9）与它的延迟出现计时
     toolbar: Option<toolbar::Toolbar>,
     toolbar_task: Option<Task<()>>,
@@ -323,6 +364,16 @@ impl Editor {
             block_drop: None,
             dragging_block: false,
             unit_bounds: Vec::new(),
+            inline_math_hits: Vec::new(),
+            note_source: false,
+            source_blocks: HashSet::new(),
+            presenters: Default::default(),
+            pending_link: None,
+            hovered_link: None,
+            callout_folds: Default::default(),
+            table_layout: Rc::default(),
+            table_resize: None,
+            table_frozen: None,
             toolbar: None,
             toolbar_task: None,
             head_bounds: Rc::default(),
@@ -574,6 +625,10 @@ impl Editor {
 
     /// 滚到块可见位置（视口上 1/3）并短暂高亮。
     fn reveal_block(&mut self, id: BlockId, cx: &mut Context<Self>) {
+        // 定位到折叠着的 callout：展开它，高亮褪去后也保持展开
+        if self.doc.blocks().find(id).is_some_and(|b| matches!(b.kind, BlockKind::Callout { .. })) {
+            self.callout_folds.insert(id, true);
+        }
         self.reveal_generation += 1;
         self.reveal = Some(id);
         self.reveal_mode = RevealMode::Center;
@@ -668,6 +723,94 @@ impl Editor {
         }
     }
 
+    fn inline_formula_at_position(&self, id: BlockId, position: Point<Pixels>) -> Option<Range<usize>> {
+        self.inline_math_hits.iter().find_map(|(block, range, bounds)| {
+            (*block == id
+                && position.x >= bounds.left()
+                && position.x < bounds.right()
+                && position.y >= bounds.top()
+                && position.y < bounds.bottom())
+            .then(|| range.clone())
+        })
+    }
+
+    /// 公式源码放到弹窗里。文档里的块继续画渲染结果，高度不因为源码而变。
+    fn open_math_popup(
+        &mut self,
+        range: Range<usize>,
+        id: Option<BlockId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cursor = range.len();
+        self.focus_range(range, id, true, cursor, window, cx);
+        if let Some(focused) = &mut self.focused {
+            focused.math_popup = true;
+        }
+        self.refresh_markup(cx);
+        cx.notify();
+    }
+
+    /// 公式弹窗。不进文档流，所以预览块的位置和高度保持原样。
+    fn render_math_editor(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let focused = self.focused.as_ref()?;
+        if !focused.math_popup {
+            return None;
+        }
+        let theme = cx.theme();
+        let origin = focused.id.and_then(|id| {
+            self.unit_bounds
+                .iter()
+                .find(|(block, _)| *block == id)
+                .map(|(_, bounds)| bounds.origin + point(px(0.), bounds.size.height + px(8.)))
+        });
+        let origin = origin.unwrap_or_else(|| point(px(80.), px(120.)));
+        let textarea = focused.textarea.clone();
+        Some(
+            deferred(
+                anchored().position(origin).snap_to_window_with_margin(px(8.)).child(
+                    v_flex()
+                        .id("math-editor")
+                        .debug_selector(|| "math-editor".into())
+                        .occlude()
+                        .w(px(440.))
+                        .max_h(px(320.))
+                        .p_3()
+                        .gap_2()
+                        .bg(theme.popover)
+                        .text_color(theme.popover_foreground)
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded(px(10.))
+                        .shadow_lg()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(focused) = &this.focused {
+                                    focused.textarea.update(cx, |textarea, cx| textarea.focus(window, cx));
+                                }
+                            }),
+                        )
+                        .child(div().text_size(px(12.)).text_color(theme.muted_foreground).child("公式"))
+                        .child(
+                            div()
+                                .w_full()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_size(theme.mono_font_size)
+                                .line_height(relative(1.6))
+                                .bg(theme.muted)
+                                .text_color(theme.foreground)
+                                .rounded(px(6.))
+                                .p_2()
+                                .child(Textarea::new(&textarea)),
+                        ),
+                ),
+            )
+            .into_any_element(),
+        )
+    }
+
     /// 点击浏览态的块：进入编辑态，然后把这次点击重放给刚出现的控件，由它按像素位置放光标。
     /// 渲染文本与源码只差行内标记（`**`、`[[`），所以落点是"近似到字符"；不重放的话光标总在块尾。
     /// 控件要先画一帧才有布局，而 `on_next_frame` 的回调在绘制之前跑，所以隔两帧再派发。
@@ -678,8 +821,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(range) = self.inline_formula_at_position(id, position) {
+            self.open_math_popup(range, Some(id), window, cx);
+            return;
+        }
         self.focus_block(id, window, cx);
-        if self.replaying_click || !self.is_focused_block(id) {
+        if self.focused.as_ref().is_some_and(|focused| focused.math_popup)
+            || self.replaying_click
+            || !self.is_focused_block(id)
+        {
             return;
         }
         let this = cx.weak_entity();
@@ -719,8 +869,77 @@ impl Editor {
 
     fn focus_unit(&mut self, ix: usize, cursor: usize, window: &mut Window, cx: &mut Context<Self>) {
         let unit = &self.units[ix];
+        if matches!(unit.kind, BlockKind::MathBlock) {
+            let (range, id) = (unit.range.clone(), unit.id);
+            self.open_math_popup(range, Some(id), window, cx);
+            return;
+        }
         let (range, id, nl) = (unit.range.clone(), Some(unit.id), unit.enter_inserts_newline());
+        let (unit_id, kind) = (unit.id, unit.kind.clone());
+        let text = self.doc.slice(range.clone()).to_string();
+        // 表格和 callout 按格子 / 标题与正文分别编辑，键盘进来时落到光标所在的那一格
+        if self.hides_markers(cx) && !self.block_shows_source(unit_id) {
+            match kind {
+                BlockKind::CodeFence { .. } => {
+                    if let Some(inner) = presenter::fence_body(&text) {
+                        let local = cursor.clamp(inner.start, inner.end) - inner.start;
+                        let abs = range.start + inner.start..range.start + inner.end;
+                        self.focus_range(abs, id, true, local, window, cx);
+                        return;
+                    }
+                }
+                BlockKind::Table
+                    if presenter::presents_table(&text)
+                        && self.focus_table_at(unit_id, cursor, window, cx) =>
+                {
+                    return;
+                }
+                BlockKind::Callout { .. } => {
+                    if let Some(parts) = callout_edit_parts(&text) {
+                        let (part, local, nl) = if cursor <= parts.title.end || parts.body.is_empty() {
+                            (parts.title.clone(), cursor.clamp(parts.title.start, parts.title.end), false)
+                        } else {
+                            (parts.body.clone(), cursor.clamp(parts.body.start, parts.body.end), true)
+                        };
+                        let abs = range.start + part.start..range.start + part.end;
+                        self.focus_range(abs, id, nl, local - part.start, window, cx);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.renders_inline_formulas(unit_id, &text, cx) {
+            let at = cursor.min(text.len());
+            if let Some(local) = math_ui::inline_formula_containing(&text, at) {
+                self.open_math_popup(range.start + local.start..range.start + local.end, id, window, cx);
+                return;
+            }
+            if let Some(local) = math_ui::text_span_for_cursor(&text, at) {
+                let abs = range.start + local.start..range.start + local.end;
+                let rel = at.saturating_sub(local.start).min(abs.len());
+                self.focus_range(abs, id, nl, rel, window, cx);
+                return;
+            }
+            if let Some(formula) = aero_core::highlight::inline_formulas(&text).into_iter().next() {
+                self.open_math_popup(
+                    range.start + formula.range.start..range.start + formula.range.end,
+                    id,
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
         self.focus_range(range, id, nl, cursor, window, cx);
+    }
+
+    /// 有渲染服务时，行内公式留在预览里，文本框只覆盖公式两侧的文字。
+    fn renders_inline_formulas(&self, id: BlockId, text: &str, cx: &App) -> bool {
+        self.images.is_some()
+            && self.hides_markers(cx)
+            && !self.block_shows_source(id)
+            && !aero_core::highlight::inline_formulas(text).is_empty()
     }
 
     /// 聚焦文档偏移 `offset` 处的单位；那里没有块（空段落）时聚焦一个空区间。
@@ -760,18 +979,70 @@ impl Editor {
         self.cancel_link_preview(cx);
         let text = self.doc.slice(range.clone()).to_string();
         let cursor = clamp_to_char_boundary(&text, cursor.min(text.len()));
-        let textarea = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 100_000));
+        // 这一段已经有控件在画（浏览态也是它）：接着用它，字一个像素都不动。
+        let textarea = match self.presenter_for(id, &range).and_then(|key| self.presenters.get(&key)) {
+            Some(p) => p.textarea.clone(),
+            None => cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 100_000)),
+        };
+        textarea.update(cx, |ta, cx| {
+            if ta.value().as_ref() != text {
+                ta.set_value(text, window, cx);
+            }
+            ta.set_selected_range(cursor..cursor, cx);
+            ta.focus(window, cx);
+        });
+        self.install_focus(range, id, enter_newline, textarea, window, cx);
+    }
+
+    /// 把 `textarea` 设为编辑中的那一段：订阅它的输入、光标与按键。文字与光标由调用方备好。
+    pub(super) fn install_focus(
+        &mut self,
+        range: Range<usize>,
+        id: Option<BlockId>,
+        enter_newline: bool,
+        textarea: Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let subscription = cx.subscribe_in(&textarea, window, Self::on_input_event);
         let editor = cx.weak_entity();
         let pair_keys = cx.intercept_keystrokes(move |event, window, cx| {
             let _ = editor.update(cx, |this, cx| this.observe_pair_key(event, window, cx));
         });
         let mut last_selection = None;
+        let mut last_text: Option<SharedString> = None;
         let cursor_subscription = cx.observe_in(&textarea, window, move |this, textarea, window, cx| {
             if this.focused.as_ref().is_some_and(|f| f.textarea == textarea) {
                 let selection = textarea.read(cx).selected_range();
+                let value = textarea.read(cx).value();
+                let typing = last_text.as_ref().is_some_and(|text| *text != value);
+                last_text = Some(value);
                 if last_selection.as_ref() != Some(&selection) {
-                    last_selection = Some(selection);
+                    last_selection = Some(selection.clone());
+                    // 光标移进 `$…$` 时改到弹窗，段落预览保持不动。正在打字（刚打完 `$x`）时不弹，
+                    // 否则闭合的 `$` 会被当成新字符。
+                    if selection.is_empty()
+                        && !typing
+                        && this.focused.as_ref().is_some_and(|focused| !focused.math_popup)
+                        && !this.note_source
+                        && !this
+                            .focused
+                            .as_ref()
+                            .and_then(|focused| focused.id)
+                            .is_some_and(|id| this.source_blocks.contains(&id))
+                        && let Some(local) =
+                            math_ui::inline_formula_containing(&textarea.read(cx).value(), selection.start)
+                    {
+                        let (start, id) = {
+                            let focused = this.focused.as_ref().unwrap();
+                            (focused.range.start, focused.id)
+                        };
+                        this.open_math_popup(start + local.start..start + local.end, id, window, cx);
+                        return;
+                    }
+                    if this.normalize_caret(&textarea, cx) {
+                        return;
+                    }
                     // 选区停下来 300 ms 后浮出工具条（5.9）
                     this.schedule_toolbar(cx);
                     cx.notify();
@@ -797,20 +1068,20 @@ impl Editor {
                 }
             }
         });
-        textarea.update(cx, |ta, cx| {
-            ta.set_value(text, window, cx);
-            ta.set_selected_range(cursor..cursor, cx);
-            ta.focus(window, cx);
-        });
         self.last_edit_at = None;
-        log::debug!("focus {:?} id={:?} cursor={cursor}", range, id);
+        log::debug!("focus {:?} id={:?}", range, id);
         self.selection = None;
         self.wiki = None;
         self.tag_menu = None;
+        match self.presenter_key_of(&textarea) {
+            Some(presenter::Key { id, part: presenter::Part::Cell(..) }) => self.freeze_table(id),
+            _ => self.table_frozen = None,
+        }
         self.focused = Some(Focused {
             range,
             id,
             enter_newline,
+            math_popup: false,
             textarea,
             pairs: Default::default(),
             highlight: Default::default(),
@@ -818,7 +1089,133 @@ impl Editor {
             _subscription: subscription,
             _cursor_subscription: cursor_subscription,
         });
+        self.refresh_markup(cx);
         cx.notify();
+    }
+
+    /// 默认藏标记。偏好、整篇源码、或这一块的「编辑源码」打开时，回到现在的源码态。
+    pub fn hides_markers(&self, cx: &App) -> bool {
+        !self.note_source && !focus_shows_source(cx)
+    }
+
+    pub fn note_source(&self) -> bool {
+        self.note_source
+    }
+
+    pub fn sync_presentation(&mut self, cx: &mut Context<Self>) {
+        self.exit_edit(cx);
+        self.presenters.clear();
+        cx.notify();
+    }
+
+    pub fn toggle_note_source(&mut self, cx: &mut Context<Self>) {
+        self.note_source = !self.note_source;
+        self.sync_presentation(cx);
+    }
+
+    fn block_shows_source(&self, id: BlockId) -> bool {
+        self.source_blocks.contains(&id)
+    }
+
+    pub(super) fn toggle_block_source(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.source_blocks.contains(&id) {
+            self.source_blocks.remove(&id);
+            self.exit_edit(cx);
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        self.source_blocks.insert(id);
+        self.exit_edit(cx);
+        self.presenters.retain(|key, _| key.id != id);
+        self.focus_block(id, window, cx);
+    }
+
+    fn conceal_focused(&self, cx: &App) -> bool {
+        if self.focused.as_ref().is_some_and(|focused| focused.math_popup) {
+            return false;
+        }
+        if !self.hides_markers(cx) {
+            return false;
+        }
+        let Some(focused) = &self.focused else { return false };
+        let Some(id) = focused.id else { return false };
+        if self.source_blocks.contains(&id) {
+            return false;
+        }
+        if self.editing_code() {
+            return false;
+        }
+        if self.presenter_key_of(&focused.textarea).is_some() {
+            return true;
+        }
+        // 夹在行内公式之间的那段文字：公式留在预览里，文字照样藏标记
+        let Some(block) = self.doc.blocks().find(id) else { return false };
+        if !matches!(block.kind, BlockKind::Paragraph | BlockKind::Heading { .. }) {
+            return false;
+        }
+        let text = self.doc.slice(self.doc.content_range(block)).to_string();
+        !preview::is_image_embed(text.trim())
+    }
+
+    fn refresh_markup(&mut self, cx: &mut Context<Self>) {
+        let Some(focused) = &self.focused else { return };
+        let textarea = focused.textarea.clone();
+        if let Some(key) = self.presenter_key_of(&textarea) {
+            self.restyle_presenter(key, cx);
+            return;
+        }
+        let markup = if self.conceal_focused(cx) {
+            let text = textarea.read(cx).value().to_string();
+            let analysis = aero_core::markup::analyze(&text);
+            self.presenter_markup(&text, &analysis, &presenter::Extra::default(), cx)
+        } else {
+            gpui_kit::base::input::Markup::default()
+        };
+        textarea.update(cx, |textarea, cx| textarea.set_markup(markup, cx));
+    }
+
+    /// 光标不停在藏起来的行首标记（`# `、`> `）前面，也不停在隐藏字节中间：
+    /// 在那里打字会拆坏标记，让语法露出来。返回是否挪了光标。
+    fn normalize_caret(&mut self, textarea: &Entity<TextareaState>, cx: &mut Context<Self>) -> bool {
+        if !self.conceal_focused(cx) {
+            return false;
+        }
+        let ta = textarea.read(cx);
+        let selection = ta.selected_range();
+        if !selection.is_empty() {
+            return false;
+        }
+        let text = ta.value().to_string();
+        let caret = selection.start;
+        let conceal = aero_core::markup::analyze_editing(&text, Some(selection)).conceal;
+        let target = text_ops::settle_caret(&conceal, &text, caret);
+        if target == caret {
+            return false;
+        }
+        textarea.update(cx, |ta, cx| ta.set_selected_range(target..target, cx));
+        true
+    }
+
+    /// `- ` / `1. ` 打完后，解析已经把它变成列表；把控件收成列表项正文，标记留给列表容器画。
+    fn promote_typed_prefix(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.hides_markers(cx) {
+            return false;
+        }
+        let Some(focused) = &self.focused else { return false };
+        let textarea = focused.textarea.clone();
+        let text = textarea.read(cx).value().to_string();
+        let cursor = textarea.read(cx).selected_range().start;
+        let Some(prefix) = ops::typed_prefix_len(&text, cursor) else { return false };
+        let doc_pos = focused.range.start + cursor.min(text.len());
+        let Some(ix) = unit_at(&self.units, doc_pos) else { return false };
+        let unit_text = self.doc.slice(self.units[ix].range.clone()).to_string();
+        if unit_text == text {
+            return false;
+        }
+        let content_cursor = cursor.saturating_sub(prefix).min(unit_text.len());
+        self.focus_unit(ix, content_cursor, window, cx);
+        true
     }
 
     /// 退出编辑态（不改焦点）。失焦即落盘（10.1）。
@@ -829,6 +1226,7 @@ impl Editor {
         self.hide_toolbar(cx);
         self.wiki = None;
         self.tag_menu = None;
+        self.table_frozen = None;
         if self.focused.take().is_some() {
             self.last_edit_at = None;
             self.save_now(cx);
@@ -1112,6 +1510,7 @@ impl Editor {
 
     /// 控件文本 → 文档：收缩成最小编辑写回。
     fn on_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sanitize_cell(window, cx);
         let paired = self.complete_pairs(window, cx);
         let Some(f) = self.focused.as_mut() else { return };
         let new_text = f.textarea.read(cx).value();
@@ -1134,6 +1533,9 @@ impl Editor {
         self.update_wiki(cx);
         self.update_tags(cx);
         self.update_slash(cx);
+        if !self.promote_typed_prefix(window, cx) {
+            self.refresh_markup(cx);
+        }
     }
 
     // ---- `/` 菜单（7.1） ----
@@ -1273,6 +1675,13 @@ impl Editor {
         }
         if self.slash.is_some() {
             self.slash_confirm(None, window, cx);
+        } else if let Some(presenter::Key { id, part: presenter::Part::Cell(row, col) }) =
+            self.focused.as_ref().and_then(|f| self.presenter_key_of(&f.textarea))
+        {
+            // 表格里 Tab 到下一格，行末换到下一行
+            let next = presenter::Key { id, part: presenter::Part::Cell(row, col + 1) };
+            let (row, col) = if self.presenters.contains_key(&next) { (row, col + 1) } else { (row + 1, 0) };
+            self.move_table_cell(id, row, col, window, cx);
         } else {
             cx.propagate();
         }
@@ -1286,8 +1695,16 @@ impl Editor {
         self.units = units::units(&self.doc);
         self.refresh_embeds(cx);
         if let Some(f) = self.focused.as_mut() {
+            // 单元格、callout 标题与正文从块中间开始：仍属于原来那一块，否则控件会在别处再画一份
+            let prev = f.id;
             f.id = unit_at(&self.units, f.range.start)
-                .filter(|&ix| self.units[ix].range.start == f.range.start)
+                .filter(|&ix| {
+                    let unit = &self.units[ix];
+                    unit.range.start == f.range.start
+                        || (Some(unit.id) == prev
+                            && unit.range.start <= f.range.start
+                            && f.range.end <= unit.range.end)
+                })
                 .map(|ix| self.units[ix].id);
         }
         self.clamp_selection();
@@ -1321,6 +1738,12 @@ impl Editor {
         unit_at(&self.units, f.range.start).filter(|&ix| self.units[ix].range.start == f.range.start)
     }
 
+    /// 编辑中的这一段在表格里（整张表的源码，或其中一格）：写进去的 `|` 要转义。
+    pub(super) fn focused_in_table(&self) -> bool {
+        let Some(f) = self.focused.as_ref() else { return false };
+        f.id.and_then(|id| self.units.iter().find(|u| u.id == id)).is_some_and(|u| u.kind == BlockKind::Table)
+    }
+
     fn textarea_text_and_cursor(&self, cx: &App) -> Option<(String, usize)> {
         let f = self.focused.as_ref()?;
         let ta = f.textarea.read(cx);
@@ -1351,6 +1774,16 @@ impl Editor {
             cx.propagate();
             return;
         };
+        if let Some(key) = self.presenter_key_of(&f.textarea) {
+            match key.part {
+                presenter::Part::CalloutTitle => return self.enter_callout_body(key.id, window, cx),
+                presenter::Part::Cell(row, col) => {
+                    return self.move_table_cell(key.id, row + 1, col, window, cx);
+                }
+                _ if f.enter_newline && !self.editing_code() => return self.enter_in_quote(window, cx),
+                _ => {}
+            }
+        }
         if f.enter_newline {
             cx.propagate();
             return;
@@ -1361,6 +1794,50 @@ impl Editor {
         self.apply_plan(plan, window, cx);
     }
 
+    /// 引用 / callout 正文里的 ⏎：新起一行并带上 `> `（界面上看不见）。空的最后一行再按 ⏎ 离开引用。
+    fn enter_in_quote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(f) = self.focused.as_mut() else { return };
+        let ta = f.textarea.clone();
+        let (text, selection) = {
+            let ta = ta.read(cx);
+            (ta.value().to_string(), ta.selected_range())
+        };
+        let ls = line_start(&text, selection.start);
+        let line_end = text[selection.end..].find('\n').map_or(text.len(), |i| selection.end + i);
+        let line = &text[ls..line_end];
+        if selection.is_empty()
+            && line_end == text.len()
+            && ls > 0
+            && line.trim_start_matches('>').trim().is_empty()
+        {
+            let abs = f.range.start + ls - 1..f.range.start + text.len();
+            self.structural_edit(Edit::replace(abs.clone(), "\n\n"), abs.start + 2, window, cx);
+            return;
+        }
+        let depth =
+            line.bytes().take_while(|b| *b == b'>' || *b == b' ').filter(|b| *b == b'>').count().max(1);
+        let prefix = format!("\n{} ", ">".repeat(depth));
+        f.pairs.pending = None;
+        ta.update(cx, |ta, cx| ta.replace(prefix, window, cx));
+        self.on_change(window, cx);
+    }
+
+    /// callout 标题里的 ⏎：到正文开头；还没有正文就先开一行。
+    fn enter_callout_body(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(block) = self.doc.blocks().find(id) else { return };
+        let range = self.doc.content_range(block);
+        let src = self.doc.slice(range.clone()).to_string();
+        let Some(parts) = callout_edit_parts(&src) else { return };
+        if parts.body.is_empty() {
+            let at = range.start + parts.title.end;
+            self.structural_edit(Edit::insert(at, "\n> "), at + 3, window, cx);
+        } else {
+            let body = range.start + parts.body.start..range.start + parts.body.end;
+            let cursor = src[parts.body.clone()].find(|c: char| c != '>' && c != ' ').unwrap_or(0);
+            self.focus_range(body, Some(id), true, cursor, window, cx);
+        }
+    }
+
     /// ⌫ 在块首：列表项脱离列表；段落合并到上一块（保留上一块类型）；否则只移动光标。
     fn on_backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         let Some((_, cursor)) = self.textarea_text_and_cursor(cx) else {
@@ -1369,6 +1846,61 @@ impl Editor {
         };
         if cursor != 0 {
             cx.propagate();
+            return;
+        }
+        self.backspace_at_block_start(window, cx);
+    }
+
+    /// 在隐藏了标记的文字里，⌫ / ⌦ 先于文本控件处理：删的是看得见的字，标记不被拆开。
+    fn capture_deletion(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_composing(window, cx) || !self.conceal_focused(cx) {
+            return;
+        }
+        let Some(f) = self.focused.as_ref() else { return };
+        let ta = f.textarea.read(cx);
+        let selection = ta.selected_range();
+        if !selection.is_empty() {
+            return;
+        }
+        let text = ta.value().to_string();
+        let analysis = aero_core::markup::analyze_editing(&text, Some(selection.clone()));
+        let spans: Vec<Range<usize>> = analysis.spans().cloned().collect();
+        let plan = if forward {
+            plan_delete(&text, &analysis.conceal, &spans, selection.start)
+        } else {
+            plan_backspace(&text, &analysis.conceal, &spans, selection.start)
+        };
+        match plan {
+            Deletion::Native => {}
+            Deletion::Nothing => cx.stop_propagation(),
+            Deletion::AtStart => {
+                cx.stop_propagation();
+                self.backspace_at_block_start(window, cx);
+            }
+            Deletion::Range { range, caret } => {
+                cx.stop_propagation();
+                let f = self.focused.as_mut().expect("checked above");
+                f.pairs.pending = None;
+                f.textarea.clone().update(cx, |ta, cx| {
+                    ta.set_selected_range(range, cx);
+                    ta.replace("", window, cx);
+                    ta.set_selected_range(caret..caret, cx);
+                });
+                self.on_change(window, cx);
+            }
+        }
+    }
+
+    /// 块首退格：列表项脱离列表、段落并入上一块，或移到上一块末尾。
+    fn backspace_at_block_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 单元格、callout 的标题与正文、代码：开头退格不跨出这一格
+        if self.editing_code()
+            || self
+                .focused
+                .as_ref()
+                .and_then(|f| self.presenter_key_of(&f.textarea))
+                .is_some_and(|key| key.part != presenter::Part::Unit)
+        {
             return;
         }
         let outcome = match self.focused_unit() {
@@ -1392,66 +1924,155 @@ impl Editor {
     // ---- ↑ / ↓ 跨块 ----
 
     fn on_block_up(&mut self, _: &BlockUp, window: &mut Window, cx: &mut Context<Self>) {
-        if self.input_composing(window, cx) {
-            cx.propagate();
-            return;
-        }
-        if self.move_tag(-1, cx) || self.move_wiki(-1, cx) {
-            return;
-        }
-        if self.slash.is_some() {
-            self.slash_move(-1, cx);
-            return;
-        }
-        let Some((text, cursor)) = self.textarea_text_and_cursor(cx) else {
-            cx.propagate();
-            return;
-        };
-        let (line, _) = line_col(&text, cursor);
-        if line != 0 {
-            cx.propagate();
-            return;
-        }
-        let col = cursor - line_start(&text, cursor);
-        let start = self.focused.as_ref().map_or(0, |f| f.range.start);
-        if let Some((ix, cursor)) = ops::up_target(&self.doc, &self.units, start, col) {
-            self.focus_unit(ix, cursor, window, cx);
-        }
+        self.move_across_blocks(false, window, cx);
     }
 
     fn on_block_down(&mut self, _: &BlockDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_across_blocks(true, window, cx);
+    }
+
+    /// ↑ / ↓：光标在这一段的首 / 末**视觉行**时才离开这一段，否则交给文本控件在折行之间移动。
+    /// 离开时保持光标的横向位置（9.4）：表格里到上 / 下一行的同一列，callout 标题与正文互通，
+    /// 其余到上 / 下一个单位里离得最近的那个字。
+    fn move_across_blocks(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.input_composing(window, cx) {
             cx.propagate();
             return;
         }
-        if self.move_tag(1, cx) || self.move_wiki(1, cx) {
+        let delta = if down { 1 } else { -1 };
+        if self.move_tag(delta, cx) || self.move_wiki(delta, cx) {
             return;
         }
         if self.slash.is_some() {
-            self.slash_move(1, cx);
+            self.slash_move(delta, cx);
             return;
         }
         let Some((text, cursor)) = self.textarea_text_and_cursor(cx) else {
             cx.propagate();
             return;
         };
-        let (line, _) = line_col(&text, cursor);
-        if line + 1 != line_count(&text) {
+        let Some(f) = self.focused.as_ref() else { return };
+        let caret = f.textarea.read(cx).range_to_bounds(&(cursor..cursor));
+        let area = f.textarea.read(cx).input_bounds();
+        let at_edge = match caret {
+            // 有布局时按视觉行判断：长段落折成几行，↓ 先在行间走
+            Some(caret) if area.size.height > px(0.) => {
+                if down {
+                    caret.bottom() >= area.bottom() - px(1.)
+                } else {
+                    caret.top() <= area.top() + px(1.)
+                }
+            }
+            _ => {
+                let (line, _) = line_col(&text, cursor);
+                if down { line + 1 == line_count(&text) } else { line == 0 }
+            }
+        };
+        if !at_edge {
             cx.propagate();
             return;
         }
-        let col = cursor - line_start(&text, cursor);
-        let Some(f) = self.focused.as_ref() else { return };
+        let x = caret.map(|caret| caret.left());
+        let key = self.presenter_key_of(&f.textarea);
+        let id = f.id;
         let range = f.range.clone();
-        match ops::down_target(&self.doc, &self.units, &range, col) {
-            Some((ix, cursor)) => self.focus_unit(ix, cursor, window, cx),
-            None => {
-                // 已是最后一块：非文本块（代码块等）用 ↓ 离开时在文末补一个空段落
-                let is_text = self.focused_unit().is_none_or(|ix| self.units[ix].is_text());
-                if !is_text {
+        // 表格：上 / 下一行的同一列；callout：标题 ↔ 正文
+        let sibling = match key.map(|key| key.part) {
+            Some(presenter::Part::Cell(row, col)) => {
+                let row = if down { Some(row + 1) } else { row.checked_sub(1) };
+                row.map(|row| presenter::Part::Cell(row, col))
+            }
+            Some(presenter::Part::CalloutTitle) if down => Some(presenter::Part::CalloutBody),
+            Some(presenter::Part::CalloutBody) if !down => Some(presenter::Part::CalloutTitle),
+            _ => None,
+        };
+        if let (Some(id), Some(part)) = (id, sibling)
+            && let Some(target) = self.presenters.get(&presenter::Key { id, part })
+            && !(part == presenter::Part::CalloutBody && target.range.is_empty())
+        {
+            let target = presenter::Key { id, part };
+            self.focus_presenter_at_x(target, x, down, window, cx);
+            return;
+        }
+        let col = cursor - line_start(&text, cursor);
+        let target = if down {
+            ops::down_target(&self.doc, &self.units, &range, col)
+        } else {
+            ops::up_target(&self.doc, &self.units, range.start, col)
+        };
+        match target {
+            Some((ix, cursor)) => {
+                if let Some(cell) = x.and_then(|x| self.table_cell_under(self.units[ix].id, x, down, cx)) {
+                    self.focus_presenter_at_x(cell, x, down, window, cx);
+                    return;
+                }
+                self.focus_unit(ix, cursor, window, cx);
+                self.place_caret_at_x(x, down, cx);
+            }
+            None if down => {
+                // 已是最后一块：非文本块（代码块、表格、callout 等）用 ↓ 离开时在文末补一个空段落
+                let is_text = id
+                    .and_then(|id| self.units.iter().find(|u| u.id == id))
+                    .is_none_or(|u| u.is_text() && key.is_none_or(|k| k.part == presenter::Part::Unit));
+                if !is_text || self.editing_code() {
                     self.append_paragraph(window, cx);
                 }
             }
+            None => {}
+        }
+    }
+
+    /// 从上面进表格落在表头行、从下面进落在末行，列取横向位置 `x` 所在的那一列。
+    fn table_cell_under(&self, id: BlockId, x: Pixels, first_row: bool, cx: &App) -> Option<presenter::Key> {
+        let cells: Vec<(usize, usize)> = self
+            .presenters
+            .keys()
+            .filter(|key| key.id == id)
+            .filter_map(|key| match key.part {
+                presenter::Part::Cell(row, col) => Some((row, col)),
+                _ => None,
+            })
+            .collect();
+        let row = if first_row { 0 } else { cells.iter().map(|(row, _)| *row).max()? };
+        let key = |col| presenter::Key { id, part: presenter::Part::Cell(row, col) };
+        let mut columns: Vec<usize> = cells.iter().filter(|(r, _)| *r == row).map(|(_, col)| *col).collect();
+        columns.sort_unstable();
+        let under = columns.iter().copied().find(|col| {
+            let area = self.presenters[&key(*col)].textarea.read(cx).input_bounds();
+            x < area.right() + px(8.)
+        });
+        under.or(columns.last().copied()).map(key)
+    }
+
+    /// 聚焦一段已经画出来的文字，光标放在离 `x` 最近的字上：从上面下来落在首行，从下面上来落在末行。
+    fn focus_presenter_at_x(
+        &mut self,
+        key: presenter::Key,
+        x: Option<Pixels>,
+        from_above: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(p) = self.presenters.get(&key) else { return };
+        let (range, nl) = (p.range.clone(), p.enter_newline);
+        let cursor = if from_above { 0 } else { range.len() };
+        self.focus_range(range, Some(key.id), nl, cursor, window, cx);
+        self.place_caret_at_x(x, from_above, cx);
+    }
+
+    /// 刚聚焦的那一段里，把光标挪到首行（`top`）或末行上离 `x` 最近的位置。控件还没布局时保持原样。
+    fn place_caret_at_x(&mut self, x: Option<Pixels>, top: bool, cx: &mut Context<Self>) {
+        let (Some(x), Some(f)) = (x, self.focused.as_ref()) else { return };
+        let ta = f.textarea.clone();
+        let area = ta.read(cx).input_bounds();
+        if area.size.height <= px(0.) {
+            return;
+        }
+        let line = ta.read(cx).line_height().unwrap_or(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT));
+        let y = if top { area.top() + line / 2. } else { area.bottom() - line / 2. };
+        let x = x.clamp(area.left(), area.right() - px(1.));
+        if let Some(offset) = ta.read(cx).offset_for_point(point(x, y)) {
+            ta.update(cx, |ta, cx| ta.set_selected_range(offset..offset, cx));
         }
     }
 
@@ -1705,6 +2326,7 @@ impl Editor {
         self.refresh_embeds(cx);
         self.clamp_selection();
         self.preview.update(cx, |state, _| *state = preview::PreviewState::default());
+        self.callout_folds.clear();
         self.dirty = false;
         self.save_task = None;
         self.last_edit_at = None;
@@ -2066,18 +2688,33 @@ impl Editor {
             .w_full()
             .child(highlight_ui::background(f.textarea.clone(), f.highlight.clone()))
             .child(Textarea::new(&f.textarea))
-            .child(highlight_ui::faded_markers(f.textarea.clone()));
+            .when(!self.conceal_focused(cx), |el| el.child(highlight_ui::faded_markers(f.textarea.clone())));
         match kind {
             Some(BlockKind::Heading { level }) => {
+                // 和预览里的标题同一套字号、字重、下边距，点进去行高不变。
                 el = el
                     .text_size(heading_size(*level))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .line_height(relative(1.3));
+                    .line_height(relative(BODY_LINE_HEIGHT))
+                    .font_weight(if *level == 1 { FontWeight::BOLD } else { FontWeight::SEMIBOLD })
+                    .pb(rems(0.3));
+            }
+            Some(BlockKind::Paragraph) => {
+                el = el.text_size(px(BODY_FONT_SIZE)).line_height(relative(BODY_LINE_HEIGHT));
+            }
+            Some(BlockKind::CodeFence { .. } | BlockKind::CodeBlock) => {
+                // 和预览代码块同一套：等宽字号、四周 p_3、行高跟正文。
+                el = el
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(theme.mono_font_size)
+                    .line_height(relative(BODY_LINE_HEIGHT))
+                    .bg(theme.muted)
+                    .rounded(theme.semantic_tokens().radius.md)
+                    .p_3();
             }
             Some(k) if is_monospace(k) => {
                 el = el
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(px(14.))
+                    .text_size(px(13.))
                     .line_height(relative(1.6))
                     .bg(theme.muted)
                     .rounded(px(6.))
@@ -2253,22 +2890,17 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let paint = crate::colors::of(&item.attrs, cx).inherit(inherited);
-        let theme = cx.theme();
+        let (muted, selection) = (cx.theme().muted_foreground, cx.theme().selection);
         let content: Vec<&Block> = item.children.iter().filter(|c| c.kind != BlockKind::Marker).collect();
         let task = match item.kind {
             BlockKind::ListItem { task } => task,
             _ => None,
         };
         let marker: AnyElement = match (task, number) {
-            (Some(checked), _) => div()
-                .text_color(if checked { theme.primary } else { theme.muted_foreground })
-                .child(if checked { "☑" } else { "☐" })
-                .into_any_element(),
-            (None, Some(n)) => {
-                div().text_color(theme.muted_foreground).child(format!("{n}.")).into_any_element()
-            }
+            (Some(checked), _) => self.render_task_checkbox(item.id, checked, cx),
+            (None, Some(n)) => div().text_color(muted).child(format!("{n}.")).into_any_element(),
             (None, None) => div()
-                .text_color(theme.muted_foreground)
+                .text_color(muted)
                 .child(match depth % 3 {
                     0 => "•",
                     1 => "◦",
@@ -2279,11 +2911,20 @@ impl Editor {
 
         let body: AnyElement = if content.is_empty() {
             let id = item.id;
-            let body = if self.is_focused_block(id) {
+            let key = presenter::Key::unit(id);
+            let body = if let Some(text) = self.render_presenter(key, cx) {
+                self.unit_frame(id, false, Paint::default(), text, cx)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.focus_presenter_near(key, event.position, window, cx);
+                        }),
+                    )
+                    .into_any_element()
+            } else if self.is_focused_block(id) {
                 self.render_textarea(None, cx)
             } else {
                 let selected = self.is_selected_block(id);
-                let selection = theme.selection;
                 div()
                     .id(("empty-item", id.0))
                     .debug_selector(|| format!("unit-{}", id.0))
@@ -2305,9 +2946,64 @@ impl Editor {
         };
 
         Self::painted(h_flex().w_full().items_start().gap(px(4.)), paint)
-            .child(div().flex_none().w(px(24.)).text_center().child(marker))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(24.))
+                    .h(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(marker),
+            )
             .child(div().flex_1().min_w_0().child(body))
             .into_any_element()
+    }
+
+    /// 任务的方框：点一下在 `[ ]` 和 `[x]` 之间切换，不进编辑态，也不挪动任何文字。
+    fn render_task_checkbox(&self, item: BlockId, checked: bool, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (primary, border, fg) =
+            (theme.primary, theme.muted_foreground.opacity(0.7), theme.primary_foreground);
+        div()
+            .id(("task", item.0))
+            .debug_selector(move || format!("task-{}", item.0))
+            .size(px(16.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .border_1()
+            .cursor_pointer()
+            .map(|el| if checked { el.bg(primary).border_color(primary) } else { el.border_color(border) })
+            .hover(move |el| if checked { el } else { el.border_color(primary) })
+            .when(checked, |el| {
+                el.child(
+                    gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Check)
+                        .size(px(12.))
+                        .text_color(fg),
+                )
+            })
+            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                cx.stop_propagation();
+                window.prevent_default();
+            })
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_task(item, cx)))
+            .into_any_element()
+    }
+
+    /// 勾选 / 取消勾选一个任务：只改 `[ ]` 里那一个字符，长度不变，编辑中的光标也不用挪。
+    pub(super) fn toggle_task(&mut self, item: BlockId, cx: &mut Context<Self>) {
+        let Some(block) = self.doc.blocks().find(item) else { return };
+        let range = self.doc.range_of(block);
+        let src = self.doc.slice(range.clone()).to_string();
+        let Some(edit) = ops::toggle_task(&src, range.start) else { return };
+        if let Err(err) = self.doc.edit(edit) {
+            log::error!("edit rejected: {err}");
+            return;
+        }
+        self.last_edit_at = None;
+        self.after_doc_change(cx);
     }
 
     /// 悬停出现的块 gutter（5.3）：`⠿` 进入块选中态，`+` 在下方插入块并打开 `/` 菜单。
@@ -2365,6 +3061,7 @@ impl Editor {
             }),
         );
         h_flex()
+            .debug_selector(move || format!("row-{}", id.0))
             .w_full()
             .items_start()
             .relative()
@@ -2403,6 +3100,147 @@ impl Editor {
             .into_any_element()
     }
 
+    fn render_callout_block(&self, block: &Block, cx: &mut Context<Self>) -> AnyElement {
+        let range = self.doc.content_range(block);
+        let src = self.doc.slice(range.clone()).to_string();
+        let Some(parts) = callout_edit_parts(&src) else {
+            return self.render_textarea(Some(&block.kind), cx);
+        };
+        let (label, icon, color) = preview::appearance(&parts.kind, cx);
+        let foreground = cx.theme().foreground;
+        let id = block.id;
+        let body_abs = range.start + parts.body.start..range.start + parts.body.end;
+        let title_key = presenter::Key { id, part: presenter::Part::CalloutTitle };
+        let body_key = presenter::Key { id, part: presenter::Part::CalloutBody };
+        let editing_body = self.focused.as_ref().is_some_and(|f| f.id == Some(id) && f.range == body_abs);
+        let foldable = parts.fold != aero_core::Fold::None;
+        let revealing = self.highlight == Some(id);
+        let open = !foldable || editing_body || revealing || self.callout_open(id, parts.fold);
+        let line = px(BODY_FONT_SIZE * BODY_LINE_HEIGHT);
+        let title_text = src[parts.title.clone()].trim().to_owned();
+        let name = SharedString::from(if title_text.is_empty() { label.to_owned() } else { title_text });
+        let title_el =
+            self.render_presenter(title_key, cx).unwrap_or_else(|| div().child(label).into_any_element());
+        let body_el: Option<AnyElement> = if !open || (parts.body.is_empty() && !editing_body) {
+            None
+        } else if let Some(text) = self.render_presenter(body_key, cx) {
+            Some(text)
+        } else if editing_body {
+            Some(self.render_textarea(None, cx))
+        } else {
+            // 正文里有列表、代码这类结构：浏览时照常渲染，点进去编辑这一段源码
+            let body_click = body_abs.clone();
+            Some(
+                div()
+                    .id(SharedString::from(format!("callout-body-hit-{}", id.0)))
+                    .w_full()
+                    .cursor_text()
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.is_right_click() {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        this.focus_range(body_click.clone(), Some(id), true, 0, window, cx);
+                    }))
+                    .child(preview::markdown(
+                        SharedString::from(format!("callout-body-{}", id.0)),
+                        aero_core::links::to_markdown(&parts.body_text).into(),
+                        self.text_view_style(cx),
+                        if revealing { self.reveal_generation } else { 0 },
+                        self.preview.clone(),
+                        cx.entity(),
+                        id,
+                        0,
+                    ))
+                    .into_any_element(),
+            )
+        };
+        let toggle = foldable.then(|| {
+            let (name, selector) = (name.clone(), name.clone());
+            div()
+                .debug_selector(move || format!("callout-toggle-{selector}"))
+                .flex_none()
+                .h(line)
+                .flex()
+                .items_center()
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    cx.stop_propagation();
+                    window.prevent_default();
+                })
+                .child(
+                    Button::new(SharedString::from(format!("callout-fold-{}", id.0)))
+                        .ghost()
+                        .xsmall()
+                        .icon(
+                            gpui_kit::component::Icon::new(if open {
+                                gpui_kit::assets::IconName::ChevronDown
+                            } else {
+                                gpui_kit::assets::IconName::ChevronRight
+                            })
+                            .text_color(color),
+                        )
+                        .tooltip(if open { "折叠" } else { "展开" })
+                        .accessibility_label(format!("{} {name}", if open { "折叠" } else { "展开" }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_callout(id, parts.fold, cx);
+                        })),
+                )
+        });
+        v_flex()
+            .id(SharedString::from(format!("callout-{}", id.0)))
+            .debug_selector(move || format!("callout-{}", id.0))
+            .w_full()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded(px(6.))
+            .border_l_3()
+            .border_color(color)
+            .bg(color.opacity(0.08))
+            .text_color(foreground)
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap_2()
+                    .text_color(color)
+                    .child(
+                        div()
+                            .flex_none()
+                            .h(line)
+                            .flex()
+                            .items_center()
+                            .child(gpui_kit::component::Icon::new(icon).size(px(18.))),
+                    )
+                    .child({
+                        let name = name.clone();
+                        div()
+                            .debug_selector(move || format!("callout-title-{name}"))
+                            .flex_1()
+                            .min_w_0()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title_el)
+                    })
+                    .children(toggle),
+            )
+            .children(body_el.map(|body| {
+                div().debug_selector(move || format!("callout-body-{name}")).w_full().min_w_0().child(body)
+            }))
+            .into_any_element()
+    }
+
+    /// 可折叠的 callout 现在是否展开。折叠状态不写回源码。
+    fn callout_open(&self, id: BlockId, fold: aero_core::Fold) -> bool {
+        self.callout_folds.get(&id).copied().unwrap_or(fold != aero_core::Fold::Collapsed)
+    }
+
+    fn toggle_callout(&mut self, id: BlockId, fold: aero_core::Fold, cx: &mut Context<Self>) {
+        let open = self.callout_open(id, fold);
+        self.callout_folds.insert(id, !open);
+        cx.notify();
+    }
+
     /// 一个编辑单位：聚焦则画控件，否则渲染。
     fn render_unit(
         &self,
@@ -2412,10 +3250,60 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let range = self.doc.content_range(b);
-        if self.is_focused_block(b.id) {
-            // 源码态也保持块颜色：属性列表本身是尾部标记，文本框里看不到它
-            let textarea =
-                Self::painted(div().w_full(), paint).child(self.render_textarea(Some(&b.kind), cx));
+        if let Some(el) = self.render_presented_unit(b, depth, paint, cx) {
+            return Some(el);
+        }
+        if self.is_focused_block(b.id) && !self.focused.as_ref().is_some_and(|focused| focused.math_popup) {
+            let full = self.doc.slice(range.clone()).to_string();
+            if self.renders_inline_formulas(b.id, &full, cx)
+                && let Some(mixed) = self.render_with_inline_math(
+                    &full,
+                    range.start,
+                    b.id,
+                    self.text_view_style(cx),
+                    SharedString::from(format!("blk-{}-{}", cx.entity_id(), b.id.0)),
+                    self.focused.as_ref().map(|focused| focused.range.clone()),
+                    cx,
+                )
+            {
+                let body = Self::painted(
+                    div().w_full().when(matches!(b.kind, BlockKind::Heading { .. }), |el| el.pt_2()),
+                    paint,
+                )
+                .child(mixed);
+                return Some(self.with_gutter(b.id, depth, body.into_any_element(), cx));
+            }
+            if matches!(b.kind, BlockKind::Callout { .. })
+                && self.hides_markers(cx)
+                && !self.block_shows_source(b.id)
+            {
+                return Some(self.with_gutter(b.id, depth, self.render_callout_block(b, cx), cx));
+            }
+            // 和未聚焦时同一套外框，点进去文字位置不变。
+            let textarea = self.render_textarea(Some(&b.kind), cx);
+            let textarea = if matches!(b.kind, BlockKind::BlockQuote)
+                && self.hides_markers(cx)
+                && !self.block_shows_source(b.id)
+            {
+                let theme = cx.theme();
+                div()
+                    .w_full()
+                    .text_color(theme.muted_foreground)
+                    .border_l_3()
+                    .border_color(theme.border)
+                    .px_4()
+                    .child(textarea)
+                    .into_any_element()
+            } else {
+                textarea
+            };
+            // 源码态也保持块颜色：属性列表本身是尾部标记，文本框里看不到它。
+            // 标题上方的空隙和预览一样留着，否则点进去下面的块会往上跳。
+            let textarea = Self::painted(
+                div().w_full().when(matches!(b.kind, BlockKind::Heading { .. }), |el| el.pt_2()),
+                paint,
+            )
+            .child(textarea);
             // 公式块在源码下面保留实时预览，改完立刻重排
             let body = if matches!(b.kind, BlockKind::MathBlock) {
                 let source = self.doc.slice(range).to_string();
@@ -2430,10 +3318,11 @@ impl Editor {
             };
             return Some(self.with_gutter(b.id, depth, body, cx));
         }
-        if self.is_covered(&range) {
+        if self.is_covered(&range) && !self.is_focused_block(b.id) {
             return None;
         }
         let theme = cx.theme().clone();
+        let base = range.start;
         let text: SharedString = self.doc.slice(range).to_string().into();
         let id = b.id;
         // 用 click 而不是 mouse down 进编辑态：预览里的链接在 mouse up 时才触发并 stop_propagation，
@@ -2477,7 +3366,7 @@ impl Editor {
                     b.kind,
                     BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::ListItem { .. }
                 ) && let Some(mixed) =
-                    self.render_with_inline_math(&text, style.clone(), view_id.clone(), cx)
+                    self.render_with_inline_math(&text, base, id, style.clone(), view_id.clone(), None, cx)
                 {
                     mixed
                 } else {
@@ -2496,6 +3385,20 @@ impl Editor {
             }
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });
+        let unit = self.unit_frame(id, is_heading, paint, body, cx).on_click(focus).into_any_element();
+        Some(self.with_gutter(id, depth, unit, cx))
+    }
+
+    /// 编辑单位的外框：块颜色、定位高亮、块选中底色，以及定位 / 颜色菜单要的矩形。
+    fn unit_frame(
+        &self,
+        id: BlockId,
+        is_heading: bool,
+        paint: Paint,
+        body: AnyElement,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = cx.theme();
         let highlighted = self.highlight == Some(id);
         let selected = self.is_selected_block(id);
         let transient = highlighted || selected;
@@ -2517,7 +3420,7 @@ impl Editor {
         } else {
             body
         };
-        let unit = div()
+        div()
             .id(("unit", id.0))
             .debug_selector(|| format!("unit-{}", id.0))
             .w_full()
@@ -2530,10 +3433,86 @@ impl Editor {
             })
             .when(highlighted, |el| el.bg(accent).rounded(px(6.)).mx(px(-8.)).px(px(8.)))
             .when(selected && !highlighted, |el| Self::selected_style(el, selection))
-            .on_click(focus)
             .child(body)
-            .into_any_element();
-        Some(self.with_gutter(id, depth, unit, cx))
+    }
+
+    /// 段落、标题、引用：浏览与编辑是同一个控件，外框也是同一个。
+    fn render_presented_unit(
+        &self,
+        b: &Block,
+        depth: usize,
+        paint: Paint,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.hides_markers(cx) || self.block_shows_source(b.id) {
+            return None;
+        }
+        let has = |part| self.presenters.contains_key(&presenter::Key { id: b.id, part });
+        let body = match &b.kind {
+            BlockKind::Table if has(presenter::Part::Cell(0, 0)) => {
+                let table = self.render_table_block(b, cx);
+                self.unit_frame(b.id, false, paint, table, cx).into_any_element()
+            }
+            BlockKind::Callout { .. } if has(presenter::Part::CalloutTitle) => {
+                let callout = self.render_callout_block(b, cx);
+                self.unit_frame(b.id, false, paint, callout, cx).into_any_element()
+            }
+            BlockKind::CodeFence { .. } => {
+                let key = presenter::Key::unit(b.id);
+                let text = self.render_presenter(key, cx)?;
+                let theme = cx.theme();
+                let code = div()
+                    .w_full()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(theme.mono_font_size)
+                    .line_height(relative(BODY_LINE_HEIGHT))
+                    .bg(theme.muted)
+                    .rounded(theme.semantic_tokens().radius.md)
+                    .p_3()
+                    .child(text);
+                self.unit_frame(b.id, false, paint, code.into_any_element(), cx)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.focus_presenter_near(key, event.position, window, cx);
+                        }),
+                    )
+                    .into_any_element()
+            }
+            BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::BlockQuote => {
+                let key = presenter::Key::unit(b.id);
+                let text = self.render_presenter(key, cx)?;
+                let theme = cx.theme();
+                let inner = match &b.kind {
+                    BlockKind::Heading { level } => div()
+                        .w_full()
+                        .text_size(heading_size(*level))
+                        .line_height(relative(BODY_LINE_HEIGHT))
+                        .font_weight(if *level == 1 { FontWeight::BOLD } else { FontWeight::SEMIBOLD })
+                        .pb(rems(0.3))
+                        .child(text),
+                    BlockKind::BlockQuote => div()
+                        .w_full()
+                        .text_color(theme.muted_foreground)
+                        .border_l_3()
+                        .border_color(theme.border)
+                        .px_4()
+                        .child(text),
+                    _ => div().w_full().child(text),
+                };
+                let is_heading = matches!(b.kind, BlockKind::Heading { .. });
+                self.unit_frame(b.id, is_heading, paint, inner.into_any_element(), cx)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.focus_presenter_near(key, event.position, window, cx);
+                        }),
+                    )
+                    .into_any_element()
+            }
+            _ => return None,
+        };
+        Some(self.with_gutter(b.id, depth, body, cx))
     }
 }
 
@@ -2545,12 +3524,19 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::colors::apply_text_selection(cx);
+        self.inline_math_hits.clear();
         if self.dragging_block && !cx.has_active_drag() {
             self.dragging_block = false;
             self.block_drop = None;
         }
+        // 在编辑区外松手收不到 drop，按拖动结束处理
+        if self.table_resize.is_some() && !cx.has_active_drag() {
+            self.finish_table_resize(cx);
+        }
         self.validate_link_preview_scroll(cx);
         self.refresh_fragment_marks();
+        self.sync_presenters(window, cx);
         self.scale = window.scale_factor();
         let (foreground, muted) = (cx.theme().foreground, cx.theme().muted_foreground);
         let roots = self.doc.blocks().roots.clone();
@@ -2568,6 +3554,12 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::on_backspace))
+            .capture_action(
+                cx.listener(|this, _: &Backspace, window, cx| this.capture_deletion(false, window, cx)),
+            )
+            .capture_action(
+                cx.listener(|this, _: &Delete, window, cx| this.capture_deletion(true, window, cx)),
+            )
             .on_action(cx.listener(Self::on_convert_block))
             .on_action(cx.listener(Self::on_menu_confirm))
             .on_action(cx.listener(Self::on_link_alias))
@@ -2596,7 +3588,12 @@ impl Render for Editor {
                 value.downcast_ref::<gpui_kit::ExternalPaths>().is_some()
                     || value.downcast_ref::<crate::file_tree::TreeDrag>().is_some_and(|drag| !drag.directory)
                     || value.downcast_ref::<block_menu::BlockDrag>().is_some()
+                    || value.downcast_ref::<table::TableResize>().is_some()
             })
+            .on_drop(cx.listener(|this, _: &table::TableResize, _, cx| this.finish_table_resize(cx)))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<table::TableResize>, _, cx| {
+                this.track_table_resize(event.event.position.x, cx);
+            }))
             .on_drop(cx.listener(|this, drag: &block_menu::BlockDrag, window, cx| {
                 this.finish_block_drag(drag, window, cx);
             }))
@@ -2609,6 +3606,8 @@ impl Render for Editor {
             })
             .size_full()
             .overflow_y_scroll()
+            // 横向滑动留给宽表格自己滚，不折算成正文的上下滚动
+            .restrict_scroll_to_axis()
             .track_scroll(&self.scroll)
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 this.cancel_link_preview(cx);
@@ -2653,6 +3652,7 @@ impl Render for Editor {
             .children(self.render_toolbar(cx))
             .children(self.render_block_menu(cx))
             .children(self.render_block_drop_line(cx))
+            .children(self.render_math_editor(cx))
             // 颜色菜单画在编辑器根上：块选中态没有控件可挂，位置由 `color_menu_position` 给
             .children(self.color_menu.is_some().then(|| self.render_color_menu(cx)))
             .children(self.render_image_viewer(window, cx))
@@ -2663,6 +3663,45 @@ impl Render for Editor {
 fn heading_key(text: &str) -> String {
     let plain = aero_core::index::plain_text(text, &BlockKind::Paragraph);
     plain.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+struct CalloutEdit {
+    kind: aero_core::CalloutKind,
+    fold: aero_core::Fold,
+    title: Range<usize>,
+    body: Range<usize>,
+    body_text: String,
+    /// 正文只有段落，按文字画；有列表、代码、表格时仍用源码编辑
+    simple_body: bool,
+}
+
+fn callout_edit_parts(src: &str) -> Option<CalloutEdit> {
+    let header_end = src.find('\n').unwrap_or(src.len());
+    let header = &src[..header_end];
+    let (kind, fold, _, _) = aero_core::parse::callout_header(header)?;
+    let close = header.find(']')?;
+    let mut title_at = close + 1;
+    let bytes = header.as_bytes();
+    if matches!(bytes.get(title_at), Some(b'-' | b'+')) {
+        title_at += 1;
+    }
+    while bytes.get(title_at) == Some(&b' ') {
+        title_at += 1;
+    }
+    let body = if header_end < src.len() { header_end + 1..src.len() } else { src.len()..src.len() };
+    let body_src = src.get(body.clone()).unwrap_or("");
+    let body_text = body_src.lines().map(strip_quote_marker).collect::<Vec<_>>().join("\n");
+    let simple_body = body_src.lines().all(|line| {
+        line.trim_start().starts_with('>') && presenter::simple_body_line(strip_quote_marker(line))
+    });
+    Some(CalloutEdit { kind, fold, title: title_at..header_end, body, body_text, simple_body })
+}
+
+fn strip_quote_marker(line: &str) -> &str {
+    line.trim_start()
+        .strip_prefix('>')
+        .map(|rest| rest.strip_prefix([' ', '\t']).unwrap_or(rest))
+        .unwrap_or(line)
 }
 
 fn heading_size(level: u8) -> Pixels {

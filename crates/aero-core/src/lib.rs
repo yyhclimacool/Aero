@@ -25,6 +25,7 @@ pub mod inline_format;
 pub mod inline_links;
 pub mod links;
 mod markdown_links;
+pub mod markup;
 pub mod parse;
 pub mod rename;
 pub mod tags;

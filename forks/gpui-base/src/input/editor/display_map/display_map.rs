@@ -33,10 +33,7 @@ pub struct DisplayMap {
 
 impl DisplayMap {
     pub fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
-        Self {
-            wrap_map: WrapMap::new(font, font_size, wrap_width),
-            fold_map: FoldMap::new(),
-        }
+        Self { wrap_map: WrapMap::new(font, font_size, wrap_width), fold_map: FoldMap::new() }
     }
 
     // ==================== Core Coordinate Mapping ====================
@@ -75,10 +72,7 @@ impl DisplayMap {
     /// Get the buffer line for a given display row
     pub fn display_row_to_buffer_line(&self, display_row: usize) -> usize {
         // Display → Wrap
-        let wrap_row = self
-            .fold_map
-            .display_row_to_wrap_row(display_row)
-            .unwrap_or(0);
+        let wrap_row = self.fold_map.display_row_to_wrap_row(display_row).unwrap_or(0);
 
         // Wrap → Buffer line
         self.wrap_map.wrap_row_to_buffer_line(wrap_row)
@@ -188,8 +182,7 @@ impl DisplayMap {
         let new_lines_in_range = new_text.chars().filter(|c| *c == '\n').count();
         let line_delta = new_lines_in_range as isize - old_lines_in_range as isize;
 
-        self.fold_map
-            .adjust_folds_for_edit(edit_start_line, edit_end_line, line_delta);
+        self.fold_map.adjust_folds_for_edit(edit_start_line, edit_end_line, line_delta);
     }
 
     /// Incrementally update fold candidates after a text edit.
@@ -203,13 +196,10 @@ impl DisplayMap {
         new_text: &Rope,
     ) {
         let new_start_line = new_text.offset_to_point(edit_byte_range.start).row;
-        let new_end_line = new_text
-            .offset_to_point(edit_byte_range.end.min(new_text.len()))
-            .row;
+        let new_end_line = new_text.offset_to_point(edit_byte_range.end.min(new_text.len())).row;
 
         let new_candidates = extract_fold_ranges(edit_byte_range, new_text);
-        self.fold_map
-            .merge_candidates_for_edit(new_start_line, new_end_line, new_candidates);
+        self.fold_map.merge_candidates_for_edit(new_start_line, new_end_line, new_candidates);
     }
 
     /// Update text (incremental or full)
@@ -220,8 +210,7 @@ impl DisplayMap {
         new_text: &Rope,
         cx: &mut App,
     ) {
-        self.wrap_map
-            .on_text_changed(changed_text, range, new_text, cx);
+        self.wrap_map.on_text_changed(changed_text, range, new_text, cx);
         self.rebuild_fold_projection();
     }
 
@@ -240,6 +229,17 @@ impl DisplayMap {
     /// Set font parameters
     pub fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) {
         self.wrap_map.set_font(font, font_size, cx);
+        self.rebuild_fold_projection();
+    }
+
+    /// Rewrap so hidden markers do not change where visible text breaks.
+    pub(crate) fn set_conceal(
+        &mut self,
+        conceal: Vec<Range<usize>>,
+        fonts: Vec<(Range<usize>, super::FontOverride)>,
+        cx: &mut App,
+    ) {
+        self.wrap_map.set_conceal(conceal, fonts, cx);
         self.rebuild_fold_projection();
     }
 
@@ -267,8 +267,7 @@ impl DisplayMap {
         } else {
             // No active folds: identity mapping (wrap_row == display_row).
             // Just update cached count so query methods work without Vec allocation.
-            self.fold_map
-                .mark_dirty_with_wrap_count(self.wrap_map.wrap_row_count());
+            self.fold_map.mark_dirty_with_wrap_count(self.wrap_map.wrap_row_count());
         }
     }
 
@@ -288,9 +287,7 @@ impl DisplayMap {
         offset: usize,
         line_end_affinity: bool,
     ) -> WrapDisplayPoint {
-        self.wrap_map
-            .wrapper()
-            .offset_to_display_point_with_affinity(offset, line_end_affinity)
+        self.wrap_map.wrapper().offset_to_display_point_with_affinity(offset, line_end_affinity)
     }
 
     /// Convert wrap display point to byte offset.
@@ -325,13 +322,8 @@ impl DisplayMap {
     }
 
     pub(crate) fn display_row_column_to_offset(&self, display_row: usize, column: usize) -> usize {
-        let wrap_row = self
-            .fold_map
-            .display_row_to_wrap_row(display_row)
-            .unwrap_or(0);
-        self.wrap_map
-            .wrapper()
-            .display_point_to_offset(WrapDisplayPoint::new(wrap_row, 0, column))
+        let wrap_row = self.fold_map.display_row_to_wrap_row(display_row).unwrap_or(0);
+        self.wrap_map.wrapper().display_point_to_offset(WrapDisplayPoint::new(wrap_row, 0, column))
     }
 
     /// Get the longest row index (by byte length).
@@ -357,8 +349,7 @@ impl DisplayMap {
     /// Calculate how many wrap rows of a buffer line are visible (not folded)
     #[inline]
     pub fn visible_wrap_row_count_for_buffer_line(&self, line: usize) -> usize {
-        self.wrap_map
-            .visible_wrap_row_count_for_line(line, &self.fold_map)
+        self.wrap_map.visible_wrap_row_count_for_line(line, &self.fold_map)
     }
 
     /// Get the wrap row count (before folding)

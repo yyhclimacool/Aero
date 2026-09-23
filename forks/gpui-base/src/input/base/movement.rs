@@ -263,7 +263,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         // palette) can act on it. This is harmless when nothing is bound there.
         // With multiple cursors the others can still move, so only the
         // single-cursor case propagates.
-        if self.selections.is_single() && self.active_selection().is_empty() && self.cursor() == 0 {
+        // Concealed bytes before the caret (a hidden `# ` or `> `) count as nothing.
+        if self.selections.is_single()
+            && self.active_selection().is_empty()
+            && self.previous_visible_boundary(self.cursor()) == self.cursor()
+        {
             cx.propagate();
             return;
         }
@@ -271,7 +275,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.move_all_cursors(
             |s, sel| {
                 let offset = if sel.is_empty() {
-                    s.previous_boundary(sel.cursor_offset())
+                    s.previous_visible_boundary(sel.cursor_offset())
                 } else {
                     sel.start
                 };
@@ -288,7 +292,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // move, so let the keystroke bubble to an ancestor.
         if self.selections.is_single()
             && self.active_selection().is_empty()
-            && self.cursor() == self.text.len()
+            && self.next_visible_boundary(self.cursor()) == self.cursor()
         {
             cx.propagate();
             return;
@@ -297,7 +301,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.move_all_cursors(
             |s, sel| {
                 let offset = if sel.is_empty() {
-                    s.next_boundary(sel.cursor_offset())
+                    s.next_visible_boundary(sel.cursor_offset())
                 } else {
                     sel.end
                 };

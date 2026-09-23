@@ -170,7 +170,11 @@ impl Renderer for Math {
         let style = if *display { MathStyle::Display } else { MathStyle::Text };
         let [r, g, b, a] = color.to_be_bytes().map(|c| f32::from(c) / 255.);
         let options = LayoutOptions::default().with_style(style).with_color(Color::new(r, g, b, a));
-        let list = to_display_list(&layout(&ast, &options));
+        // 排版单位是 em。正文列宽 720px，超宽的公式按这个宽度折行，而不是画成一条横过去的图。
+        // 左右各留一点给渲染 padding，避免折行后的位图仍然超出列宽。
+        let max_em = if request.size == 0 { f64::MAX } else { (720.0 - 8.0) / f64::from(request.size) };
+        let laid_out = wrap_formula(layout(&ast, &options), max_em);
+        let list = to_display_list(&laid_out);
         let png = ratex_render::render_to_png(
             &list,
             &ratex_render::RenderOptions {
@@ -184,6 +188,97 @@ impl Renderer for Math {
         )
         .map_err(|e| format!("公式渲染失败：{e}"))?;
         image::load_from_memory(&png).map(|image| image.to_rgba8()).map_err(|e| readable(&e.to_string()))
+    }
+}
+
+/// 把超宽公式折成若干行。只在水平盒子的子项之间断开，分数、上下标不会被从中切开。
+fn wrap_formula(mut laid_out: ratex_layout::LayoutBox, max_em: f64) -> ratex_layout::LayoutBox {
+    use ratex_layout::layout_box::{BoxContent, VBoxChild, VBoxChildKind};
+    use ratex_layout::vbox::make_vbox;
+
+    if max_em <= 1.0 || laid_out.width <= max_em {
+        return laid_out;
+    }
+    match &mut laid_out.content {
+        BoxContent::HBox(_) => {}
+        BoxContent::VBox(children) => {
+            for child in children.iter_mut() {
+                if let VBoxChildKind::Box(inner) = &mut child.kind {
+                    let wrapped = wrap_formula(
+                        std::mem::replace(inner.as_mut(), ratex_layout::LayoutBox::new_empty()),
+                        max_em,
+                    );
+                    *inner = Box::new(wrapped);
+                }
+            }
+            return make_vbox(std::mem::take(children));
+        }
+        _ => return laid_out,
+    }
+    let BoxContent::HBox(children) = laid_out.content else { return laid_out };
+    let pieces = children.into_iter().flat_map(|child| expand_wide(child, max_em)).collect::<Vec<_>>();
+    let mut lines: Vec<Vec<ratex_layout::LayoutBox>> = Vec::new();
+    let mut line: Vec<ratex_layout::LayoutBox> = Vec::new();
+    let mut width = 0.0;
+    for piece in pieces {
+        let glue = matches!(piece.content, BoxContent::Kern);
+        if !line.is_empty() && width + piece.width > max_em && !glue {
+            lines.push(std::mem::take(&mut line));
+            width = 0.0;
+        }
+        if line.is_empty() && glue {
+            continue;
+        }
+        width += piece.width;
+        line.push(piece);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.len() <= 1 {
+        let only = lines.pop().unwrap_or_default();
+        return hbox(only, laid_out.color);
+    }
+    let gap = 0.35;
+    let mut stacked = Vec::new();
+    for (i, row) in lines.into_iter().enumerate() {
+        if i > 0 {
+            stacked.push(VBoxChild { kind: VBoxChildKind::Kern(gap), shift: 0.0 });
+        }
+        stacked.push(VBoxChild { kind: VBoxChildKind::Box(Box::new(hbox(row, laid_out.color))), shift: 0.0 });
+    }
+    let mut wrapped = make_vbox(stacked);
+    wrapped.color = laid_out.color;
+    wrapped
+}
+
+fn expand_wide(box_: ratex_layout::LayoutBox, max_em: f64) -> Vec<ratex_layout::LayoutBox> {
+    use ratex_layout::layout_box::BoxContent;
+    if box_.width <= max_em {
+        return vec![box_];
+    }
+    if let BoxContent::HBox(children) = box_.content {
+        children.into_iter().flat_map(|child| expand_wide(child, max_em)).collect()
+    } else {
+        vec![box_]
+    }
+}
+
+fn hbox(children: Vec<ratex_layout::LayoutBox>, color: ratex_types::Color) -> ratex_layout::LayoutBox {
+    let mut width = 0.0_f64;
+    let mut height = 0.0_f64;
+    let mut depth = 0.0_f64;
+    for child in &children {
+        width += child.width;
+        height = height.max(child.height);
+        depth = depth.max(child.depth);
+    }
+    ratex_layout::LayoutBox {
+        width,
+        height,
+        depth,
+        content: ratex_layout::layout_box::BoxContent::HBox(children),
+        color,
     }
 }
 
@@ -396,7 +491,8 @@ fn produce(vault: &Vault, cache: &Path, request: &Request) -> Result<Produced, S
         }
         // 公式没有磁盘文件：指纹取源码 + 行间 / 行内 + 颜色
         Source::Formula { latex, display, color } => {
-            let key = format!("{latex}\u{1}{display}\u{1}{color}");
+            // `w720` 把折行宽度算进指纹，旧的单行缓存不会被当成现在的多行结果。
+            let key = format!("{latex}\u{1}{display}\u{1}{color}\u{1}w720");
             (latex.clone().into_bytes(), aero_core::hash_bytes(key.as_bytes()))
         }
     };
@@ -582,6 +678,23 @@ mod tests {
         assert!(error.starts_with("公式"), "{error}");
         // 图片渲染器不接受公式源，反之亦然
         assert!(Math.rasterize(&req(&VaultPath::new("a.png").unwrap(), 10, 100), b"x", 16).is_err());
+    }
+
+    /// 比正文列宽更长的公式要折成多行；`\\` 仍然是另起一行，不能被折行逻辑挤回同一行。
+    #[test]
+    fn long_formula_wraps_to_the_column_and_explicit_breaks_stay_stacked() {
+        let piece = "a + b + c + d + e + f + g + h";
+        let latex = format!("{piece} + {piece} + {piece} + {piece}");
+        let request = formula(&latex, false, 16);
+        let rgba = Math.rasterize(&request, latex.as_bytes(), 16).unwrap();
+        assert!(rgba.width() <= 720, "折行后应落在列宽内，实际 {}", rgba.width());
+        let one = Math.rasterize(&formula("a", false, 16), b"a", 16).unwrap();
+        assert!(rgba.height() > one.height() * 2, "长公式应占多行: {} vs {}", rgba.height(), one.height());
+
+        let broken = "a \\\\ b";
+        let rows = Math.rasterize(&formula(broken, true, 16), broken.as_bytes(), 16).unwrap();
+        let single = Math.rasterize(&formula("a", true, 16), b"a", 16).unwrap();
+        assert!(rows.height() > single.height() + 4, "\\\\ 应保留第二行");
     }
 
     /// 公式没有磁盘文件：磁盘缓存按源码 + 行间 / 行内 + 颜色的指纹命中。

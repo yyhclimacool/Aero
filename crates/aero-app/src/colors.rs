@@ -132,6 +132,14 @@ fn highlight_hex(dark: bool) -> String {
     hex(Slot::Background, "yellow", dark).expect("yellow 在调色板里")
 }
 
+/// 拖出的文字选区。主题会把选区压到 30% 透明度，这里改成不透明的紫色。
+pub fn apply_text_selection(cx: &mut App) {
+    let color = Hsla::from(rgb(0xa855f7)).alpha(1.);
+    let theme = gpui_kit::component::Theme::global_mut(cx);
+    theme.selection = color;
+    gpui_kit::base::Theme::global_mut(cx).tokens.colors.selection = color;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

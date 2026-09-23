@@ -46,7 +46,7 @@ impl Editor {
         };
         let range = self.wiki.as_ref().unwrap().trigger.range.clone();
         let embed = self.wiki.as_ref().unwrap().trigger.embed;
-        let in_table = self.focused_unit().is_some_and(|ix| matches!(self.units[ix].kind, BlockKind::Table));
+        let in_table = self.focused_in_table();
         let (replacement, selected) =
             wiki::insertion(&target, alias.then_some(label.as_str()), in_table, embed);
         let mut at = range.start;

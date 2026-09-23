@@ -298,6 +298,10 @@ impl Editor {
             .find(block)
             .map(|b| self.doc.slice(self.doc.content_range(b)).to_string())
             .is_some_and(|text| preview::is_image_embed(text.trim()));
+        let prose = self.doc.blocks().find(block).is_some_and(|b| {
+            matches!(b.kind, BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::BlockQuote)
+                && !image
+        });
         let row = |id: &'static str, label: String, action: &'static str| {
             div()
                 .id(id)
@@ -322,6 +326,13 @@ impl Editor {
                                 cx.notify();
                             }
                             "color" => this.block_menu_color(window, cx),
+                            "source" => {
+                                let Some(id) = this.block_menu.as_ref().map(|menu| menu.block) else {
+                                    return;
+                                };
+                                this.block_menu = None;
+                                this.toggle_block_source(id, window, cx);
+                            }
                             "link" => this.block_menu_copy_link(window, cx),
                             "id" => this.block_menu_add_id(window, cx),
                             "duplicate" => this.block_menu_duplicate(window, cx),
@@ -338,11 +349,17 @@ impl Editor {
         let mut rows = vec![
             row("block-menu-convert", "转换为 ▸".into(), "convert"),
             row("block-menu-color", "颜色 ▸".into(), "color"),
+        ];
+        if prose {
+            let label = if self.block_shows_source(block) { "完成源码" } else { "编辑源码" };
+            rows.push(row("block-menu-source", label.into(), "source"));
+        }
+        rows.extend([
             row("block-menu-link", "复制块链接".into(), "link"),
             row("block-menu-id", if has_id.is_some() { "复制 ^id".into() } else { "添加 ^id".into() }, "id"),
             row("block-menu-duplicate", "复制块".into(), "duplicate"),
             row("block-menu-delete", "删除".into(), "delete"),
-        ];
+        ]);
         if image {
             rows.push(row("block-menu-width-small", "宽度 · 小".into(), "small"));
             rows.push(row("block-menu-width-medium", "宽度 · 中".into(), "medium"));

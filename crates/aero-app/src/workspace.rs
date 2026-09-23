@@ -124,7 +124,15 @@ impl Workspace {
         });
         let preview = state.link_preview;
         crate::editor::set_preview_mode(preview, cx);
-        crate::actions::sync_menus(preview, cx);
+        crate::editor::set_focus_shows_source(state.focus_shows_source, cx);
+        crate::actions::sync_menus(
+            crate::actions::MenuState {
+                preview,
+                focus_shows_source: state.focus_shows_source,
+                note_source: false,
+            },
+            cx,
+        );
         let mut this = Workspace {
             data_dir,
             quick_open: None,
@@ -396,6 +404,7 @@ impl Workspace {
                     .push_notification(Notification::error(format!("无法打开 {}：{err}", path.as_str())), cx);
             }
         }
+        self.sync_editor_menus(cx);
         cx.notify();
     }
 
@@ -863,11 +872,54 @@ impl Workspace {
         self.state.link_preview = mode;
         self.state.save(&self.data_dir);
         crate::editor::set_preview_mode(mode, cx);
-        crate::actions::sync_menus(mode, cx);
+        self.sync_editor_menus(cx);
         if let Some(editor) = self.open.as_ref().and_then(|o| o.editor.clone()) {
             editor.update(cx, |editor, cx| editor.preview_mode_changed(window, cx));
         }
         cx.notify();
+    }
+
+    fn sync_editor_menus(&mut self, cx: &mut Context<Self>) {
+        let note_source = self
+            .open
+            .as_ref()
+            .and_then(|open| open.editor.as_ref())
+            .is_some_and(|editor| editor.read(cx).note_source());
+        crate::actions::sync_menus(
+            crate::actions::MenuState {
+                preview: self.state.link_preview,
+                focus_shows_source: self.state.focus_shows_source,
+                note_source,
+            },
+            cx,
+        );
+    }
+
+    fn on_toggle_note_source(
+        &mut self,
+        _: &crate::actions::ToggleNoteSource,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(editor) = self.open.as_ref().and_then(|open| open.editor.clone()) {
+            editor.update(cx, |editor, cx| editor.toggle_note_source(cx));
+        }
+        self.sync_editor_menus(cx);
+    }
+
+    fn on_toggle_focus_source(
+        &mut self,
+        _: &crate::actions::ToggleFocusSource,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.focus_shows_source = !self.state.focus_shows_source;
+        self.state.save(&self.data_dir);
+        crate::editor::set_focus_shows_source(self.state.focus_shows_source, cx);
+        if let Some(editor) = self.open.as_ref().and_then(|open| open.editor.clone()) {
+            editor.update(cx, |editor, cx| editor.sync_presentation(cx));
+        }
+        self.sync_editor_menus(cx);
     }
 
     fn on_link_preview_hover(&mut self, _: &LinkPreviewHover, window: &mut Window, cx: &mut Context<Self>) {
@@ -1769,6 +1821,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_search))
             .on_action(cx.listener(Self::on_open_files))
             .on_action(cx.listener(Self::on_open_tags))
+            .on_action(cx.listener(Self::on_toggle_note_source))
+            .on_action(cx.listener(Self::on_toggle_focus_source))
             .on_action(cx.listener(Self::on_link_preview_hover))
             .on_action(cx.listener(Self::on_link_preview_command))
             .on_action(cx.listener(Self::on_link_preview_off))
@@ -2448,7 +2502,7 @@ mod tests {
             assert_eq!(window.focused(cx), Some(original));
         });
         cx.simulate_input("X");
-        cx.update(|_, cx| assert_eq!(editor.read(cx).index_snapshot().1, "X# Heading\n"));
+        cx.update(|_, cx| assert_eq!(editor.read(cx).index_snapshot().1, "# XHeading\n"));
         cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
     }
 
@@ -2478,7 +2532,7 @@ mod tests {
             assert_eq!(window.focused(cx), Some(original));
         });
         cx.simulate_input("X");
-        cx.update(|_, cx| assert_eq!(editor.read(cx).index_snapshot().1, "X# Heading!\n"));
+        cx.update(|_, cx| assert_eq!(editor.read(cx).index_snapshot().1, "# XHeading!\n"));
         cx.simulate_keystrokes("cmd-shift-p");
         cx.run_until_parked();
         cx.simulate_input("heading 2");
@@ -2487,7 +2541,7 @@ mod tests {
         cx.update(|window, cx| {
             window.simulate_next_frame(cx);
             assert!(workspace.read(cx).quick_open.is_none());
-            assert_eq!(editor.read(cx).index_snapshot().1, "## X# Heading!\n");
+            assert_eq!(editor.read(cx).index_snapshot().1, "## XHeading!\n");
             assert!(editor.read(cx).command_available(&crate::actions::ConvertBlock(1)));
         });
         cx.simulate_keystrokes("cmd-shift-p");
@@ -2497,7 +2551,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|window, cx| {
             window.simulate_next_frame(cx);
-            assert_eq!(editor.read(cx).index_snapshot().1, "X# Heading!\n");
+            assert_eq!(editor.read(cx).index_snapshot().1, "# XHeading!\n");
             assert!(editor.read(cx).command_available(&crate::actions::ConvertBlock(2)));
             assert_eq!(workspace.read(cx).recent_commands, ["undo", "heading-2"]);
         });
@@ -2508,7 +2562,7 @@ mod tests {
         cx.run_until_parked();
         cx.update(|window, cx| {
             window.simulate_next_frame(cx);
-            assert_eq!(editor.read(cx).index_snapshot().1, "## X# Heading!\n");
+            assert_eq!(editor.read(cx).index_snapshot().1, "## XHeading!\n");
             assert!(editor.read(cx).command_available(&crate::actions::ConvertBlock(1)));
             assert_eq!(workspace.read(cx).recent_commands, ["redo", "undo", "heading-2"]);
         });
@@ -2522,7 +2576,7 @@ mod tests {
             assert!(workspace.read(cx).quick_open.is_none());
             assert_eq!(
                 editor.read(cx).index_snapshot().1,
-                "X# Heading!\n",
+                "# XHeading!\n",
                 "most recent available command is undo"
             );
             assert_eq!(workspace.read(cx).recent_commands, ["undo", "redo", "heading-2"]);

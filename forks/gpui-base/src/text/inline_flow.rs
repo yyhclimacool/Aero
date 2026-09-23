@@ -320,12 +320,12 @@ impl Element for InlineFlow {
                         .line_height(fragment_size.height)
                         .child(inline)
                         .into_any_element();
+                    // This fragment is already one visual line. A definite width equal to the
+                    // shaped line makes the inner text wrap again: the last glyph (often one CJK
+                    // character) drops below the line while its horizontal slot stays empty.
                     element.prepaint_as_root(
                         bounds.origin + origin + point(padding, Pixels::ZERO),
-                        size(
-                            AvailableSpace::Definite(fragment_size.width - padding * 2.),
-                            AvailableSpace::Definite(fragment_size.height),
-                        ),
+                        size(AvailableSpace::MaxContent, AvailableSpace::Definite(fragment_size.height)),
                         window,
                         cx,
                     );

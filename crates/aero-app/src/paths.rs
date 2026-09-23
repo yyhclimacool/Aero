@@ -50,6 +50,8 @@ pub struct PersistedState {
     pub sidebar_visible: Option<bool>,
     pub panel_visible: Option<bool>,
     pub link_preview: LinkPreviewMode,
+    /// 聚焦块显示源码（9.1）。默认关闭：聚焦时隐藏标记。
+    pub focus_shows_source: bool,
 }
 
 impl PersistedState {

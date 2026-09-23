@@ -603,10 +603,7 @@ impl Element for Inline {
         }
 
         if let Some(selection) = &state.selection {
-            let color = GlobalState::global(cx)
-                .text_view_state()
-                .map(|state| state.read(cx).text_view_style.selection())
-                .unwrap_or_else(|| crate::Theme::global(cx).tokens.colors.selection);
+            let color = gpui::Hsla::from(gpui::rgb(0xa855f7)).alpha(1.);
             Self::paint_selection(selection, &text_layout, &bounds, window, color);
         }
 

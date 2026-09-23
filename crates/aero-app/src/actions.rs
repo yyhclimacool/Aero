@@ -113,6 +113,10 @@ actions!(
         /// 颜色菜单里的 `Tab` / `Esc`
         ConfirmColorMenu,
         CloseColorMenu,
+        /// 当前笔记在「隐藏标记」和「整篇源码」之间换（9.1）
+        ToggleNoteSource,
+        /// 偏好：聚焦时显示源码，等于原来的 Live Preview（9.1）
+        ToggleFocusSource,
     ]
 );
 
@@ -196,6 +200,14 @@ pub fn commands() -> Vec<Command> {
         Command::new("edit-link", "插入或编辑链接", "link url insert edit lj", Editor, EditLink),
         Command::new("color-last", "应用上次使用的颜色", "color last ysyd", Editor, ApplyLastColor),
         Command::new("color-menu", "颜色…", "color palette ys tsb", Editor, OpenColorMenu),
+        Command::new("note-source", "查看源码", "source markdown ckym", Note, ToggleNoteSource),
+        Command::new(
+            "focus-source",
+            "聚焦时显示源码",
+            "focus source live preview jjxsxym",
+            Vault,
+            ToggleFocusSource,
+        ),
         Command::new("quit", "退出 Aero", "quit exit tc", Global, Quit),
     ];
     use aero_core::inline_format::Format;
@@ -307,11 +319,25 @@ pub fn init(cx: &mut App) {
     // 窗口里没人处理时的兜底
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 
-    sync_menus(crate::paths::LinkPreviewMode::Hover, cx);
+    sync_menus(
+        MenuState {
+            preview: crate::paths::LinkPreviewMode::Hover,
+            focus_shows_source: false,
+            note_source: false,
+        },
+        cx,
+    );
+}
+
+pub struct MenuState {
+    pub preview: crate::paths::LinkPreviewMode,
+    pub focus_shows_source: bool,
+    pub note_source: bool,
 }
 
 /// 按当前预览设置重画菜单（勾选「悬停 / 按住 ⌘ / 关闭」里的一项）。
-pub fn sync_menus(preview: crate::paths::LinkPreviewMode, cx: &mut App) {
+pub fn sync_menus(state: MenuState, cx: &mut App) {
+    let MenuState { preview, focus_shows_source, note_source } = state;
     use crate::paths::LinkPreviewMode;
     use aero_core::inline_format::Format;
     cx.set_menus(vec![
@@ -358,6 +384,8 @@ pub fn sync_menus(preview: crate::paths::LinkPreviewMode, cx: &mut App) {
                 MenuItem::action("按住 ⌘", LinkPreviewCommand).checked(preview == LinkPreviewMode::Command),
                 MenuItem::action("关闭", LinkPreviewOff).checked(preview == LinkPreviewMode::Off),
             ])),
+            MenuItem::action("查看源码", ToggleNoteSource).checked(note_source),
+            MenuItem::action("聚焦时显示源码", ToggleFocusSource).checked(focus_shows_source),
             MenuItem::separator(),
             MenuItem::action("折叠 / 展开左侧栏", ToggleSidebar),
             MenuItem::action("折叠 / 展开右侧面板", TogglePanel),

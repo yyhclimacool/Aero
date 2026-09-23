@@ -2,6 +2,9 @@ use super::*;
 
 impl Editor {
     fn wiki_trigger(&self, cx: &App) -> Option<wiki::Trigger> {
+        if self.editing_code() {
+            return None;
+        }
         let f = self.focused.as_ref()?;
         let ta = f.textarea.read(cx);
         if !ta.selected_range().is_empty() {
@@ -266,8 +269,7 @@ impl Editor {
         };
         let range = menu.trigger.range.clone();
         let embed = menu.trigger.embed;
-        let in_table =
-            self.focused_unit().is_some_and(|ix| matches!(self.units[ix].kind, BlockKind::Table { .. }));
+        let in_table = self.focused_in_table();
         let (replacement, selected) =
             wiki::insertion(&target, alias.then_some(label.as_str()), in_table, embed);
         let at = range.start;

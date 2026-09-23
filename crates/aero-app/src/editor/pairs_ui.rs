@@ -7,6 +7,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.editing_code() {
+            return;
+        }
         let Some(f) = &mut self.focused else { return };
         f.pairs.pending = None;
         if !f.textarea.focus_handle(cx).is_focused(window) || self.picker_open || self.title_edit.is_some() {

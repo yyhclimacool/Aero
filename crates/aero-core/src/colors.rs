@@ -231,6 +231,10 @@ pub fn inline_edit(src: &str, selection: Range<usize>, slot: Slot, color: Option
         return None;
     }
     let selected = src.get(selection.clone())?;
+    // 没选字时黄色背景就是 `==`：插入一对空标记，光标在中间
+    if selected.is_empty() && slot == Slot::Background && color == Some("yellow") {
+        return Some(Inline::Highlight);
+    }
     if selected.trim().is_empty() || selected.contains(['\n', '\r']) {
         return None;
     }
@@ -452,7 +456,7 @@ fn expands_over(selection: &Range<usize>, content: &Range<usize>) -> bool {
         && (selection.start < content.start || selection.end > content.end)
 }
 
-fn has_color(attrs: &Attrs) -> bool {
+pub(crate) fn has_color(attrs: &Attrs) -> bool {
     attrs.classes.iter().any(|class| Slot::Text.owns(class) || Slot::Background.owns(class))
 }
 
@@ -500,12 +504,12 @@ fn splice_out(src: &str, range: &Range<usize>, holes: &[Range<usize>]) -> String
     out
 }
 
-fn line_start(src: &str, at: usize) -> usize {
+pub(crate) fn line_start(src: &str, at: usize) -> usize {
     src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0)
 }
 
 /// `close` 处 `]` 配对的 `[`（同一行内、未转义、允许嵌套）。
-fn bracket_start(src: &str, close: usize, limit: usize) -> Option<usize> {
+pub(crate) fn bracket_start(src: &str, close: usize, limit: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (at, ch) in src[limit..close].char_indices().rev() {
         let at = limit + at;

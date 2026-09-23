@@ -24,9 +24,7 @@ pub(super) struct WrapMap {
 
 impl WrapMap {
     pub(super) fn new(font: Font, font_size: Pixels, wrap_width: Option<Pixels>) -> Self {
-        Self {
-            wrapper: TextWrapper::new(font, font_size, wrap_width),
-        }
+        Self { wrapper: TextWrapper::new(font, font_size, wrap_width) }
     }
 
     /// Get total number of wrap rows (visual rows after soft-wrapping)
@@ -49,11 +47,7 @@ impl WrapMap {
         let line = line.min(self.buffer_line_count().saturating_sub(1));
         let line_item = self.wrapper.line(line);
 
-        let col = if let Some(line_item) = line_item {
-            col.min(line_item.len())
-        } else {
-            0
-        };
+        let col = if let Some(line_item) = line_item { col.min(line_item.len()) } else { 0 };
 
         // Calculate offset in rope
         let line_start_offset = self.wrapper.text().line_start_offset(line);
@@ -125,6 +119,15 @@ impl WrapMap {
         self.wrapper.set_font(font, font_size, cx);
     }
 
+    pub(super) fn set_conceal(
+        &mut self,
+        conceal: Vec<Range<usize>>,
+        fonts: Vec<(Range<usize>, super::text_wrapper::FontOverride)>,
+        cx: &mut App,
+    ) {
+        self.wrapper.set_conceal(conceal, fonts, cx);
+    }
+
     /// Ensure text is prepared (initializes wrapper if needed)
     pub(super) fn ensure_text_prepared(&mut self, text: &Rope, cx: &mut App) -> bool {
         self.wrapper.prepare_if_need(text, cx)
@@ -155,8 +158,6 @@ impl WrapMap {
     /// Calculate how many wrap rows of a buffer line are visible (not folded)
     pub(super) fn visible_wrap_row_count_for_line(&self, line: usize, fold_map: &FoldMap) -> usize {
         let wrap_range = self.buffer_line_to_wrap_row_range(line);
-        wrap_range
-            .filter(|&wr| fold_map.wrap_row_to_display_row(wr).is_some())
-            .count()
+        wrap_range.filter(|&wr| fold_map.wrap_row_to_display_row(wr).is_some()).count()
     }
 }

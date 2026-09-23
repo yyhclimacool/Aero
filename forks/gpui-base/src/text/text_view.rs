@@ -83,7 +83,7 @@ pub enum LinkUnderline {
     None,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LinkStyle {
     pub color: Option<gpui::Hsla>,
     pub underline: LinkUnderline,

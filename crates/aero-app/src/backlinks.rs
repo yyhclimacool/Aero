@@ -195,20 +195,21 @@ fn rich_snippet(ix: usize, source: &str, cx: &App) -> AnyElement {
         .with_border(theme.border)
         .with_paragraph_gap(rems(0.))
         .with_dark(theme.mode.is_dark());
+    let markdown = aero_core::links::to_markdown(source);
+    let id = SharedString::from(format!("backlink-md-{ix}"));
+    // `==高亮==` 与 `{.red}` 这类标记普通 Markdown 渲染不认识，会原样露出来；与编辑器预览一样先转成富文本
+    let view = match aero_core::highlight::preview(&markdown, 0..markdown.len()) {
+        Some(aero_core::highlight::Preview::Html(lines)) => {
+            TextView::html(id, crate::colors::paint_html(&lines.join("<br>"), theme.mode.is_dark()))
+        }
+        _ => TextView::markdown(id, markdown),
+    };
     div()
         .debug_selector(move || format!("backlink-rich-{ix}"))
         .w_full()
         .text_sm()
         .line_height(relative(1.4))
-        .child(
-            TextView::markdown(
-                SharedString::from(format!("backlink-md-{ix}")),
-                aero_core::links::to_markdown(source),
-            )
-            .style(style)
-            .selectable(false)
-            .on_link_click(|_, _, _, cx| cx.stop_propagation()),
-        )
+        .child(view.style(style).selectable(false).on_link_click(|_, _, _, cx| cx.stop_propagation()))
         .into_any_element()
 }
 

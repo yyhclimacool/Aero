@@ -17,6 +17,8 @@ pub struct ListCtx {
     /// 有序列表的起始编号
     pub ordered: Option<u32>,
     pub task: bool,
+    /// 任务项是否已勾选；不是任务项时为 `None`
+    pub checked: Option<bool>,
     /// 嵌套列表：所属的外层列表项
     pub parent: Option<Box<ListCtx>>,
 }
@@ -83,12 +85,16 @@ fn walk(doc: &Document, blocks: &[Block], list: Option<&ListCtx>, out: &mut Vec<
                 let items: Vec<&Block> =
                     b.children.iter().filter(|c| matches!(c.kind, BlockKind::ListItem { .. })).collect();
                 for (i, item) in items.iter().enumerate() {
-                    let task = matches!(item.kind, BlockKind::ListItem { task: Some(_) });
+                    let checked = match item.kind {
+                        BlockKind::ListItem { task } => task,
+                        _ => None,
+                    };
                     let ctx = ListCtx {
                         item_range: doc.range_of(item),
                         item_index: i,
                         ordered: ordered.then_some(*start),
-                        task,
+                        task: checked.is_some(),
+                        checked,
                         parent: list.cloned().map(Box::new),
                     };
                     let content: Vec<&Block> =

@@ -453,6 +453,25 @@ fn squash_blank_lines(text: &str, trailing_newline: bool) -> String {
     out
 }
 
+/// 段首刚打完的列表标记。光标还没走出这段标记时不认。标题和引用的标记留在单位源码里，不在这里。
+pub fn typed_prefix_len(text: &str, cursor: usize) -> Option<usize> {
+    if text.starts_with("- [ ] ") || text.starts_with("- [x] ") || text.starts_with("- [X] ") {
+        return (cursor >= 6).then_some(6);
+    }
+    if matches!(text.as_bytes().first(), Some(b'-' | b'*' | b'+')) && text.as_bytes().get(1) == Some(&b' ') {
+        return (cursor >= 2).then_some(2);
+    }
+    let digits = text.bytes().take_while(|byte| byte.is_ascii_digit()).count();
+    if (1..=9).contains(&digits) {
+        let rest = &text[digits..];
+        if rest.starts_with(". ") || rest.starts_with(") ") {
+            let len = digits + 2;
+            return (cursor >= len).then_some(len);
+        }
+    }
+    None
+}
+
 /// `/` 菜单与 `⌘⌥0–8` 能切换到的块类型（`ui_design.md` 7.1 的最小集合）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockType {
@@ -597,6 +616,29 @@ fn strip_fence(src: &str) -> &str {
         _ if body.trim().starts_with("```") || body.trim().starts_with("~~~") => "",
         _ => body,
     }
+}
+
+/// 任务项源码（`item_src` 从行首缩进开始，位于文档 `base`）里复选框的勾：`[ ]` ↔ `[x]`。
+pub fn toggle_task(item_src: &str, base: usize) -> Option<Edit> {
+    let indent = item_src.len() - item_src.trim_start_matches([' ', '\t']).len();
+    let s = &item_src[indent..];
+    let marker = if s.starts_with(['-', '*', '+']) {
+        1
+    } else {
+        let digits = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 || !matches!(s.as_bytes().get(digits), Some(b'.' | b')')) {
+            return None;
+        }
+        digits + 1
+    };
+    let spaces = s[marker..].len() - s[marker..].trim_start_matches(' ').len();
+    let box_at = indent + marker + spaces;
+    let mark = match item_src.get(box_at..box_at + 3)? {
+        "[ ]" => "x",
+        "[x]" | "[X]" => " ",
+        _ => return None,
+    };
+    Some(Edit::replace(base + box_at + 1..base + box_at + 2, mark))
 }
 
 /// `- `、`3) `、`- [x] `（可带缩进）是否只是列表标记。

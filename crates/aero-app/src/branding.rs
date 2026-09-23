@@ -8,6 +8,9 @@ use gpui_kit::{AssetSource, Result, SharedString};
 pub const ICON_PATH: &str = "branding/aero-icon.png";
 const ICON_PNG: &[u8] = include_bytes!("../../../assets/branding/aero-icon-v1.png");
 
+// 默认图标包之外、callout 等处用到的图标。没列进来的图标会画成空白。
+gpui_kit::assets::icon_assets!(ExtraIcons, [Lightbulb, CircleAlert, CircleQuestionMark, List, Quote]);
+
 /// 扩展 GPUI Kit 的资源源，保留组件库所需的全部默认图标。
 pub struct AppAssets;
 
@@ -16,11 +19,15 @@ impl AssetSource for AppAssets {
         if path == ICON_PATH {
             return Ok(Some(Cow::Borrowed(ICON_PNG)));
         }
+        if let Some(icon) = ExtraIcons.load(path)? {
+            return Ok(Some(icon));
+        }
         Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut assets = Assets.list(path)?;
+        assets.extend(ExtraIcons.list(path)?);
         if ICON_PATH.starts_with(path) {
             assets.push(ICON_PATH.into());
         }

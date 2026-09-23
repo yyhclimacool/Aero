@@ -73,6 +73,7 @@ fn main() {
 
     gpui_kit::application().with_assets(branding::AppAssets).run(move |cx| {
         gpui_kit::init(cx);
+        colors::apply_text_selection(cx);
         actions::init(cx);
         branding::set_application_icon();
 
