@@ -139,7 +139,6 @@ def cmd_diff(args):
         shot = Shot.__new__(Shot)
         shot.scale, shot.ox, shot.oy, shot.im = a.scale, a.ox, a.oy, out
         shot.save(rest[2])
-        print(f"差异图：{rest[2]}")
 
 
 def cmd_shift(args):

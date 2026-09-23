@@ -1,7 +1,7 @@
-//! 左侧文件树：笔记与目录、拖放移动、行内重命名。
+//! 左侧文件视图（资源管理器）：收藏、vault 名与路径、笔记与目录树；拖放移动、行内重命名。
 //!
 //! 只显示文件夹与 `.md`（扩展名隐藏）；`*.assets/` 与其他文件由 `Vault::notes()` 过滤掉。
-//! 文件夹按名称排序，`daily/` 例外按日期倒序。行高固定，用 VirtualList 承载大 vault。
+//! 文件夹按名称排序，`daily/` 例外按日期倒序。收藏、vault 标题与树行在同一个 VirtualList 里一起滚动。
 
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
@@ -15,12 +15,20 @@ use gpui_kit::component::{ActiveTheme as _, Icon, VirtualListScrollHandle, h_fle
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::actions::{CopyNotePath, RevealInFinder, TrashNote};
+use crate::actions::{CopyNotePath, OpenInNewTab, RevealInFinder, ToggleFavoriteNote, TrashNote};
 
 pub const ROW_HEIGHT: f32 = 28.;
+/// vault 标题行：名字一行、路径一行
+const VAULT_ROW_HEIGHT: f32 = 44.;
+/// 每深一层缩进的宽度
+const INDENT: f32 = 14.;
 
 pub enum FileTreeEvent {
     Open(VaultPath),
+    /// ⌘ 点击 / 中键 / 右键「在新标签页打开」
+    OpenInNewTab(VaultPath),
+    /// 行上的 ☆ 或右键「收藏」
+    ToggleFavorite(VaultPath),
     Move {
         from: VaultPath,
         to: VaultPath,
@@ -148,6 +156,21 @@ impl Folder {
 
 #[derive(Clone, Debug)]
 enum Row {
+    /// 「收藏」分区标题，可折叠
+    FavoritesHeader {
+        expanded: bool,
+    },
+    Favorite {
+        path: VaultPath,
+    },
+    /// 还没有收藏时的提示
+    FavoritesEmpty,
+    /// vault 名与路径，可折叠；也是「移到 vault 根目录」的落点
+    VaultHeader {
+        expanded: bool,
+    },
+    /// vault 里一篇笔记、一个文件夹都没有
+    VaultEmpty,
     Folder {
         path: String,
         name: String,
@@ -178,6 +201,12 @@ pub struct FileTree {
     row_sizes: Rc<Vec<Size<Pixels>>>,
     selected: Option<VaultPath>,
     selected_folder: Option<VaultPath>,
+    /// 收藏的笔记（工作区持有并持久化，这里只显示）
+    favorites: Vec<VaultPath>,
+    /// 在某个标签页里打开着的笔记
+    opened: HashSet<VaultPath>,
+    favorites_collapsed: bool,
+    vault_collapsed: bool,
     rename_input: Option<RenameInput>,
     scroll: VirtualListScrollHandle,
     /// 点击行后树持有焦点，`⌘⌫` 等树内快捷键（上下文 `FileTree`）才有处可去
@@ -197,6 +226,10 @@ impl FileTree {
             row_sizes: Rc::new(Vec::new()),
             selected: None,
             selected_folder: None,
+            favorites: Vec::new(),
+            opened: HashSet::new(),
+            favorites_collapsed: false,
+            vault_collapsed: false,
             rename_input: None,
             scroll: VirtualListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
@@ -291,8 +324,51 @@ impl FileTree {
         cx.notify();
     }
 
+    /// 工作区送来的收藏列表与打开中的笔记（标签页）。
+    pub fn set_favorites(&mut self, favorites: Vec<VaultPath>, cx: &mut Context<Self>) {
+        if self.favorites != favorites {
+            self.favorites = favorites;
+            self.rebuild_rows();
+            cx.notify();
+        }
+    }
+
+    pub fn set_opened(&mut self, opened: HashSet<VaultPath>, cx: &mut Context<Self>) {
+        if self.opened != opened {
+            self.opened = opened;
+            cx.notify();
+        }
+    }
+
+    /// 收起所有文件夹（收藏与 vault 分区保持原样）。
+    pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.expanded.clear();
+        self.rebuild_rows();
+        cx.notify();
+    }
+
+    /// 面包屑点文件夹：展开到它、选中并滚到它那一行。
+    pub fn reveal_folder(&mut self, dir: &str, cx: &mut Context<Self>) {
+        self.vault_collapsed = false;
+        let mut prefix = String::new();
+        for seg in dir.split('/').filter(|s| !s.is_empty()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(seg);
+            self.expanded.insert(prefix.clone());
+        }
+        self.selected = None;
+        self.selected_folder = VaultPath::new(dir).ok();
+        self.rebuild_rows();
+        if let Some(ix) = self.rows.iter().position(|r| matches!(r, Row::Folder { path, .. } if path == dir))
+        {
+            self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
     /// 树里是否有这篇笔记（上次 `rescan` 时磁盘上的、且没被忽略规则过滤掉）。
-    #[cfg(test)]
     pub fn contains(&self, path: &VaultPath) -> bool {
         let mut cur = &self.root;
         for seg in path.parent().split('/').filter(|s| !s.is_empty()) {
@@ -328,6 +404,7 @@ impl FileTree {
         self.selected_folder = None;
         // 展开到该笔记
         if let Some(p) = &path {
+            self.vault_collapsed = false;
             let mut prefix = String::new();
             for seg in p.parent().split('/').filter(|s| !s.is_empty()) {
                 if !prefix.is_empty() {
@@ -377,10 +454,41 @@ impl FileTree {
                 }
             }
         }
-        let mut rows = Vec::new();
-        walk(&self.root, 0, &self.expanded, &self.attachments, &mut rows);
-        self.row_sizes = Rc::new(vec![size(px(200.), px(ROW_HEIGHT)); rows.len()]);
+        let mut rows = vec![Row::FavoritesHeader { expanded: !self.favorites_collapsed }];
+        if !self.favorites_collapsed {
+            if self.favorites.is_empty() {
+                rows.push(Row::FavoritesEmpty);
+            }
+            rows.extend(self.favorites.iter().map(|path| Row::Favorite { path: path.clone() }));
+        }
+        rows.push(Row::VaultHeader { expanded: !self.vault_collapsed });
+        if !self.vault_collapsed {
+            let before = rows.len();
+            walk(&self.root, 0, &self.expanded, &self.attachments, &mut rows);
+            if rows.len() == before {
+                rows.push(Row::VaultEmpty);
+            }
+        }
+        self.row_sizes = Rc::new(
+            rows.iter()
+                .map(|row| {
+                    let height =
+                        if matches!(row, Row::VaultHeader { .. }) { VAULT_ROW_HEIGHT } else { ROW_HEIGHT };
+                    size(px(200.), px(height))
+                })
+                .collect(),
+        );
         self.rows = rows;
+    }
+
+    fn toggle_section(&mut self, favorites: bool, cx: &mut Context<Self>) {
+        if favorites {
+            self.favorites_collapsed = !self.favorites_collapsed;
+        } else {
+            self.vault_collapsed = !self.vault_collapsed;
+        }
+        self.rebuild_rows();
+        cx.notify();
     }
 
     fn toggle_folder(&mut self, path: &str, cx: &mut Context<Self>) {
@@ -393,11 +501,11 @@ impl FileTree {
         cx.notify();
     }
 
-    fn open(&mut self, path: VaultPath, window: &mut Window, cx: &mut Context<Self>) {
+    fn open(&mut self, path: VaultPath, new_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = Some(path.clone());
         self.selected_folder = None;
         self.focus_handle.focus(window, cx);
-        cx.emit(FileTreeEvent::Open(path));
+        cx.emit(if new_tab { FileTreeEvent::OpenInNewTab(path) } else { FileTreeEvent::Open(path) });
         cx.notify();
     }
 
@@ -496,28 +604,189 @@ impl FileTree {
         let hover = theme.list_hover;
         let active = theme.list_active;
         let warning = theme.warning;
-        let indent = |depth: usize| px(8. + depth as f32 * 14.);
+        // 树行比 vault 标题深一层
+        let indent = |depth: usize| px(8. + (depth + 1) as f32 * INDENT);
         let row_path = match &self.rows[ix] {
-            Row::Folder { path, .. } => path.as_str(),
+            Row::Folder { path, .. } => Some(path.as_str()),
             // 附件不参与行内重命名（改名要连着引用一起改，见 11 节）
-            Row::Note { path, .. } | Row::Attachment { path, .. } => path.as_str(),
+            Row::Note { path, .. } | Row::Attachment { path, .. } => Some(path.as_str()),
+            _ => None,
         };
-        if let Some(edit) = self.rename_input.as_ref().filter(|edit| edit.path.as_str() == row_path) {
+        if let Some(edit) = self.rename_input.as_ref().filter(|edit| Some(edit.path.as_str()) == row_path) {
             return div()
                 .id("file-tree-rename-input")
                 .debug_selector(|| "file-tree-rename-input".into())
+                .w_full()
                 .h(px(ROW_HEIGHT))
                 .child(gpui_kit::component::input::Input::new(&edit.input))
                 .into_any_element();
         }
+        let chevron = |expanded: bool| {
+            Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                .size(px(14.))
+                .text_color(muted)
+        };
 
         match self.rows[ix].clone() {
+            Row::FavoritesHeader { expanded } => h_flex()
+                .id("favorites-header")
+                .debug_selector(|| "file-tree-favorites".into())
+                .w_full()
+                .h(px(ROW_HEIGHT))
+                .pl(px(8.))
+                .pr_2()
+                .gap_1()
+                .items_center()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(muted)
+                .child(chevron(expanded))
+                .child(Icon::new(IconName::Star).size(px(13.)).text_color(muted))
+                .child(div().flex_1().child("收藏"))
+                .when(!self.favorites.is_empty(), |el| el.child(self.favorites.len().to_string()))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_section(true, cx)))
+                .into_any_element(),
+            Row::FavoritesEmpty => div()
+                .w_full()
+                .h(px(ROW_HEIGHT))
+                .pl(indent(0))
+                .pr_2()
+                .flex()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .truncate()
+                .child("还没有收藏。在笔记上点 ☆ 收藏")
+                .into_any_element(),
+            Row::Favorite { path } => {
+                let exists = self.contains(&path);
+                let selected = self.selected.as_ref() == Some(&path);
+                let (open_path, star_path) = (path.clone(), path.clone());
+                let dir = path.parent().to_owned();
+                h_flex()
+                    .id(("favorite", ix))
+                    .debug_selector({
+                        let rel = path.as_str().to_owned();
+                        move || format!("file-tree-favorite:{rel}")
+                    })
+                    .group("tree-row")
+                    .w_full()
+                    .h(px(ROW_HEIGHT))
+                    .pl(indent(0))
+                    .pr_2()
+                    .gap_1()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(selected, |s| s.bg(active))
+                    .when(!selected, |s| s.hover(move |s| s.bg(hover)))
+                    .text_sm()
+                    .child(Icon::new(IconName::StarFill).size(px(13.)).text_color(warning))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .when(!exists, |s| s.text_color(muted).line_through())
+                            .child(path.stem().to_owned()),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(muted).child(dir))
+                    .child(self.star_button(ix, &star_path, true, cx))
+                    .when(!exists, |el| {
+                        el.tooltip(|window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new("这篇笔记已经不在了").build(window, cx)
+                        })
+                    })
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        let new_tab = event.modifiers().platform || event.is_middle_click();
+                        this.open(open_path.clone(), new_tab, window, cx)
+                    }))
+                    .context_menu({
+                        let rel = path.as_str().to_owned();
+                        move |menu, _, _| {
+                            menu.menu("在新标签页打开", Box::new(OpenInNewTab(rel.clone())))
+                                .menu("取消收藏", Box::new(ToggleFavoriteNote(rel.clone())))
+                        }
+                    })
+                    .into_any_element()
+            }
+            Row::VaultHeader { expanded } => {
+                let name = self
+                    .vault
+                    .root()
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let location = crate::paths::display_path(self.vault.root());
+                v_flex()
+                    .id("file-tree-root")
+                    .debug_selector(|| "file-tree-root".into())
+                    .w_full()
+                    .h(px(VAULT_ROW_HEIGHT))
+                    .pl(px(8.))
+                    .pr_2()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(chevron(expanded))
+                            .child(div().flex_1().min_w_0().truncate().child(name)),
+                    )
+                    .child(div().pl(px(18.)).text_xs().text_color(muted).truncate().child(location))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_section(false, cx)))
+                    .can_drop({
+                        let vault = self.vault.id().to_owned();
+                        move |value, _, _| {
+                            value.downcast_ref::<gpui_kit::ExternalPaths>().is_some()
+                                || value
+                                    .downcast_ref::<TreeDrag>()
+                                    .is_some_and(|d| d.target(&vault, "").is_some())
+                        }
+                    })
+                    .drag_over::<TreeDrag>({
+                        let vault = self.vault.id().to_owned();
+                        move |style, drag, _, _| {
+                            if drag.target(&vault, "").is_some() { style.bg(active) } else { style }
+                        }
+                    })
+                    .on_drop(cx.listener(|this, drag: &TreeDrag, _, cx| {
+                        if let Some(to) = drag.target(this.vault.id(), "") {
+                            cx.emit(FileTreeEvent::Move { from: drag.path.clone(), to });
+                        }
+                    }))
+                    .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                        this.import_external(paths.paths(), "", None);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+            Row::VaultEmpty => div()
+                .w_full()
+                .h(px(ROW_HEIGHT))
+                .pl(indent(0))
+                .pr_2()
+                .flex()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .truncate()
+                .child("这个 vault 还没有笔记。按 ⌘N 新建一篇。")
+                .into_any_element(),
             Row::Folder { path, name, depth, expanded } => h_flex()
                 .id(("folder", ix))
                 .debug_selector({
                     let path = path.clone();
                     move || format!("file-tree-folder:{path}")
                 })
+                .w_full()
                 .h(px(ROW_HEIGHT))
                 .pl(indent(depth))
                 .pr_2()
@@ -525,14 +794,15 @@ impl FileTree {
                 .items_center()
                 .rounded_md()
                 .cursor_pointer()
+                .when(self.selected_folder.as_ref().is_some_and(|f| f.as_str() == path), |s| s.bg(active))
                 .hover(move |s| s.bg(hover))
                 .text_sm()
+                .child(chevron(expanded))
                 .child(
-                    Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                    Icon::new(if expanded { IconName::FolderOpen } else { IconName::Folder })
                         .size(px(14.))
                         .text_color(muted),
                 )
-                .child(Icon::new(IconName::Folder).size(px(14.)).text_color(muted))
                 .child(div().flex_1().truncate().child(name))
                 .on_drag(
                     TreeDrag {
@@ -588,6 +858,8 @@ impl FileTree {
                 .into_any_element(),
             Row::Note { path, depth } => {
                 let selected = self.selected.as_ref() == Some(&path);
+                let opened = self.opened.contains(&path);
+                let favorite = self.favorites.contains(&path);
                 let rel = path.as_str().to_owned();
                 h_flex()
                     .id(("note", ix))
@@ -595,8 +867,10 @@ impl FileTree {
                         let rel = rel.clone();
                         move || format!("file-tree-note:{rel}")
                     })
+                    .group("tree-row")
+                    .w_full()
                     .h(px(ROW_HEIGHT))
-                    .pl(indent(depth) + px(18.))
+                    .pl(indent(depth))
                     .pr_2()
                     .gap_1()
                     .items_center()
@@ -605,8 +879,26 @@ impl FileTree {
                     .when(selected, |s| s.bg(active))
                     .when(!selected, |s| s.hover(move |s| s.bg(hover)))
                     .text_sm()
-                    .child(Icon::new(IconName::FileText).size(px(14.)).text_color(muted))
+                    // 与文件夹的箭头同宽的一格：打开在某个标签页里的笔记画一个点（4.1 的 ●）
+                    .child(div().w(px(14.)).flex_none().flex().justify_center().when(opened, |el| {
+                        el.child(
+                            div()
+                                .debug_selector({
+                                    let rel = rel.clone();
+                                    move || format!("file-tree-opened:{rel}")
+                                })
+                                .size(px(5.))
+                                .rounded_full()
+                                .bg(if selected { theme.foreground } else { muted }),
+                        )
+                    }))
+                    .child(Icon::new(IconName::FileText).size(px(14.)).text_color(if opened {
+                        theme.foreground
+                    } else {
+                        muted
+                    }))
                     .child(div().flex_1().truncate().child(path.stem().to_owned()))
+                    .child(self.star_button(ix, &path, favorite, cx))
                     // 📎 与附件数：点它展开 / 收起附件，不打开笔记（4.1）
                     .when_some(self.attachments.get(&path).map(Vec::len).filter(|n| *n > 0), |el, count| {
                         let note = path.clone();
@@ -643,10 +935,19 @@ impl FileTree {
                             cx.notify();
                         }
                     }))
-                    .on_click(cx.listener(move |this, _, window, cx| this.open(path.clone(), window, cx)))
-                    // 右键菜单（4.1 的 M1a 子集；重命名走标题，新建走 ⌘N）
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        let new_tab = event.modifiers().platform || event.is_middle_click();
+                        this.open(path.clone(), new_tab, window, cx)
+                    }))
+                    // 右键菜单（4.1 的子集；新建走 ⌘N）
                     .context_menu(move |menu, _, _| {
-                        menu.menu("重命名", Box::new(RenameEntry(rel.clone())))
+                        menu.menu("在新标签页打开", Box::new(OpenInNewTab(rel.clone())))
+                            .menu(
+                                if favorite { "取消收藏" } else { "收藏" },
+                                Box::new(ToggleFavoriteNote(rel.clone())),
+                            )
+                            .separator()
+                            .menu("重命名", Box::new(RenameEntry(rel.clone())))
                             .menu("移到废纸篓", Box::new(TrashNote(rel.clone())))
                             .separator()
                             .menu("在 Finder 中显示", Box::new(RevealInFinder(rel.clone())))
@@ -664,8 +965,9 @@ impl FileTree {
                         let rel = path.as_str().to_owned();
                         move || format!("file-tree-attachment:{rel}")
                     })
+                    .w_full()
                     .h(px(ROW_HEIGHT))
-                    .pl(indent(depth) + px(32.))
+                    .pl(indent(depth) + px(18.))
                     .pr_2()
                     .gap_1()
                     .items_center()
@@ -705,6 +1007,43 @@ impl FileTree {
     }
 }
 
+impl FileTree {
+    /// 行尾的 ☆：悬停这一行才出现，点它收藏 / 取消收藏，不打开笔记。
+    fn star_button(&self, ix: usize, path: &VaultPath, favorite: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (pressed, color) =
+            (theme.list_active, if favorite { theme.warning } else { theme.muted_foreground });
+        let path = path.clone();
+        div()
+            .id(("star", ix))
+            .debug_selector({
+                let rel = path.as_str().to_owned();
+                move || format!("file-tree-star:{rel}")
+            })
+            .flex_none()
+            .p(px(2.))
+            .rounded_sm()
+            .invisible()
+            .group_hover("tree-row", |s| s.visible())
+            .hover(move |s| s.bg(pressed))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.emit(FileTreeEvent::ToggleFavorite(path.clone()));
+            }))
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(if favorite { "取消收藏" } else { "收藏" })
+                    .build(window, cx)
+            })
+            .child(
+                Icon::new(if favorite { IconName::StarFill } else { IconName::Star })
+                    .size(px(13.))
+                    .text_color(color),
+            )
+            .into_any_element()
+    }
+}
+
 /// `notes/a.assets/x.png` → `notes/a.md`；不在某篇笔记附件目录里的附件返回 `None`。
 fn owner_note(path: &VaultPath) -> Option<VaultPath> {
     let at = path.as_str().find(".assets/")?;
@@ -713,7 +1052,6 @@ fn owner_note(path: &VaultPath) -> Option<VaultPath> {
 
 impl Render for FileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
         let list = v_flex()
             .id("file-tree-rows")
             .relative()
@@ -759,49 +1097,6 @@ impl Render for FileTree {
             .when_some(self.error.clone(), |this, err| {
                 this.child(div().p_3().text_xs().text_color(cx.theme().danger).child(err))
             })
-            .when(self.rows.is_empty() && self.error.is_none(), |this| {
-                this.child(
-                    div().p_3().text_sm().text_color(muted).child("这个 vault 还没有笔记。按 ⌘N 新建一篇。"),
-                )
-            })
-            .child(
-                div()
-                    .id("file-tree-root")
-                    .debug_selector(|| "file-tree-root".into())
-                    .px_3()
-                    .py_1()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("Vault 根目录")
-                    .can_drop({
-                        let vault = self.vault.id().to_owned();
-                        move |value, _, _| {
-                            value.downcast_ref::<gpui_kit::ExternalPaths>().is_some()
-                                || value
-                                    .downcast_ref::<TreeDrag>()
-                                    .is_some_and(|d| d.target(&vault, "").is_some())
-                        }
-                    })
-                    .drag_over::<TreeDrag>({
-                        let vault = self.vault.id().to_owned();
-                        move |style, drag, _, cx| {
-                            if drag.target(&vault, "").is_some() {
-                                style.bg(cx.theme().list_active)
-                            } else {
-                                style
-                            }
-                        }
-                    })
-                    .on_drop(cx.listener(|this, drag: &TreeDrag, _, cx| {
-                        if let Some(to) = drag.target(this.vault.id(), "") {
-                            cx.emit(FileTreeEvent::Move { from: drag.path.clone(), to });
-                        }
-                    }))
-                    .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
-                        this.import_external(paths.paths(), "", None);
-                        cx.notify();
-                    })),
-            )
             .child(list)
     }
 }
@@ -924,8 +1219,10 @@ mod tests {
                 super::FileTreeEvent::Move { from, to } => {
                     moves.borrow_mut().push((from.to_string(), to.to_string()))
                 }
-                super::FileTreeEvent::Open(_) => *opened.borrow_mut() += 1,
-                super::FileTreeEvent::Touched(_) => {}
+                super::FileTreeEvent::Open(_) | super::FileTreeEvent::OpenInNewTab(_) => {
+                    *opened.borrow_mut() += 1
+                }
+                super::FileTreeEvent::Touched(_) | super::FileTreeEvent::ToggleFavorite(_) => {}
             })
             .detach();
         });
@@ -993,6 +1290,58 @@ mod tests {
         cx.simulate_keystrokes("enter");
         draw(cx);
         assert_eq!(moves.borrow().last(), Some(&("empty".into(), "renamed-folder".into())));
+    }
+
+    /// 资源管理器（4.1）：收藏分区、打开中的笔记带点、⌘ 点击发「新标签页打开」、行尾 ☆ 只切换收藏。
+    #[gpui_kit::test]
+    fn favorites_opened_markers_and_star_buttons(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, collections::HashSet, rc::Rc};
+        let (_dir, _vault, tree) = setup(cx);
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let events = Rc::new(RefCell::new(Vec::<String>::new()));
+        cx.update(|_, cx| {
+            let sink = events.clone();
+            cx.subscribe(&tree, move |_, event, _| {
+                sink.borrow_mut().push(match event {
+                    super::FileTreeEvent::Open(p) => format!("open:{p}"),
+                    super::FileTreeEvent::OpenInNewTab(p) => format!("new-tab:{p}"),
+                    super::FileTreeEvent::ToggleFavorite(p) => format!("star:{p}"),
+                    _ => "other".into(),
+                })
+            })
+            .detach();
+        });
+        draw(cx);
+        assert!(cx.update(|_, cx| tree.read(cx).rows.iter().any(|r| matches!(r, Row::FavoritesEmpty))));
+        let a = aero_core::VaultPath::new("source/a.md").unwrap();
+        let root = aero_core::VaultPath::new("root.md").unwrap();
+        cx.update(|_, cx| {
+            tree.update(cx, |t, cx| {
+                t.set_favorites(vec![a.clone()], cx);
+                t.set_opened(HashSet::from([root.clone()]), cx);
+            })
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("file-tree-opened:root.md").is_some(), "打开中的笔记带点");
+        assert!(cx.debug_bounds("file-tree-opened:source/a.md").is_none());
+
+        click(cx, "file-tree-favorite:source/a.md");
+        let row = cx.debug_bounds("file-tree-note:root.md").unwrap().center();
+        cx.simulate_click(row, Modifiers::command());
+        draw(cx);
+        assert_eq!(&*events.borrow(), &["open:source/a.md", "new-tab:root.md"]);
+
+        // ☆ 在悬停的行上出现；点它不打开笔记
+        cx.simulate_mouse_move(row, None, Modifiers::default());
+        draw(cx);
+        click(cx, "file-tree-star:root.md");
+        assert_eq!(events.borrow().last().map(String::as_str), Some("star:root.md"));
+        assert_eq!(events.borrow().len(), 3);
+
+        click(cx, "file-tree-favorites");
+        assert!(cx.debug_bounds("file-tree-favorite:source/a.md").is_none(), "收藏分区可以收起");
+        click(cx, "file-tree-root");
+        assert!(cx.debug_bounds("file-tree-note:root.md").is_none(), "vault 分区可以收起");
     }
 
     #[test]

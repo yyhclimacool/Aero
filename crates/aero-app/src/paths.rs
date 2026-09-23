@@ -55,9 +55,25 @@ pub struct PersistedState {
     pub recent_vaults: Vec<PathBuf>,
     pub sidebar_visible: Option<bool>,
     pub panel_visible: Option<bool>,
+    /// 左侧栏 / 右侧面板拖出来的宽度（px）
+    pub sidebar_width: Option<f32>,
+    pub panel_width: Option<f32>,
     pub link_preview: LinkPreviewMode,
     /// 聚焦块显示源码（9.1）。默认关闭：聚焦时隐藏标记。
     pub focus_shows_source: bool,
+    /// 按 vault_id 记住的界面状态（`ui_design.md` 2.1：不写入 vault）
+    pub vaults: std::collections::BTreeMap<String, VaultUi>,
+}
+
+/// 一个 vault 的标签页与收藏。路径都是 vault 内的相对路径。
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VaultUi {
+    /// 打开的标签页，从左到右；空串是空白的「新标签页」
+    pub tabs: Vec<String>,
+    pub active_tab: usize,
+    /// 收藏的笔记，按收藏的先后
+    pub favorites: Vec<String>,
 }
 
 impl PersistedState {

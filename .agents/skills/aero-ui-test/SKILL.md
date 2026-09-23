@@ -24,9 +24,9 @@ description: >-
 ## 快速开始
 
 ```sh
-S=.cursor/skills/aero-ui-test/scripts/aero-ui
+S=.agents/skills/aero-ui-test/scripts/aero-ui
 $S start                      # 构建，用样例库启动，窗口停在屏幕右缘外，等到能接收事件
-$S shot full && $S grid full  # 截整窗，另存一张叠了坐标网格的，用 Read 看 full.grid.png 读坐标
+$S shot full && $S grid full  # 截整窗，另存一张叠了坐标网格的；用 Read 看它打印出来的路径读坐标
 $S probe para 450 272         # 点一段文字：点击前后、Esc 退出后各比一次
 $S stop                       # 用完一定要停
 ```
@@ -41,7 +41,13 @@ $S stop                       # 用完一定要停
 相同
 ```
 
-有差异时会列出区域（窗口点），差异图在 `/tmp/aero-ui/shots/<名字>.diff.png`。
+有差异时会列出区域（窗口点），并打印差异图的路径。
+
+## 看图：用打印出来的路径
+
+`shot`、`grid`、`crop`、`stack`、`diff`、`probe` 打印的图片路径每次都不一样（`shots/view/<名字>~<序号>.png`）。
+Read 按路径缓存图片：同名截图重拍后直接读 `shots/<名字>.png` 会拿到旧图；刚写出的文件偶尔也要隔一两秒才读得到（报 File not found 就再读一次）。
+命令之间引用图片仍用短名（`diff para.0 para.1`、`crop full cell …`），短名指向 `shots/<名字>.png` 里最新的那张。
 
 ## 坐标：最容易错的地方
 
@@ -69,6 +75,7 @@ $S stop                       # 用完一定要停
 - 所有东西在 `/tmp/aero-ui/`：`vault/`（样例库副本）、`data/`（`AERO_DATA_DIR`，应用状态与索引）、`shots/`、`app.log`。用户自己的 `~/Library/Application Support/Aero` 不受影响。
 - 每次 `start` 都重新复制样例库、清空 `data/`；想接着上次的状态用 `start <库目录> --keep-data`。
 - 样例库 `fixtures/vault/体验.md` 覆盖各类块（行内格式、标题、列表、任务、带长文字的表格、引用、callout、代码块），启动时打开它。别的场景另加笔记，不要改动已有内容，免得别人的坐标失效。
+- 临时要文件夹、更多笔记：`start` 之后直接写进 `/tmp/aero-ui/vault/`，文件监听一两百毫秒内刷新文件树；下次 `start` 会还原。
 
 ## 其他注意
 

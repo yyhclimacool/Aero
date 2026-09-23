@@ -27,8 +27,8 @@ const SNIPPET_CONTEXT: usize = 36;
 const SNIPPET_MAX: usize = 110;
 
 pub enum SearchViewEvent {
-    /// 定位到某篇笔记的第 `block_ord` 个可索引块
-    Open { path: VaultPath, block_ord: u32 },
+    /// 定位到某篇笔记的第 `block_ord` 个可索引块；`preview` 是 ↑↓ 预览（放进预览标签页），不是 ⏎ / 点击
+    Open { path: VaultPath, block_ord: u32, preview: bool },
     /// Esc：把焦点交还给编辑器
     Dismiss,
 }
@@ -219,8 +219,8 @@ impl SearchView {
             Some(p) => (p as isize + delta).rem_euclid(order.len() as isize) as usize,
         };
         self.selected = Some(order[next]);
-        // 预览定位（4.2：↑↓ 在编辑区预览，⏎ 才确认）——M1b 没有历史，两者行为相同
-        self.emit_open(order[next], cx);
+        // 预览定位（4.2：↑↓ 在编辑区预览，⏎ 才确认）
+        self.emit_open(order[next], true, cx);
         cx.notify();
     }
 
@@ -245,12 +245,12 @@ impl SearchView {
             },
         };
         self.selected = Some(ix);
-        self.emit_open(ix, cx);
+        self.emit_open(ix, false, cx);
     }
 
-    fn emit_open(&mut self, ix: usize, cx: &mut Context<Self>) {
+    fn emit_open(&mut self, ix: usize, preview: bool, cx: &mut Context<Self>) {
         if let Some(h) = self.hits.get(ix) {
-            cx.emit(SearchViewEvent::Open { path: h.path.clone(), block_ord: h.block_ord });
+            cx.emit(SearchViewEvent::Open { path: h.path.clone(), block_ord: h.block_ord, preview });
         }
     }
 
@@ -288,7 +288,7 @@ impl SearchView {
             .child(text)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected = Some(ix);
-                this.emit_open(ix, cx);
+                this.emit_open(ix, false, cx);
                 cx.notify();
             }))
             .into_any_element()
@@ -538,7 +538,7 @@ mod tests {
         cx.update(|_, cx| {
             cx.subscribe(&view, move |_, ev: &SearchViewEvent, _| {
                 sink.borrow_mut().push(match ev {
-                    SearchViewEvent::Open { path, block_ord } => {
+                    SearchViewEvent::Open { path, block_ord, .. } => {
                         format!("open {}#{block_ord}", path.as_str())
                     }
                     SearchViewEvent::Dismiss => "dismiss".into(),

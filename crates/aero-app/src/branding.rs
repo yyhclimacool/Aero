@@ -8,8 +8,24 @@ use gpui_kit::{AssetSource, Result, SharedString};
 pub const ICON_PATH: &str = "branding/aero-icon.png";
 const ICON_PNG: &[u8] = include_bytes!("../../../assets/branding/aero-icon-v1.png");
 
-// 默认图标包之外、callout 等处用到的图标。没列进来的图标会画成空白。
-gpui_kit::assets::icon_assets!(ExtraIcons, [Lightbulb, CircleAlert, CircleQuestionMark, List, Quote]);
+// 默认图标包之外用到的图标。没列进来的图标会画成空白（`tests::every_icon_in_the_source_is_bundled` 把关）。
+gpui_kit::assets::icon_assets!(
+    ExtraIcons,
+    [
+        Lightbulb,
+        CircleAlert,
+        CircleQuestionMark,
+        List,
+        Quote,
+        FilePlus,
+        FolderPlus,
+        Tag,
+        Link,
+        TableOfContents,
+        ChevronsDownUp,
+        LocateFixed,
+    ]
+);
 
 /// 扩展 GPUI Kit 的资源源，保留组件库所需的全部默认图标。
 pub struct AppAssets;
@@ -58,3 +74,35 @@ pub fn set_application_icon() {
 
 #[cfg(not(target_os = "macos"))]
 pub fn set_application_icon() {}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::AssetSource as _;
+    use gpui_kit::assets::IconName;
+
+    #[test]
+    fn every_icon_in_the_source_is_bundled() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![src];
+        let mut missing = Vec::new();
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path).unwrap().map(|entry| entry.unwrap().path()));
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (at, _) in text.match_indices("IconName::") {
+                let name: String = text[at + 10..].chars().take_while(char::is_ascii_alphanumeric).collect();
+                let Some(icon) = IconName::ALL.iter().find(|icon| format!("{icon:?}") == name) else {
+                    continue;
+                };
+                if super::AppAssets.load(&icon.path()).unwrap().is_none() {
+                    missing.push(format!("{name} ({})", path.display()));
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "图标没打进资源包，会画成空白：{missing:?}");
+    }
+}

@@ -63,7 +63,7 @@ fn init_logger() {
     log::set_max_level(level);
 }
 
-/// debug 构建里由脚本驱动界面、窗口停在屏幕外（`ui_channel`，`.cursor/skills/aero-ui-test/`）。
+/// debug 构建里由脚本驱动界面、窗口停在屏幕外（`ui_channel`，`.agents/skills/aero-ui-test/`）。
 fn ui_parked() -> bool {
     #[cfg(debug_assertions)]
     return ui_channel::parked();

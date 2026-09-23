@@ -38,10 +38,10 @@ cargo test -p aero-app -p aero-core -p aero-index
 
 ## 真实窗口核对
 
-用 `.cursor/skills/aero-ui-test`（样例库就是这次验收用的笔记）重跑：
+用 `.agents/skills/aero-ui-test`（样例库就是这次验收用的笔记）重跑：
 
 ```sh
-S=.cursor/skills/aero-ui-test/scripts/aero-ui
+S=.agents/skills/aero-ui-test/scripts/aero-ui
 $S start && $S shot full && $S grid full   # 从网格图读出各块坐标
 $S probe para 450 272                      # 每块一次：点击前后、退出后都应为「相同」
 $S stop

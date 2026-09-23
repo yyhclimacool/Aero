@@ -40,6 +40,17 @@ shot_path() {
   if [[ $1 == */* ]]; then print -r -- $1; else print -r -- $SHOTS/${1%.png}.png; fi
 }
 
+# 打印给人（和 agent 的 Read）看的路径：每次复制成一个没用过的文件名。
+# Read 按路径缓存图片，同名截图重拍后会读到旧图；短名（diff、crop 用）仍指向原文件。
+view() {
+  local seq=$(( $(cat $STATE/view-seq 2>/dev/null || print 0) + 1 ))
+  print $seq >$STATE/view-seq
+  mkdir -p $SHOTS/view
+  local copy=$SHOTS/view/${${1:t}%.png}~$seq.png
+  cp $1 $copy
+  print -r -- $copy
+}
+
 # 把一批命令行交给应用，等它回写 ack。批末尾补一个 wait，让事件引发的重绘、焦点回调都跑完。
 send() {
   alive || die "Aero 没在运行，先 aero-ui start"
@@ -139,7 +150,7 @@ cmd_shot() {
   mkdir -p ${out:h}
   screencapture -x -o -l $id $out || die "截图失败：需要在沙箱外运行，且终端有屏幕录制权限"
   py tag $out $w "${@:2}"
-  print -r -- $out
+  view $out
 }
 
 cmd_drag() {
@@ -173,6 +184,7 @@ cmd_probe() {
   cmd_shot $name.1 >/dev/null
   print "== 点击 ($x, $y) 前后"
   py diff $(shot_path $name.0) $(shot_path $name.1) $(shot_path $name.diff)
+  print "   差异图：$(view $(shot_path $name.diff))"
   focus=$(tail -n +$(( seen + 1 )) $STATE/app.log | grep -E '\] focus ' | tail -1 || true)
   print "   编辑器：${focus:-没有 focus 日志（这次点击没有进入编辑态）}"
   if [[ -z ${KEEP:-} ]]; then
@@ -236,21 +248,23 @@ case $cmd in
   grid)
     src=$(shot_path $1)
     py grid $src ${src%.png}.grid.png ${2:-50}
-    print -r -- ${src%.png}.grid.png ;;
+    view ${src%.png}.grid.png ;;
   crop)
     (( $# == 6 )) || die "用法：crop <图> <新名字> x y w h"
     py crop $(shot_path $1) $(shot_path $2) "${@:3}"
-    shot_path $2 ;;
+    view $(shot_path $2) ;;
   diff)
     (( $# >= 2 )) || die "用法：diff <图a> <图b> [--ignore x y w h]..."
     a=$(shot_path $1) b=$(shot_path $2)
-    py diff $a $b $SHOTS/${${a:t}%.png}-vs-${${b:t}%.png}.png "${@:3}" ;;
+    out=$SHOTS/${${a:t}%.png}-vs-${${b:t}%.png}.png
+    py diff $a $b $out "${@:3}"
+    [[ -f $out ]] && print "差异图：$(view $out)" ;;
   shift) py shift $(shot_path $1) $(shot_path $2) "${@:3}" ;;
   stack)
     out=$(shot_path $1)
     shift
     py stack $out ${(f)"$(for s in "$@"; do shot_path $s; done)"}
-    print -r -- $out ;;
+    view $out ;;
   color) py color $(shot_path $1) "${@:2}" ;;
   probe) cmd_probe "$@" ;;
   log)

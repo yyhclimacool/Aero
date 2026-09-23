@@ -2319,6 +2319,9 @@ impl Editor {
         log::info!("reload {} (changed on disk)", self.path.as_str());
         self.cancel_link_preview(cx);
         self.focused = None;
+        // 块 id 随新文档重排，旧的定位高亮会落到别的块上
+        self.highlight = None;
+        self.highlight_task = None;
         self.doc = doc;
         self.update_local_link_names();
         self.stamp = stamp;

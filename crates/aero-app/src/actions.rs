@@ -27,7 +27,7 @@ actions!(
         DeleteNote,
         /// ⌘⇧F：左侧栏切到搜索视图并聚焦输入框（`ui_design.md` 4.2）
         OpenSearch,
-        /// ⌘⇧E：左侧栏切回文件视图
+        /// ⌘⇧E：左侧栏切回文件视图，并在树里定位当前笔记
         OpenFiles,
         /// 左侧栏切到标签视图（`ui_design.md` 4.3）
         OpenTags,
@@ -40,8 +40,41 @@ actions!(
         /// ⌘P：快速打开（3.2）
         QuickOpen,
         CommandPalette,
+        /// ⌘T：在当前标签右边开一个空白的「新标签页」（`ui_design.md` 2.3）
+        NewTab,
+        /// ⌘W：关闭当前标签页
+        CloseTab,
+        /// 关闭当前之外的所有标签页
+        CloseOtherTabs,
+        /// ⌘⇧T：重新打开最近关闭的标签页
+        ReopenClosedTab,
+        /// ⌘⇧] / ⌃⇥：下一个标签页
+        NextTab,
+        /// ⌘⇧[ / ⌃⇧⇥：上一个标签页
+        PrevTab,
+        /// 收藏 / 取消收藏当前笔记
+        ToggleFavorite,
+        /// 右侧面板切到反链
+        ShowBacklinks,
+        /// 右侧面板切到大纲
+        ShowOutline,
     ]
 );
+
+/// ⌘1–⌘8 跳到第 n 个标签页（从 0 数），⌘9 跳到最后一个（`usize::MAX`）
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = aero, no_json)]
+pub struct ActivateTab(pub usize);
+
+/// 文件树右键菜单：收藏 / 取消收藏某一篇
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = aero, no_json)]
+pub struct ToggleFavoriteNote(pub String);
+
+/// 文件树右键菜单：在新标签页打开
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = aero, no_json)]
+pub struct OpenInNewTab(pub String);
 
 actions!(
     picker,
@@ -176,8 +209,29 @@ pub fn commands() -> Vec<Command> {
         Command::new("delete-note", "移到废纸篓", "delete trash ydfzl", NoteTarget, DeleteNote),
         Command::new("quick-open", "快速打开笔记…", "quick open ksdk", Vault, QuickOpen),
         Command::new("search", "全文搜索", "search find qwss", Vault, OpenSearch),
-        Command::new("files", "显示文件树", "files explorer xswjs", Vault, OpenFiles),
+        Command::new(
+            "files",
+            "在文件树中定位当前笔记",
+            "files explorer reveal locate wjs dw",
+            Vault,
+            OpenFiles,
+        ),
         Command::new("tags", "显示标签", "tags bq", Vault, OpenTags),
+        Command::new("backlinks", "显示反链", "backlinks fl", Vault, ShowBacklinks),
+        Command::new("outline", "显示大纲", "outline headings dg", Vault, ShowOutline),
+        Command::new("new-tab", "新建标签页", "new tab xjbqy", Vault, NewTab),
+        Command::new("close-tab", "关闭标签页", "close tab gbbqy", Vault, CloseTab),
+        Command::new("close-other-tabs", "关闭其他标签页", "close other tabs gbqtbqy", Vault, CloseOtherTabs),
+        Command::new("reopen-tab", "重新打开关闭的标签页", "reopen closed tab cxdk", Vault, ReopenClosedTab),
+        Command::new("next-tab", "下一个标签页", "next tab xygbqy", Vault, NextTab),
+        Command::new("prev-tab", "上一个标签页", "previous tab sygbqy", Vault, PrevTab),
+        Command::new(
+            "favorite",
+            "收藏 / 取消收藏当前笔记",
+            "favorite star bookmark pin sc",
+            Note,
+            ToggleFavorite,
+        ),
         Command::new(
             "link-preview-hover",
             "链接预览：悬停",
@@ -261,6 +315,16 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-\\", ToggleSidebar, None),
         KeyBinding::new("cmd-shift-\\", TogglePanel, None),
         KeyBinding::new("cmd-|", TogglePanel, None),
+        // 标签页（`ui_design.md` 14）。⇧ 与 [ ] 组合时 macOS 可能报成 { }，两种写法都绑
+        KeyBinding::new("cmd-t", NewTab, None),
+        KeyBinding::new("cmd-w", CloseTab, None),
+        KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
+        KeyBinding::new("cmd-shift-]", NextTab, None),
+        KeyBinding::new("cmd-}", NextTab, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("cmd-shift-[", PrevTab, None),
+        KeyBinding::new("cmd-{", PrevTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         // 编辑器：覆盖 gpui-base 同键绑定，处理不了时 propagate
         KeyBinding::new("up", BlockUp, Some("Input")),
         KeyBinding::new("down", BlockDown, Some("Input")),
@@ -315,6 +379,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-/", OpenColorMenu, Some("Editor")),
     ]);
     cx.bind_keys((0..=8u8).map(|n| KeyBinding::new(&format!("cmd-alt-{n}"), ConvertBlock(n), Some("Input"))));
+    cx.bind_keys((1..=9usize).map(|n| {
+        KeyBinding::new(&format!("cmd-{n}"), ActivateTab(if n == 9 { usize::MAX } else { n - 1 }), None)
+    }));
 
     // 窗口里没人处理时的兜底
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
@@ -351,6 +418,11 @@ pub fn sync_menus(state: MenuState, cx: &mut App) {
             MenuItem::action("今日日记", OpenDaily),
             MenuItem::action("保存", SaveNow),
             MenuItem::separator(),
+            MenuItem::action("新建标签页", NewTab),
+            MenuItem::action("关闭标签页", CloseTab),
+            MenuItem::action("重新打开关闭的标签页", ReopenClosedTab),
+            MenuItem::separator(),
+            MenuItem::action("收藏 / 取消收藏", ToggleFavorite),
             MenuItem::action("移到废纸篓", DeleteNote),
         ]),
         Menu::new("编辑").items(vec![
@@ -376,6 +448,12 @@ pub fn sync_menus(state: MenuState, cx: &mut App) {
             MenuItem::action("文件", OpenFiles),
             MenuItem::action("搜索", OpenSearch),
             MenuItem::action("标签", OpenTags),
+            MenuItem::action("反链", ShowBacklinks),
+            MenuItem::action("大纲", ShowOutline),
+            MenuItem::separator(),
+            MenuItem::action("下一个标签页", NextTab),
+            MenuItem::action("上一个标签页", PrevTab),
+            MenuItem::separator(),
             MenuItem::action("快速打开…", QuickOpen),
             MenuItem::action("命令面板…", CommandPalette),
             MenuItem::separator(),
