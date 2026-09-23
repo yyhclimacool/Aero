@@ -1995,7 +1995,7 @@ impl Editor {
     }
 
     /// 这个块（作为编辑单位）在块选区里。
-    fn is_selected_block(&self, id: BlockId) -> bool {
+    pub(super) fn is_selected_block(&self, id: BlockId) -> bool {
         let Some(sel) = self.selection else { return false };
         self.units.iter().position(|u| u.id == id).is_some_and(|ix| sel.contains(ix))
     }
@@ -2339,7 +2339,19 @@ impl Editor {
             // 源码态也保持块颜色：属性列表本身是尾部标记，文本框里看不到它
             let textarea =
                 Self::painted(div().w_full(), paint).child(self.render_textarea(Some(&b.kind), cx));
-            return Some(self.with_gutter(b.id, depth, textarea.into_any_element(), cx));
+            // 公式块在源码下面保留实时预览，改完立刻重排
+            let body = if matches!(b.kind, BlockKind::MathBlock) {
+                let source = self.doc.slice(range).to_string();
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(textarea)
+                    .child(self.render_math_block(&source, cx))
+                    .into_any_element()
+            } else {
+                textarea.into_any_element()
+            };
+            return Some(self.with_gutter(b.id, depth, body, cx));
         }
         if self.is_covered(&range) {
             return None;
@@ -2384,8 +2396,26 @@ impl Editor {
                     Some(color) => style.with_foreground(color),
                     None => style,
                 };
-                preview::markdown(view_id, rendered, style, reveal, self.preview.clone(), cx.entity(), id, 0)
+                if matches!(
+                    b.kind,
+                    BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::ListItem { .. }
+                ) && let Some(mixed) =
+                    self.render_with_inline_math(&text, style.clone(), view_id.clone(), cx)
+                {
+                    mixed
+                } else {
+                    preview::markdown(
+                        view_id,
+                        rendered,
+                        style,
+                        reveal,
+                        self.preview.clone(),
+                        cx.entity(),
+                        id,
+                        0,
+                    )
                     .into_any_element()
+                }
             }
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });
@@ -2439,6 +2469,7 @@ impl Focusable for Editor {
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.validate_link_preview_scroll(cx);
+        self.refresh_fragment_marks();
         self.scale = window.scale_factor();
         let (foreground, muted) = (cx.theme().foreground, cx.theme().muted_foreground);
         let roots = self.doc.blocks().roots.clone();

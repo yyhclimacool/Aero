@@ -275,6 +275,40 @@ impl super::Editor {
         })
     }
 
+    /// 选中图片后改 `|宽度`。块 id 按同类型就近匹配沿用，改完仍保持选中。
+    pub(super) fn set_image_width(
+        &mut self,
+        block: aero_core::BlockId,
+        width: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(range) = self
+            .doc
+            .blocks()
+            .iter()
+            .find(|(_, item)| item.id == block)
+            .map(|(_, item)| self.doc.content_range(item))
+        else {
+            return;
+        };
+        let source = self.doc.slice(range.clone()).to_string();
+        let Some(next) = super::preview::image_source_with_width(source.trim(), width) else { return };
+        if next == source.trim() {
+            return;
+        }
+        let start = range.start + source.len() - source.trim_start().len();
+        let end = range.end - (source.len() - source.trim_end().len());
+        if let Err(err) = self.doc.edit(Edit::replace(start..end, next)) {
+            log::warn!("改图片宽度失败: {err}");
+            return;
+        }
+        self.after_doc_change(cx);
+        if let Some(ix) = self.unit_index(block) {
+            self.select_blocks(ix, ix, window, cx);
+        }
+    }
+
     /// 双击图片。
     pub(super) fn open_image_viewer(&mut self, target: String, window: &mut Window, cx: &mut Context<Self>) {
         let focus = cx.focus_handle();

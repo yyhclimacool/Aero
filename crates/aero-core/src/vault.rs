@@ -289,24 +289,25 @@ impl Vault {
             fs::create_dir_all(dir).map_err(io_err(dir))?;
         }
         if fs::symlink_metadata(&src).map_err(io_err(&src))?.is_dir() {
-            return rename_exclusive(&src, &dst).map_err(io_err(&dst));
+            return move_path(&src, &dst, true).map_err(io_err(&dst));
         }
         // create-only 发布新路径，目标在预检后被创建也不会被覆盖。
-        fs::hard_link(&src, &dst).map_err(io_err(&dst))?;
+        // 同一文件系统用硬链接；跨设备（EXDEV）退回复制，调用方随后删掉源文件。
+        publish_file(&src, &dst).map_err(io_err(&dst))?;
         let assets = from
             .assets_dir()
             .zip(to.assets_dir())
             .map(|(a, b)| (self.fs_path(&a), self.fs_path(&b)))
             .filter(|(a, _)| a.is_dir());
         if let Some((a, b)) = &assets {
-            if let Err(error) = rename_exclusive(a, b) {
+            if let Err(error) = move_path(a, b, true) {
                 let _ = fs::remove_file(&dst);
                 return Err(io_err(a)(error));
             }
         }
         if let Err(error) = fs::remove_file(&src) {
             if let Some((a, b)) = assets {
-                rename_exclusive(&b, &a).map_err(io_err(&b))?;
+                move_path(&b, &a, true).map_err(io_err(&b))?;
             }
             fs::remove_file(&dst).map_err(io_err(&dst))?;
             return Err(io_err(&src)(error));
@@ -368,6 +369,55 @@ impl Vault {
     pub fn exists(&self, p: &VaultPath) -> bool {
         self.fs_path(p).exists()
     }
+}
+
+/// `rename` / `hard_link` 跨文件系统时的 errno。
+fn crosses_devices(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(18)
+}
+
+/// 发布一个还不存在的目标文件。同一设备用硬链接；跨设备则复制，且不用会覆盖的 `copy`。
+fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    match fs::hard_link(src, dst) {
+        Ok(()) => Ok(()),
+        Err(err) if crosses_devices(&err) => copy_new(src, dst),
+        Err(err) => Err(err),
+    }
+}
+
+/// 目录移动。跨设备时整棵复制再删掉源目录。
+fn move_path(src: &Path, dst: &Path, is_dir: bool) -> std::io::Result<()> {
+    let moved = if is_dir { rename_exclusive(src, dst) } else { publish_file(src, dst) };
+    match moved {
+        Ok(()) => Ok(()),
+        Err(err) if is_dir && crosses_devices(&err) => {
+            copy_tree(src, dst)?;
+            fs::remove_dir_all(src)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn copy_new(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut input = fs::File::open(src)?;
+    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+    std::io::copy(&mut input, &mut output)?;
+    Ok(())
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        let meta = fs::symlink_metadata(entry.path())?;
+        if meta.is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else if meta.is_file() {
+            copy_new(&entry.path(), &to)?;
+        }
+    }
+    Ok(())
 }
 
 fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -612,5 +662,21 @@ mod tests {
         fs::write(root.join("y.md"), "").unwrap();
         let v = Vault::open(root).unwrap();
         assert_eq!(v.notes().unwrap().iter().map(|p| p.as_str()).collect::<Vec<_>>(), ["y.md"]);
+    }
+
+    #[test]
+    fn cross_device_errors_are_recognized_and_trees_copy_without_overwrite() {
+        assert!(super::crosses_devices(&std::io::Error::from_raw_os_error(18)));
+        assert!(!super::crosses_devices(&std::io::Error::from_raw_os_error(17)));
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("a.md"), b"A").unwrap();
+        fs::write(src.join("nested/b.md"), b"B").unwrap();
+        super::copy_tree(&src, &dst).unwrap();
+        assert_eq!(fs::read(dst.join("nested/b.md")).unwrap(), b"B");
+        assert!(super::copy_tree(&src, &dst).is_err(), "目标已存在时不覆盖");
+        assert_eq!(fs::read(src.join("a.md")).unwrap(), b"A");
     }
 }

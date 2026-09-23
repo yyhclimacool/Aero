@@ -3175,6 +3175,8 @@ mod tests {
         std::fs::write(dir.path().join("b.md"), "# 引用 [[a]]\n\n> 再次 [[a|目标]]\n").unwrap();
         cx.update(|_, cx| search.update(cx, |s, cx| s.note_changed(b.clone(), cx)));
         wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).hits().len() == 2));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("backlink-rich-0").is_some(), "反链行应渲染来源块");
 
         // 从真实面板行点击到来源标题块。
         cx.update(|window, cx| window.draw(cx).clear(cx));

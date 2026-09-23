@@ -202,6 +202,50 @@ impl FileTree {
         this
     }
 
+    /// Finder 拖进文件树：`.md` 复制进落点目录；其他文件拖到笔记上时进入该笔记的 `.assets/`。
+    fn import_external(&mut self, paths: &[std::path::PathBuf], directory: &str, note: Option<&VaultPath>) {
+        let mut errors = Vec::new();
+        for src in paths {
+            if src.is_dir() {
+                continue;
+            }
+            let Some(name) = src.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let bytes = match std::fs::read(src) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    errors.push(format!("{name}：{error}"));
+                    continue;
+                }
+            };
+            let imported = if name.to_ascii_lowercase().ends_with(".md") {
+                let stem = &name[..name.len() - 3];
+                let existing = self.vault.notes().unwrap_or_default();
+                let dest = unique_note_name(&existing, directory, stem);
+                self.vault.create_bytes(&dest, &bytes).map(|_| ()).map_err(|e| e.to_string())
+            } else if let Some(note) = note {
+                let extension = std::path::Path::new(&name)
+                    .extension()
+                    .map(|ext| ext.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match aero_core::attachments::import_path(&self.vault, note, Some(&name), &extension) {
+                    Some(dest) => {
+                        self.vault.create_bytes(&dest, &bytes).map(|_| ()).map_err(|e| e.to_string())
+                    }
+                    None => Err(format!("无法导入 {name}")),
+                }
+            } else {
+                Err(format!("{name} 不是笔记。请拖到某一篇笔记上，它会进入这篇笔记的附件目录。"))
+            };
+            if let Err(error) = imported {
+                errors.push(error);
+            }
+        }
+        self.rescan();
+        self.error = errors.into_iter().next();
+    }
+
     /// 重新枚举磁盘上的笔记和目录（包括空目录）与每篇笔记的附件。
     pub fn rescan(&mut self) {
         match self.vault.notes().and_then(|notes| self.vault.folders().map(|folders| (notes, folders))) {
@@ -455,7 +499,10 @@ impl FileTree {
                     let vault = self.vault.id().to_owned();
                     let path = path.clone();
                     move |value, _, _| {
-                        value.downcast_ref::<TreeDrag>().is_some_and(|d| d.target(&vault, &path).is_some())
+                        value.downcast_ref::<gpui_kit::ExternalPaths>().is_some()
+                            || value
+                                .downcast_ref::<TreeDrag>()
+                                .is_some_and(|d| d.target(&vault, &path).is_some())
                     }
                 })
                 .drag_over::<TreeDrag>({
@@ -471,6 +518,13 @@ impl FileTree {
                         if let Some(to) = drag.target(this.vault.id(), &path) {
                             cx.emit(FileTreeEvent::Move { from: drag.path.clone(), to });
                         }
+                    }
+                }))
+                .on_drop(cx.listener({
+                    let path = path.clone();
+                    move |this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                        this.import_external(paths.paths(), &path, None);
+                        cx.notify();
                     }
                 }))
                 .on_click(cx.listener({
@@ -533,6 +587,15 @@ impl FileTree {
                         TreeDrag { vault: self.vault.id().into(), path: path.clone(), directory: false },
                         |drag, _, _, cx| cx.new(|_| drag.clone()),
                     )
+                    .can_drop(|value, _, _| value.downcast_ref::<gpui_kit::ExternalPaths>().is_some())
+                    .drag_over::<gpui_kit::ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().list_active))
+                    .on_drop(cx.listener({
+                        let path = path.clone();
+                        move |this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                            this.import_external(paths.paths(), path.parent(), Some(&path));
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(move |this, _, window, cx| this.open(path.clone(), window, cx)))
                     // 右键菜单（4.1 的 M1a 子集；重命名走标题，新建走 ⌘N）
                     .context_menu(move |menu, _, _| {
@@ -654,7 +717,10 @@ impl Render for FileTree {
                     .can_drop({
                         let vault = self.vault.id().to_owned();
                         move |value, _, _| {
-                            value.downcast_ref::<TreeDrag>().is_some_and(|d| d.target(&vault, "").is_some())
+                            value.downcast_ref::<gpui_kit::ExternalPaths>().is_some()
+                                || value
+                                    .downcast_ref::<TreeDrag>()
+                                    .is_some_and(|d| d.target(&vault, "").is_some())
                         }
                     })
                     .drag_over::<TreeDrag>({
@@ -671,6 +737,10 @@ impl Render for FileTree {
                         if let Some(to) = drag.target(this.vault.id(), "") {
                             cx.emit(FileTreeEvent::Move { from: drag.path.clone(), to });
                         }
+                    }))
+                    .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                        this.import_external(paths.paths(), "", None);
+                        cx.notify();
                     })),
             )
             .child(list)
@@ -723,6 +793,35 @@ mod tests {
         let bounds = cx.debug_bounds(selector).expect(selector);
         cx.simulate_click(bounds.center(), Modifiers::default());
         draw(cx);
+    }
+
+    #[gpui_kit::test]
+    fn dropping_finder_files_imports_notes_and_assets(cx: &mut TestAppContext) {
+        let (dir, _vault, tree) = setup(cx);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("新笔记.md"), "# 新\n").unwrap();
+        std::fs::write(outside.path().join("图.png"), b"png").unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        draw(cx);
+        let drop = |cx: &mut VisualTestContext, selector: &'static str, file: &std::path::Path| {
+            draw(cx);
+            let at = cx.debug_bounds(selector).expect(selector).center();
+            let paths = gpui_kit::ExternalPaths([file.to_path_buf()].into_iter().collect());
+            cx.simulate_event(gpui_kit::FileDropEvent::Entered { position: at, paths });
+            cx.simulate_event(gpui_kit::FileDropEvent::Submit { position: at });
+            draw(cx);
+        };
+        drop(cx, "file-tree-folder:empty", &outside.path().join("新笔记.md"));
+        let err = cx.update(|_, cx| tree.read(cx).error.clone());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("empty/新笔记.md")).map_err(|e| e.to_string()),
+            Ok("# 新\n".into()),
+            "tree error: {err:?}"
+        );
+        drop(cx, "file-tree-note:source/a.md", &outside.path().join("图.png"));
+        assert_eq!(std::fs::read(dir.path().join("source/a.assets/图.png")).unwrap(), b"png");
+        drop(cx, "file-tree-folder:empty", &outside.path().join("图.png"));
+        assert!(!dir.path().join("empty/图.png").exists(), "文件夹上不接收非笔记文件");
     }
 
     #[gpui_kit::test]

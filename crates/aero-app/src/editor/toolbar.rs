@@ -2,13 +2,14 @@
 //!
 //! 它是**发现路径**而不是唯一路径——每一项都有等价快捷键（14 节），所以这里只负责出现 / 消失的时机、
 //! 按下态，以及把点击转成已有的那几条命令。`A ▾` 打开 7.7 的颜色菜单；`转换 ▾` 打开与 `/` 菜单
-//! 同一套块类型。复制块链接 / 添加 `^id`（`⋯`）跟 5.3 的块菜单走，这一轮不做。
+//! 同一套块类型。`⋯` 复制块链接，或给当前块补上 `^id`。
 
 use std::ops::Range;
 use std::time::Duration;
 
 use aero_core::colors::{self, Slot};
 use aero_core::inline_format::Format;
+use gpui_kit::component::WindowExt as _;
 
 use super::ops::BlockType;
 use super::slash::SlashAction;
@@ -24,6 +25,7 @@ const HEIGHT: Pixels = px(32.);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Submenu {
     Convert,
+    More,
 }
 
 /// 工具条态。位置每帧按选区重算，所以这里只记"为哪个选区出现的"。
@@ -155,9 +157,63 @@ impl Editor {
         let Some(bar) = self.toolbar.as_mut() else { return };
         bar.submenu = match bar.submenu {
             Some(Submenu::Convert) => None,
-            None => Some(Submenu::Convert),
+            _ => Some(Submenu::Convert),
         };
         cx.notify();
+    }
+
+    fn toggle_more_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.close_color_menu(window, cx);
+        let Some(bar) = self.toolbar.as_mut() else { return };
+        bar.submenu = match bar.submenu {
+            Some(Submenu::More) => None,
+            _ => Some(Submenu::More),
+        };
+        cx.notify();
+    }
+
+    /// 当前块没有 `^id` 就写上一个。返回这块的 id。
+    fn ensure_block_id(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<String, String> {
+        let block = self.focused_unit().map(|ix| self.units[ix].id).ok_or_else(|| "没有当前块".to_owned())?;
+        let assignment = aero_core::block_refs::prepare(&self.doc, block)?;
+        let id = assignment.id.clone();
+        if let Some(edit) = assignment.edit {
+            let at = edit.range.start;
+            self.structural_edit(edit, at, window, cx);
+        }
+        Ok(id)
+    }
+
+    fn copy_block_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = match self.ensure_block_id(window, cx) {
+            Ok(id) => id,
+            Err(error) => {
+                window.push_notification(
+                    gpui_kit::component::notification::Notification::error(error).title("复制块链接"),
+                    cx,
+                );
+                return;
+            }
+        };
+        let bare = self.path.as_str().strip_suffix(".md").unwrap_or(self.path.as_str());
+        let Some(target) = aero_core::links::escape_target(bare) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(format!("[[{target}#^{id}]]")));
+        let _ = self.close_toolbar_submenu(cx);
+    }
+
+    fn add_block_id(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.ensure_block_id(window, cx) {
+            Ok(id) => cx.write_to_clipboard(ClipboardItem::new_string(format!("^{id}"))),
+            Err(error) => {
+                window.push_notification(
+                    gpui_kit::component::notification::Notification::error(error).title("添加块 ID"),
+                    cx,
+                );
+            }
+        }
+        let _ = self.close_toolbar_submenu(cx);
     }
 
     fn convert_from_toolbar(&mut self, target: BlockType, window: &mut Window, cx: &mut Context<Self>) {
@@ -182,6 +238,7 @@ impl Editor {
         let theme = cx.theme().clone();
         let divider = || div().w(px(1.)).h(px(18.)).bg(theme.border);
         let convert_open = bar.submenu == Some(Submenu::Convert);
+        let more_open = bar.submenu == Some(Submenu::More);
         Some(
             deferred(
                 anchored().position(point(line.origin.x, y)).snap_to_window_with_margin(px(8.)).child(
@@ -252,9 +309,27 @@ impl Editor {
                                             this.toggle_convert_menu(window, cx);
                                         }),
                                     ),
+                                )
+                                .child(divider())
+                                .child(
+                                    Self::toolbar_button(
+                                        "toolbar-more",
+                                        "⋯",
+                                        "复制块链接、添加 ^id",
+                                        more_open,
+                                        &theme,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_more_menu(window, cx);
+                                        }),
+                                    ),
                                 ),
                         )
-                        .when(convert_open, |el| el.child(self.render_convert_menu(&theme, cx))),
+                        .when(convert_open, |el| el.child(self.render_convert_menu(&theme, cx)))
+                        .when(more_open, |el| el.child(self.render_more_menu(&theme, cx))),
                 ),
             )
             .into_any_element(),
@@ -315,6 +390,64 @@ impl Editor {
             .rounded(px(8.))
             .shadow_lg()
             .children(rows)
+            .into_any_element()
+    }
+
+    fn render_more_menu(&self, theme: &gpui_kit::component::Theme, cx: &mut Context<Self>) -> AnyElement {
+        let has_id = self.focused_unit().and_then(|ix| {
+            let id = self.units[ix].id;
+            self.doc.blocks().find(id).and_then(|block| block.persisted_id.clone())
+        });
+        let id_label = if has_id.is_some() { "复制 ^id" } else { "添加 ^id" };
+        v_flex()
+            .id("toolbar-more-menu")
+            .debug_selector(|| "toolbar-more-menu".to_owned())
+            .occlude()
+            .mt(px(4.))
+            .w(px(180.))
+            .p_1()
+            .bg(theme.popover)
+            .text_color(theme.popover_foreground)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(px(8.))
+            .shadow_lg()
+            .child(self.more_row("toolbar-copy-link", "复制块链接", cx, |this, window, cx| {
+                this.copy_block_link(window, cx);
+            }))
+            .child(self.more_row("toolbar-add-id", id_label, cx, |this, window, cx| {
+                this.add_block_id(window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn more_row(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let hover = cx.theme().list_hover;
+        h_flex()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .w_full()
+            .h(px(28.))
+            .px_2()
+            .rounded(px(4.))
+            .items_center()
+            .text_size(px(13.))
+            .cursor_pointer()
+            .hover(move |el| el.bg(hover))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    action(this, window, cx);
+                }),
+            )
+            .child(label)
             .into_any_element()
     }
 
@@ -387,6 +520,10 @@ impl Editor {
 
     pub(super) fn toolbar_convert_open(&self) -> bool {
         self.toolbar.as_ref().is_some_and(|bar| bar.submenu == Some(Submenu::Convert))
+    }
+
+    pub(super) fn toolbar_more_open(&self) -> bool {
+        self.toolbar.as_ref().is_some_and(|bar| bar.submenu == Some(Submenu::More))
     }
 
     pub(super) fn toolbar_colored(&self) -> bool {

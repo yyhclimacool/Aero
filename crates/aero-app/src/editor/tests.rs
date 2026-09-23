@@ -369,6 +369,22 @@ fn color_menu_filters_and_applies_to_the_selection(cx: &mut TestAppContext) {
     assert!(cx.update(|_, cx| editor.read(cx).is_editing()), "Esc 只关菜单，还在编辑态");
 }
 
+/// 选区盖住整块时，颜色菜单可以改去给块上色，而不是包一层行内属性。
+#[gpui_kit::test]
+fn color_menu_can_apply_a_full_selection_to_the_whole_block(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "第一段\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "第一段", cx);
+    open_color_menu(&editor, cx);
+    let switch = cx.debug_bounds("color-apply-block").expect("盖住整块时应有「应用到整块」");
+    cx.simulate_click(switch.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_input("蓝");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), "第一段 {.blue}\n");
+}
+
 /// 编辑态没有选区时菜单改当前块；块选中态一次改选中的每一块（7.7）。
 #[gpui_kit::test]
 fn color_menu_colors_blocks_when_no_text_is_selected(cx: &mut TestAppContext) {
@@ -456,6 +472,32 @@ fn click_toolbar(id: &'static str, cx: &mut VisualTestContext) {
     cx.simulate_click(bounds.center(), gpui_kit::Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// `⋯`：给当前块补上 `^id` 并复制 `[[笔记#^id]]`。已有 id 时不重复写。
+#[gpui_kit::test]
+fn toolbar_more_menu_copies_a_block_link_and_adds_an_id(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "正文", cx);
+    appear_toolbar(&editor, cx);
+    let more = cx.debug_bounds("toolbar-more").expect("toolbar-more");
+    cx.simulate_click(more.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.update(|_, cx| editor.read(cx).toolbar_more_open()));
+    let copy = cx.debug_bounds("toolbar-copy-link").expect("toolbar-copy-link");
+    cx.simulate_click(copy.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    let body = text(&editor, cx);
+    let id = body.split_once("^").expect(&body).1.trim();
+    let copied = cx.update(|_, cx| {
+        let item = cx.read_from_clipboard().expect("clipboard");
+        item.text().unwrap_or_default()
+    });
+    assert_eq!(copied, format!("[[a#^{id}]]"));
+    assert_eq!(body.matches('^').count(), 1, "只写一个块 id：{body}");
 }
 
 /// 选区浮动工具条（5.9）：键盘选区等 300 ms 出现，点粗体加 / 去格式，按下态跟着变。
@@ -3478,6 +3520,36 @@ fn clicking_an_image_selects_its_block_and_double_click_opens_the_viewer(cx: &mu
     assert!(cx.debug_bounds("image-viewer").is_none(), "Space 关闭看图");
 }
 
+/// 选中图片后，宽度预设写回 `|宽度`；原始去掉参数。
+#[gpui_kit::test]
+fn image_width_presets_rewrite_the_embed_parameter(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "![[photo.png]]\n");
+    write_attachment(&dir, "a.assets/photo.png", 800, 400);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+    assert!(cx.debug_bounds("image-width-medium").is_none(), "没选中时不显示宽度预设");
+    let image = cx.debug_bounds("image-photo.png").unwrap();
+    cx.simulate_click(image.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let medium = cx.debug_bounds("image-width-medium").expect("选中后应有宽度预设");
+    cx.simulate_click(medium.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    assert!(text(&editor, cx).contains("![[photo.png|400]]"), "中档写入文档示例的 |400");
+    let shown = cx.debug_bounds("image-photo.png").expect("改宽度后图片仍在");
+    assert!((f32::from(shown.size.width) - 400.).abs() < 1., "应按 |400 显示: {:?}", shown.size);
+    assert!(cx.update(|_, cx| editor.read(cx).selection.is_some()), "改完仍保持选中");
+    let original = cx.debug_bounds("image-width-original").expect("选中态还在，原始预设可见");
+    cx.simulate_click(original.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    let body = text(&editor, cx);
+    assert!(body.contains("![[photo.png]]"), "原始去掉宽度参数: {body}");
+    assert!(!body.contains('|'), "不应残留 |宽度: {body}");
+}
+
 /// 粘贴位图：写进 `<note>.assets/`、插入嵌入、单步撤销；纯文字粘贴仍走文本控件。
 #[gpui_kit::test]
 fn pasting_a_bitmap_imports_it_and_leaves_text_paste_alone(cx: &mut TestAppContext) {
@@ -3700,4 +3772,33 @@ fn math_blocks_render_as_bitmaps_and_fall_back_to_source(cx: &mut TestAppContext
     assert!(cx.debug_bounds("math-source").is_some(), "渲染不了要显示源码");
     assert!(cx.debug_bounds("math-error").is_some(), "并给出错误");
     assert!(cx.debug_bounds("math-block").is_none());
+}
+
+/// 段落里的 `$…$` 渲染成行内位图，代码里的美元符号保持源码。
+#[gpui_kit::test]
+fn inline_math_renders_inside_a_paragraph(cx: &mut TestAppContext) {
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, "能量 $E=mc^2$ 守恒\n\n` $E$ `\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+    assert!(cx.debug_bounds("math-inline-0").is_some(), "行内公式应渲染成位图");
+    assert!(cx.debug_bounds("math-inline-1").is_none(), "代码里的 $ 不是公式");
+}
+
+/// 编辑公式块时源码下面仍有实时预览；公式放在横向滚动里。
+#[gpui_kit::test]
+fn editing_a_math_block_keeps_a_live_preview(cx: &mut TestAppContext) {
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, "$$\n\\int_0^1 x\\,dx\n$$\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+    assert!(cx.debug_bounds("math-scroll").is_some(), "公式块可以横向滚动");
+    focus_unit(&editor, 0, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.update(|_, cx| editor.read(cx).is_editing()), "应进入源码态");
+    assert!(cx.debug_bounds("math-block").is_some(), "源码态下面仍有实时预览");
 }

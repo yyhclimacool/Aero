@@ -2,13 +2,13 @@
 
 use aero_core::VaultPath;
 use aero_index::Backlink;
+use gpui_kit::base::text::{TextView, TextViewStyle};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::search::{Phase, SearchService};
-use crate::search_view::snippet;
 
 const LIMIT: usize = 200;
 
@@ -165,14 +165,9 @@ impl BacklinksView {
 
     fn render_hit(&self, ix: usize, cx: &Context<Self>) -> AnyElement {
         let hit = &self.hits[ix];
-        let (text, ranges) = snippet(&hit.body, std::slice::from_ref(&hit.label));
         let theme = cx.theme();
         let hover = theme.list_hover;
-        let highlight = HighlightStyle {
-            color: Some(theme.link),
-            font_weight: Some(FontWeight::MEDIUM),
-            ..Default::default()
-        };
+        let source = hit.source.clone();
         let hit = hit.clone();
         div()
             .id(SharedString::from(format!("backlink-{ix}")))
@@ -183,13 +178,38 @@ impl BacklinksView {
             .rounded_md()
             .cursor_pointer()
             .hover(move |s| s.bg(hover))
-            .text_sm()
-            .text_color(theme.muted_foreground)
-            .line_height(relative(1.4))
-            .child(StyledText::new(text).with_highlights(ranges.into_iter().map(|r| (r, highlight))))
+            .child(rich_snippet(ix, &source, cx))
             .on_click(cx.listener(move |_, _, _, cx| cx.emit(BacklinkOpened(hit.clone()))))
             .into_any_element()
     }
+}
+
+/// 来源块按笔记预览渲染：wikilink 变成链接，强调和代码保留。点整行仍跳到来源，片段里的链接不另开。
+fn rich_snippet(ix: usize, source: &str, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let style = TextViewStyle::default()
+        .with_foreground(theme.muted_foreground)
+        .with_muted_foreground(theme.muted_foreground)
+        .with_link(theme.link)
+        .with_code_background(theme.muted)
+        .with_border(theme.border)
+        .with_paragraph_gap(rems(0.))
+        .with_dark(theme.mode.is_dark());
+    div()
+        .debug_selector(move || format!("backlink-rich-{ix}"))
+        .w_full()
+        .text_sm()
+        .line_height(relative(1.4))
+        .child(
+            TextView::markdown(
+                SharedString::from(format!("backlink-md-{ix}")),
+                aero_core::links::to_markdown(source),
+            )
+            .style(style)
+            .selectable(false)
+            .on_link_click(|_, _, _, cx| cx.stop_propagation()),
+        )
+        .into_any_element()
 }
 
 impl Render for BacklinksView {

@@ -75,11 +75,25 @@ enum Cmd {
         #[arg(long)]
         template: Option<String>,
     },
+    /// 导出一篇笔记
+    Export {
+        note: String,
+        /// `md` 源码，`html` 渲染结果，`json` 路径、标题、源码和块列表
+        #[arg(long, value_enum)]
+        format: ExportFormat,
+    },
     /// 索引状态，或清空后按磁盘重建
     Index {
         #[command(subcommand)]
         action: IndexCmd,
     },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ExportFormat {
+    Md,
+    Html,
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -94,7 +108,7 @@ enum IndexCmd {
 pub fn wants_cli(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some(flag) if flag.starts_with('-') => true,
-        Some("search" | "read" | "backlinks" | "append" | "new" | "index" | "help") => true,
+        Some("search" | "read" | "backlinks" | "append" | "new" | "index" | "export" | "help") => true,
         _ => false,
     }
 }
@@ -125,19 +139,45 @@ pub fn run(args: &[String]) -> i32 {
 fn execute(cli: &Cli, data_dir: &Path) -> Result<String, String> {
     let root = vault_root(cli.vault.as_deref(), data_dir)?;
     let vault = Arc::new(Vault::open(&root).map_err(|e| e.to_string())?);
-    let mut indexer = open_index(&vault, data_dir)?;
     match &cli.command {
-        Cmd::Search { query, tag, limit } => search(&indexer, query, tag, *limit, cli.json),
-        Cmd::Read { note, block } => read(&mut indexer, &vault, note, block.as_deref(), cli.json),
-        Cmd::Backlinks { note, block, limit } => {
-            backlinks(&mut indexer, &vault, note, block.as_deref(), *limit, cli.json)
+        Cmd::Read { note, block } => {
+            if let Some(path) = existing_note(&vault, note) {
+                return read_at(&vault, &path, block.as_deref(), cli.json);
+            }
+            let mut indexer = open_index(&vault, data_dir)?;
+            read(&mut indexer, &vault, note, block.as_deref(), cli.json)
         }
-        Cmd::Append { note, text } => append(&mut indexer, &vault, note, text, cli.json),
-        Cmd::New { path, template } => create(&mut indexer, &vault, path, template.as_deref(), cli.json),
-        Cmd::Index { action } => match action {
-            IndexCmd::Status => status(&indexer, &vault, cli.json),
-            IndexCmd::Rebuild => rebuild(&mut indexer, cli.json),
-        },
+        Cmd::Export { note, format } => {
+            if let Some(path) = existing_note(&vault, note) {
+                return export_at(&vault, &path, *format, cli.json);
+            }
+            let mut indexer = open_index(&vault, data_dir)?;
+            export_note(&mut indexer, &vault, note, *format, cli.json)
+        }
+        Cmd::Append { note, text } => {
+            if let Some(path) = existing_note(&vault, note) {
+                return append_at(&vault, &path, text, cli.json, data_dir);
+            }
+            let mut indexer = open_index(&vault, data_dir)?;
+            append(&mut indexer, &vault, note, text, cli.json)
+        }
+        Cmd::New { path, template } => create_note(&vault, path, template.as_deref(), cli.json, data_dir),
+        command => {
+            let mut indexer = open_index(&vault, data_dir)?;
+            match command {
+                Cmd::Search { query, tag, limit } => search(&indexer, query, tag, *limit, cli.json),
+                Cmd::Backlinks { note, block, limit } => {
+                    backlinks(&mut indexer, &vault, note, block.as_deref(), *limit, cli.json)
+                }
+                Cmd::Index { action } => match action {
+                    IndexCmd::Status => status(&indexer, &vault, cli.json),
+                    IndexCmd::Rebuild => rebuild(&mut indexer, cli.json),
+                },
+                Cmd::Read { .. } | Cmd::Export { .. } | Cmd::Append { .. } | Cmd::New { .. } => {
+                    unreachable!("已在上面处理")
+                }
+            }
+        }
     }
 }
 
@@ -158,12 +198,18 @@ fn vault_root(flag: Option<&Path>, data_dir: &Path) -> Result<PathBuf, String> {
 fn open_index(vault: &Arc<Vault>, data_dir: &Path) -> Result<Indexer, String> {
     Indexer::open(Arc::clone(vault), &data_dir.join("index")).map_err(|err| {
         let message = err.to_string();
-        if message.to_ascii_lowercase().contains("can't lock") {
-            format!("无法打开索引：{message}。Aero 正在使用这个库时，请先退出再运行命令。")
+        if is_lock_error(&err) {
+            format!(
+                "无法打开索引：{message}。搜索、反链和 index 要等 Aero 退出后才能用；读、导出、新建和追加不需要这份锁。"
+            )
         } else {
             format!("无法打开索引：{message}")
         }
     })
+}
+
+fn is_lock_error(err: &aero_index::IndexerError) -> bool {
+    err.to_string().to_ascii_lowercase().contains("can't lock")
 }
 
 fn locate(indexer: &mut Indexer, vault: &Vault, target: &str) -> Result<VaultPath, String> {
@@ -247,6 +293,10 @@ fn read(
     json: bool,
 ) -> Result<String, String> {
     let path = locate(indexer, vault, note)?;
+    read_at(vault, &path, block, json)
+}
+
+fn read_at(vault: &Vault, path: &VaultPath, block: Option<&str>, json: bool) -> Result<String, String> {
     let (doc, _) = vault.read(&path).map_err(|e| e.to_string())?;
     let (text, block_id) = match block {
         Some(id) => (block_text(&doc, id)?, Some(id.trim().trim_start_matches('^').to_owned())),
@@ -324,22 +374,44 @@ fn append(
     json: bool,
 ) -> Result<String, String> {
     let path = locate(indexer, vault, note)?;
-    let (bytes, _) = vault.read_bytes(&path).map_err(|e| e.to_string())?;
-    let existing = String::from_utf8(bytes).map_err(|_| format!("笔记不是 UTF-8：{}", path.as_str()))?;
-    let next = join_markdown(&existing, text)?;
-    let doc = Document::from_text(&next);
-    vault.write(&path, &doc).map_err(|e| e.to_string())?;
+    write_append(vault, &path, text)?;
     reindex(indexer, &path)?;
     written(&path, json)
 }
 
-fn create(
-    indexer: &mut Indexer,
-    vault: &Vault,
+fn append_at(
+    vault: &Arc<Vault>,
+    path: &VaultPath,
+    text: &str,
+    json: bool,
+    data_dir: &Path,
+) -> Result<String, String> {
+    write_append(vault, path, text)?;
+    try_reindex(vault, data_dir, path)?;
+    written(path, json)
+}
+
+fn write_append(vault: &Vault, path: &VaultPath, text: &str) -> Result<(), String> {
+    let (bytes, _) = vault.read_bytes(path).map_err(|e| e.to_string())?;
+    let existing = String::from_utf8(bytes).map_err(|_| format!("笔记不是 UTF-8：{}", path.as_str()))?;
+    let next = join_markdown(&existing, text)?;
+    let doc = Document::from_text(&next);
+    vault.write(path, &doc).map(|_| ()).map_err(|e| e.to_string())
+}
+
+fn create_note(
+    vault: &Arc<Vault>,
     path: &str,
     template: Option<&str>,
     json: bool,
+    data_dir: &Path,
 ) -> Result<String, String> {
+    let path = write_new(vault, path, template)?;
+    try_reindex(vault, data_dir, &path)?;
+    written(&path, json)
+}
+
+fn write_new(vault: &Vault, path: &str, template: Option<&str>) -> Result<VaultPath, String> {
     let path = creation_path("", path).ok_or_else(|| format!("无效的笔记路径：{path}"))?;
     if vault.exists(&path) {
         return Err(format!("笔记已存在：{}", path.as_str()));
@@ -349,8 +421,7 @@ fn create(
         None => format!("# {}\n\n", path.stem()),
     };
     vault.create_bytes(&path, body.as_bytes()).map_err(|e| e.to_string())?;
-    reindex(indexer, &path)?;
-    written(&path, json)
+    Ok(path)
 }
 
 fn template_body(vault: &Vault, name: &str) -> Result<String, String> {
@@ -388,6 +459,15 @@ fn reindex(indexer: &mut Indexer, path: &VaultPath) -> Result<(), String> {
     indexer.refresh_note(path).map_err(|e| e.to_string())?;
     indexer.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 索引被图形界面占用时不失败：文件已经落盘，监听会把它收进索引。
+fn try_reindex(vault: &Arc<Vault>, data_dir: &Path, path: &VaultPath) -> Result<(), String> {
+    match Indexer::open(Arc::clone(vault), &data_dir.join("index")) {
+        Ok(mut indexer) => reindex(&mut indexer, path),
+        Err(err) if is_lock_error(&err) => Ok(()),
+        Err(err) => Err(format!("无法打开索引：{err}")),
+    }
 }
 
 fn written(path: &VaultPath, json: bool) -> Result<String, String> {
@@ -433,6 +513,62 @@ fn rebuild(indexer: &mut Indexer, json: bool) -> Result<String, String> {
     Ok(format!("已重建：写入 {}，未变化 {}，删除 {}", report.indexed, report.unchanged, report.removed))
 }
 
+fn export_note(
+    indexer: &mut Indexer,
+    vault: &Vault,
+    note: &str,
+    format: ExportFormat,
+    json: bool,
+) -> Result<String, String> {
+    let path = locate(indexer, vault, note)?;
+    export_at(vault, &path, format, json)
+}
+
+fn export_at(vault: &Vault, path: &VaultPath, format: ExportFormat, json: bool) -> Result<String, String> {
+    let (doc, _) = vault.read(&path).map_err(|e| e.to_string())?;
+    let markdown = doc.to_string();
+    let title = doc.title_or(path.stem());
+    let pretty = |value: serde_json::Value| serde_json::to_string_pretty(&value).map_err(|e| e.to_string());
+    match format {
+        ExportFormat::Md if json => pretty(json!({
+            "path": path.as_str(),
+            "title": title,
+            "markdown": markdown,
+        })),
+        ExportFormat::Md => Ok(markdown.trim_end().to_owned()),
+        ExportFormat::Html => {
+            let html = aero_core::highlight::export_html(&markdown);
+            if json {
+                pretty(json!({
+                    "path": path.as_str(),
+                    "title": title,
+                    "html": html,
+                }))
+            } else {
+                Ok(html)
+            }
+        }
+        ExportFormat::Json => {
+            let blocks = doc
+                .blocks()
+                .iter()
+                .map(|(_, block)| {
+                    json!({
+                        "kind": block.kind.tag(),
+                        "text": doc.slice(doc.content_range(block)).to_string(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            pretty(json!({
+                "path": path.as_str(),
+                "title": title,
+                "markdown": markdown,
+                "blocks": blocks,
+            }))
+        }
+    }
+}
+
 #[cfg(test)]
 fn execute_args(args: &[&str], data_dir: &Path) -> Result<String, String> {
     let cli = Cli::try_parse_from(std::iter::once("aero").chain(args.iter().copied()))
@@ -455,13 +591,14 @@ mod tests {
         assert!(wants_cli(&["search".into(), "ripgrep".into()]));
         assert!(wants_cli(&["--help".into()]));
         assert!(wants_cli(&["index".into(), "status".into()]));
+        assert!(wants_cli(&["export".into(), "note".into(), "--format".into(), "md".into()]));
     }
 
     #[test]
     fn help_lists_the_six_commands() {
         let err = Cli::try_parse_from(["aero", "--help"]).unwrap_err();
         let text = err.to_string();
-        for name in ["search", "read", "backlinks", "append", "new", "index"] {
+        for name in ["search", "read", "backlinks", "append", "new", "index", "export"] {
             assert!(text.contains(name), "{text}");
         }
         assert!(!err.use_stderr());
@@ -535,5 +672,47 @@ mod tests {
         assert_eq!(join_markdown("# 标题\n", "下一段").unwrap(), "# 标题\n\n下一段\n");
         assert_eq!(join_markdown("# 标题\n\n", "下一段\n").unwrap(), "# 标题\n\n下一段\n");
         assert!(join_markdown("x\n", "  \n").is_err());
+    }
+
+    #[test]
+    fn export_writes_markdown_html_and_json() {
+        let (dir, data) = vault();
+        let vault_arg = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("note.md"), "# 标题\n\n前 [文字]{.red} 后\n").unwrap();
+        let md =
+            execute_args(&["--vault", vault_arg, "export", "note", "--format", "md"], data.path()).unwrap();
+        assert!(md.contains("# 标题"), "{md}");
+        let html =
+            execute_args(&["--vault", vault_arg, "export", "note", "--format", "html"], data.path()).unwrap();
+        assert!(html.contains("<h1>标题</h1>"), "{html}");
+        assert!(html.contains("<span class=\"red\">文字</span>"), "{html}");
+        let raw =
+            execute_args(&["--vault", vault_arg, "export", "note", "--format", "json"], data.path()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["path"], "note.md");
+        assert_eq!(value["title"], "note");
+        assert!(value["markdown"].as_str().unwrap().contains("[文字]{.red}"));
+        assert!(value["blocks"].as_array().unwrap().len() >= 2, "{raw}");
+    }
+
+    #[test]
+    fn file_commands_work_while_the_index_lock_is_held() {
+        let (dir, data) = vault();
+        let vault_arg = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("a.md"), "正文\n").unwrap();
+        let opened = Arc::new(aero_core::Vault::open(dir.path()).unwrap());
+        let _held = aero_index::Indexer::open(opened, &data.path().join("index")).unwrap();
+        let text = execute_args(&["--vault", vault_arg, "read", "a.md"], data.path()).unwrap();
+        assert_eq!(text, "正文");
+        let exported =
+            execute_args(&["--vault", vault_arg, "export", "a.md", "--format", "md"], data.path()).unwrap();
+        assert!(exported.contains("正文"), "{exported}");
+        let created = execute_args(&["--vault", vault_arg, "new", "fresh"], data.path()).unwrap();
+        assert_eq!(created, "fresh.md");
+        assert!(dir.path().join("fresh.md").is_file());
+        execute_args(&["--vault", vault_arg, "append", "a.md", "--text", "又一段"], data.path()).unwrap();
+        assert!(std::fs::read_to_string(dir.path().join("a.md")).unwrap().contains("又一段"));
+        let err = execute_args(&["--vault", vault_arg, "search", "正文"], data.path()).unwrap_err();
+        assert!(err.contains("退出"), "{err}");
     }
 }

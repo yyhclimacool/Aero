@@ -43,6 +43,8 @@ pub struct Backlink {
     pub title: String,
     pub range: std::ops::Range<usize>,
     pub body: String,
+    /// 来源块的 Markdown，反链列表按笔记预览渲染这一段。
+    pub source: String,
     pub label: String,
     /// 点击前校验来源是否仍是查询时的版本，避免旧偏移定位到其他块。
     pub source_hash: u64,
@@ -252,18 +254,36 @@ impl Indexer {
             let Some(doc) = &doc else { continue };
             let Some(block) = doc.block_at(row.range.start) else { continue };
             let text = doc.slice(row.range.clone()).to_string();
+            let raw = doc.slice(doc.content_range(block)).to_string();
             hits.push(Backlink {
                 path,
                 title: row.source.title,
                 range: row.range,
                 body: aero_core::index::plain_text(&doc.block_text(block), &block.kind),
+                source: snippet_source(&raw),
                 label: aero_core::index::plain_text(&text, &aero_core::BlockKind::Paragraph),
                 source_hash: row.source.stamp.hash,
             });
         }
         Ok(BacklinkPage { total, matched, hits })
     }
+}
 
+/// 反链片段最多保留大约一段的源码，按字符边界截断。
+fn snippet_source(text: &str) -> String {
+    const MAX: usize = 400;
+    let text = text.trim();
+    if text.len() <= MAX {
+        return text.to_owned();
+    }
+    let mut end = MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", text[..end].trim_end())
+}
+
+impl Indexer {
     /// 与磁盘对齐：新文件与指纹变了的文件重索引，消失的文件删掉。`progress(done, total)` 每处理一篇调一次。
     /// 一把锁里跑完；UI 层若想在文件之间放开锁，用 [`Self::plan_sync`] + [`Self::sync_step`] 自己驱动。
     pub fn sync_all(&mut self, mut progress: impl FnMut(usize, usize)) -> SyncReport {
@@ -771,6 +791,10 @@ mod tests {
             let a = VaultPath::new("a.md").unwrap();
             let b = VaultPath::new("b.md").unwrap();
             assert_eq!(ix.backlinks(&a, None, 20).unwrap().hits.len(), 2);
+            assert!(
+                ix.backlinks(&a, None, 20).unwrap().hits.iter().any(|hit| hit.source.contains("[[shared]]")),
+                "反链片段保留来源块的 Markdown"
+            );
             std::fs::write(dir.path().join("b.md"), "---\ntitle: shared\n---\nbody\n").unwrap();
             ix.index_note(&b).unwrap();
             assert_eq!(ix.backlinks(&a, None, 20).unwrap().hits.len(), 1);

@@ -381,6 +381,54 @@ fn paint(lines: &mut [String], carriers: &[Carrier]) {
     }
 }
 
+/// 整篇笔记导出成 HTML。行内颜色属性按预览同一套规则变成 `<span class>`，标记本身不出现。
+pub fn export_html(src: &str) -> String {
+    let mut options = parse::comrak_options();
+    options.render.sourcepos = false;
+    let range = 0..src.len();
+    let found = {
+        let arena = Arena::new();
+        let root = parse_document(&arena, src, &options);
+        carriers(src, &range, root)
+    };
+    let source = if found.is_empty() { src.to_owned() } else { rewrite(src, &range, &found).0 };
+    let arena = Arena::new();
+    let root = parse_document(&arena, &source, &options);
+    let mut html = String::new();
+    if comrak::format_html(root, &options, &mut html).is_err() {
+        return String::new();
+    }
+    let mut lines = vec![html];
+    paint(&mut lines, &found);
+    lines.pop().unwrap_or_default()
+}
+
+/// 段落里的行内公式 `$…$`（不含 `$$` 行间公式）。区间含定界符。
+pub struct InlineFormula {
+    pub range: Range<usize>,
+    pub latex: String,
+}
+
+pub fn inline_formulas(src: &str) -> Vec<InlineFormula> {
+    if !src.contains('$') {
+        return Vec::new();
+    }
+    let options = parse::comrak_options();
+    let arena = Arena::new();
+    let root = parse_document(&arena, src, &options);
+    let positions = SourceMap::new(src);
+    let mut out = Vec::new();
+    for node in root.descendants() {
+        let NodeValue::Math(math) = &node.data().value else { continue };
+        if math.display_math || math.literal.trim().is_empty() {
+            continue;
+        }
+        let Some(range) = positions.range(node) else { continue };
+        out.push(InlineFormula { range, latex: math.literal.trim().to_owned() });
+    }
+    out
+}
+
 // TextView 吞掉嵌套 br；按硬换行拆分并复制祖先，保留每行的强调和链接。
 fn split_lines<'a>(node: &'a AstNode<'a>, arena: &'a Arena<'a>) -> Vec<&'a AstNode<'a>> {
     if matches!(node.data().value, NodeValue::LineBreak) {
@@ -512,5 +560,25 @@ mod tests {
         for src in ["`==code==`", "\\==escaped==", "$==math==$", "ordinary"] {
             assert!(preview(src, 0..src.len()).is_none(), "{src}");
         }
+    }
+
+    #[test]
+    fn export_html_renders_structure_and_inline_color() {
+        let html = export_html("# 标题\n\n正文\n");
+        assert!(html.contains("<h1>标题</h1>"), "{html}");
+        assert!(html.contains("<p>正文</p>"), "{html}");
+        let colored = export_html("前 [文字]{.red} 后\n");
+        assert!(colored.contains("<span class=\"red\">文字</span>"), "{colored}");
+        assert!(!colored.contains("{.red}"), "{colored}");
+    }
+
+    #[test]
+    fn inline_formulas_skip_display_math_and_code() {
+        let found = inline_formulas("能量 $E=mc^2$ 守恒");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].latex, "E=mc^2");
+        assert_eq!(&"能量 $E=mc^2$ 守恒"[found[0].range.clone()], "$E=mc^2$");
+        assert!(inline_formulas("$$\nE=mc^2\n$$").is_empty());
+        assert!(inline_formulas("` $E$ `").is_empty());
     }
 }

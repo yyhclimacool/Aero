@@ -162,6 +162,20 @@ struct ImageEmbed {
 
 /// 正文列宽内的默认显示宽度（正文列 720，两侧留白）。
 const IMAGE_WIDTH: u32 = 680;
+/// 块菜单宽度预设（`ui_design.md` 5.6）。像素值设计里没有规定，中档对齐文档示例 `|400`，大档等于正文列宽。
+pub(super) const IMAGE_WIDTH_SMALL: u32 = 240;
+pub(super) const IMAGE_WIDTH_MEDIUM: u32 = 400;
+pub(super) const IMAGE_WIDTH_LARGE: u32 = IMAGE_WIDTH;
+
+/// 把独占一段的图片嵌入改成指定宽度；`None` 去掉 `|宽度`，按原图尺寸显示。
+pub(super) fn image_source_with_width(source: &str, width: Option<u32>) -> Option<String> {
+    let embed = image_embed(source)?;
+    let target = aero_core::links::escape_target(&embed.target)?;
+    Some(match width {
+        Some(width) => format!("![[{target}|{width}]]"),
+        None => format!("![[{target}]]"),
+    })
+}
 
 /// 整段只有一个图片嵌入时才当图片块渲染；与文字混排的嵌入仍按源码显示。
 fn image_embed(source: &str) -> Option<ImageEmbed> {
@@ -359,8 +373,10 @@ fn render_image(
             let logical = (pixels.width as f32 / scale).min(width as f32);
             let height = logical * pixels.height as f32 / pixels.width as f32;
             let click = image_click(editor, block, embed.target.clone());
-            div()
+            let selected = editor.read(cx).is_selected_block(block);
+            v_flex()
                 .w_full()
+                .gap_1()
                 .pb(rems(0.5))
                 .child(
                     div()
@@ -376,6 +392,7 @@ fn render_image(
                         .on_click(click)
                         .child(img(ImageSource::Render(image)).w(px(logical)).h(px(height))),
                 )
+                .when(selected, |el| el.child(image_width_bar(editor, block, embed.width, cx)))
                 .into_any_element()
         }
         // 首帧占位用上次已知比例，渲染完成后替换，列表不抖动
@@ -432,7 +449,38 @@ fn render_image(
     }
 }
 
-/// 单击选中这一块（要改 `|宽度` 就按 ⏎ 进编辑态），双击全屏看图。
+/// 选中图片后出现的宽度预设（小 / 中 / 大 / 原始）。点按钮只改 `|宽度`，不进入编辑态。
+fn image_width_bar(
+    editor: &Entity<super::Editor>,
+    block: aero_core::BlockId,
+    current: Option<u32>,
+    cx: &App,
+) -> AnyElement {
+    let presets = [
+        ("image-width-small", "小", Some(IMAGE_WIDTH_SMALL)),
+        ("image-width-medium", "中", Some(IMAGE_WIDTH_MEDIUM)),
+        ("image-width-large", "大", Some(IMAGE_WIDTH_LARGE)),
+        ("image-width-original", "原始", None),
+    ];
+    h_flex()
+        .gap_1()
+        .children(presets.map(|(id, label, width)| {
+            let editor = editor.clone();
+            let active = current == width;
+            div()
+                .debug_selector(|| id.to_owned())
+                .rounded(px(4.))
+                .when(active, |el| el.bg(cx.theme().accent.opacity(0.16)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(Button::new(id).ghost().xsmall().label(label).on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    editor.update(cx, |editor, cx| editor.set_image_width(block, width, window, cx));
+                }))
+        }))
+        .into_any_element()
+}
+
+/// 单击选中这一块并打开宽度预设，双击全屏看图。
 fn image_click(
     editor: &Entity<super::Editor>,
     block: aero_core::BlockId,

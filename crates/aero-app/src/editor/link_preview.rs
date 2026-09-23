@@ -3,6 +3,7 @@ use crate::paths::LinkPreviewMode;
 use crate::search::SearchService;
 use aero_core::links::{Resolution, Resolver};
 use gpui_kit::base::text::{LinkStyle, LinkUnderline};
+use std::collections::HashMap;
 
 /// 当前的链接预览设置。工作区从 `state.toml` 写入；编辑器悬停时读取。
 #[derive(Clone, Copy, Debug, Default)]
@@ -34,6 +35,13 @@ pub(super) struct LinkPreview {
     in_popup: bool,
     /// 最近一次见到的 ⌘ 状态。按住 ⌘ 才预览时，目录刷新不能在没按键时把浮层打开。
     platform_down: bool,
+    /// 跨篇 `#标题` / `#^块` 是否还在。键是目标路径和片段，值带文件指纹，改了才重读。
+    fragments: HashMap<(VaultPath, String), FragmentMark>,
+}
+
+struct FragmentMark {
+    hash: u64,
+    exists: bool,
 }
 
 struct Popup {
@@ -229,6 +237,43 @@ impl Editor {
         self.update_local_link_names();
     }
 
+    /// 画出链接之前，把跨篇片段是否存在读进缓存。同一指纹不重复读盘。
+    pub(super) fn refresh_fragment_marks(&mut self) {
+        let Some(resolver) = self.link_preview.resolver.clone() else { return };
+        let parent = self.path.parent();
+        let mut needed = Vec::new();
+        for span in aero_core::links::scan(&self.doc.to_string()) {
+            let Some(fragment) = span.fragment.as_deref().filter(|fragment| !fragment.is_empty()) else {
+                continue;
+            };
+            if span.target.is_empty() {
+                continue;
+            }
+            if let Resolution::Resolved { path, .. } = resolver.resolve(&span.target, Some(fragment), &parent)
+                && path != self.path
+            {
+                needed.push((path, fragment.to_owned()));
+            }
+        }
+        needed.sort();
+        needed.dedup();
+        for (path, fragment) in needed {
+            let key = (path.clone(), fragment.clone());
+            match self.vault.read(&path) {
+                Ok((doc, stamp)) => {
+                    if self.link_preview.fragments.get(&key).is_some_and(|mark| mark.hash == stamp.hash) {
+                        continue;
+                    }
+                    let exists = excerpt(&doc, Some(&fragment)).is_ok();
+                    self.link_preview.fragments.insert(key, FragmentMark { hash: stamp.hash, exists });
+                }
+                Err(_) => {
+                    self.link_preview.fragments.insert(key, FragmentMark { hash: 0, exists: false });
+                }
+            }
+        }
+    }
+
     pub(super) fn preview_link_style(&self, url: &str, cx: &App) -> LinkStyle {
         let Some((target, fragment)) = aero_core::links::decode_note_url(url) else {
             return LinkStyle { color: Some(cx.theme().link), underline: LinkUnderline::Solid };
@@ -245,8 +290,23 @@ impl Editor {
             return LinkStyle { color: Some(cx.theme().link), underline: LinkUnderline::Solid };
         };
         match resolution {
-            Resolution::Resolved { .. } => {
-                LinkStyle { color: Some(cx.theme().link), underline: LinkUnderline::Solid }
+            Resolution::Resolved { path, fragment } => {
+                let missing =
+                    fragment.as_deref().filter(|fragment| !fragment.is_empty()).is_some_and(|fragment| {
+                        if path == self.path {
+                            excerpt(&self.doc, Some(fragment)).is_err()
+                        } else {
+                            self.link_preview
+                                .fragments
+                                .get(&(path, fragment.to_owned()))
+                                .is_some_and(|mark| !mark.exists)
+                        }
+                    });
+                if missing {
+                    LinkStyle { color: Some(cx.theme().muted_foreground), underline: LinkUnderline::Dashed }
+                } else {
+                    LinkStyle { color: Some(cx.theme().link), underline: LinkUnderline::Solid }
+                }
             }
             Resolution::Unresolved => {
                 LinkStyle { color: Some(cx.theme().muted_foreground), underline: LinkUnderline::Dashed }
@@ -630,6 +690,46 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(200));
         cx.run_until_parked();
         cx.update(|_, cx| assert!(editor.read(cx).link_preview.popup.is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn missing_cross_note_fragments_are_dashed_before_hover(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.md"), "# 存在\n\n正文\n").unwrap();
+        let vault = Arc::new(aero_core::Vault::open(dir.path()).unwrap());
+        let dashed = |cx: &mut TestAppContext, source: &str| {
+            std::fs::write(dir.path().join("a.md"), source).unwrap();
+            let path = aero_core::VaultPath::new("a.md").unwrap();
+            let (doc, stamp) = vault.read(&path).unwrap();
+            let (editor, visual) =
+                cx.add_window_view(|_, cx| Editor::new(vault.clone(), path, doc, stamp, cx));
+            visual.update(|_, cx| {
+                editor.update(cx, |e, cx| {
+                    e.link_preview.resolver = Some(aero_core::links::Resolver::from_notes([
+                        aero_core::VaultPath::new("a.md").unwrap(),
+                        aero_core::VaultPath::new("b.md").unwrap(),
+                    ]));
+                    cx.notify();
+                })
+            });
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                use gpui_kit::component::ActiveTheme as _;
+                window.draw(cx).clear(cx);
+                let scale = window.scale_factor();
+                let muted = cx.theme().muted_foreground;
+                window
+                    .painted_quads()
+                    .into_iter()
+                    .filter(|quad| {
+                        quad.background.as_solid() == Some(muted) && quad.bounds.size.height.0 <= scale * 1.1
+                    })
+                    .count()
+            })
+        };
+        assert_eq!(dashed(cx, "[[b#存在]]\n"), 0, "还在的跨篇标题不是虚线");
+        assert!(dashed(cx, "[[b#没有]]\n") > 0, "缺失的跨篇标题不用悬停也是虚线");
     }
 
     #[gpui_kit::test]

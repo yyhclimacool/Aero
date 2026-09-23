@@ -33,6 +33,9 @@ pub(super) struct ColorMenu {
     selected: usize,
     /// 打开时目标已有的颜色（文字、背景），用来画选中标记
     current: [Option<String>; 2],
+    /// 选区盖住整块时可以改去给块上色。`None` 表示这次菜单没有这个开关。
+    whole_block_id: Option<BlockId>,
+    whole_block: bool,
     _subscription: Subscription,
 }
 
@@ -97,21 +100,20 @@ impl Editor {
                 self.format_inline(aero_core::inline_format::Format::Highlight, window, cx)
             }
             Some(Inline::Edit(edit)) => {
-                // 上色后选区仍然盖住原来那段文字，可以接着换颜色
-                let body = source[selection].to_owned();
-                let at = edit.text.find(&body).map(|i| edit.range.start + i);
+                // 上色后选区仍然盖住被上色的正文（扩大选区时里面的标记已经收掉）
+                let painted = colors::painted_content(&edit.text);
+                let at = edit.range.start + painted.start;
+                let len = painted.end - painted.start;
                 self.slash = None;
                 self.wiki = None;
                 self.tag_menu = None;
                 self.last_edit_at = None;
-                let cursor = at.map_or(edit.new_range().end, |at| at + body.len());
-                self.structural_edit(edit, cursor, window, cx);
-                if let Some(at) = at
-                    && let Some(f) = &self.focused
+                self.structural_edit(edit, at + len, window, cx);
+                if let Some(f) = &self.focused
                     && at >= f.range.start
-                    && at + body.len() <= f.range.end
+                    && at + len <= f.range.end
                 {
-                    let selected = at - f.range.start..at + body.len() - f.range.start;
+                    let selected = at - f.range.start..at + len - f.range.start;
                     f.textarea.update(cx, |ta, cx| ta.set_selected_range(selected, cx));
                 }
                 cx.notify();
@@ -231,6 +233,16 @@ impl Editor {
             }
             (None, None) => return false,
         };
+        let whole_block_id = match &self.focused {
+            Some(f) if matches!(target, Target::Inline) => {
+                let selected = f.textarea.read(cx).selected_range();
+                let len = f.textarea.read(cx).value().len();
+                (selected.start == 0 && selected.end == len && len > 0)
+                    .then(|| self.focused_block_id())
+                    .flatten()
+            }
+            _ => None,
+        };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("过滤颜色"));
         let subscription = cx.subscribe_in(&input, window, Self::on_color_menu_input);
         self.slash = None;
@@ -242,6 +254,8 @@ impl Editor {
             matches: color_menu::filter(""),
             selected: 0,
             current,
+            whole_block_id,
+            whole_block: false,
             _subscription: subscription,
         });
         input.update(cx, |state, cx| state.focus(window, cx));
@@ -353,8 +367,12 @@ impl Editor {
         let Some(&ix) = at.or(Some(menu.selected)).and_then(|at| menu.matches.get(at)) else { return };
         let item = color_menu::item(ix);
         let target = menu.target.clone();
+        let whole = menu.whole_block.then_some(menu.whole_block_id).flatten();
         self.close_color_menu(window, cx);
         match &target {
+            Target::Inline if let Some(id) = whole => {
+                self.color_blocks(&[id], item.slot, item.color, cx);
+            }
             Target::Inline => {
                 self.color_selection(item.slot, item.color, window, cx);
             }
@@ -428,6 +446,32 @@ impl Editor {
                     .border_color(theme.border)
                     .rounded(px(8.))
                     .shadow_lg()
+                    .when(menu.whole_block_id.is_some(), |el| {
+                        let on = menu.whole_block;
+                        el.child(
+                            h_flex()
+                                .id("color-apply-block")
+                                .debug_selector(|| "color-apply-block".to_owned())
+                                .w_full()
+                                .h(px(28.))
+                                .px_2()
+                                .items_center()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(|el| el.bg(theme.list_hover))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(menu) = &mut this.color_menu {
+                                            menu.whole_block = !menu.whole_block;
+                                        }
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(if on { "应用到整块  ✓" } else { "应用到整块" }),
+                        )
+                    })
                     // 「上次使用」那一行：⌘⇧H 不开菜单也能直接用它
                     .child(
                         h_flex()
