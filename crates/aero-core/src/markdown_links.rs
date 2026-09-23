@@ -113,6 +113,37 @@ pub(crate) fn destinations(src: &str) -> Result<Vec<Destination>, String> {
     Ok(result)
 }
 
+/// 实际生效的链接 / 图片地址，只解析一次。用来数附件引用、记笔记引用了哪些附件；
+/// 要改写源码时用 [`destinations`]，它为了证明每个地址的字节位置，每个链接都要整篇重解析一遍，
+/// 几百个链接的长笔记要几十秒。计法与 `destinations` 一致：不含自动链接，代码、数学里的不算，
+/// 内联链接按出现次数计，引用式链接按定义计一次。
+pub(crate) fn link_targets(src: &str) -> Vec<String> {
+    let text = src.strip_prefix('\u{feff}').unwrap_or(src);
+    let arena = Arena::new();
+    let root = parse_document(&arena, text, &parse::comrak_options());
+    let Ok(links) = collect_links(root, text) else {
+        // 源码位置映射不上时分不清自动链接与引用式，宁可多数也不漏数
+        return root
+            .descendants()
+            .filter_map(|node| match &node.data().value {
+                NodeValue::Link(link) | NodeValue::Image(link) => Some(link.url.clone()),
+                _ => None,
+            })
+            .collect();
+    };
+    let mut definitions = std::collections::HashSet::new();
+    links
+        .into_iter()
+        .filter(|link| link.bracketed)
+        .filter(|link| {
+            let raw = &text[link.range.clone()];
+            let inline = raw.ends_with(')') && raw.contains("](");
+            inline || definitions.insert(link.url.clone())
+        })
+        .map(|link| link.url)
+        .collect()
+}
+
 #[derive(Debug)]
 struct Link {
     range: Range<usize>,

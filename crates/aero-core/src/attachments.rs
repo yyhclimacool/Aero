@@ -176,8 +176,7 @@ impl References {
             let Ok((bytes, _)) = vault.read_bytes(&note) else { continue };
             let Ok(text) = String::from_utf8(bytes) else { continue };
             let embeds = links::scan_embeds(&text).into_iter().map(|e| e.target);
-            let markdown =
-                crate::markdown_links::destinations(&text).unwrap_or_default().into_iter().map(|d| d.url);
+            let markdown = crate::markdown_links::link_targets(&text);
             for target in embeds.chain(markdown) {
                 // 普通 Markdown 地址可能带锚点 / 查询，也可能写成 `../`
                 let target = target.split(['#', '?']).next().unwrap_or(&target);
@@ -213,12 +212,10 @@ pub fn referenced_targets(text: &str) -> Vec<String> {
             out.push(embed.target);
         }
     }
-    if let Ok(destinations) = crate::markdown_links::destinations(text) {
-        for destination in destinations {
-            let bare = destination.url.split(['#', '?']).next().unwrap_or("");
-            if Kind::for_path(bare).is_some() {
-                out.push(destination.url);
-            }
+    for url in crate::markdown_links::link_targets(text) {
+        let bare = url.split(['#', '?']).next().unwrap_or("");
+        if Kind::for_path(bare).is_some() {
+            out.push(url);
         }
     }
     out
@@ -245,7 +242,14 @@ pub fn rewrite_references(
                 edits.push(start..start + embed.target.len());
             }
         }
-        if let Ok(destinations) = crate::markdown_links::destinations(&text) {
+        // 先用一次解析看这篇有没有指向它的普通链接，没有就不做逐个链接的定位
+        let points_here = |url: &String| {
+            let bare = url.split(['#', '?']).next().unwrap_or("");
+            matches!(catalog.resolve(bare, &note), Resolution::Resolved { ref path, .. } if path == from)
+        };
+        if crate::markdown_links::link_targets(&text).iter().any(points_here)
+            && let Ok(destinations) = crate::markdown_links::destinations(&text)
+        {
             for destination in destinations {
                 let bare = destination.url.split(['#', '?']).next().unwrap_or("");
                 if matches!(catalog.resolve(bare, &note), Resolution::Resolved { ref path, .. } if path == from)

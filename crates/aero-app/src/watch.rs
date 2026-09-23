@@ -231,8 +231,16 @@ fn debounce_loop(
                 }
             }
         }
+        let sample: Vec<String> = acc.paths.iter().take(4).map(|p| p.display().to_string()).collect();
         let batch = acc.finish(roots);
         if !batch.is_empty() {
+            log::debug!(
+                "watch batch: {} changed, {} removed, {} attachments, rescan={} ({sample:?})",
+                batch.changed.len(),
+                batch.removed.len(),
+                batch.attachments.len(),
+                batch.rescan
+            );
             sink.lock().unwrap().push(batch);
         }
         if disconnected {

@@ -154,6 +154,31 @@ impl Folder {
     }
 }
 
+/// 一次磁盘枚举的结果：目录树与每篇笔记的附件。只读磁盘，可以在后台线程做。
+struct Scan {
+    tree: Result<Folder, String>,
+    attachments: BTreeMap<VaultPath, Vec<VaultPath>>,
+}
+
+impl Scan {
+    fn read(vault: &Vault) -> Scan {
+        let tree = vault
+            .notes()
+            .and_then(|notes| vault.folders().map(|folders| Folder::build(&notes, &folders)))
+            .map_err(|e| e.to_string());
+        // 附件只按后缀枚举、不读内容；枚举失败不影响笔记树
+        let mut attachments: BTreeMap<VaultPath, Vec<VaultPath>> = BTreeMap::new();
+        if let Ok(catalog) = aero_core::attachments::Catalog::read(vault) {
+            for entry in catalog.entries {
+                if let Some(note) = owner_note(&entry.path) {
+                    attachments.entry(note).or_default().push(entry.path);
+                }
+            }
+        }
+        Scan { tree, attachments }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Row {
     /// 「收藏」分区标题，可折叠
@@ -208,6 +233,9 @@ pub struct FileTree {
     favorites_collapsed: bool,
     vault_collapsed: bool,
     rename_input: Option<RenameInput>,
+    /// 后台重扫（`rescan_in_background`）进行中；期间又来请求就置 `scan_again`
+    scanning: Option<Task<()>>,
+    scan_again: bool,
     scroll: VirtualListScrollHandle,
     /// 点击行后树持有焦点，`⌘⌫` 等树内快捷键（上下文 `FileTree`）才有处可去
     focus_handle: FocusHandle,
@@ -231,6 +259,8 @@ impl FileTree {
             favorites_collapsed: false,
             vault_collapsed: false,
             rename_input: None,
+            scanning: None,
+            scan_again: false,
             scroll: VirtualListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             error: None,
@@ -288,24 +318,43 @@ impl FileTree {
         self.error = errors.into_iter().next();
     }
 
-    /// 重新枚举磁盘上的笔记和目录（包括空目录）与每篇笔记的附件。
+    /// 重新枚举磁盘上的笔记和目录（包括空目录）与每篇笔记的附件。用户操作之后调用，调用方紧接着要用新树。
     pub fn rescan(&mut self) {
-        match self.vault.notes().and_then(|notes| self.vault.folders().map(|folders| (notes, folders))) {
-            Ok((notes, folders)) => {
-                self.root = Folder::build(&notes, &folders);
+        let scan = Scan::read(&self.vault);
+        self.apply(scan);
+    }
+
+    /// 文件监听触发的重扫放到后台：目录遍历在有安全软件逐个审计文件访问的机器上可能要几秒，
+    /// 不能卡住界面。扫描中又来请求就在这次结束后再扫一次，同时最多一个在跑。
+    pub fn rescan_in_background(&mut self, cx: &mut Context<Self>) {
+        if self.scanning.is_some() {
+            self.scan_again = true;
+            return;
+        }
+        let vault = self.vault.clone();
+        let scan = cx.background_spawn(async move { Scan::read(&vault) });
+        self.scanning = Some(cx.spawn(async move |this, cx| {
+            let scan = scan.await;
+            let _ = this.update(cx, |this, cx| {
+                this.scanning = None;
+                this.apply(scan);
+                cx.notify();
+                if std::mem::take(&mut this.scan_again) {
+                    this.rescan_in_background(cx);
+                }
+            });
+        }));
+    }
+
+    fn apply(&mut self, scan: Scan) {
+        match scan.tree {
+            Ok(root) => {
+                self.root = root;
                 self.error = None;
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => self.error = Some(e),
         }
-        // 附件只按后缀枚举、不读内容；枚举失败不影响笔记树
-        self.attachments.clear();
-        if let Ok(catalog) = aero_core::attachments::Catalog::read(&self.vault) {
-            for entry in catalog.entries {
-                if let Some(note) = owner_note(&entry.path) {
-                    self.attachments.entry(note).or_default().push(entry.path);
-                }
-            }
-        }
+        self.attachments = scan.attachments;
         self.rebuild_rows();
     }
 
@@ -366,6 +415,11 @@ impl FileTree {
             self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
         }
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn is_scanning(&self) -> bool {
+        self.scanning.is_some()
     }
 
     /// 树里是否有这篇笔记（上次 `rescan` 时磁盘上的、且没被忽略规则过滤掉）。

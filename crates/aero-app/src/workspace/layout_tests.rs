@@ -343,3 +343,30 @@ fn breadcrumb_folders_reveal_themselves_in_the_file_tree(cx: &mut TestAppContext
     assert!(cx.debug_bounds("file-tree-folder:项目/进行中").is_some(), "展开到被点的文件夹");
     close_index(cx, &workspace);
 }
+
+/// 文件监听的一批变化：只改了已有笔记的内容（包括自己的自动保存）不动文件树；
+/// 有新笔记时在后台重扫，界面线程上不做目录遍历（有安全软件审计文件访问时一次要几秒）。
+#[gpui_kit::test]
+fn saving_a_note_leaves_the_tree_alone_and_new_files_rescan_in_the_background(cx: &mut TestAppContext) {
+    use crate::watch::Batch;
+    let (dir, _data, workspace) = open(cx, Some("# A\n"));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let tree = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().tree.clone());
+    workspace.update_in(cx, |w, window, cx| {
+        w.on_vault_changed(&Batch { changed: vec![note("a.md")], ..Default::default() }, window, cx);
+        assert!(!tree.read(cx).is_scanning(), "只改内容不重扫");
+    });
+    std::fs::write(dir.path().join("b.md"), "# B\n").unwrap();
+    workspace.update_in(cx, |w, window, cx| {
+        w.on_vault_changed(&Batch { changed: vec![note("b.md")], ..Default::default() }, window, cx);
+        w.on_vault_changed(&Batch { rescan: true, ..Default::default() }, window, cx);
+        assert!(tree.read(cx).is_scanning(), "新笔记触发重扫");
+        assert!(!tree.read(cx).contains(&note("b.md")), "界面线程上没有同步遍历");
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(tree.read(cx).contains(&note("b.md")));
+        assert!(!tree.read(cx).is_scanning(), "扫描中又来的请求合并成一次补扫，然后停下");
+    });
+    close_index(cx, &workspace);
+}

@@ -92,6 +92,9 @@ pub struct Workspace {
     panel_width: Pixels,
     /// 正在拖的分割线
     split: Option<SplitDrag>,
+    /// 后台算附件引用计数（`refresh_attachment_references`）；算的时候又来请求就置 `references_again`
+    references_task: Option<Task<()>>,
+    references_again: bool,
     next_tab_id: u64,
     tab_scroll: ScrollHandle,
     /// 上次交给系统的窗口标题（窗口菜单、调度中心里显示）
@@ -161,6 +164,8 @@ impl Workspace {
             sidebar_width: px(state.sidebar_width.unwrap_or(SIDEBAR_DEFAULT)),
             panel_width: px(state.panel_width.unwrap_or(PANEL_DEFAULT)),
             split: None,
+            references_task: None,
+            references_again: false,
             next_tab_id: 0,
             tab_scroll: ScrollHandle::new(),
             window_title: String::new(),
@@ -288,11 +293,16 @@ impl Workspace {
 
     /// 后台扫一遍附件引用（读每篇笔记的正文），算完把报告交给文件树标"未引用"。
     /// 打开 vault 与附件 / 目录变化后各算一次；只在笔记里加减引用不会立刻刷新计数。
-    fn refresh_attachment_references(&self, cx: &mut Context<Self>) {
+    /// 同时最多一个在算，算的时候又来的请求合并成算完后的一次补算。
+    fn refresh_attachment_references(&mut self, cx: &mut Context<Self>) {
+        if self.references_task.is_some() {
+            self.references_again = true;
+            return;
+        }
         let Some(open) = self.open.as_ref() else { return };
         let indexer = open.search.read(cx).share_indexer();
         let (vault, tree) = (open.vault.clone(), open.tree.clone());
-        cx.spawn(async move |_, cx| {
+        self.references_task = Some(cx.spawn(async move |this, cx| {
             let report = cx
                 .background_spawn(async move {
                     let from_index = indexer.lock().ok().and_then(|guard| {
@@ -308,8 +318,13 @@ impl Workspace {
             if let Some(report) = report {
                 let _ = tree.update(cx, |tree, cx| tree.set_references(report, cx));
             }
-        })
-        .detach();
+            let _ = this.update(cx, |this, cx| {
+                this.references_task = None;
+                if std::mem::take(&mut this.references_again) {
+                    this.refresh_attachment_references(cx);
+                }
+            });
+        }));
     }
 
     fn on_open_vault(&mut self, _: &OpenVault, window: &mut Window, cx: &mut Context<Self>) {
@@ -1396,10 +1411,14 @@ impl Workspace {
         let Some(open) = self.open.as_ref() else { return };
         let editors: Vec<Entity<Editor>> = open.editors().cloned().collect();
         let shown: Vec<VaultPath> = editors.iter().map(|e| e.read(cx).path().clone()).collect();
-        open.tree.update(cx, |t, cx| {
-            t.rescan();
-            cx.notify();
-        });
+        // 只改了已有笔记的内容（包括我们自己的自动保存）不动文件树；增删、目录与附件变化才重扫，而且在后台扫
+        let tree_changed = batch.rescan
+            || !batch.removed.is_empty()
+            || !batch.attachments.is_empty()
+            || batch.changed.iter().any(|p| !open.tree.read(cx).contains(p));
+        if tree_changed {
+            open.tree.update(cx, |t, cx| t.rescan_in_background(cx));
+        }
         let mine = |p: &VaultPath| shown.contains(p);
         let changed: Vec<VaultPath> = batch.changed.iter().chain(&batch.removed).cloned().collect();
         for (editor, path) in editors.iter().zip(&shown) {
@@ -1927,6 +1946,8 @@ mod tests {
                 sidebar_width: px(super::SIDEBAR_DEFAULT),
                 panel_width: px(super::PANEL_DEFAULT),
                 split: None,
+                references_task: None,
+                references_again: false,
                 next_tab_id: 1,
                 tab_scroll: gpui_kit::ScrollHandle::new(),
                 window_title: String::new(),
@@ -2262,6 +2283,8 @@ mod tests {
             rescan: false,
         };
         workspace.update_in(cx, |w, window, cx| w.on_vault_changed(&batch, window, cx));
+        // 文件树在后台重扫
+        cx.run_until_parked();
         cx.update(|_, cx| assert!(tree.read(cx).contains(&b)));
         wait_until(cx, |cx| hit_paths(cx, &search, "anchor").len() == 2);
 

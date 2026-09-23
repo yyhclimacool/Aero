@@ -479,7 +479,25 @@ impl RewriteContext<'_> {
             let range = links::target_range(text, &span);
             edits.push((bom + range.start..bom + range.end, replacement));
         }
-        for destination in crate::markdown_links::destinations(text).map_err(RenameError::Invalid)? {
+        // 先用一次解析拿到的地址看有没有要改的：多数笔记一个都没有，省掉每个链接一次的整篇重解析。
+        // 判断条件与下面循环里的跳过条件相同。
+        let needs_rewrite = |url: &str| {
+            if url.is_empty() || url.starts_with(['#', '?']) || url.starts_with("//") || url::Url::parse(url).is_ok()
+            {
+                return false;
+            }
+            let split = url.find(['#', '?']).unwrap_or(url.len());
+            let Some(decoded) = decode_path(&url[..split]) else { return false };
+            let Some(path) = resolve_file(&decoded, source.parent(), self.files) else { return false };
+            let desired = relocated(&path, self.from, self.to, self.directory);
+            resolve_file(&decoded, new_source.parent(), self.after_files).as_ref() != Some(&desired)
+        };
+        let destinations = if crate::markdown_links::link_targets(text).iter().any(|url| needs_rewrite(url)) {
+            crate::markdown_links::destinations(text).map_err(RenameError::Invalid)?
+        } else {
+            Vec::new()
+        };
+        for destination in destinations {
             let url = &destination.url;
             if url.is_empty()
                 || url.starts_with(['#', '?'])
