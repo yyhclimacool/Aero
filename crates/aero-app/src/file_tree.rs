@@ -21,7 +21,12 @@ pub const ROW_HEIGHT: f32 = 28.;
 
 pub enum FileTreeEvent {
     Open(VaultPath),
-    Move { from: VaultPath, to: VaultPath },
+    Move {
+        from: VaultPath,
+        to: VaultPath,
+    },
+    /// 附件改名改写了这些笔记，或附件被删除。
+    Touched(Vec<VaultPath>),
 }
 
 actions!(file_tree, [RenameSelection]);
@@ -29,6 +34,10 @@ actions!(file_tree, [RenameSelection]);
 #[derive(Clone, Debug, PartialEq, Eq, Action)]
 #[action(namespace = file_tree, no_json)]
 pub struct RenameEntry(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = file_tree, no_json)]
+pub struct TrashAttachment(pub String);
 
 struct RenameInput {
     path: VaultPath,
@@ -428,8 +437,23 @@ impl FileTree {
             cx.notify();
             return;
         }
-        let name =
-            if edit.directory || name.ends_with(".md") { name.to_owned() } else { format!("{name}.md") };
+        let attachment = edit.path.as_str().contains(".assets/");
+        let name = if edit.directory {
+            name.to_owned()
+        } else if attachment {
+            if name.contains('.') {
+                name.to_owned()
+            } else {
+                match edit.path.as_str().rsplit_once('.') {
+                    Some((_, ext)) => format!("{name}.{ext}"),
+                    None => name.to_owned(),
+                }
+            }
+        } else if name.ends_with(".md") {
+            name.to_owned()
+        } else {
+            format!("{name}.md")
+        };
         let target =
             if edit.path.parent().is_empty() { name } else { format!("{}/{name}", edit.path.parent()) };
         let to = VaultPath::new(&target).expect("validated entry name");
@@ -437,8 +461,31 @@ impl FileTree {
         self.rename_input = None;
         self.error = None;
         self.focus_handle.focus(window, cx);
-        if from != to {
+        if from != to && attachment {
+            match aero_core::attachments::rewrite_references(&self.vault, &from, &to) {
+                Ok(notes) => {
+                    if let Err(err) = self.vault.rename(&from, &to) {
+                        self.error = Some(err.to_string());
+                    } else {
+                        self.rescan();
+                        cx.emit(FileTreeEvent::Touched(notes));
+                    }
+                }
+                Err(err) => self.error = Some(err.to_string()),
+            }
+        } else if from != to {
             cx.emit(FileTreeEvent::Move { from, to });
+        }
+        cx.notify();
+    }
+
+    fn trash_attachment(&mut self, path: VaultPath, cx: &mut Context<Self>) {
+        let file = self.vault.fs_path(&path);
+        if let Err(err) = crate::trash::move_to_trash(&file) {
+            self.error = Some(err);
+        } else {
+            self.rescan();
+            cx.emit(FileTreeEvent::Touched(Vec::new()));
         }
         cx.notify();
     }
@@ -645,6 +692,13 @@ impl FileTree {
                             cx.open_url(&crate::paths::file_url(&file));
                         }
                     })
+                    .context_menu({
+                        let rel = path.as_str().to_owned();
+                        move |menu, _, _| {
+                            menu.menu("重命名", Box::new(RenameEntry(rel.clone())))
+                                .menu("删除", Box::new(TrashAttachment(rel.clone())))
+                        }
+                    })
                     .into_any_element()
             }
         }
@@ -686,6 +740,11 @@ impl Render for FileTree {
             .on_action(cx.listener(|this, action: &RenameEntry, window, cx| {
                 if let Ok(path) = VaultPath::new(&action.0) {
                     this.start_rename(path, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, action: &TrashAttachment, _, cx| {
+                if let Ok(path) = VaultPath::new(&action.0) {
+                    this.trash_attachment(path, cx);
                 }
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -866,6 +925,7 @@ mod tests {
                     moves.borrow_mut().push((from.to_string(), to.to_string()))
                 }
                 super::FileTreeEvent::Open(_) => *opened.borrow_mut() += 1,
+                super::FileTreeEvent::Touched(_) => {}
             })
             .detach();
         });

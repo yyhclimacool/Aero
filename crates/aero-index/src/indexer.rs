@@ -542,6 +542,8 @@ impl Indexer {
                 (s, id)
             })
             .collect();
+        let targets = aero_core::attachments::referenced_targets(&doc.to_string());
+        self.meta.replace_attachment_targets(&note_id, &targets)?;
         if self.bulk {
             self.link_batch.push((note_id, rows));
             if self.link_batch.len() >= LINK_BATCH_NOTES {
@@ -742,6 +744,104 @@ impl Indexer {
         (self.meta.note_count().unwrap_or(0), self.fts.len())
     }
 
+    /// 附件被引用的次数。目标存在索引里，解析只用一次附件目录扫描，不再读每篇笔记。
+    pub fn attachment_references(&self) -> Result<aero_core::attachments::References, IndexerError> {
+        use aero_core::links::Resolution;
+        let catalog = aero_core::attachments::Catalog::read(self.vault.as_ref())?;
+        let mut refs = aero_core::attachments::References::from_catalog(&catalog);
+        for (note, target) in self.meta.attachment_targets()? {
+            let Ok(note) = aero_core::VaultPath::new(&note) else { continue };
+            let bare = target.split(['#', '?']).next().unwrap_or(&target);
+            if let Resolution::Resolved { path, .. } = catalog.resolve(bare, &note) {
+                refs.increment(&path);
+            }
+        }
+        Ok(refs)
+    }
+
+    /// 外部把笔记改名或搬走：内容指纹唯一对上时，改写入链并让 note_id 跟着新路径走。
+    pub fn adopt_external_moves(&mut self, paths: &[aero_core::VaultPath]) -> Result<(), IndexerError> {
+        let mut removed = Vec::new();
+        let mut appeared = Vec::new();
+        for path in paths {
+            if self.vault.exists(path) {
+                if self.meta.note_by_path(path.as_str())?.is_none() {
+                    appeared.push(path.clone());
+                }
+            } else if let Some(row) = self.meta.note_by_path(path.as_str())? {
+                removed.push(row);
+            }
+        }
+        for row in removed {
+            let hash = row.stamp.hash;
+            let matched: Vec<_> = appeared
+                .iter()
+                .filter(|path| self.vault.read(path).ok().is_some_and(|(_, stamp)| stamp.hash == hash))
+                .cloned()
+                .collect();
+            let [to] = matched.as_slice() else { continue };
+            let from = aero_core::VaultPath::new(&row.path)?;
+            self.rewrite_incoming_links(&row.note_id, to)?;
+            self.rename_note(&from, to)?;
+        }
+        Ok(())
+    }
+
+    fn rewrite_incoming_links(
+        &mut self,
+        note_id: &str,
+        to: &aero_core::VaultPath,
+    ) -> Result<(), IndexerError> {
+        let rows = self.meta.incoming_link_locations(note_id)?;
+        let mut by_path: std::collections::HashMap<String, Vec<(String, i64, i64)>> =
+            std::collections::HashMap::new();
+        for (path, target, start, end) in rows {
+            by_path.entry(path).or_default().push((target, start, end));
+        }
+        let mut sources = Vec::new();
+        for (path, spans) in by_path {
+            let path = aero_core::VaultPath::new(&path)?;
+            let (bytes, _) = self.vault.read_bytes(&path)?;
+            let mut text = String::from_utf8(bytes).map_err(|_| {
+                IndexerError::Vault(aero_core::VaultError::Utf8 { path: self.vault.fs_path(&path) })
+            })?;
+            let mut edits = Vec::new();
+            for (target, start, end) in spans {
+                let start = start as usize;
+                let end = end as usize;
+                if end > text.len() || start >= end {
+                    continue;
+                }
+                let span = aero_core::links::LinkSpan {
+                    range: start..end,
+                    target: target.clone(),
+                    alias: None,
+                    fragment: None,
+                };
+                let range = aero_core::links::target_range(&text, &span);
+                let replacement = if target.contains('/') {
+                    to.as_str().trim_end_matches(".md").to_owned()
+                } else {
+                    to.stem().to_owned()
+                };
+                let Some(escaped) = aero_core::links::escape_target(&replacement) else { continue };
+                edits.push((range, escaped));
+            }
+            edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+            for (range, replacement) in edits {
+                if range.end <= text.len() && range.start <= range.end {
+                    text.replace_range(range, &replacement);
+                }
+            }
+            self.vault.write_bytes(&path, text.as_bytes())?;
+            sources.push(path);
+        }
+        for path in sources {
+            self.refresh_note(&path)?;
+        }
+        Ok(())
+    }
+
     /// 清空并全量重建。
     pub fn rebuild(&mut self, progress: impl FnMut(usize, usize)) -> Result<SyncReport, IndexerError> {
         self.meta.reset()?;
@@ -808,6 +908,22 @@ mod tests {
             assert!(ix.backlinks(&a, None, 20).unwrap().hits.is_empty());
             assert_eq!(ix.meta.pending_links().unwrap().len(), 2);
         }
+    }
+
+    #[test]
+    fn external_rename_follows_the_file_hash_and_rewrites_the_link() {
+        let (dir, mut ix) = setup(&[("a.md", "见 [[b]]\n"), ("b.md", "目标\n")]);
+        ix.sync_all(|_, _| {});
+        std::fs::rename(dir.path().join("b.md"), dir.path().join("c.md")).unwrap();
+        ix.adopt_external_moves(&[
+            aero_core::VaultPath::new("b.md").unwrap(),
+            aero_core::VaultPath::new("c.md").unwrap(),
+        ])
+        .unwrap();
+        let text = std::fs::read_to_string(dir.path().join("a.md")).unwrap();
+        assert!(text.contains("[[c]]"), "{text}");
+        assert!(ix.meta.note_by_path("c.md").unwrap().is_some());
+        assert!(ix.meta.note_by_path("b.md").unwrap().is_none());
     }
 
     #[test]

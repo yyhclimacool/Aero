@@ -195,6 +195,10 @@ fn image_embed(source: &str) -> Option<ImageEmbed> {
     })
 }
 
+pub(super) fn is_image_embed(source: &str) -> bool {
+    image_embed(source).is_some()
+}
+
 /// 笔记 / 章节 / 块嵌入（`ui_design.md` 5.6）：`![[笔记]]`、`![[笔记#章节]]`、`![[笔记#^块]]`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NoteEmbed {

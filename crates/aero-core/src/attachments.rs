@@ -157,6 +157,15 @@ pub struct References {
 }
 
 impl References {
+    pub fn from_catalog(catalog: &Catalog) -> Self {
+        let counts = catalog.entries.iter().map(|entry| (entry.path.clone(), 0)).collect();
+        Self { counts }
+    }
+
+    pub fn increment(&mut self, path: &VaultPath) {
+        *self.counts.entry(path.clone()).or_insert(0) += 1;
+    }
+
     /// 扫描整库：枚举附件 + 读每篇笔记的正文。会读盘，放后台跑。
     /// 个别笔记读不出来（权限、非 UTF-8）只跳过它，不让一篇坏文件毁掉整份报告。
     pub fn read(vault: &Vault) -> Result<References, VaultError> {
@@ -193,6 +202,76 @@ impl References {
     pub fn is_empty(&self) -> bool {
         self.counts.is_empty()
     }
+}
+
+/// 一篇笔记正文里指向附件的目标（嵌入和普通链接），原样保留，解析留给索引查询。
+pub fn referenced_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for embed in links::scan_embeds(text) {
+        let bare = embed.target.split(['#', '?']).next().unwrap_or("");
+        if Kind::for_path(bare).is_some() {
+            out.push(embed.target);
+        }
+    }
+    if let Ok(destinations) = crate::markdown_links::destinations(text) {
+        for destination in destinations {
+            let bare = destination.url.split(['#', '?']).next().unwrap_or("");
+            if Kind::for_path(bare).is_some() {
+                out.push(destination.url);
+            }
+        }
+    }
+    out
+}
+
+/// 把指向 `from` 的附件链接改成 `to` 的文件名。文件本身要由调用方改名。
+pub fn rewrite_references(
+    vault: &Vault,
+    from: &VaultPath,
+    to: &VaultPath,
+) -> Result<Vec<VaultPath>, VaultError> {
+    let catalog = Catalog::read(vault)?;
+    let new_name = to.file_name();
+    let mut updated = Vec::new();
+    for note in vault.notes()? {
+        let (bytes, _) = vault.read_bytes(&note)?;
+        let Ok(mut text) = String::from_utf8(bytes) else { continue };
+        let mut edits = Vec::new();
+        for embed in links::scan_embeds(&text) {
+            if matches!(catalog.resolve(&embed.target, &note), Resolution::Resolved { ref path, .. } if path == from)
+                && let Some(rel) = text[embed.range.clone()].find(&embed.target)
+            {
+                let start = embed.range.start + rel;
+                edits.push(start..start + embed.target.len());
+            }
+        }
+        if let Ok(destinations) = crate::markdown_links::destinations(&text) {
+            for destination in destinations {
+                let bare = destination.url.split(['#', '?']).next().unwrap_or("");
+                if matches!(catalog.resolve(bare, &note), Resolution::Resolved { ref path, .. } if path == from)
+                {
+                    let url_at = text[destination.range.clone()]
+                        .find(&destination.url)
+                        .map(|rel| destination.range.start + rel);
+                    if let Some(start) = url_at {
+                        let split = destination.url.find(['#', '?']).unwrap_or(destination.url.len());
+                        edits.push(start..start + split);
+                    }
+                }
+            }
+        }
+        if edits.is_empty() {
+            continue;
+        }
+        edits.sort_by_key(|range| std::cmp::Reverse(range.start));
+        edits.dedup();
+        for range in edits {
+            text.replace_range(range, &new_name);
+        }
+        vault.write_bytes(&note, text.as_bytes())?;
+        updated.push(note);
+    }
+    Ok(updated)
 }
 
 /// 把 `./` 与 `../` 归到 vault 内的路径；越过根目录就当解析不了。

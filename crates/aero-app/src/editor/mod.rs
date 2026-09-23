@@ -10,6 +10,7 @@
 //! 或粘贴出多个块时，控件仍然有归属，不会因为块消失而失焦。
 
 mod backlinks_ui;
+mod block_menu;
 mod block_refs_ui;
 mod color_menu;
 mod colors_ui;
@@ -237,6 +238,8 @@ pub struct Editor {
     slash: Option<SlashMenu>,
     /// 颜色菜单（7.7）；开着时焦点在它的过滤输入框上
     color_menu: Option<colors_ui::ColorMenu>,
+    /// 块菜单（5.3）
+    block_menu: Option<block_menu::BlockMenu>,
     /// 选区浮动工具条（5.9）与它的延迟出现计时
     toolbar: Option<toolbar::Toolbar>,
     toolbar_task: Option<Task<()>>,
@@ -312,6 +315,7 @@ impl Editor {
             title_edit: None,
             slash: None,
             color_menu: None,
+            block_menu: None,
             toolbar: None,
             toolbar_task: None,
             head_bounds: Rc::default(),
@@ -824,6 +828,9 @@ impl Editor {
             return;
         }
         if self.close_color_menu(window, cx) {
+            return;
+        }
+        if self.close_block_menu(cx) {
             return;
         }
         if self.dismiss_toolbar(cx) {
@@ -2019,7 +2026,8 @@ impl Editor {
             .relative()
             .w_full()
             .child(highlight_ui::background(f.textarea.clone(), f.highlight.clone()))
-            .child(Textarea::new(&f.textarea));
+            .child(Textarea::new(&f.textarea))
+            .child(highlight_ui::faded_markers(f.textarea.clone()));
         match kind {
             Some(BlockKind::Heading { level }) => {
                 el = el
@@ -2291,9 +2299,10 @@ impl Editor {
         };
         let handle = button("gutter-handle", "⠿", "选中块").on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |this, _, window, cx| {
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
                 this.select_block_by_id(id, window, cx);
+                this.open_block_menu(id, event.position, window, cx);
             }),
         );
         let plus = button("gutter-plus", "+", "在下方插入块").on_mouse_down(
@@ -2310,6 +2319,14 @@ impl Editor {
             .group("unit")
             .ml(-reach)
             .pl(reach)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.select_block_by_id(id, window, cx);
+                    this.open_block_menu(id, event.position, window, cx);
+                }),
+            )
             .child(
                 h_flex()
                     .absolute()
@@ -2563,6 +2580,7 @@ impl Render for Editor {
             .vertical_scrollbar(&self.scroll)
             .children(self.render_link_preview(window, cx))
             .children(self.render_toolbar(cx))
+            .children(self.render_block_menu(cx))
             // 颜色菜单画在编辑器根上：块选中态没有控件可挂，位置由 `color_menu_position` 给
             .children(self.color_menu.is_some().then(|| self.render_color_menu(cx)))
             .children(self.render_image_viewer(window, cx))

@@ -177,7 +177,7 @@ impl Editor {
     }
 
     /// 编辑态里当前那一块。空段落（还没成块）时没有。
-    fn focused_block_id(&self) -> Option<BlockId> {
+    pub(super) fn focused_block_id(&self) -> Option<BlockId> {
         let f = self.focused.as_ref()?;
         f.id.or_else(|| self.focused_unit().map(|at| self.units[at].id))
     }
@@ -265,9 +265,11 @@ impl Editor {
 
     fn block_colors(&self, id: BlockId, source: &str) -> [Option<String>; 2] {
         let Some(block) = self.doc.blocks().find(id) else { return [None, None] };
-        let range = self.doc.range_of(block);
-        let read = |slot| colors::block_color(source, range.clone(), slot);
-        [read(Slot::Text), read(Slot::Background)]
+        let _ = source;
+        [
+            Slot::Text.color_of(&block.attrs).map(str::to_owned),
+            Slot::Background.color_of(&block.attrs).map(str::to_owned),
+        ]
     }
 
     pub(super) fn on_open_color_menu(
@@ -276,7 +278,16 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.editing_with_keyboard(window, cx) || !self.open_color_menu(window, cx) {
+        if self.input_composing(window, cx) {
+            cx.propagate();
+            return;
+        }
+        // 颜色菜单已经开着：⌘/ 把它关掉。否则 ⌘/ 打开块菜单，颜色从「颜色 ▸」进去。
+        if self.color_menu.is_some() {
+            let _ = self.close_color_menu(window, cx);
+            return;
+        }
+        if !self.open_block_menu_for_current(window, cx) {
             cx.propagate();
         }
     }

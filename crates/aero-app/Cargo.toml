@@ -25,6 +25,8 @@ clap = { version = "4", features = ["derive"] }
 log = "0.4"
 # 图片解码 / 缩放（渲染服务，方案 9.9）。特性集与 GPUI 已启用的一致，不额外引入编解码器
 image = "0.25"
+# SVG 光栅化进同一条位图管线。版本跟依赖树里已有的 resvg 对齐
+resvg = "0.45.1"
 # 本地时间：冲突副本文件名、daily 笔记（锁到已在依赖树里的版本）
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # vault 文件监听（macOS FSEvents；方案 12）。与 GPUI 用的是同一个版本

@@ -56,7 +56,7 @@ pub(crate) fn attrs_at(src: &str, at: usize) -> Option<(Attrs, usize)> {
     Attrs::parse_inner(&rest[1..close]).map(|attrs| (attrs, at + close + 1))
 }
 
-/// 块末属性列表里的颜色。
+/// 块末属性列表里的颜色。多行块写在后面独占行上的颜色不在这段正文里，读块上的 `attrs`。
 pub fn block_color(src: &str, block: Range<usize>, slot: Slot) -> Option<String> {
     let text = src.get(block)?;
     let trailing = crate::parse::markers::strip_trailing(text.trim_end());
@@ -65,14 +65,23 @@ pub fn block_color(src: &str, block: Range<usize>, slot: Slot) -> Option<String>
 
 /// 给一个块上色 / 去色：`color` 为 `None` 时移除这一组（对应菜单里的"默认"）。
 ///
-/// 只改块末的属性列表，不动正文、不动 `^id`、不动其他类名；属性空了就把 ` {...}` 一并删掉。
-/// 已经是这个颜色时返回 `None`（无需编辑）。多行块的独占行属性（6.3.10 末尾那种）暂不支持。
+/// 单行块把属性列表写在块末。多行块写在后面的独占行 `{.bg-gray}`，规则同 `^id`。
+/// 只改这一组颜色，不动正文、不动 `^id`、不动其他类名；属性空了就把标记删掉。
+/// 已经是这个颜色时返回 `None`（无需编辑）。
 pub fn block_edit(src: &str, block: Range<usize>, slot: Slot, color: Option<&str>) -> Option<Edit> {
     if let Some(color) = color
         && !PALETTE.contains(&color)
     {
         return None;
     }
+    let text = src.get(block.clone())?;
+    if text.trim_end().contains('\n') {
+        return marker_line_edit(src, block.end, slot, color);
+    }
+    trailing_block_edit(src, block, slot, color)
+}
+
+fn trailing_block_edit(src: &str, block: Range<usize>, slot: Slot, color: Option<&str>) -> Option<Edit> {
     let text = src.get(block.clone())?;
     // 保留块末的空白 / 换行：只重写正文那一段
     let body_len = text.trim_end().len();
@@ -100,6 +109,82 @@ pub fn block_edit(src: &str, block: Range<usize>, slot: Slot, color: Option<&str
     }
     out.push_str(tail);
     Some(Edit::replace(block, out))
+}
+
+/// 多行块的颜色写在块后面的独占行。已有 `{...}` / `^id` 行就改那一行。
+fn marker_line_edit(src: &str, at: usize, slot: Slot, color: Option<&str>) -> Option<Edit> {
+    if let Some((range, mut attrs, id)) = marker_line_at(src, at) {
+        let had = slot.color_of(&attrs).map(str::to_owned);
+        if had.as_deref() == color {
+            return None;
+        }
+        attrs.classes.retain(|class| !slot.owns(class));
+        if let Some(color) = color {
+            attrs.classes.push(slot.class(color));
+        }
+        let mut line = String::new();
+        if !attrs.is_empty() {
+            line.push('{');
+            line.push_str(&render(&attrs));
+            line.push('}');
+        }
+        if let Some(id) = id {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push('^');
+            line.push_str(&id);
+        }
+        if line.is_empty() {
+            let end = (range.end + 1).min(src.len());
+            let start = range.start.saturating_sub(1);
+            return Some(Edit::delete(start..end));
+        }
+        return Some(Edit::replace(range, line));
+    }
+    let color = color?;
+    let mut attrs = Attrs::default();
+    attrs.classes.push(slot.class(color));
+    Some(Edit::insert(at, format!("\n\n{{{}}}\n", render(&attrs))))
+}
+
+fn marker_line_at(src: &str, at: usize) -> Option<(Range<usize>, Attrs, Option<String>)> {
+    let rest = src.get(at..)?;
+    let rest = rest.strip_prefix('\n')?;
+    let mut line_at = at + 1;
+    let mut line = rest;
+    if let Some(stripped) = line.strip_prefix('\n') {
+        line_at += 1;
+        line = stripped;
+    }
+    let line_len = line.find('\n').unwrap_or(line.len());
+    let (id, attrs) = crate::parse::markers::parse_marker_line(&line[..line_len])?;
+    Some((line_at..line_at + line_len, attrs.unwrap_or_default(), id))
+}
+
+/// 源码态里要淡化的颜色标记：`[`、`]` 和 `{.red}` / `{.bg-blue}`。
+pub fn marker_ranges(src: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = src[search..].find('{') {
+        let open = search + rel;
+        let Some((attrs, end)) = attrs_at(src, open) else {
+            search = open + 1;
+            continue;
+        };
+        if has_color(&attrs) {
+            ranges.push(open..end);
+            if open > 0 && src.as_bytes()[open - 1] == b']' {
+                ranges.push(open - 1..open);
+                if let Some(bracket) = bracket_start(src, open - 1, line_start(src, open)) {
+                    ranges.push(bracket..bracket + 1);
+                }
+            }
+        }
+        search = end;
+    }
+    ranges.sort_by_key(|range| range.start);
+    ranges
 }
 
 /// 选区当前承载的颜色（菜单画选中标记、工具条显示按下态都要读它）。
@@ -517,6 +602,20 @@ mod tests {
         assert!(block_edit(&plain.to_string(), range.clone(), Slot::Text, None).is_none());
         // 不在调色板里的颜色一律拒绝，不写脏数据
         assert!(block_edit(&plain.to_string(), range, Slot::Text, Some("chartreuse")).is_none());
+        let list = Document::from_text("- a\n- b\n");
+        let list_range = list.blocks().iter().next().map(|(_, b)| list.range_of(b)).unwrap();
+        let edited = block_edit(&list.to_string(), list_range, Slot::Background, Some("gray")).unwrap();
+        let mut doc = list;
+        doc.edit(edited).unwrap();
+        doc.reparse();
+        assert!(doc.to_string().contains("\n\n{.bg-gray}"), "{}", doc.to_string());
+        assert_eq!(
+            Slot::Background
+                .color_of(&doc.blocks().iter().next().unwrap().1.attrs)
+                .map(str::to_owned)
+                .as_deref(),
+            Some("gray")
+        );
     }
 
     /// 行内上色：没有承载者就包 `[文本]{...}`，已有的就地改，去空了连括号一起收掉。

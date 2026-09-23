@@ -10,8 +10,8 @@ use aero_core::FileStamp;
 use aero_core::links::LinkSpan;
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// 5: persist front matter aliases; older caches rebuild from Markdown.
-const SCHEMA_VERSION: i64 = 5;
+/// 6: attachment reference targets live in the index, so the file tree does not rescan every note.
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagCount {
@@ -96,6 +96,7 @@ impl Meta {
             "DROP TABLE IF EXISTS notes;
              DROP TABLE IF EXISTS links;
              DROP TABLE IF EXISTS note_tags;
+             DROP TABLE IF EXISTS attachment_refs;
              DROP TABLE IF EXISTS index_state;
              CREATE TABLE notes (
                  note_id     TEXT PRIMARY KEY,
@@ -123,6 +124,11 @@ impl Meta {
                  PRIMARY KEY(note_id, tag)
              );
              CREATE INDEX note_tags_tag_idx ON note_tags(tag);
+             CREATE TABLE attachment_refs (
+                 source_note_id TEXT NOT NULL,
+                 target TEXT NOT NULL
+             );
+             CREATE INDEX attachment_refs_source_idx ON attachment_refs(source_note_id);
              CREATE TABLE index_state (name TEXT PRIMARY KEY, version INTEGER NOT NULL);
              INSERT INTO index_state (name, version) VALUES ('meta', {SCHEMA_VERSION});"
         ))?;
@@ -185,9 +191,46 @@ impl Meta {
         Ok(())
     }
 
+    pub fn replace_attachment_targets(&mut self, note_id: &str, targets: &[String]) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM attachment_refs WHERE source_note_id = ?1", params![note_id])?;
+        let mut insert =
+            tx.prepare_cached("INSERT INTO attachment_refs (source_note_id, target) VALUES (?1, ?2)")?;
+        for target in targets {
+            insert.execute(params![note_id, target])?;
+        }
+        drop(insert);
+        tx.commit()
+    }
+
+    /// `(笔记路径, 原文里的附件目标)`。
+    pub fn attachment_targets(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.path, a.target FROM attachment_refs a JOIN notes n ON n.note_id = a.source_note_id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// 指向这篇笔记的链接：`(源路径, target, 字节起, 字节止)`。区间是整个 `[[...]]`。
+    pub fn incoming_link_locations(
+        &self,
+        note_id: &str,
+    ) -> rusqlite::Result<Vec<(String, String, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.path, l.target, l.byte_start, l.byte_end
+             FROM links l JOIN notes n ON n.note_id = l.source_note_id
+             WHERE l.resolved_note_id = ?1",
+        )?;
+        let rows =
+            stmt.query_map(params![note_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        rows.collect()
+    }
+
     pub fn remove_note(&mut self, note_id: &str) -> rusqlite::Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM note_tags WHERE note_id = ?1", params![note_id])?;
+        tx.execute("DELETE FROM attachment_refs WHERE source_note_id = ?1", params![note_id])?;
         tx.execute("DELETE FROM notes WHERE note_id = ?1", params![note_id])?;
         tx.commit()
     }

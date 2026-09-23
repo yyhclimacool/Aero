@@ -1,6 +1,7 @@
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
 use gpui_kit::base::input::TextareaState;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -48,6 +49,29 @@ pub(super) fn background(input: Entity<TextareaState>, cache: SourceHighlight) -
             window.with_content_mask(Some(ContentMask { bounds }), |window| {
                 for bounds in rectangles {
                     window.paint_quad(fill(bounds, color(cx)));
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+    .into_any_element()
+}
+
+/// 盖在源码文字上，把颜色标记洗淡，正文颜色不受影响。
+pub(super) fn faded_markers(input: Entity<TextareaState>) -> AnyElement {
+    canvas(
+        |_, _, _| (),
+        move |_, _, window, cx| {
+            let input = input.read(cx);
+            let source = input.value().to_string();
+            let ranges = aero_core::colors::marker_ranges(&source);
+            let rectangles = rectangles(input, &source, &ranges);
+            let Some(bounds) = input.text_bounds() else { return };
+            let wash = cx.theme().background.opacity(0.55);
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                for bounds in rectangles {
+                    window.paint_quad(fill(bounds, wash));
                 }
             });
         },

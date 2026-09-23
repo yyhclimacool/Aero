@@ -379,7 +379,7 @@ fn scan_tree_impl<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str, embeds: b
 }
 
 /// 只替换 `[[ target #fragment | alias ]]` 中的 target，保留所有空白、转义和其他字节。
-pub(crate) fn target_range(src: &str, span: &LinkSpan) -> Range<usize> {
+pub fn target_range(src: &str, span: &LinkSpan) -> Range<usize> {
     let inner = &src[span.range.start + 2..span.range.end - 2];
     let (head, _) = split_alias(inner);
     let (target, _) = split_unescaped(head, '#');

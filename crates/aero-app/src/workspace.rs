@@ -256,13 +256,19 @@ impl Workspace {
     /// 打开 vault 与附件 / 目录变化后各算一次；只在笔记里加减引用不会立刻刷新计数。
     fn refresh_attachment_references(&self, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_ref() else { return };
+        let indexer = open.search.read(cx).share_indexer();
         let (vault, tree) = (open.vault.clone(), open.tree.clone());
         cx.spawn(async move |_, cx| {
             let report = cx
                 .background_spawn(async move {
-                    aero_core::attachments::References::read(&vault)
-                        .map_err(|error| log::warn!("attachment references: {error}"))
-                        .ok()
+                    let from_index = indexer.lock().ok().and_then(|guard| {
+                        guard.as_ref().and_then(|index| index.attachment_references().ok())
+                    });
+                    from_index.or_else(|| {
+                        aero_core::attachments::References::read(&vault)
+                            .map_err(|error| log::warn!("attachment references: {error}"))
+                            .ok()
+                    })
                 })
                 .await;
             if let Some(report) = report {
@@ -430,6 +436,15 @@ impl Workspace {
                 }
             }
             FileTreeEvent::Move { from, to } => this.move_entry(from.clone(), to.clone(), window, cx),
+            FileTreeEvent::Touched(paths) => {
+                if !paths.is_empty() {
+                    let search = this.open.as_ref().map(|open| open.search.clone());
+                    if let Some(search) = search {
+                        search.update(cx, |search, cx| search.notes_touched(paths.clone(), cx));
+                    }
+                }
+                this.refresh_attachment_references(cx);
+            }
         })
     }
 

@@ -386,6 +386,11 @@ impl SearchService {
         });
     }
 
+    /// 附件引用计数。把索引句柄交给后台线程，避免在界面线程上扫目录。
+    pub fn share_indexer(&self) -> Arc<Mutex<Option<Indexer>>> {
+        self.indexer.clone()
+    }
+
     /// 文件监听报告这些路径有动静：逐篇按指纹对齐（新建 / 改动 → 重索引，消失 → 删除，没变 → 跳过）。
     pub fn notes_touched(&mut self, paths: Vec<VaultPath>, cx: &mut Context<Self>) {
         if paths.is_empty() {
@@ -394,6 +399,7 @@ impl SearchService {
         self.run(cx, false, move |ix| {
             let mut errors = Vec::new();
             let mut written = false;
+            let _ = ix.adopt_external_moves(&paths);
             for path in &paths {
                 match ix.refresh_note(path) {
                     Ok(Refresh::Unchanged) => {}

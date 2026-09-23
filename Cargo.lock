@@ -132,6 +132,7 @@ dependencies = [
  "ratex-parser",
  "ratex-render",
  "ratex-types",
+ "resvg 0.45.1",
  "serde",
  "serde_json",
  "tempfile",

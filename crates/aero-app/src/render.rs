@@ -102,6 +102,9 @@ struct Images;
 impl Renderer for Images {
     /// 只等比缩小、不放大：原图比目标窄时保持原尺寸，由元素按自然宽度显示。
     fn rasterize(&self, _: &Request, bytes: &[u8], target: u32) -> Result<RgbaImage, String> {
+        if is_svg(bytes) {
+            return rasterize_svg(bytes, target);
+        }
         let decoded = image::load_from_memory(bytes).map_err(|e| readable(&e.to_string()))?;
         let (width, height) = (decoded.width(), decoded.height());
         if width == 0 || height == 0 {
@@ -123,6 +126,31 @@ fn readable(error: &str) -> String {
     } else {
         format!("图片无法解码：{error}")
     }
+}
+
+fn is_svg(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(512)];
+    let text = String::from_utf8_lossy(head).trim_start().to_ascii_lowercase();
+    text.starts_with("<svg") || (text.starts_with("<?xml") && text.contains("<svg"))
+}
+
+fn rasterize_svg(bytes: &[u8], target: u32) -> Result<RgbaImage, String> {
+    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default())
+        .map_err(|error| format!("SVG 无法解析：{error}"))?;
+    let size = tree.size();
+    let src_w = size.width().ceil() as u32;
+    let src_h = size.height().ceil() as u32;
+    if src_w == 0 || src_h == 0 {
+        return Err("图片尺寸为 0".into());
+    }
+    let width = src_w.min(target.max(1));
+    let height = u32::try_from(u64::from(src_h) * u64::from(width) / u64::from(src_w))
+        .map_err(|_| "图片尺寸超出范围".to_owned())?
+        .max(1);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).ok_or("无法分配位图")?;
+    let scale = width as f32 / size.width();
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    RgbaImage::from_raw(width, height, pixmap.take()).ok_or_else(|| "SVG 光栅化失败".into())
 }
 
 /// 数学公式（方案 6.5）：LaTeX → AST → 排版（带主题色）→ 位图。

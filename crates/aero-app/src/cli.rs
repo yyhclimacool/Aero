@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use aero_core::links::{Resolution, creation_path};
 use aero_core::{Document, Vault, VaultPath};
-use aero_index::Indexer;
+use aero_index::{Indexer, Meta, ZvecFts};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
@@ -144,26 +144,27 @@ fn execute(cli: &Cli, data_dir: &Path) -> Result<String, String> {
             if let Some(path) = existing_note(&vault, note) {
                 return read_at(&vault, &path, block.as_deref(), cli.json);
             }
-            let mut indexer = open_index(&vault, data_dir)?;
+            let mut indexer = open_index(&vault, data_dir, false)?.0;
             read(&mut indexer, &vault, note, block.as_deref(), cli.json)
         }
         Cmd::Export { note, format } => {
             if let Some(path) = existing_note(&vault, note) {
                 return export_at(&vault, &path, *format, cli.json);
             }
-            let mut indexer = open_index(&vault, data_dir)?;
+            let mut indexer = open_index(&vault, data_dir, false)?.0;
             export_note(&mut indexer, &vault, note, *format, cli.json)
         }
         Cmd::Append { note, text } => {
             if let Some(path) = existing_note(&vault, note) {
                 return append_at(&vault, &path, text, cli.json, data_dir);
             }
-            let mut indexer = open_index(&vault, data_dir)?;
+            let mut indexer = open_index(&vault, data_dir, false)?.0;
             append(&mut indexer, &vault, note, text, cli.json)
         }
         Cmd::New { path, template } => create_note(&vault, path, template.as_deref(), cli.json, data_dir),
         command => {
-            let mut indexer = open_index(&vault, data_dir)?;
+            let allow_snapshot = !matches!(command, Cmd::Index { action: IndexCmd::Rebuild });
+            let (mut indexer, _snapshot) = open_index(&vault, data_dir, allow_snapshot)?;
             match command {
                 Cmd::Search { query, tag, limit } => search(&indexer, query, tag, *limit, cli.json),
                 Cmd::Backlinks { note, block, limit } => {
@@ -195,17 +196,56 @@ fn vault_root(flag: Option<&Path>, data_dir: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "没有打开的知识库。请用 --vault 指定目录，或先在 Aero 里打开一次。".to_owned())
 }
 
-fn open_index(vault: &Arc<Vault>, data_dir: &Path) -> Result<Indexer, String> {
-    Indexer::open(Arc::clone(vault), &data_dir.join("index")).map_err(|err| {
-        let message = err.to_string();
-        if is_lock_error(&err) {
-            format!(
-                "无法打开索引：{message}。搜索、反链和 index 要等 Aero 退出后才能用；读、导出、新建和追加不需要这份锁。"
-            )
-        } else {
-            format!("无法打开索引：{message}")
+fn open_index(
+    vault: &Arc<Vault>,
+    data_dir: &Path,
+    snapshot_if_locked: bool,
+) -> Result<(Indexer, Option<tempfile::TempDir>), String> {
+    match Indexer::open(Arc::clone(vault), &data_dir.join("index")) {
+        Ok(indexer) => Ok((indexer, None)),
+        Err(err) if snapshot_if_locked && is_lock_error(&err) => {
+            let (indexer, snapshot) = open_snapshot(vault, data_dir)?;
+            Ok((indexer, Some(snapshot)))
         }
-    })
+        Err(err) => {
+            let message = err.to_string();
+            if is_lock_error(&err) {
+                Err(format!(
+                    "无法打开索引：{message}。搜索、反链和 index 要等 Aero 退出后才能用；读、导出、新建和追加不需要这份锁。"
+                ))
+            } else {
+                Err(format!("无法打开索引：{message}"))
+            }
+        }
+    }
+}
+
+/// 图形界面占着引擎锁时，复制一份全文索引再打开。元数据库用 WAL，可以同时读。
+fn open_snapshot(vault: &Arc<Vault>, data_dir: &Path) -> Result<(Indexer, tempfile::TempDir), String> {
+    let dir = data_dir.join("index").join(vault.id());
+    let snapshot = tempfile::tempdir().map_err(|e| e.to_string())?;
+    copy_index_dir(&dir.join("fts"), &snapshot.path().join("fts"))?;
+    let meta = Meta::open(&dir.join("meta.sqlite")).map_err(|e| e.to_string())?;
+    let fts = ZvecFts::open(&snapshot.path().join("fts")).map_err(|e| e.to_string())?;
+    Ok((Indexer::with_parts(Arc::clone(vault), meta, Box::new(fts)), snapshot))
+}
+
+fn copy_index_dir(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(from).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if name == "LOCK" {
+            continue;
+        }
+        let dest = to.join(&name);
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            copy_index_dir(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), dest).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn is_lock_error(err: &aero_index::IndexerError) -> bool {
@@ -712,7 +752,7 @@ mod tests {
         assert!(dir.path().join("fresh.md").is_file());
         execute_args(&["--vault", vault_arg, "append", "a.md", "--text", "又一段"], data.path()).unwrap();
         assert!(std::fs::read_to_string(dir.path().join("a.md")).unwrap().contains("又一段"));
-        let err = execute_args(&["--vault", vault_arg, "search", "正文"], data.path()).unwrap_err();
-        assert!(err.contains("退出"), "{err}");
+        let search = execute_args(&["--vault", vault_arg, "search", "正文"], data.path()).unwrap();
+        assert!(search.contains("没有结果") || search.contains("a.md"), "{search}");
     }
 }

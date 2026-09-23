@@ -317,7 +317,29 @@ fn open_color_menu(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
     cx.simulate_keystrokes("cmd-/");
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.run_until_parked();
+    let color = cx.debug_bounds("block-menu-color").expect("⌘/ 应先打开块菜单");
+    cx.simulate_click(color.center(), gpui_kit::Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
     assert!(color_menu_open(editor, cx), "颜色菜单没打开");
+}
+
+/// `⌘/` 打开块菜单，从「颜色 ▸」进入颜色菜单。
+#[gpui_kit::test]
+fn block_menu_opens_with_command_slash_and_reaches_colors(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "段落\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("cmd-/");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("block-menu").is_some(), "⌘/ 打开块菜单");
+    assert!(!color_menu_open(&editor, cx));
+    let color = cx.debug_bounds("block-menu-color").unwrap();
+    cx.simulate_click(color.center(), gpui_kit::Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert!(color_menu_open(&editor, cx), "颜色 ▸ 打开颜色菜单");
 }
 
 /// 颜色菜单（7.7）：`⌘/` 打开，输入过滤，⏎ 应用到选中的文字，再打开时当前颜色有选中标记。

@@ -175,6 +175,15 @@ impl Editor {
     /// 当前块没有 `^id` 就写上一个。返回这块的 id。
     fn ensure_block_id(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<String, String> {
         let block = self.focused_unit().map(|ix| self.units[ix].id).ok_or_else(|| "没有当前块".to_owned())?;
+        self.ensure_id_for(block, window, cx)
+    }
+
+    pub(super) fn ensure_id_for(
+        &mut self,
+        block: aero_core::BlockId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
         let assignment = aero_core::block_refs::prepare(&self.doc, block)?;
         let id = assignment.id.clone();
         if let Some(edit) = assignment.edit {
@@ -185,7 +194,18 @@ impl Editor {
     }
 
     fn copy_block_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = match self.ensure_block_id(window, cx) {
+        let Some(block) = self.focused_unit().map(|ix| self.units[ix].id) else { return };
+        self.copy_block_link_for(block, window, cx);
+        let _ = self.close_toolbar_submenu(cx);
+    }
+
+    pub(super) fn copy_block_link_for(
+        &mut self,
+        block: aero_core::BlockId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = match self.ensure_id_for(block, window, cx) {
             Ok(id) => id,
             Err(error) => {
                 window.push_notification(
@@ -200,7 +220,6 @@ impl Editor {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(format!("[[{target}#^{id}]]")));
-        let _ = self.close_toolbar_submenu(cx);
     }
 
     fn add_block_id(&mut self, window: &mut Window, cx: &mut Context<Self>) {
