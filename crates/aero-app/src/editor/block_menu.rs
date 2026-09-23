@@ -5,7 +5,7 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use super::ops::BlockType;
+use super::ops::{BlockType, DropPlace};
 use super::slash::{self, SlashAction};
 use super::*;
 
@@ -18,6 +18,44 @@ pub(super) struct BlockMenu {
     block: BlockId,
     origin: Point<Pixels>,
     submenu: Option<Submenu>,
+}
+
+/// 正在拖的块。松手时按落点重排。
+#[derive(Clone, Copy)]
+pub(super) struct BlockDrag {
+    pub id: BlockId,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct BlockDropHint {
+    before: usize,
+    parent: Option<usize>,
+    origin: Point<Pixels>,
+    width: Pixels,
+}
+
+pub(super) struct BlockDragGhost {
+    text: SharedString,
+}
+
+impl BlockDragGhost {
+    pub(super) fn new(text: SharedString) -> Self {
+        Self { text }
+    }
+}
+
+impl Render for BlockDragGhost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(6.))
+            .shadow_md()
+            .bg(cx.theme().popover.opacity(0.92))
+            .text_sm()
+            .opacity(0.9)
+            .child(self.text.clone())
+    }
 }
 
 impl Editor {
@@ -60,6 +98,128 @@ impl Editor {
         }
         cx.notify();
         true
+    }
+
+    pub(super) fn remember_unit_bounds(&mut self, id: BlockId, bounds: Bounds<Pixels>) {
+        if let Some((_, stored)) = self.unit_bounds.iter_mut().find(|(stored_id, _)| *stored_id == id) {
+            *stored = bounds;
+        } else {
+            self.unit_bounds.push((id, bounds));
+        }
+    }
+
+    /// 拖拽刚越过阈值时记下落点。此时活动拖拽还没登记，不能 `notify`，否则这一帧会把提示清掉。
+    pub(super) fn preview_block_drag(&mut self, cursor: Point<Pixels>) {
+        self.dragging_block = true;
+        self.block_drop = self.block_drop_hint(cursor);
+    }
+
+    pub(super) fn track_block_drag(&mut self, cursor: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.dragging_block {
+            return;
+        }
+        let hint = self.block_drop_hint(cursor);
+        if hint != self.block_drop {
+            self.block_drop = hint;
+            cx.notify();
+        }
+    }
+
+    fn block_drop_hint(&self, cursor: Point<Pixels>) -> Option<BlockDropHint> {
+        let mut hovered: Option<(usize, Bounds<Pixels>)> = None;
+        let mut nearest: Option<(usize, Bounds<Pixels>, Pixels)> = None;
+        for (ix, unit) in self.units.iter().enumerate() {
+            let Some(bounds) =
+                self.unit_bounds.iter().find(|(id, _)| *id == unit.id).map(|(_, bounds)| *bounds)
+            else {
+                continue;
+            };
+            if cursor.y >= bounds.top() && cursor.y <= bounds.bottom() {
+                hovered = Some((ix, bounds));
+                break;
+            }
+            let distance =
+                if cursor.y < bounds.top() { bounds.top() - cursor.y } else { cursor.y - bounds.bottom() };
+            if nearest.as_ref().is_none_or(|(_, _, best)| distance < *best) {
+                nearest = Some((ix, bounds, distance));
+            }
+        }
+        let (ix, bounds) = hovered.or_else(|| nearest.map(|(ix, bounds, _)| (ix, bounds)))?;
+        let before = if cursor.y < bounds.top() + bounds.size.height / 2. { ix } else { ix + 1 };
+        let nest = self.units[ix].list.is_some() && cursor.x >= bounds.right() - px(24.);
+        let parent = nest.then_some(ix);
+        let y = if nest || before > ix { bounds.bottom() } else { bounds.top() };
+        let x = if nest { bounds.left() + px(24.) } else { bounds.left() };
+        Some(BlockDropHint { before, parent, origin: point(x, y), width: (bounds.right() - x).max(px(48.)) })
+    }
+
+    pub(super) fn finish_block_drag(
+        &mut self,
+        drag: &BlockDrag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dragging_block = false;
+        let cursor = window.mouse_position();
+        let hint = self.block_drop_hint(cursor);
+        self.block_drop = None;
+        let Some(hint) = hint else {
+            cx.notify();
+            return;
+        };
+        let Some(from) = self.unit_index(drag.id) else {
+            cx.notify();
+            return;
+        };
+        let Some(plan) = ops::move_unit(
+            &self.doc,
+            &self.units,
+            from,
+            DropPlace { before: hint.before, parent: hint.parent },
+        ) else {
+            cx.notify();
+            return;
+        };
+        if let Err(err) = self.doc.edit(plan.edit) {
+            log::warn!("拖拽重排失败: {err}");
+            cx.notify();
+            return;
+        }
+        self.focused = None;
+        self.block_menu = None;
+        self.after_doc_change(cx);
+        if let Some(ix) = super::units::unit_at(&self.units, plan.focus_offset) {
+            let id = self.units[ix].id;
+            self.select_blocks(ix, ix, window, cx);
+            self.pulse_block(id, cx);
+        }
+    }
+
+    pub(super) fn block_preview_text(&self, id: BlockId) -> SharedString {
+        let Some(ix) = self.unit_index(id) else { return "块".into() };
+        let text = self.doc.slice(self.units[ix].range.clone()).to_string();
+        let line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or("块");
+        let line = line.trim();
+        if line.chars().count() > 32 {
+            format!("{}…", line.chars().take(32).collect::<String>()).into()
+        } else if line.is_empty() {
+            "块".into()
+        } else {
+            line.to_owned().into()
+        }
+    }
+
+    pub(super) fn render_block_drop_line(&self, cx: &App) -> Option<AnyElement> {
+        let hint = self.block_drop?;
+        let color = cx.theme().accent;
+        Some(
+            deferred(
+                anchored().position(hint.origin).child(
+                    div().debug_selector(|| "block-drop-line".into()).w(hint.width).h(px(2.)).bg(color),
+                ),
+            )
+            .into_any_element(),
+        )
     }
 
     fn block_menu_convert(&mut self, target: BlockType, window: &mut Window, cx: &mut Context<Self>) {

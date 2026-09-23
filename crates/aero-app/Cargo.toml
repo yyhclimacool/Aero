@@ -37,6 +37,8 @@ ratex-layout = "0.1.14"
 ratex-types = "0.1.14"
 # embed-fonts：内嵌 KaTeX 字体，运行时不依赖 font_dir，打进 .app 即可用
 ratex-render = { version = "0.1.14", features = ["embed-fonts"] }
+# 索引被图形界面锁住时，CLI 把全文索引复制到临时目录再打开，进程结束时删掉
+tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # GPUI 当前没有设置 macOS 应用图标的 API；复用它已依赖的 AppKit 绑定。
@@ -48,4 +50,3 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 [dev-dependencies]
 # 无头 GPUI 测试（TestAppContext）：在测试里真正渲染编辑器并模拟按键
 gpui-kit = { workspace = true, features = ["test-support"] }
-tempfile = "3"

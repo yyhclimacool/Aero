@@ -342,6 +342,95 @@ fn block_menu_opens_with_command_slash_and_reaches_colors(cx: &mut TestAppContex
     assert!(color_menu_open(&editor, cx), "颜色 ▸ 打开颜色菜单");
 }
 
+/// 拖动 `⠿` 把块插到另一块前面，并画出插入线。点击手柄仍只是选中并打开菜单。
+#[gpui_kit::test]
+fn dragging_a_block_handle_reorders_it(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "aaa\n\nbbb\n\nccc\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let draw = |cx: &mut VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+    let selector = |name: &str, id: aero_core::BlockId| -> &'static str {
+        Box::leak(format!("{name}-{}", id.0).into_boxed_str())
+    };
+    draw(cx);
+    let ids: Vec<aero_core::BlockId> =
+        cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    let handle = cx.debug_bounds(selector("gutter-handle", ids[2])).expect("第三块的拖动手柄");
+    let target = cx.debug_bounds(selector("unit", ids[0])).expect("第一块");
+    let drop_at = target.origin + gpui_kit::point(gpui_kit::px(24.), gpui_kit::px(4.));
+    cx.simulate_mouse_move(handle.center(), None, gpui_kit::Modifiers::default());
+    cx.simulate_mouse_down(handle.center(), gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+    cx.simulate_mouse_move(
+        handle.center() + gpui_kit::point(gpui_kit::px(12.), gpui_kit::px(0.)),
+        gpui_kit::MouseButton::Left,
+        gpui_kit::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(drop_at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+    draw(cx);
+    assert!(cx.debug_bounds("block-drop-line").is_some(), "拖动时显示插入线");
+    cx.simulate_mouse_up(drop_at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "ccc\n\naaa\n\nbbb\n");
+    cx.update(|_, cx| {
+        assert!(editor.read(cx).block_menu.is_none(), "拖完不打开块菜单");
+        assert_eq!(editor.read(cx).highlighted_block(), Some(editor.read(cx).units[0].id));
+    });
+}
+
+/// 拖到列表项右侧 24 px 时，块缩进成该项的子项。
+#[gpui_kit::test]
+fn dragging_onto_the_right_edge_nests_under_the_list_item(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "- a\n- b\n\npara\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let draw = |cx: &mut VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+    let selector = |name: &str, id: aero_core::BlockId| -> &'static str {
+        Box::leak(format!("{name}-{}", id.0).into_boxed_str())
+    };
+    draw(cx);
+    let ids: Vec<aero_core::BlockId> =
+        cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    let handle = cx.debug_bounds(selector("gutter-handle", ids[2])).unwrap();
+    let item = cx.debug_bounds(selector("unit", ids[0])).unwrap();
+    let drop_at = gpui_kit::point(item.right() - gpui_kit::px(8.), item.origin.y + gpui_kit::px(4.));
+    cx.simulate_mouse_down(handle.center(), gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+    cx.simulate_mouse_move(
+        handle.center() + gpui_kit::point(gpui_kit::px(12.), gpui_kit::px(0.)),
+        gpui_kit::MouseButton::Left,
+        gpui_kit::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(drop_at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+    cx.simulate_mouse_up(drop_at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "- a\n  - para\n- b\n");
+}
+
+/// `Esc` 取消拖拽，松手不再改文档。
+#[gpui_kit::test]
+fn escape_cancels_a_block_drag(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "aaa\n\nbbb\n\nccc\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let draw = |cx: &mut VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+    let selector = |name: &str, id: aero_core::BlockId| -> &'static str {
+        Box::leak(format!("{name}-{}", id.0).into_boxed_str())
+    };
+    draw(cx);
+    let ids: Vec<aero_core::BlockId> =
+        cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    let handle = cx.debug_bounds(selector("gutter-handle", ids[2])).unwrap();
+    let target = cx.debug_bounds(selector("unit", ids[0])).unwrap();
+    let drop_at = target.origin + gpui_kit::point(gpui_kit::px(24.), gpui_kit::px(4.));
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| editor.focus_handle.focus(window, cx));
+    });
+    cx.simulate_mouse_down(handle.center(), gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+    cx.simulate_mouse_move(drop_at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert!(cx.debug_bounds("block-drop-line").is_none(), "Esc 去掉插入线");
+    cx.simulate_mouse_up(drop_at, gpui_kit::MouseButton::Left, gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "aaa\n\nbbb\n\nccc\n");
+}
+
 /// 颜色菜单（7.7）：`⌘/` 打开，输入过滤，⏎ 应用到选中的文字，再打开时当前颜色有选中标记。
 #[gpui_kit::test]
 fn color_menu_filters_and_applies_to_the_selection(cx: &mut TestAppContext) {

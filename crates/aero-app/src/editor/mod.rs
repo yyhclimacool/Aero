@@ -240,6 +240,10 @@ pub struct Editor {
     color_menu: Option<colors_ui::ColorMenu>,
     /// 块菜单（5.3）
     block_menu: Option<block_menu::BlockMenu>,
+    /// 拖拽块时的插入线
+    block_drop: Option<block_menu::BlockDropHint>,
+    dragging_block: bool,
+    unit_bounds: Vec<(BlockId, Bounds<Pixels>)>,
     /// 选区浮动工具条（5.9）与它的延迟出现计时
     toolbar: Option<toolbar::Toolbar>,
     toolbar_task: Option<Task<()>>,
@@ -316,6 +320,9 @@ impl Editor {
             slash: None,
             color_menu: None,
             block_menu: None,
+            block_drop: None,
+            dragging_block: false,
+            unit_bounds: Vec::new(),
             toolbar: None,
             toolbar_task: None,
             head_bounds: Rc::default(),
@@ -588,6 +595,20 @@ impl Editor {
         self.highlight
     }
 
+    /// 松手落位后高亮 300 ms（`ui_design.md` 6 拖拽态）。
+    pub(super) fn pulse_block(&mut self, id: BlockId, cx: &mut Context<Self>) {
+        self.highlight = Some(id);
+        self.highlight_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(300)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.highlight == Some(id) {
+                    this.highlight = None;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
     /// 定位块的滚动：在块的子元素布局完成后算出它相对滚动容器的位置——`Center` 放到视口上 1/3 处，
     /// `Visible` 只在块超出视口时把它挪进来。改 offset 在本帧已经来不及生效，所以顺手 `notify` 再画一帧。
     fn reveal_listener(
@@ -833,6 +854,9 @@ impl Editor {
         if self.close_block_menu(cx) {
             return;
         }
+        if self.cancel_block_drag(window, cx) {
+            return;
+        }
         if self.dismiss_toolbar(cx) {
             return;
         }
@@ -860,6 +884,9 @@ impl Editor {
         if self.close_image_viewer(window, cx) {
             return;
         }
+        if self.cancel_block_drag(window, cx) {
+            return;
+        }
         let busy = self.title_edit.is_some()
             || self.slash.is_some()
             || self.focused.is_some()
@@ -869,6 +896,17 @@ impl Editor {
         } else {
             cx.propagate();
         }
+    }
+
+    fn cancel_block_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.dragging_block && self.block_drop.is_none() {
+            return false;
+        }
+        self.dragging_block = false;
+        self.block_drop = None;
+        cx.stop_active_drag(window);
+        cx.notify();
+        true
     }
 
     fn blur_to_browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1016,7 +1054,7 @@ impl Editor {
         self.units.iter().position(|u| u.id == id)
     }
 
-    /// gutter 的 `⠿`：进入块选中态（块菜单与拖拽重排不在 M1）。
+    /// gutter 的 `⠿`：进入块选中态。点击另开块菜单；拖动走 `on_drag`。
     fn select_block_by_id(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.unit_index(id) {
             self.select_blocks(ix, ix, window, cx);
@@ -1025,6 +1063,7 @@ impl Editor {
 
     /// gutter 的 `+`：在块下方新开段落并打开 `/` 菜单。
     fn insert_block_below(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        self.block_menu = None;
         let Some(ix) = self.unit_index(id) else { return };
         let plan = ops::insert_slash_below(&self.doc, &self.units, ix);
         self.apply_plan(plan, window, cx);
@@ -2297,14 +2336,27 @@ impl Editor {
                 })
                 .child(glyph)
         };
-        let handle = button("gutter-handle", "⠿", "选中块").on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+        let editor = cx.entity();
+        let handle = button("gutter-handle", "⠿", "拖动重排，点击打开菜单")
+            .on_drag(block_menu::BlockDrag { id }, move |drag, _, window, cx| {
+                let cursor = window.mouse_position();
+                editor.update(cx, |this, _| this.preview_block_drag(cursor));
+                let text = editor.read(cx).block_preview_text(drag.id);
+                cx.new(|_| block_menu::BlockDragGhost::new(text))
+            })
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                if cx.has_active_drag() || this.dragging_block {
+                    return;
+                }
                 cx.stop_propagation();
+                let origin = match event {
+                    ClickEvent::Mouse(click) => click.down.position,
+                    ClickEvent::Keyboard(key) => key.bounds.center(),
+                    ClickEvent::Touch(touch) => touch.position,
+                };
                 this.select_block_by_id(id, window, cx);
-                this.open_block_menu(id, event.position, window, cx);
-            }),
-        );
+                this.open_block_menu(id, origin, window, cx);
+            }));
         let plus = button("gutter-plus", "+", "在下方插入块").on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, window, cx| {
@@ -2327,6 +2379,14 @@ impl Editor {
                     this.open_block_menu(id, event.position, window, cx);
                 }),
             )
+            .on_children_prepainted({
+                let this = cx.weak_entity();
+                move |bounds, _, cx| {
+                    if let Some(bounds) = bounds.last().copied() {
+                        let _ = this.update(cx, |editor, _| editor.remember_unit_bounds(id, bounds));
+                    }
+                }
+            })
             .child(
                 h_flex()
                     .absolute()
@@ -2485,6 +2545,10 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.dragging_block && !cx.has_active_drag() {
+            self.dragging_block = false;
+            self.block_drop = None;
+        }
         self.validate_link_preview_scroll(cx);
         self.refresh_fragment_marks();
         self.scale = window.scale_factor();
@@ -2531,7 +2595,14 @@ impl Render for Editor {
             .can_drop(|value, _, _| {
                 value.downcast_ref::<gpui_kit::ExternalPaths>().is_some()
                     || value.downcast_ref::<crate::file_tree::TreeDrag>().is_some_and(|drag| !drag.directory)
+                    || value.downcast_ref::<block_menu::BlockDrag>().is_some()
             })
+            .on_drop(cx.listener(|this, drag: &block_menu::BlockDrag, window, cx| {
+                this.finish_block_drag(drag, window, cx);
+            }))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<block_menu::BlockDrag>, _, cx| {
+                this.track_block_drag(event.event.position, cx);
+            }))
             .drag_over::<gpui_kit::ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().list_active))
             .drag_over::<crate::file_tree::TreeDrag>(|style, drag, _, cx| {
                 if drag.directory { style } else { style.bg(cx.theme().list_active) }
@@ -2581,6 +2652,7 @@ impl Render for Editor {
             .children(self.render_link_preview(window, cx))
             .children(self.render_toolbar(cx))
             .children(self.render_block_menu(cx))
+            .children(self.render_block_drop_line(cx))
             // 颜色菜单画在编辑器根上：块选中态没有控件可挂，位置由 `color_menu_position` 给
             .children(self.color_menu.is_some().then(|| self.render_color_menu(cx)))
             .children(self.render_image_viewer(window, cx))

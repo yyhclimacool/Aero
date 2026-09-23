@@ -212,6 +212,247 @@ pub fn append_paragraph(doc: &Document) -> (Option<Edit>, usize) {
     if insert.is_empty() { (None, len) } else { (Some(Edit::insert(len, insert)), len + insert.len()) }
 }
 
+/// 拖拽落点：插到第 `before` 个单位之前；`parent` 有值时成为那个列表项的子项。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DropPlace {
+    pub before: usize,
+    pub parent: Option<usize>,
+}
+
+/// 把单位 `from` 搬到 `place`。列表之间搬动会改标记和缩进；缩进一层成为子项。
+/// 原地、或搬进自己的子树时返回 `None`。
+pub fn move_unit(doc: &Document, units: &[Unit], from: usize, place: DropPlace) -> Option<Plan> {
+    if from >= units.len() || place.before > units.len() {
+        return None;
+    }
+    if place.parent == Some(from) {
+        return None;
+    }
+    if place.parent.is_none() && place.before == from {
+        return None;
+    }
+    if place.parent.is_none() && place.before == from + 1 {
+        let src_list = units[from].list.is_some();
+        let dest_list = place.before < units.len() && units[place.before].list.is_some();
+        if src_list == dest_list {
+            return None;
+        }
+    }
+    if let Some(parent) = place.parent {
+        if parent >= units.len() || contains_unit(units, from, parent) {
+            return None;
+        }
+    } else if place.before < units.len() && contains_unit(units, from, place.before) {
+        return None;
+    }
+    let text = doc.to_string();
+    let span = units_span(doc, units, from, from);
+    let mut cut_end = span.end;
+    while cut_end < text.len() && text.as_bytes()[cut_end] == b'\n' {
+        cut_end += 1;
+    }
+    let mut cut_start = span.start;
+    if cut_end == text.len() {
+        while cut_start >= 2 && text[..cut_start].ends_with("\n\n") {
+            cut_start -= 1;
+        }
+    }
+    let raw = text[span].to_string();
+    let mut piece = adapt_moved_block(&raw, &units[from], units, place, &text);
+    let insert_at = if let Some(parent) = place.parent {
+        let mut at =
+            units[parent].list.as_ref().map(|ctx| ctx.item_range.end).unwrap_or(units[parent].range.end);
+        // 项的源区间常常停在行尾换行之前。先跨过这个换行，子项才接在下一行，而不会把下一行顶出空行。
+        if at < text.len() && text.as_bytes()[at] == b'\n' {
+            at += 1;
+        }
+        at
+    } else if place.before >= units.len() {
+        text.len()
+    } else {
+        line_start(&text, units_span(doc, units, place.before, place.before).start)
+    };
+    if place.parent.is_some()
+        && !piece.starts_with('\n')
+        && insert_at > 0
+        && !text[..insert_at].ends_with('\n')
+    {
+        piece.insert(0, '\n');
+    }
+    if place.parent.is_none() && insert_at > cut_start && insert_at < cut_end {
+        return None;
+    }
+    let assembled = assemble_move(&text, cut_start..cut_end, insert_at, &piece);
+    if assembled == text {
+        return None;
+    }
+    let focus = assembled.find(piece.trim_end()).unwrap_or(0);
+    Some(Plan { edit: Edit::replace(0..text.len(), assembled), focus_offset: focus })
+}
+
+fn contains_unit(units: &[Unit], ancestor: usize, index: usize) -> bool {
+    if index == ancestor {
+        return false;
+    }
+    let span = units[ancestor]
+        .list
+        .as_ref()
+        .map(|ctx| ctx.item_range.clone())
+        .unwrap_or_else(|| units[ancestor].range.clone());
+    let unit = &units[index];
+    unit.range.start >= span.start && unit.range.end <= span.end && span.start != span.end
+}
+
+fn adapt_moved_block(raw: &str, source: &Unit, units: &[Unit], place: DropPlace, text: &str) -> String {
+    let body = strip_list_marker(raw);
+    let style = destination_style(source, units, place, text);
+    let plain = style.is_none();
+    let mut rendered = match style {
+        Some(style) => prefix_list(&body, &style),
+        None => body,
+    };
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    // 段落之间留空行；列表项只换行，避免把列表拆开
+    if plain {
+        rendered.push('\n');
+    }
+    rendered
+}
+
+struct ListStyle {
+    indent: String,
+    marker: String,
+}
+
+fn destination_style(source: &Unit, units: &[Unit], place: DropPlace, text: &str) -> Option<ListStyle> {
+    if let Some(parent) = place.parent {
+        let item = units.get(parent)?;
+        let ctx = item.list.as_ref()?;
+        let src = &text[ctx.item_range.clone()];
+        let marker = ListMarker::from_item_source(src, None, false);
+        return Some(ListStyle { indent: format!("{}  ", marker.indent), marker: "- ".into() });
+    }
+    if place.before < units.len() && units[place.before].list.is_none() {
+        return None;
+    }
+    let neighbor = if place.before < units.len() { units.get(place.before) } else { units.last() };
+    let ctx = neighbor?.list.as_ref()?;
+    if place.before == units.len() && source.list.is_none() {
+        return None;
+    }
+    let item = &text[ctx.item_range.clone()];
+    let ordered = ctx.ordered.map(|start| start + ctx.item_index as u32);
+    let marker =
+        ListMarker::from_item_source(item, ordered, ctx.task && source.list.as_ref().is_some_and(|s| s.task));
+    Some(ListStyle { indent: marker.indent, marker: marker.marker })
+}
+
+fn strip_list_marker(piece: &str) -> String {
+    let Some(first) = piece.lines().next() else { return piece.to_owned() };
+    let indent_len = first.chars().take_while(|c| *c == ' ' || *c == '\t').map(char::len_utf8).sum();
+    let Some(marker_len) = list_marker_len(&first[indent_len..]) else { return piece.trim_end().to_owned() };
+    let indent = &first[..indent_len];
+    let mut body = first[indent_len + marker_len..].to_owned();
+    for line in piece.lines().skip(1) {
+        body.push('\n');
+        body.push_str(line.strip_prefix(indent).unwrap_or(line));
+    }
+    body.trim_end().to_owned()
+}
+
+fn list_marker_len(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    if bytes.first().is_some_and(|c| matches!(c, b'-' | b'*' | b'+')) && bytes.get(1) == Some(&b' ') {
+        let mut len = 2;
+        if rest[len..].starts_with("[ ] ")
+            || rest[len..].starts_with("[x] ")
+            || rest[len..].starts_with("[X] ")
+        {
+            len += 4;
+        }
+        return Some(len);
+    }
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 {
+        let delim = *bytes.get(digits)?;
+        if (delim == b'.' || delim == b')') && bytes.get(digits + 1) == Some(&b' ') {
+            return Some(digits + 2);
+        }
+    }
+    None
+}
+
+fn prefix_list(body: &str, style: &ListStyle) -> String {
+    let mut lines = body.lines();
+    let first = lines.next().unwrap_or("");
+    let mut out = format!("{}{}{first}", style.indent, style.marker);
+    for line in lines {
+        out.push('\n');
+        if !line.is_empty() {
+            out.push_str(&style.indent);
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+fn assemble_move(text: &str, cut: Range<usize>, insert_at: usize, piece: &str) -> String {
+    let piece = if piece.ends_with('\n') { piece.to_owned() } else { format!("{piece}\n") };
+    let mut out = String::with_capacity(text.len() + piece.len());
+    let push_piece = |out: &mut String, left_ends: bool, piece: &str| {
+        if left_ends && !piece.starts_with('\n') && !is_list_piece(piece) && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(piece);
+    };
+    if insert_at <= cut.start {
+        out.push_str(&text[..insert_at]);
+        let gap = !out.is_empty();
+        push_piece(&mut out, gap, &piece);
+        let between = &text[insert_at..cut.start];
+        if !between.chars().all(|ch| ch == '\n') {
+            out.push_str(between);
+        }
+        out.push_str(&text[cut.end..]);
+    } else {
+        let at = insert_at.max(cut.end);
+        out.push_str(&text[..cut.start]);
+        out.push_str(&text[cut.end..at]);
+        let gap = !out.is_empty();
+        push_piece(&mut out, gap, &piece);
+        out.push_str(&text[at..]);
+    }
+    squash_blank_lines(&out, text.ends_with('\n'))
+}
+
+fn is_list_piece(piece: &str) -> bool {
+    let line = piece.trim_start_matches('\n').lines().next().unwrap_or("");
+    let indent = line.chars().take_while(|c| *c == ' ' || *c == '\t').map(char::len_utf8).sum();
+    list_marker_len(&line[indent..]).is_some()
+}
+
+fn squash_blank_lines(text: &str, trailing_newline: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut newlines = 0u8;
+    for ch in text.chars() {
+        if ch == '\n' {
+            newlines = newlines.saturating_add(1);
+            if newlines <= 2 {
+                out.push('\n');
+            }
+        } else {
+            newlines = 0;
+            out.push(ch);
+        }
+    }
+    if trailing_newline && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /// `/` 菜单与 `⌘⌥0–8` 能切换到的块类型（`ui_design.md` 7.1 的最小集合）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockType {
@@ -745,5 +986,26 @@ mod tests {
         assert_eq!(append_paragraph(&Document::from_text("a")), (Some(Edit::insert(1, "\n\n")), 3));
         assert_eq!(append_paragraph(&Document::from_text("a\n")), (Some(Edit::insert(2, "\n")), 3));
         assert_eq!(append_paragraph(&Document::from_text("a\n\n")), (None, 3));
+    }
+
+    #[test]
+    fn move_unit_reorders_paragraphs_and_adjusts_list_indent() {
+        let moved = |src: &str, from: usize, before: usize, parent: Option<usize>| {
+            let doc = Document::from_text(src);
+            let us = units(&doc);
+            move_unit(&doc, &us, from, DropPlace { before, parent }).map(|plan| {
+                let mut doc = doc;
+                doc.edit(plan.edit).unwrap();
+                doc.reparse();
+                doc.to_string()
+            })
+        };
+        assert_eq!(moved("aaa\n\nbbb\n\nccc\n", 2, 0, None).as_deref(), Some("ccc\n\naaa\n\nbbb\n"));
+        assert_eq!(moved("aaa\n\nbbb\n\nccc\n", 0, 2, None).as_deref(), Some("bbb\n\naaa\n\nccc\n"));
+        assert!(moved("aaa\n\nbbb\n", 0, 0, None).is_none());
+        assert_eq!(moved("- a\n- b\n- c\n", 2, 0, None).as_deref(), Some("- c\n- a\n- b\n"));
+        assert_eq!(moved("- a\n\npara\n", 1, 1, Some(0)).as_deref(), Some("- a\n  - para\n"));
+        assert_eq!(moved("- a\n  - child\n\npara\n", 1, 2, None).as_deref(), Some("- a\n\nchild\n\npara\n"));
+        assert_eq!(moved("- a\n- b\n\npara\n", 2, 0, Some(0)).as_deref(), Some("- a\n  - para\n- b\n"));
     }
 }
