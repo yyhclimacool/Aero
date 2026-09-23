@@ -23,6 +23,8 @@ mod search_view;
 mod tag_tree;
 mod tags_view;
 mod trash;
+#[cfg(debug_assertions)]
+mod ui_channel;
 mod watch;
 mod workspace;
 
@@ -61,6 +63,14 @@ fn init_logger() {
     log::set_max_level(level);
 }
 
+/// debug 构建里由脚本驱动界面、窗口停在屏幕外（`ui_channel`，`.cursor/skills/aero-ui-test/`）。
+fn ui_parked() -> bool {
+    #[cfg(debug_assertions)]
+    return ui_channel::parked();
+    #[cfg(not(debug_assertions))]
+    false
+}
+
 fn main() {
     init_logger();
 
@@ -83,20 +93,32 @@ fn main() {
             }
         })
         .detach();
-        cx.activate(true);
+        // 界面自动化时窗口停在屏幕外，不去抢正在用的应用的焦点
+        if !ui_parked() {
+            cx.activate(true);
+        }
 
-        let options = WindowOptions {
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        let mut options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
             window_min_size: Some(size(px(760.), px(480.))),
             ..TitleBar::window_options()
         };
+        #[cfg(debug_assertions)]
+        ui_channel::prepare_window(&mut options, cx);
 
         cx.spawn(async move |cx| {
-            cx.open_window(options, |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(initial_vault, paths::app_data_dir(), window, cx));
-                cx.new(|cx| Root::new(workspace, window, cx))
-            })
-            .expect("failed to open window");
+            let window = cx
+                .open_window(options, |window, cx| {
+                    let workspace =
+                        cx.new(|cx| Workspace::new(initial_vault, paths::app_data_dir(), window, cx));
+                    cx.new(|cx| Root::new(workspace, window, cx))
+                })
+                .expect("failed to open window");
+            #[cfg(debug_assertions)]
+            let _ = cx.update(|cx| ui_channel::spawn(window.into(), cx));
+            #[cfg(not(debug_assertions))]
+            let _ = window;
         })
         .detach();
     });

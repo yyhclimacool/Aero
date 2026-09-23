@@ -36,7 +36,16 @@ cargo test -p aero-app --bin aero layout_tests
 cargo test -p aero-app -p aero-core -p aero-index
 ```
 
-## 手动核对
+## 真实窗口核对
+
+用 `.cursor/skills/aero-ui-test`（样例库就是这次验收用的笔记）重跑：
+
+```sh
+S=.cursor/skills/aero-ui-test/scripts/aero-ui
+$S start && $S shot full && $S grid full   # 从网格图读出各块坐标
+$S probe para 450 272                      # 每块一次：点击前后、退出后都应为「相同」
+$S stop
+```
 
 在真实窗口里逐块点击，截图前后逐像素比对：标题、两段正文、列表、任务、每个单元格（含内边距处）、引用、callout 标题与正文、代码块，前后除光标外完全一致（修改前：点标题下方所有块下移 1 个物理像素，点第一段下移 2 pt 且行尾「还」字被裁掉，点单元格整张表换成等宽列，点 callout 正文时标题并进正文）。另核对了列宽拖动写回分隔行、方框勾选、跨块拖选与反链面板渲染。
 

@@ -1,0 +1,261 @@
+#!/bin/zsh
+# aero-ui：启动 debug 版 Aero，经 AERO_UI_CHANNEL 注入鼠标键盘事件，截窗口图并比对。
+# 坐标一律是窗口里的点（左上角原点，窗口 1280×820）。命令说明见 ../reference.md，`aero-ui help` 列出全部命令。
+setopt err_exit no_unset pipe_fail
+
+SKILL=${0:A:h:h}
+REPO=$(git -C $SKILL rev-parse --show-toplevel)
+STATE=${AERO_UI_STATE:-/tmp/aero-ui}
+TOOLS=$REPO/target/ui-test   # 图片工具的 venv
+SHOTS=$STATE/shots
+CH=$STATE/cmd
+ACK=$STATE/cmd.ack
+SETTLE_MS=${AERO_UI_SETTLE_MS:-150}
+MAIN_NOTE=体验.md
+
+die() { print -u2 "aero-ui: $*"; exit 1 }
+
+alive() { [[ -f $STATE/pid ]] && kill -0 $(<$STATE/pid) 2>/dev/null }
+
+find_window() { osascript -l JavaScript $SKILL/scripts/window.js $1 }
+
+# 窗口号 x y 宽 高
+win() {
+  alive || die "Aero 没在运行，先 aero-ui start"
+  local found=$(find_window $(<$STATE/pid))
+  [[ -n $found ]] || die "找不到 Aero 的窗口"
+  print -r -- $found
+}
+
+py() {
+  local venv=$TOOLS/venv
+  if [[ ! -x $venv/bin/python ]]; then
+    print -u2 "aero-ui: 首次使用，在 $venv 安装 pillow numpy"
+    { python3 -m venv $venv && $venv/bin/pip -q install pillow numpy } >&2 || { rm -rf $venv; die "安装图片依赖失败" }
+  fi
+  $venv/bin/python $SKILL/scripts/img.py "$@"
+}
+
+shot_path() {
+  if [[ $1 == */* ]]; then print -r -- $1; else print -r -- $SHOTS/${1%.png}.png; fi
+}
+
+# 把一批命令行交给应用，等它回写 ack。批末尾补一个 wait，让事件引发的重绘、焦点回调都跑完。
+send() {
+  alive || die "Aero 没在运行，先 aero-ui start"
+  local before waited=0 line
+  before=$(cat $ACK 2>/dev/null || print 0)
+  for line in "$@"; do
+    [[ $line == wait\ * ]] && (( waited += ${line#wait } ))
+  done
+  printf '%s\n' "$@" "wait $SETTLE_MS" > $CH.tmp
+  mv $CH.tmp $CH
+  local deadline=$(( SECONDS + 5 + (waited + SETTLE_MS) / 1000 ))
+  while (( SECONDS <= deadline )); do
+    [[ $(cat $ACK 2>/dev/null || print 0) != $before ]] && return 0
+    sleep 0.02
+  done
+  die "应用没有回应（卡住或已退出？看 aero-ui log）"
+}
+
+cmd_vault() {
+  local dir=${1:-$STATE/vault}
+  rm -rf $dir
+  mkdir -p ${dir:h}
+  cp -R $SKILL/fixtures/vault $dir
+  # 启动时打开最近修改的笔记
+  find $dir -name '*.md' -exec touch -t 202001010000 {} +
+  touch $dir/$MAIN_NOTE
+  print -r -- $dir
+}
+
+cmd_start() {
+  local vault="" build=1 park=1 keep=0 a
+  for a in "$@"; do
+    case $a in
+      --no-build) build=0 ;;
+      --show) park=0 ;;
+      --keep-data) keep=1 ;;
+      -*) die "未知选项 $a" ;;
+      *) vault=${a:A} ;;
+    esac
+  done
+  [[ -n $vault ]] || vault=$(cmd_vault)
+  cmd_stop >/dev/null
+  if (( build )); then
+    (cd $REPO && cargo build -q -p aero-app) || die "cargo build 失败"
+  fi
+  local bin=${AERO_BIN:-}
+  if [[ -z $bin ]]; then
+    bin=$(cd $REPO && cargo metadata --format-version 1 --no-deps |
+      python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')/debug/aero
+  fi
+  [[ -x $bin ]] || die "找不到 $bin"
+  mkdir -p $SHOTS
+  rm -f $CH $CH.tmp $ACK
+  (( keep )) || rm -rf $STATE/data
+  # 新开会话：调用方（agent 的终端）结束时不连带杀掉应用
+  AERO_UI_CHANNEL=$CH AERO_UI_PARK=$park AERO_DATA_DIR=$STATE/data AERO_LOG=${AERO_LOG:-debug} \
+    perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' $bin $vault </dev/null >$STATE/app.log 2>&1 &!
+  print $! >$STATE/pid
+  print -r -- $vault >$STATE/current-vault
+  local deadline=$(( SECONDS + 30 ))
+  until [[ -f $ACK && -n $(find_window $(<$STATE/pid)) ]]; do
+    alive || die "应用启动后退出了：$(tail -5 $STATE/app.log)"
+    (( SECONDS <= deadline )) || die "30 秒内没有等到窗口"
+    sleep 0.1
+  done
+  send "wait 400"
+  print "pid $(<$STATE/pid)  窗口 $(win)  库 $vault"
+}
+
+cmd_stop() {
+  alive || { print "没在运行"; return 0 }
+  local pid=$(<$STATE/pid)
+  kill $pid 2>/dev/null || true
+  repeat 40; do
+    kill -0 $pid 2>/dev/null || break
+    sleep 0.05
+  done
+  kill -9 $pid 2>/dev/null || true
+  rm -f $STATE/pid
+  print "已停止 $pid"
+}
+
+cmd_status() {
+  if alive; then
+    print "运行中 pid $(<$STATE/pid)  窗口 $(win)  库 $(<$STATE/current-vault)"
+  else
+    print "没在运行"
+  fi
+}
+
+cmd_shot() {
+  (( $# == 1 || $# == 5 )) || die "用法：shot <名字> [x y w h]"
+  local info id x y w h out
+  info=$(win)
+  read id x y w h <<<$info
+  out=$(shot_path $1)
+  mkdir -p ${out:h}
+  screencapture -x -o -l $id $out || die "截图失败：需要在沙箱外运行，且终端有屏幕录制权限"
+  py tag $out $w "${@:2}"
+  print -r -- $out
+}
+
+cmd_drag() {
+  (( $# >= 4 )) || die "用法：drag x1 y1 x2 y2 [步数]"
+  local x1=$1 y1=$2 x2=$3 y2=$4 steps=${5:-12} i
+  local -F 1 px py
+  local -a lines=("move $x1 $y1" "down $x1 $y1" "wait 60")
+  for i in {1..$steps}; do
+    (( px = x1 + (x2 - x1) * i / (steps * 1.0), py = y1 + (y2 - y1) * i / (steps * 1.0) ))
+    lines+=("move $px $py" "wait 16")
+  done
+  lines+=("up $x2 $y2")
+  send $lines
+}
+
+cmd_key() {
+  local k
+  local -a lines=()
+  for k in "$@"; do lines+=("key $k" "wait 30"); done
+  send $lines
+}
+
+# 悬停 → 截图 → 点击 → 截图 → Esc 两次 → 截图，报告点击和退出引起的变化。KEEP=1 时点完停在编辑态。
+cmd_probe() {
+  (( $# >= 3 )) || die "用法：probe <名字> x y [shift|cmd|alt]"
+  local name=$1 x=$2 y=$3
+  send "move $x $y" "wait 300"
+  cmd_shot $name.0 >/dev/null
+  local seen=$(wc -l <$STATE/app.log) focus
+  send "down $x $y ${@:4}" "wait 40" "up $x $y" "wait ${WAIT:-500}"
+  cmd_shot $name.1 >/dev/null
+  print "== 点击 ($x, $y) 前后"
+  py diff $(shot_path $name.0) $(shot_path $name.1) $(shot_path $name.diff)
+  focus=$(tail -n +$(( seen + 1 )) $STATE/app.log | grep -E '\] focus ' | tail -1 || true)
+  print "   编辑器：${focus:-没有 focus 日志（这次点击没有进入编辑态）}"
+  if [[ -z ${KEEP:-} ]]; then
+    # 指针不动 GPUI 不重算悬停，晃一下让块手柄等悬停效果回到点击前的状态
+    send "key escape" "wait 80" "key escape" "wait 100" "move $(( x + 1 )) $y" "move $x $y" "wait 300"
+    cmd_shot $name.2 >/dev/null
+    print "== 退出编辑后与点击前"
+    py diff $(shot_path $name.0) $(shot_path $name.2)
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+aero-ui <命令>，坐标是窗口里的点（左上角原点）：
+  start [库目录] [--show] [--no-build] [--keep-data]
+                          构建并启动（默认用样例库，窗口停在屏幕右缘外），等到可以接收事件
+  stop | status           停止 / 查看状态
+  vault [目录]            把样例库复制到目录（默认 /tmp/aero-ui/vault），覆盖旧的
+  click x y [shift|cmd|alt|ctrl]    单击（可带修饰键）
+  dclick x y | tclick x y           双击 / 三击
+  drag x1 y1 x2 y2 [步数]           按住左键拖动
+  move x y | scroll x y dy [dx]     移动指针 / 滚轮（像素，负数向下翻）
+  key <按键>...           依次按键，GPUI 写法：escape enter cmd-z shift-down cmd-shift-k
+  type <文字>             逐字输入
+  do <行>...              原样发送通道命令（见 ui_channel.rs），如 do "down 10 10" "move 40 10" "up 40 10"
+  shot <名字> [x y w h]   截窗口（可裁剪）到 /tmp/aero-ui/shots/<名字>.png，打印路径
+  grid <图> [步长]        叠加坐标网格（默认 50pt）另存为 <图>.grid.png，用来读坐标
+  crop <图> <新名字> x y w h        从已有截图裁一块
+  diff <图a> <图b> [--ignore x y w h]...   列出差异区域，差异图写到 <a>-vs-<b>.png
+  shift <图a> <图b> x y w h [--range pt]   区域内整体平移了多少
+  stack <新名字> <图>...  上下拼接，便于对照
+  color <图> x y          取色
+  probe <名字> x y [修饰键]         点击前后 + 退出后各截一张并比对（KEEP=1 不退出，WAIT=ms 调点后等待）
+  log [正则]              应用日志（默认最后 40 行；带正则则过滤）
+  window                  窗口号 x y 宽 高（屏幕点）
+图名可以写短名（shots 目录下，省略 .png）或路径。
+EOF
+}
+
+(( $# )) || { usage; exit 0 }
+cmd=$1
+shift
+case $cmd in
+  start) cmd_start "$@" ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  vault) cmd_vault "$@" ;;
+  click)
+    (( $# >= 2 )) || die "用法：click x y [修饰键]"
+    send "move $1 $2" "down $1 $2 ${@:3}" "wait 30" "up $1 $2" ;;
+  dclick | tclick)
+    (( $# == 2 )) || die "用法：$cmd x y"
+    send "move $1 $2" "$cmd $1 $2" ;;
+  drag) cmd_drag "$@" ;;
+  move) send "move $1 $2" ;;
+  scroll) send "scroll $*" ;;
+  key) cmd_key "$@" ;;
+  type) send "type $*" ;;
+  do) send "$@" ;;
+  shot) cmd_shot "$@" ;;
+  grid)
+    src=$(shot_path $1)
+    py grid $src ${src%.png}.grid.png ${2:-50}
+    print -r -- ${src%.png}.grid.png ;;
+  crop)
+    (( $# == 6 )) || die "用法：crop <图> <新名字> x y w h"
+    py crop $(shot_path $1) $(shot_path $2) "${@:3}"
+    shot_path $2 ;;
+  diff)
+    (( $# >= 2 )) || die "用法：diff <图a> <图b> [--ignore x y w h]..."
+    a=$(shot_path $1) b=$(shot_path $2)
+    py diff $a $b $SHOTS/${${a:t}%.png}-vs-${${b:t}%.png}.png "${@:3}" ;;
+  shift) py shift $(shot_path $1) $(shot_path $2) "${@:3}" ;;
+  stack)
+    out=$(shot_path $1)
+    shift
+    py stack $out ${(f)"$(for s in "$@"; do shot_path $s; done)"}
+    print -r -- $out ;;
+  color) py color $(shot_path $1) "${@:2}" ;;
+  probe) cmd_probe "$@" ;;
+  log)
+    if (( $# )); then grep -E -- "$1" $STATE/app.log | tail -40; else tail -40 $STATE/app.log; fi ;;
+  window) win ;;
+  help | -h | --help) usage ;;
+  *) usage; exit 2 ;;
+esac

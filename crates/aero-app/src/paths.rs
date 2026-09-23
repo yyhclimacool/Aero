@@ -8,7 +8,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// `~/Library/Application Support/Aero`（macOS）、`$XDG_DATA_HOME/aero`（Linux）、`%APPDATA%\Aero`（Windows）。
+/// debug 构建可以用 `AERO_DATA_DIR` 指到别处，界面自动化靠它不碰用户自己的状态与索引。
 pub fn app_data_dir() -> PathBuf {
+    if cfg!(debug_assertions)
+        && let Some(dir) = std::env::var_os("AERO_DATA_DIR")
+    {
+        return PathBuf::from(dir);
+    }
     if cfg!(target_os = "macos") {
         home().join("Library").join("Application Support").join("Aero")
     } else if cfg!(target_os = "windows") {
