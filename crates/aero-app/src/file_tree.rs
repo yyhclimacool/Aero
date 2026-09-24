@@ -18,8 +18,6 @@ use gpui_kit::*;
 use crate::actions::{CopyNotePath, OpenInNewTab, RevealInFinder, ToggleFavoriteNote, TrashNote};
 
 pub const ROW_HEIGHT: f32 = 28.;
-/// vault 标题行：名字一行、路径一行
-const VAULT_ROW_HEIGHT: f32 = 44.;
 /// 每深一层缩进的宽度
 const INDENT: f32 = 14.;
 
@@ -523,15 +521,7 @@ impl FileTree {
                 rows.push(Row::VaultEmpty);
             }
         }
-        self.row_sizes = Rc::new(
-            rows.iter()
-                .map(|row| {
-                    let height =
-                        if matches!(row, Row::VaultHeader { .. }) { VAULT_ROW_HEIGHT } else { ROW_HEIGHT };
-                    size(px(200.), px(height))
-                })
-                .collect(),
-        );
+        self.row_sizes = Rc::new(vec![size(px(200.), px(ROW_HEIGHT)); rows.len()]);
         self.rows = rows;
     }
 
@@ -773,28 +763,22 @@ impl FileTree {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let location = crate::paths::display_path(self.vault.root());
-                v_flex()
+                h_flex()
                     .id("file-tree-root")
                     .debug_selector(|| "file-tree-root".into())
                     .w_full()
-                    .h(px(VAULT_ROW_HEIGHT))
+                    .h(px(ROW_HEIGHT))
                     .pl(px(8.))
                     .pr_2()
-                    .justify_center()
+                    .gap_1()
+                    .items_center()
                     .rounded_md()
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(chevron(expanded))
-                            .child(div().flex_1().min_w_0().truncate().child(name)),
-                    )
-                    .child(div().pl(px(18.)).text_xs().text_color(muted).truncate().child(location))
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(chevron(expanded))
+                    .child(div().flex_1().min_w_0().truncate().child(name))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_section(false, cx)))
                     .can_drop({
                         let vault = self.vault.id().to_owned();
@@ -1201,6 +1185,27 @@ mod tests {
         let bounds = cx.debug_bounds(selector).expect(selector);
         cx.simulate_click(bounds.center(), Modifiers::default());
         draw(cx);
+    }
+
+    #[gpui_kit::test]
+    fn vault_header_uses_one_row_without_a_path_line(cx: &mut TestAppContext) {
+        let (_dir, _vault, tree) = setup(cx);
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        draw(cx);
+        for _ in 0..2 {
+            let header = cx.debug_bounds("file-tree-root").unwrap();
+            assert_eq!(header.size.height, gpui_kit::px(super::ROW_HEIGHT));
+            let folder = cx.debug_bounds("file-tree-folder:empty").unwrap();
+            assert_eq!(folder.top(), header.bottom(), "no blank path row below the vault name");
+            cx.update(|_, cx| {
+                let tree = tree.read(cx);
+                let ix = tree.rows.iter().position(|row| matches!(row, Row::VaultHeader { .. })).unwrap();
+                assert_eq!(tree.row_sizes[ix].height, header.size.height);
+            });
+            click(cx, "file-tree-root");
+            assert!(cx.debug_bounds("file-tree-folder:empty").is_none());
+            click(cx, "file-tree-root");
+        }
     }
 
     #[gpui_kit::test]

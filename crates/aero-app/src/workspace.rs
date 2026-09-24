@@ -1688,6 +1688,8 @@ impl Workspace {
     fn render_status_bar(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
+        let root = open.vault.root().to_path_buf();
+        let path_hint = format!("{}\n点击复制路径；⌘点击在文件管理器中打开", root.display());
         let right: Vec<AnyElement> = match open.editor() {
             Some(editor) => {
                 let e = editor.read(cx);
@@ -1737,7 +1739,26 @@ impl Workspace {
             .bg(theme.sidebar)
             .border_t_1()
             .border_color(theme.border)
-            .child(div().min_w_0().truncate().child(display_path(open.vault.root())))
+            .child(
+                div()
+                    .id("status-vault-path")
+                    .debug_selector(|| "status-vault-path".into())
+                    .min_w_0()
+                    .truncate()
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(theme.foreground))
+                    .child(display_path(&root))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(path_hint.clone()).build(window, cx)
+                    })
+                    .on_click(move |event: &ClickEvent, _, cx| {
+                        if event.modifiers().platform {
+                            cx.open_with_system(&root);
+                        } else {
+                            cx.write_to_clipboard(ClipboardItem::new_string(root.display().to_string()));
+                        }
+                    }),
+            )
             .child(h_flex().flex_none().gap_3().items_center().children(index_item).children(right))
     }
 }

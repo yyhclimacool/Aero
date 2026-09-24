@@ -44,6 +44,26 @@ fn close_index(cx: &mut VisualTestContext, workspace: &Entity<Workspace>) {
 }
 
 #[gpui_kit::test]
+fn status_vault_path_click_copies_the_full_directory(cx: &mut TestAppContext) {
+    let (dir, _data, workspace) = open(cx, Some("# A\n"));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    with_root(cx, &workspace);
+    close_index(cx, &workspace);
+    let expected = dir.path().canonicalize().unwrap().display().to_string();
+    for width in [1000., 480.] {
+        cx.simulate_resize(size(px(width), px(640.)));
+        draw(cx);
+        cx.update(|_, cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("unchanged".into())));
+        let status = cx.debug_bounds("status-bar").unwrap();
+        cx.simulate_click(point(status.left() + px(20.), status.center().y), Modifiers::default());
+        draw(cx);
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some(expected.as_str()), "copy the full path even when truncated");
+    }
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "# A\n");
+}
+
+#[gpui_kit::test]
 fn each_note_opens_in_its_own_tab_and_opening_it_again_switches_back(cx: &mut TestAppContext) {
     let (dir, _data, workspace) = open(cx, Some("# A\n"));
     std::fs::write(dir.path().join("b.md"), "# B\n").unwrap();
