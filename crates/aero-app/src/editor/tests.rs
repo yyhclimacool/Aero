@@ -1237,6 +1237,132 @@ fn open_color_menu(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
     assert!(color_menu_open(editor, cx), "颜色菜单没打开");
 }
 
+#[gpui_kit::test]
+fn block_handle_click_selects_without_opening_menu(cx: &mut TestAppContext) {
+    let source =
+        "# 标题\n\n正文\n\n- 列表项\n\n> 引用\n\n```rust\nlet x = 1;\n```\n\n| 表头 |\n| --- |\n| 单元格 |\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    let ids: Vec<_> = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    for (ix, id) in ids.into_iter().enumerate() {
+        settle(cx);
+        let selector = Box::leak(format!("gutter-handle-{}", id.0).into_boxed_str());
+        let handle = cx.debug_bounds(selector).unwrap();
+        cx.simulate_mouse_move(handle.center(), None, gpui_kit::Modifiers::default());
+        cx.simulate_click(handle.center(), gpui_kit::Modifiers::default());
+        settle(cx);
+        cx.update(|_, cx| {
+            let e = editor.read(cx);
+            assert_eq!(e.selected_blocks(), Some(ix..ix + 1));
+            assert!(e.focused.is_none());
+            assert!(e.block_menu.is_none(), "left-clicking a handle must only select its block");
+        });
+        assert!(cx.debug_bounds("block-menu").is_none());
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn block_menu_dismisses_on_outside_click_and_keeps_submenu_clicks(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, point, px};
+    let source = "first\n\nsecond\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    let first_id = cx.update(|_, cx| editor.read(cx).units[0].id);
+    let first = cx.debug_bounds(Box::leak(format!("unit-{}", first_id.0).into_boxed_str())).unwrap();
+    let at = first.origin + point(px(8.), px(8.));
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("block-menu").is_some());
+    cx.update(|_, cx| assert_eq!(editor.read(cx).selected_blocks(), Some(0..1)));
+    let convert = cx.debug_bounds("block-menu-convert").unwrap();
+    cx.simulate_click(convert.center(), Modifiers::default());
+    settle(cx);
+    let submenu = cx.debug_bounds("block-menu-convert-list").unwrap();
+    cx.simulate_click(submenu.origin + point(px(2.), px(2.)), Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("block-menu").is_some(), "submenu padding is inside the menu");
+    assert!(cx.debug_bounds("block-menu-convert-list").is_some());
+    assert_eq!(text(&editor, cx), source);
+    let menu = cx.debug_bounds("block-menu").unwrap();
+    let outside = point(menu.left() + px(8.), submenu.bottom() - px(8.));
+    assert!(!menu.contains(&outside) && !submenu.contains(&outside));
+    cx.simulate_click(outside, Modifiers::default());
+    settle(cx);
+    cx.update(|_, cx| assert!(editor.read(cx).block_menu.is_none(), "outside click must close menu state"));
+    assert!(cx.debug_bounds("block-menu").is_none());
+    assert!(cx.debug_bounds("block-menu-convert-list").is_none());
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn block_menu_dismisses_when_an_outside_link_captures_the_click(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, point, px};
+    let source = "[外部链接](https://example.com)\n\n正文\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    let ids: Vec<_> = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    let body = cx.debug_bounds(Box::leak(format!("unit-{}", ids[1].0).into_boxed_str())).unwrap();
+    let at = body.origin + point(px(8.), px(8.));
+    cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("block-menu").is_some());
+    let link = cx.debug_bounds(Box::leak(format!("unit-{}", ids[0].0).into_boxed_str())).unwrap();
+    cx.simulate_click(link.origin + point(px(8.), px(8.)), Modifiers::default());
+    settle(cx);
+    cx.update(|_, cx| assert!(editor.read(cx).block_menu.is_none()));
+    assert!(cx.debug_bounds("block-menu").is_none());
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn block_menu_right_click_retargets_and_outside_click_reaches_content(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, point, px};
+    let source = "first\n\nsecond\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    let ids: Vec<_> = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    for (ix, id) in ids.iter().enumerate() {
+        let bounds = cx.debug_bounds(Box::leak(format!("unit-{}", id.0).into_boxed_str())).unwrap();
+        let at = if ix == 0 {
+            bounds.origin + point(px(8.), px(8.))
+        } else {
+            point(bounds.right() - px(8.), bounds.center().y)
+        };
+        cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+        settle(cx);
+        assert!(cx.debug_bounds("block-menu").is_some());
+        cx.update(|_, cx| assert_eq!(editor.read(cx).selected_blocks(), Some(ix..ix + 1)));
+    }
+    let duplicate = cx.debug_bounds("block-menu-duplicate").unwrap();
+    cx.simulate_click(duplicate.center(), Modifiers::default());
+    settle(cx);
+    assert_eq!(text(&editor, cx), "first\n\nsecond\nsecond\n");
+    assert!(cx.debug_bounds("block-menu").is_none());
+    cx.simulate_keystrokes("escape");
+    cx.simulate_keystrokes("cmd-z");
+    settle(cx);
+    assert_eq!(text(&editor, cx), source);
+    let first = cx.debug_bounds(Box::leak(format!("unit-{}", ids[0].0).into_boxed_str())).unwrap();
+    let menu_at = point(first.right() - px(8.), first.center().y);
+    cx.simulate_mouse_down(menu_at, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(menu_at, MouseButton::Right, Modifiers::default());
+    settle(cx);
+    let second = cx.debug_bounds(Box::leak(format!("unit-{}", ids[1].0).into_boxed_str())).unwrap();
+    cx.simulate_click(second.origin + point(px(8.), px(8.)), Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("block-menu").is_none());
+    cx.update(|_, cx| assert_eq!(editor.read(cx).focused.as_ref().map(|f| f.id), Some(Some(ids[1]))));
+    assert_eq!(text(&editor, cx), source);
+}
+
 /// `⌘/` 打开块菜单，从「颜色 ▸」进入颜色菜单。
 #[gpui_kit::test]
 fn block_menu_opens_with_command_slash_and_reaches_colors(cx: &mut TestAppContext) {
@@ -1255,7 +1381,7 @@ fn block_menu_opens_with_command_slash_and_reaches_colors(cx: &mut TestAppContex
     assert!(color_menu_open(&editor, cx), "颜色 ▸ 打开颜色菜单");
 }
 
-/// 拖动 `⠿` 把块插到另一块前面，并画出插入线。点击手柄仍只是选中并打开菜单。
+/// 拖动 `⠿` 把块插到另一块前面，并画出插入线。点击手柄只选中块。
 #[gpui_kit::test]
 fn dragging_a_block_handle_reorders_it(cx: &mut TestAppContext) {
     let (_dir, _vault, _path, editor) = open(cx, "aaa\n\nbbb\n\nccc\n");

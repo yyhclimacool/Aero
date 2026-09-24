@@ -1465,7 +1465,7 @@ impl Editor {
         self.units.iter().position(|u| u.id == id)
     }
 
-    /// gutter 的 `⠿`：进入块选中态。点击另开块菜单；拖动走 `on_drag`。
+    /// gutter 的 `⠿`：进入块选中态；拖动走 `on_drag`。
     fn select_block_by_id(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.unit_index(id) {
             self.select_blocks(ix, ix, window, cx);
@@ -3077,25 +3077,19 @@ impl Editor {
                 .child(glyph)
         };
         let editor = cx.entity();
-        let handle = button("gutter-handle", "⠿", "拖动重排，点击打开菜单")
+        let handle = button("gutter-handle", "⠿", "点击选中块，拖动重排；右键打开菜单")
             .on_drag(block_menu::BlockDrag { id }, move |drag, _, window, cx| {
                 let cursor = window.mouse_position();
                 editor.update(cx, |this, _| this.preview_block_drag(cursor));
                 let text = editor.read(cx).block_preview_text(drag.id);
                 cx.new(|_| block_menu::BlockDragGhost::new(text))
             })
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 if cx.has_active_drag() || this.dragging_block {
                     return;
                 }
                 cx.stop_propagation();
-                let origin = match event {
-                    ClickEvent::Mouse(click) => click.down.position,
-                    ClickEvent::Keyboard(key) => key.bounds.center(),
-                    ClickEvent::Touch(touch) => touch.position,
-                };
                 this.select_block_by_id(id, window, cx);
-                this.open_block_menu(id, origin, window, cx);
             }));
         let plus = button("gutter-plus", "+", "在下方插入块").on_mouse_down(
             MouseButton::Left,
@@ -3630,6 +3624,10 @@ impl Render for Editor {
             .debug_selector(|| "editor".into())
             .key_context("Editor")
             .track_focus(&self.focus_handle)
+            // 菜单面板由 occlude 排除；在正文链接吞掉捕获事件前关闭菜单。
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                this.close_block_menu(cx);
+            }))
             .on_action(cx.listener(Self::on_block_up))
             .on_action(cx.listener(Self::on_block_down))
             .on_action(cx.listener(Self::on_split_block))

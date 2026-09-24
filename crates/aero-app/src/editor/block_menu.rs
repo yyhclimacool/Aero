@@ -1,4 +1,4 @@
-//! 块菜单（`ui_design.md` 5.3）：`⠿`、右键、`⌘/` 打开。颜色从这里进入 7.7 的颜色菜单。
+//! 块菜单：右键、`⌘/` 打开，点击外部关闭。颜色从这里进入颜色菜单。
 
 use aero_core::BlockId;
 use gpui_kit::component::WindowExt as _;
@@ -372,6 +372,12 @@ impl Editor {
                 anchored().position(menu.origin).snap_to_window_with_margin(px(8.)).child(
                     h_flex()
                         .items_start()
+                        .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                            this.close_block_menu(cx);
+                        }))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.close_block_menu(cx);
+                        }))
                         .child(
                             v_flex()
                                 .id("block-menu")
