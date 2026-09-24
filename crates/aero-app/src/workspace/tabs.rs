@@ -530,6 +530,7 @@ impl Workspace {
             .collect();
         h_flex()
             .id("tab-strip")
+            .debug_selector(|| "tab-strip".into())
             .flex_1()
             .min_w_0()
             .h_full()
@@ -539,6 +540,7 @@ impl Workspace {
             .child(
                 h_flex()
                     .id("tabs")
+                    .debug_selector(|| "tabs-viewport".into())
                     .min_w_0()
                     .flex_shrink(1.)
                     .h_full()
@@ -548,14 +550,17 @@ impl Workspace {
                     .track_scroll(&self.tab_scroll)
                     .children(tabs),
             )
-            .child(stop_title_drag(
-                Button::new("new-tab")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Plus)
-                    .tooltip_with_action("新建标签页", &NewTab, None)
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
-            ))
+            .child(
+                stop_title_drag(
+                    Button::new("new-tab")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .tooltip_with_action("新建标签页", &NewTab, None)
+                        .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTab), cx)),
+                )
+                .debug_selector(|| "new-tab-button".into()),
+            )
     }
 
     fn render_tab(&self, ix: usize, tab: &Tab, active: bool, cx: &mut Context<Self>) -> AnyElement {

@@ -23,6 +23,7 @@ mod inline_links_ui;
 mod layout_tests;
 mod link_preview;
 mod math_ui;
+mod navigation;
 mod ops;
 mod pairs;
 mod pairs_ui;
@@ -299,6 +300,7 @@ pub struct Editor {
     tag_generation: u64,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
+    navigation: navigation::Navigation,
     /// 下一帧把这个块滚到合适位置（搜索命中定位、块选区移动）
     reveal: Option<BlockId>,
     reveal_mode: RevealMode,
@@ -388,6 +390,7 @@ impl Editor {
             tag_generation: 0,
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            navigation: navigation::Navigation::default(),
             reveal: None,
             reveal_mode: RevealMode::Center,
             reveal_generation: 0,
@@ -1252,6 +1255,7 @@ impl Editor {
     /// 编辑态里的 Esc（文本控件的 `Escape` 冒泡到这里）：先关菜单 / 标题编辑；否则退出编辑并选中刚才的块
     /// （`ui_design.md` 6："Esc 两段式退出"）。光标在没有块的空位上时直接回浏览态。
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_navigation(cx);
         self.cancel_link_preview(cx);
         if self.close_image_viewer(window, cx) {
             return;
@@ -3591,6 +3595,7 @@ impl Focusable for Editor {
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::colors::apply_text_selection(cx);
+        self.sync_navigation();
         self.inline_math_hits.clear();
         if self.dragging_block && !cx.has_active_drag() {
             self.dragging_block = false;
@@ -3620,7 +3625,7 @@ impl Render for Editor {
         let blocks = self.render_blocks(&roots, cx);
         let empty = self.doc.blocks().is_empty() && self.focused.is_none();
 
-        div()
+        let body = div()
             .id("editor")
             .debug_selector(|| "editor".into())
             .key_context("Editor")
@@ -3628,6 +3633,7 @@ impl Render for Editor {
             // 菜单面板由 occlude 排除；在正文链接吞掉捕获事件前关闭菜单。
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
                 this.close_block_menu(cx);
+                this.clear_navigation(cx);
             }))
             .on_action(cx.listener(Self::on_block_up))
             .on_action(cx.listener(Self::on_block_down))
@@ -3695,6 +3701,7 @@ impl Render for Editor {
             .track_scroll(&self.scroll)
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 this.cancel_link_preview(cx);
+                this.clear_navigation(cx);
                 this.toolbar_scrolled(cx);
             }))
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
@@ -3740,7 +3747,13 @@ impl Render for Editor {
             .children(self.render_math_editor(cx))
             // 颜色菜单画在编辑器根上：块选中态没有控件可挂，位置由 `color_menu_position` 给
             .children(self.color_menu.is_some().then(|| self.render_color_menu(cx)))
-            .children(self.render_image_viewer(window, cx))
+            .children(self.render_image_viewer(window, cx));
+        div()
+            .relative()
+            .size_full()
+            .child(body)
+            .children(self.render_navigation(window, cx))
+            .children(self.render_navigation_preview(window, cx))
     }
 }
 

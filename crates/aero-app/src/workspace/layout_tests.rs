@@ -309,6 +309,145 @@ fn favorites_follow_renames_and_drop_trashed_notes(cx: &mut TestAppContext) {
     close_index(cx, &workspace);
 }
 
+fn open_long_title_tabs(
+    cx: &mut TestAppContext,
+) -> (tempfile::TempDir, tempfile::TempDir, Entity<Workspace>) {
+    let source = format!("# {}\n", "很长的标签标题 Long-unbroken-document-title ".repeat(12));
+    let (dir, data, workspace) = open(cx, Some(&source));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    with_root(cx, &workspace);
+    for ix in 1..12 {
+        let path = format!("long-title-{ix}.md");
+        std::fs::write(dir.path().join(&path), &source).unwrap();
+        workspace.update_in(cx, |w, window, cx| w.open_note(note(&path), window, cx));
+    }
+    workspace.update_in(cx, |w, window, cx| w.activate_tab(0, window, cx));
+    close_index(cx, &workspace);
+    (dir, data, workspace)
+}
+
+fn assert_title_alignment(cx: &mut VisualTestContext, case: &str) {
+    let (viewport, fullscreen) = cx.update(|window, _| (window.viewport_size(), window.is_fullscreen()));
+    let title = cx.debug_bounds("title-content").unwrap();
+    let right = cx.debug_bounds("title-panel").unwrap();
+    let strip = cx.debug_bounds("tab-strip").unwrap();
+    let tabs = cx.debug_bounds("tabs-viewport").unwrap();
+    let new_tab = cx.debug_bounds("new-tab-button").unwrap();
+    if let Some(panel) = cx.debug_bounds("context-panel") {
+        let editor = cx.debug_bounds("editor-column").unwrap();
+        assert_eq!(right.left(), panel.left(), "{case}: title/body panel boundary");
+        assert_eq!(right.left(), editor.right(), "{case}: title/editor boundary");
+        assert_eq!(right.size.width, panel.size.width, "{case}: panel widths");
+    }
+    assert_eq!(right.right(), viewport.width, "{case}: right controls stay at window edge");
+    assert_eq!(title.right(), viewport.width, "{case}: title content stays inside window");
+    // gpui-component's inner `bar` adds pl_3 in fullscreen (12 px at the default rem size).
+    assert_eq!(title.left(), px(if fullscreen { 12. } else { 0. }), "{case}: native bar inset");
+    if let Some(sidebar) = cx.debug_bounds("sidebar") {
+        let left = cx.debug_bounds("title-left").unwrap();
+        assert_eq!(left.right(), sidebar.right(), "{case}: sidebar boundary");
+    }
+    assert_eq!(strip.right(), right.left(), "{case}: tabs cannot push the panel");
+    assert!(tabs.size.width > px(0.) && tabs.right() <= new_tab.left(), "{case}: tabs scroll separately");
+    assert!(new_tab.right() <= right.left(), "{case}: new-tab does not overlap panel");
+    for selector in ["new-tab-button", "panel-toggle-button"] {
+        let button = cx.debug_bounds(selector).unwrap();
+        assert!(button.size.width > px(0.) && button.size.height > px(0.), "{case}: {selector} has size");
+        assert!(
+            button.left() >= px(0.)
+                && button.right() <= viewport.width
+                && button.top() >= title.top()
+                && button.bottom() <= title.bottom(),
+            "{case}: {selector} is fully inside the title bar: {button:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn title_panel_stays_aligned_with_many_long_tabs_across_window_sizes(cx: &mut TestAppContext) {
+    let (_dir, _data, workspace) = open_long_title_tabs(cx);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for fullscreen in [false, true, false] {
+        cx.update(|window, _| {
+            if window.is_fullscreen() != fullscreen {
+                window.toggle_fullscreen();
+            }
+        });
+        for sidebar in [true, false] {
+            for panel in [220., 300., 380.] {
+                workspace.update_in(cx, |w, _, cx| {
+                    w.sidebar_visible = sidebar;
+                    w.panel_width = px(panel);
+                    cx.notify();
+                });
+                for width in [1400., 1100., 800., 640., 1400.] {
+                    cx.simulate_resize(size(px(width), px(800.)));
+                    draw(cx);
+                    assert_title_alignment(
+                        cx,
+                        &format!("width={width}, sidebar={sidebar}, panel={panel}, fullscreen={fullscreen}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn title_tabs_scroll_and_controls_work_while_the_panel_is_resized(cx: &mut TestAppContext) {
+    use gpui_kit::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+
+    let (_dir, _data, workspace) = open_long_title_tabs(cx);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(1100.), px(800.)));
+    draw(cx);
+    assert_title_alignment(cx, "before scrolling");
+    let tabs = cx.debug_bounds("tabs-viewport").unwrap();
+    for (dx, selector) in [(-5000., "tab:11"), (5000., "tab:0")] {
+        cx.simulate_event(ScrollWheelEvent {
+            position: tabs.center(),
+            delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Started,
+        });
+        draw(cx);
+        let tab = cx.debug_bounds(selector).expect("scrolled tab is rendered");
+        assert!(tab.left() >= tabs.left() && tab.right() <= tabs.right(), "{selector} is reachable");
+        assert_title_alignment(cx, "after scrolling");
+    }
+    for sidebar in [true, false] {
+        workspace.update_in(cx, |w, _, cx| {
+            w.sidebar_visible = sidebar;
+            cx.notify();
+        });
+        draw(cx);
+        let start = cx.debug_bounds("split-panel").unwrap().center();
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        draw(cx);
+        for dx in [-40., -80., 80., 0.] {
+            cx.simulate_mouse_move(start + point(px(dx), px(0.)), MouseButton::Left, Modifiers::default());
+            draw(cx);
+            assert_title_alignment(cx, &format!("drag dx={dx}, sidebar={sidebar}"));
+        }
+        cx.simulate_mouse_up(start, MouseButton::Left, Modifiers::default());
+        draw(cx);
+    }
+    cx.simulate_resize(size(px(640.), px(800.)));
+    draw(cx);
+    let new_tab = cx.debug_bounds("new-tab-button").unwrap();
+    cx.simulate_click(new_tab.center(), Modifiers::default());
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().tabs.len()), 13);
+    assert_title_alignment(cx, "after new tab");
+    for visible in [false, true] {
+        let toggle = cx.debug_bounds("panel-toggle-button").unwrap();
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        draw(cx);
+        assert_eq!(cx.update(|_, cx| workspace.read(cx).panel_visible), visible);
+        assert_title_alignment(cx, "after toggling panel");
+    }
+}
+
 #[gpui_kit::test]
 fn side_columns_keep_their_width_and_the_editor_absorbs_window_changes(cx: &mut TestAppContext) {
     let (_dir, _data, workspace) = open(cx, Some("# A\n"));

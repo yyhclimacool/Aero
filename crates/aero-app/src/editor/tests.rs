@@ -108,7 +108,7 @@ fn rich_root(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
 
 #[gpui_kit::test]
 fn rich_selection_and_highlight_keep_images_and_following_text_still(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, px, size};
+    use gpui_kit::{px, size, Modifiers};
     for source in [
         "```mermaid\nflowchart LR\n A[开始] --> B[结束]\n```\n\n后续正文\n",
         "![[paper.pdf|400]]\n\n后续正文\n",
@@ -159,7 +159,7 @@ fn rich_selection_and_highlight_keep_images_and_following_text_still(cx: &mut Te
 
 #[gpui_kit::test]
 fn rich_long_errors_keep_retry_visible_and_clickable(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, px, size};
+    use gpui_kit::{px, size, Modifiers};
     let source = "```mermaid\nthis is not a diagram\n```\n";
     let (_dir, _cache, _vault, editor) = open_with_images(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -381,7 +381,7 @@ fn assert_nested_pdf_read_only(cx: &mut TestAppContext, source: &str) {
 
 #[gpui_kit::test]
 fn rich_pdf_hover_uses_target_note_assets_and_stays_read_only(cx: &mut TestAppContext) {
-    use gpui_kit::{Bounds, point, px};
+    use gpui_kit::{point, px, Bounds};
     let source = "见 [[b]]\n";
     let target = "![[paper.pdf#page=2|240]]\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
@@ -437,7 +437,7 @@ fn rich_pdf_hover_uses_target_note_assets_and_stays_read_only(cx: &mut TestAppCo
 
 #[gpui_kit::test]
 fn pdf_reader_toolbar_and_page_input_are_above_the_viewport(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, px, size};
+    use gpui_kit::{px, size, Modifiers};
     let source = "![[paper.pdf#page=1|400]]\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
     std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
@@ -478,7 +478,7 @@ fn pdf_reader_toolbar_and_page_input_are_above_the_viewport(cx: &mut TestAppCont
 
 #[gpui_kit::test]
 fn pdf_reader_scrolls_across_pages_without_scrolling_or_editing_the_note(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px, size};
+    use gpui_kit::{point, px, size, Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase};
     let source = "![[paper.pdf|400]]\n\n正文\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
     let pdf = String::from_utf8(crate::render::two_page_pdf()).unwrap().replace("200 100", "200 500");
@@ -506,7 +506,7 @@ fn pdf_reader_scrolls_across_pages_without_scrolling_or_editing_the_note(cx: &mu
 
 #[gpui_kit::test]
 fn pdf_reader_input_does_not_edit_the_previously_focused_note_text(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, px, size};
+    use gpui_kit::{px, size, Modifiers};
     let source = "正文\n\n![[paper.pdf|400]]\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
     std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
@@ -572,7 +572,7 @@ fn pdf_reader_input_undo_never_undoes_note_edits(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn pdf_reader_resizes_from_both_edges_without_changing_the_note(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, point, px, size};
+    use gpui_kit::{point, px, size, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
     let source = "![[paper.pdf|400]]\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
     std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
@@ -1238,6 +1238,109 @@ fn open_color_menu(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
 }
 
 #[gpui_kit::test]
+fn navigation_marks_preview_and_jump_without_entering_edit_mode(cx: &mut TestAppContext) {
+    use gpui_kit::{point, px, size, Modifiers};
+    let source =
+        format!("# 导航标题\n\n{}最后一段 **保留内容**。\n", "正文段落，保持编辑行为不变。\n\n".repeat(30));
+    let (_dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    settle(cx);
+    let rail = cx.debug_bounds("document-navigator").expect("fixed right-edge navigation rail");
+    let ids: Vec<_> = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    let last = *ids.last().unwrap();
+    let marker = cx.debug_bounds(Box::leak(format!("navigation-mark-{}", last.0).into_boxed_str())).unwrap();
+    cx.simulate_mouse_move(marker.center(), None, Modifiers::default());
+    cx.executor().advance_clock(Duration::from_millis(250));
+    settle(cx);
+    let preview = cx.debug_bounds("navigation-preview").expect("hover preview");
+    assert!(preview.right() <= rail.left(), "preview stays to the left of the rail");
+    assert!(preview.top() >= px(0.) && preview.bottom() <= px(700.));
+    assert_eq!(text(&editor, cx), source);
+    cx.simulate_click(marker.center(), Modifiers::default());
+    settle(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.focused.is_none(), "navigation must not enter source editing");
+        assert_eq!(e.highlighted_block(), Some(last));
+        assert!(e.scroll.offset().y < px(0.));
+    });
+    assert_eq!(cx.debug_bounds("document-navigator").unwrap(), rail, "rail is fixed while content scrolls");
+    assert!(cx.debug_bounds("navigation-preview").is_none());
+    cx.simulate_mouse_move(point(px(200.), px(100.)), None, Modifiers::default());
+    settle(cx);
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn navigation_marks_magnify_around_the_pointer_then_settle_back(cx: &mut TestAppContext) {
+    use gpui_kit::{point, px, Modifiers};
+    let source = format!("# 标题\n\n{}最后一段。\n", "段落。\n\n".repeat(11));
+    let (_dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size_of_navigation());
+    settle(cx);
+    let ids: Vec<_> = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    let last = ids[ids.len() - 1];
+    let prev = ids[ids.len() - 2];
+    let rest = navigation_bar_width(cx, last.0);
+    let neighbor_rest = navigation_bar_width(cx, prev.0);
+    let rail = cx.debug_bounds("document-navigator").unwrap();
+    let marker = cx.debug_bounds(Box::leak(format!("navigation-mark-{}", last.0).into_boxed_str())).unwrap();
+    cx.simulate_mouse_move(marker.center(), None, Modifiers::default());
+    // 悬停当帧只记下目标，弹簧要等下一帧才开始走
+    settle(cx);
+    assert!(
+        (navigation_bar_width(cx, last.0) - rest).abs() < 1.,
+        "magnification eases in instead of popping"
+    );
+    pump_frames(cx, 50);
+    let mid = navigation_bar_width(cx, last.0);
+    assert!(mid > rest + 1.5 && mid < rest + 12., "partway through the grow: {mid} from {rest}");
+    for _ in 0..8 {
+        pump_frames(cx, 50);
+    }
+    let grown = navigation_bar_width(cx, last.0);
+    let neighbor = navigation_bar_width(cx, prev.0);
+    assert!(grown > rest + 10., "hovered mark grows: {grown} from {rest}");
+    assert!(
+        neighbor > neighbor_rest + 3. && neighbor < grown - 2.,
+        "neighbors grow less: {neighbor} between {neighbor_rest} and {grown}"
+    );
+    assert_eq!(cx.debug_bounds("document-navigator").unwrap().size, rail.size, "the rail itself stays put");
+    cx.simulate_mouse_move(point(px(40.), px(40.)), None, Modifiers::default());
+    settle(cx);
+    for _ in 0..8 {
+        pump_frames(cx, 50);
+    }
+    let back = navigation_bar_width(cx, last.0);
+    assert!(back < rest + 1.5, "the mark shrinks back: {back} toward {rest}");
+}
+
+fn size_of_navigation() -> gpui_kit::Size<gpui_kit::Pixels> {
+    gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(700.))
+}
+
+fn navigation_bar_width(cx: &mut VisualTestContext, id: u64) -> f32 {
+    let selector = Box::leak(format!("navigation-bar-{id}").into_boxed_str());
+    f32::from(cx.debug_bounds(selector).expect("navigation bar").size.width)
+}
+
+fn pump_frames(cx: &mut VisualTestContext, ms: u64) {
+    cx.executor().advance_clock(Duration::from_millis(ms));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+#[gpui_kit::test]
+fn empty_document_has_no_navigation_marks(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    assert!(cx.debug_bounds("document-navigator").is_none());
+    assert_eq!(text(&editor, cx), "");
+}
+
+#[gpui_kit::test]
 fn block_handle_click_selects_without_opening_menu(cx: &mut TestAppContext) {
     let source =
         "# 标题\n\n正文\n\n- 列表项\n\n> 引用\n\n```rust\nlet x = 1;\n```\n\n| 表头 |\n| --- |\n| 单元格 |\n";
@@ -1265,7 +1368,7 @@ fn block_handle_click_selects_without_opening_menu(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn block_menu_dismisses_on_outside_click_and_keeps_submenu_clicks(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, MouseButton, point, px};
+    use gpui_kit::{point, px, Modifiers, MouseButton};
     let source = "first\n\nsecond\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -1300,7 +1403,7 @@ fn block_menu_dismisses_on_outside_click_and_keeps_submenu_clicks(cx: &mut TestA
 
 #[gpui_kit::test]
 fn block_menu_dismisses_when_an_outside_link_captures_the_click(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, MouseButton, point, px};
+    use gpui_kit::{point, px, Modifiers, MouseButton};
     let source = "[外部链接](https://example.com)\n\n正文\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -1322,7 +1425,7 @@ fn block_menu_dismisses_when_an_outside_link_captures_the_click(cx: &mut TestApp
 
 #[gpui_kit::test]
 fn block_menu_right_click_retargets_and_outside_click_reaches_content(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, MouseButton, point, px};
+    use gpui_kit::{point, px, Modifiers, MouseButton};
     let source = "first\n\nsecond\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -2659,11 +2762,10 @@ fn block_ref_mouse_writes_external_id_and_undo_keeps_it(cx: &mut TestAppContext)
     let changed = std::fs::read_to_string(&target).unwrap();
     let doc = aero_core::Document::from_text(&changed);
     let block = aero_core::block_refs::resolve(&doc, &id).unwrap();
-    assert!(
-        doc.blocks()
-            .iter()
-            .any(|(_, b)| b.id == block && matches!(b.kind, aero_core::BlockKind::CodeFence { .. }))
-    );
+    assert!(doc
+        .blocks()
+        .iter()
+        .any(|(_, b)| b.id == block && matches!(b.kind, aero_core::BlockKind::CodeFence { .. })));
     cx.simulate_input("!");
     assert_eq!(text(&editor, cx), completed.replace("]] after", "]]! after"));
     cx.simulate_keystrokes("cmd-z");
@@ -3553,7 +3655,7 @@ fn table_preview_enables_horizontal_overflow(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn wide_table_scroll_keeps_vertical_document_navigation(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+    use gpui_kit::{point, px, Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase};
     let mut source = format!(
         "| {} |\n| {} |\n| {} |\n\n",
         ["Heading"; 12].join(" | "),
@@ -4968,7 +5070,7 @@ fn inline_math_renders_inside_a_paragraph(cx: &mut TestAppContext) {
 /// 点进标题、段落、引用或列表时，其它块的位置不能变。
 #[gpui_kit::test]
 fn focusing_a_block_keeps_the_following_block_in_place(cx: &mut TestAppContext) {
-    use gpui_kit::{Bounds, Pixels, px, size};
+    use gpui_kit::{px, size, Bounds, Pixels};
     let source = "# 标题一\n\n这是一段很长的正文，用来看点击之后会不会跳。这是一段很长的正文，用来看点击之后会不会跳。这是一段很长的正文，用来看点击之后会不会跳。这是一段很长的正文，用来看点击之后会不会跳。\n\n## 小标题\n\n> 引用一行\n\n- 列表项\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);

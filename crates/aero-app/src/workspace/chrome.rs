@@ -252,8 +252,9 @@ impl Workspace {
         let theme = cx.theme();
         let (sidebar_bg, sidebar_border, muted) =
             (theme.sidebar, theme.sidebar_border, theme.muted_foreground);
-        // 全屏时没有交通灯，标题栏自己留 12 px
+        // 全屏时没有交通灯，TitleBar 内部的 bar 自带 pl_3（默认 12 px）。
         let lights = px(if window.is_fullscreen() { 0. } else { TRAFFIC_LIGHTS });
+        let inset = if window.is_fullscreen() { window.rem_size() * 0.75 } else { px(0.) };
         let Some(open) = self.open.as_ref() else {
             return TitleBar::new().child(div().text_sm().text_color(muted).child("Aero"));
         };
@@ -281,7 +282,8 @@ impl Workspace {
                     None,
                 )
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(TogglePanel), cx)),
-        );
+        )
+        .debug_selector(|| "panel-toggle-button".into());
         let left = if self.sidebar_visible {
             let view = |id: &'static str,
                         icon: IconName,
@@ -307,7 +309,7 @@ impl Workspace {
             };
             h_flex()
                 .flex_none()
-                .w(sidebar)
+                .w((sidebar - inset).max(px(0.)))
                 .h_full()
                 .pl(lights)
                 .pr_1()
@@ -349,13 +351,18 @@ impl Workspace {
         } else {
             h_flex().flex_none().h_full().px_1().items_center().child(panel_toggle)
         };
+        // gpui-component 0.6.1 的 bar 没有 min_w_0，百分比宽度会被标签的固有宽度撑开。
+        // 给它确定的可用宽度，让溢出只留在 tabs 的横向滚动区，不改库的拖窗与原生按钮。
         TitleBar::new().pl_0().child(
             h_flex()
-                .size_full()
+                .debug_selector(|| "title-content".into())
+                .flex_none()
+                .w((window.viewport_size().width - inset).max(px(0.)))
+                .h_full()
                 .items_center()
-                .child(left)
+                .child(left.debug_selector(|| "title-left".into()))
                 .child(self.render_tab_strip(open, cx))
-                .child(right),
+                .child(right.debug_selector(|| "title-panel".into())),
         )
     }
 
