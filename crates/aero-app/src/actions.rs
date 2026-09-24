@@ -357,6 +357,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-/", CloseColorMenu, Some("ColorMenu > Input")),
         KeyBinding::new("cmd-z", DocUndo, Some("Input")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Input")),
+        KeyBinding::new("cmd-z", gpui_kit::base::input::Undo, Some("PdfPageInput > Input")),
+        KeyBinding::new("cmd-shift-z", gpui_kit::base::input::Redo, Some("PdfPageInput > Input")),
         // 编辑态里 ⇧↑↓ 越过块边界时升级为块选中；否则 propagate 给控件扩展字符选区
         KeyBinding::new("shift-up", ExtendBlockUp, Some("Input")),
         KeyBinding::new("shift-down", ExtendBlockDown, Some("Input")),

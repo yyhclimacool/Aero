@@ -436,6 +436,205 @@ fn rich_pdf_hover_uses_target_note_assets_and_stays_read_only(cx: &mut TestAppCo
 }
 
 #[gpui_kit::test]
+fn pdf_reader_toolbar_and_page_input_are_above_the_viewport(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, px, size};
+    let source = "![[paper.pdf#page=1|400]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(1000.)));
+    rich_root(&editor, cx);
+    let previous = cx.debug_bounds("pdf-prev").unwrap();
+    let image = cx.debug_bounds("pdf-block").unwrap();
+    assert!(previous.bottom() <= image.top(), "controls must be above the PDF page");
+    let viewport = cx.debug_bounds("pdf-viewport").expect("independent PDF viewport");
+    let toolbar = cx.debug_bounds("pdf-toolbar").unwrap();
+    assert!(toolbar.bottom() <= viewport.top());
+    for invalid in ["", "0", "3", "-1", "1.5", "not-a-page"] {
+        let input = cx.debug_bounds("pdf-page-input").unwrap();
+        cx.simulate_click(input.center(), Modifiers::default());
+        cx.simulate_keystrokes("cmd-a backspace");
+        if !invalid.is_empty() {
+            cx.simulate_input(invalid);
+        }
+        cx.simulate_keystrokes("enter");
+        settle(cx);
+        assert_eq!(text(&editor, cx), source, "invalid page: {invalid}");
+        assert!(cx.debug_bounds("pdf-page-1-of-2").is_some());
+    }
+    let input = cx.debug_bounds("pdf-page-input").unwrap();
+    cx.simulate_click(input.center(), Modifiers::default());
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input("2");
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    assert!(cx.debug_bounds("pdf-page-2-of-2").is_some());
+    assert_eq!(text(&editor, cx), source.replace("page=1", "page=2"));
+    cx.simulate_keystrokes("cmd-z");
+    settle(cx);
+    assert_eq!(text(&editor, cx), source);
+    assert!(cx.debug_bounds("pdf-page-1-of-2").is_some());
+}
+
+#[gpui_kit::test]
+fn pdf_reader_scrolls_across_pages_without_scrolling_or_editing_the_note(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px, size};
+    let source = "![[paper.pdf|400]]\n\n正文\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    let pdf = String::from_utf8(crate::render::two_page_pdf()).unwrap().replace("200 100", "200 500");
+    std::fs::write(dir.path().join("paper.pdf"), pdf).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(1000.)));
+    rich_root(&editor, cx);
+    let viewport = cx.debug_bounds("pdf-viewport").expect("PDF scroll viewport");
+    let toolbar = cx.debug_bounds("pdf-toolbar").unwrap();
+    for (dy, current) in [(-1200., 2), (1200., 1)] {
+        cx.simulate_event(ScrollWheelEvent {
+            position: viewport.center(),
+            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Started,
+        });
+        settle(cx);
+        let selector: &'static str = Box::leak(format!("pdf-page-{current}-of-2").into_boxed_str());
+        assert!(cx.debug_bounds(selector).is_some(), "wheel must reach page {current}");
+        assert_eq!(cx.debug_bounds("pdf-toolbar").unwrap(), toolbar);
+        assert_eq!(cx.debug_bounds("pdf-viewport").unwrap(), viewport);
+        assert_eq!(text(&editor, cx), source, "passive scrolling must not create document edits");
+    }
+}
+
+#[gpui_kit::test]
+fn pdf_reader_input_does_not_edit_the_previously_focused_note_text(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, px, size};
+    let source = "正文\n\n![[paper.pdf|400]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(1000.)));
+    rich_root(&editor, cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("新增");
+    settle(cx);
+    let before = text(&editor, cx);
+    let input = cx.debug_bounds("pdf-page-input").unwrap();
+    cx.simulate_click(input.center(), Modifiers::default());
+    cx.simulate_keystrokes("cmd-a backspace");
+    cx.simulate_input("2");
+    assert_eq!(text(&editor, cx), before, "page input must not change the note before confirmation");
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    assert_eq!(text(&editor, cx), before.replace("paper.pdf|", "paper.pdf#page=2|"));
+    cx.simulate_keystrokes("cmd-z");
+    settle(cx);
+    assert_eq!(text(&editor, cx), before, "page navigation is one separate undo group");
+}
+
+#[gpui_kit::test]
+fn pdf_reader_empty_input_backspace_never_deletes_the_pdf_block(cx: &mut TestAppContext) {
+    let source = "![[paper.pdf|400]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    let page = cx.debug_bounds("pdf-block").unwrap().center();
+    cx.simulate_click(page, gpui_kit::Modifiers::default());
+    let input = cx.debug_bounds("pdf-page-input").unwrap().center();
+    cx.simulate_click(input, gpui_kit::Modifiers::default());
+    cx.simulate_keystrokes("cmd-a backspace backspace delete");
+    settle(cx);
+    assert_eq!(text(&editor, cx), source);
+    assert!(cx.debug_bounds("pdf-viewport").is_some());
+}
+
+#[gpui_kit::test]
+fn pdf_reader_input_undo_never_undoes_note_edits(cx: &mut TestAppContext) {
+    let source = "正文\n\n![[paper.pdf|400]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("新增");
+    settle(cx);
+    let before = text(&editor, cx);
+    let input = cx.debug_bounds("pdf-page-input").unwrap().center();
+    cx.simulate_click(input, gpui_kit::Modifiers::default());
+    cx.simulate_keystrokes("cmd-a");
+    cx.simulate_input("2");
+    cx.simulate_keystrokes("cmd-z");
+    settle(cx);
+    assert_eq!(text(&editor, cx), before);
+    cx.simulate_keystrokes("cmd-shift-z");
+    settle(cx);
+    assert_eq!(text(&editor, cx), before);
+}
+
+#[gpui_kit::test]
+fn pdf_reader_resizes_from_both_edges_without_changing_the_note(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, point, px, size};
+    let source = "![[paper.pdf|400]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(1600.)));
+    rich_root(&editor, cx);
+    for (selector, dy) in [("pdf-resize-bottom", 80.), ("pdf-resize-top", -60.)] {
+        let before = cx.debug_bounds("pdf-viewport").unwrap();
+        let start = cx.debug_bounds(selector).expect("PDF resize edge").center();
+        let end = start + point(px(0.), px(dy));
+        cx.simulate_event(MouseDownEvent {
+            position: start,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseMoveEvent {
+            position: end,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: end,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 1,
+        });
+        settle(cx);
+        let after = cx.debug_bounds("pdf-viewport").unwrap();
+        assert_eq!(after.size.height, before.size.height + px(dy.abs()));
+        assert_eq!(after.size.width, before.size.width);
+        assert_eq!(text(&editor, cx), source);
+    }
+    let before = cx.debug_bounds("pdf-viewport").unwrap();
+    let start = cx.debug_bounds("pdf-resize-bottom").unwrap().center();
+    let end = start + point(px(0.), px(100.));
+    cx.simulate_event(MouseDownEvent {
+        position: start,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseMoveEvent {
+        position: end,
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.simulate_keystrokes("escape");
+    cx.simulate_event(MouseUpEvent {
+        position: end,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count: 1,
+    });
+    settle(cx);
+    assert_eq!(cx.debug_bounds("pdf-viewport").unwrap(), before, "Esc cancels the resize");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
 fn rich_pdf_paging_controls_keyboard_boundaries_and_undo(cx: &mut TestAppContext) {
     let source = "![[paper.pdf|240]]\n\n后文\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);

@@ -205,6 +205,37 @@ pub fn export_diagram(
     })
 }
 
+/// 仅打开并校验文档与页面声明，不解码内容流或分配页面位图；由后台任务调用。
+pub(super) fn pdf_dimensions(bytes: Vec<u8>) -> Result<Vec<gpui_kit::Size<f32>>, String> {
+    guarded("PDF", || {
+        let pdf = open_pdf(bytes)?;
+        if pdf.pages().is_empty() {
+            return Err("PDF 没有页面".into());
+        }
+        pdf.pages().iter().map(page_dimensions).collect()
+    })
+}
+
+fn open_pdf(bytes: Vec<u8>) -> Result<Pdf, String> {
+    // catch_unwind 不能捕获依赖的栈溢出，必须在任何递归语法解析前限制源数据。
+    pdf_preflight::source(&bytes)?;
+    let pdf = Pdf::new(bytes).map_err(|error| match error {
+        hayro::hayro_syntax::LoadPdfError::Decryption(_) => "PDF 无法解密，请先移除密码保护",
+        hayro::hayro_syntax::LoadPdfError::Invalid => "PDF 无法打开：文件已损坏或格式无效",
+    })?;
+    pdf_preflight::images(&pdf)?;
+    Ok(pdf)
+}
+
+fn page_dimensions(page: &hayro::hayro_syntax::page::Page<'_>) -> Result<gpui_kit::Size<f32>, String> {
+    // hayro 会把零面积页自动换成 A4；在调用它之前拒绝非法原始页框。
+    let bounds = page.intersected_crop_box();
+    render_size(bounds.width(), bounds.height(), 1)?;
+    let (width, height) = page.render_dimensions();
+    render_size(f64::from(width), f64::from(height), 1)?;
+    Ok(gpui_kit::size(width, height))
+}
+
 /// 每次磁盘命中前也打开 PDF：页码校验和总页数不依赖只存在于内存的状态。
 pub(super) struct PdfPage {
     pdf: Pdf,
@@ -219,22 +250,13 @@ impl PdfPage {
             if page == 0 {
                 return Err("PDF 页码从 1 开始".into());
             }
-            // catch_unwind 不能捕获依赖的栈溢出，必须在任何递归语法解析前限制源数据。
-            pdf_preflight::source(&bytes)?;
-            let pdf = Pdf::new(bytes).map_err(|error| match error {
-                hayro::hayro_syntax::LoadPdfError::Decryption(_) => "PDF 无法解密，请先移除密码保护",
-                hayro::hayro_syntax::LoadPdfError::Invalid => "PDF 无法打开：文件已损坏或格式无效",
-            })?;
-            pdf_preflight::images(&pdf)?;
+            let pdf = open_pdf(bytes)?;
             let pages = u32::try_from(pdf.pages().len()).map_err(|_| "PDF 页数超出范围")?;
             let index = (page - 1) as usize;
             let selected =
                 pdf.pages().get(index).ok_or_else(|| format!("PDF 页码 {page} 超出范围（共 {pages} 页）"))?;
-            // hayro 会把零面积页自动换成 A4；在调用它之前拒绝非法原始页框。
-            let bounds = selected.intersected_crop_box();
-            render_size(bounds.width(), bounds.height(), 1)?;
-            let (width, height) = selected.render_dimensions();
-            let size = render_size(f64::from(width), f64::from(height), device)?;
+            let dimensions = page_dimensions(selected)?;
+            let size = render_size(f64::from(dimensions.width), f64::from(dimensions.height), device)?;
             Ok(Self { pdf, index, pages, size })
         })
     }
@@ -283,7 +305,7 @@ fn test_pdf(width: &str, height: &str) -> Vec<u8> {
 #[cfg(test)]
 fn test_pdf_extra(width: &str, height: &str, catalog: &str, extra: &[String]) -> Vec<u8> {
     let streams = ["1 0 0 rg 0 0 200 100 re f", "0 0 1 rg 0 0 200 100 re f"];
-    let objects = [
+    let mut objects = vec![
         format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>"),
         "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_owned(),
         format!(
@@ -295,9 +317,27 @@ fn test_pdf_extra(width: &str, height: &str, catalog: &str, extra: &[String]) ->
         format!("<< /Length {} >>\nstream\n{}\nendstream", streams[0].len(), streams[0]),
         format!("<< /Length {} >>\nstream\n{}\nendstream", streams[1].len(), streams[1]),
     ];
+    objects.extend_from_slice(extra);
+    test_pdf_objects(&objects)
+}
+
+/// 无内容流的多页夹具；每页可指定独立页框、裁剪与旋转。
+#[cfg(test)]
+pub(super) fn pages_pdf(pages: &[&str]) -> Vec<u8> {
+    let kids = (0..pages.len()).map(|i| format!("{} 0 R", i + 3)).collect::<Vec<_>>().join(" ");
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()),
+    ];
+    objects.extend(pages.iter().map(|fields| format!("<< /Type /Page /Parent 2 0 R {fields} >>")));
+    test_pdf_objects(&objects)
+}
+
+#[cfg(test)]
+fn test_pdf_objects(objects: &[String]) -> Vec<u8> {
     let mut pdf = String::from("%PDF-1.4\n");
     let mut offsets = vec![0];
-    for (i, object) in objects.iter().chain(extra).enumerate() {
+    for (i, object) in objects.iter().enumerate() {
         offsets.push(pdf.len());
         pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", i + 1));
     }
@@ -328,6 +368,43 @@ mod tests {
 
     fn pdf_open_error(bytes: Vec<u8>) -> String {
         PdfPage::new(bytes, 1, 200).err().expect("预检应在渲染前拒绝此 PDF")
+    }
+
+    #[test]
+    fn pdf_info_dimensions_include_rotation_crop_and_mixed_page_sizes() {
+        use gpui_kit::size;
+        assert_eq!(super::pdf_dimensions(two_page_pdf()).unwrap(), vec![size(200., 100.); 2]);
+        let bytes = super::pages_pdf(&[
+            "/MediaBox [0 0 200 100] /Rotate 90",
+            "/MediaBox [0 0 300.5 400.25] /Rotate 180",
+            "/MediaBox [0 0 600 800] /CropBox [10 20 210 320] /Rotate 270",
+        ]);
+        assert_eq!(
+            super::pdf_dimensions(bytes).unwrap(),
+            vec![size(100., 200.), size(300.5, 400.25), size(300., 200.)]
+        );
+    }
+
+    #[test]
+    fn pdf_info_rejects_empty_broken_and_invalid_later_pages() {
+        for bytes in [
+            b"not PDF".to_vec(),
+            super::pages_pdf(&[]),
+            super::pages_pdf(&["/MediaBox [0 0 200 100]", "/MediaBox [0 0 0 100]"]),
+            test_pdf("1", "1000000000"),
+        ] {
+            assert!(super::pdf_dimensions(bytes).is_err());
+        }
+        let catalog = format!("/Unused {}0{}", "[".repeat(160), "]".repeat(160));
+        assert!(super::pdf_dimensions(test_pdf_extra("200", "100", &catalog, &[])).is_err());
+        let image = image_object("16385", "1", "/BitsPerComponent 8");
+        assert!(super::pdf_dimensions(test_pdf_extra("200", "100", "", &[image])).is_err());
+    }
+
+    #[test]
+    fn pdf_info_checks_image_declarations_without_decoding_pixels() {
+        let image = image_object("1", "1", "/Filter /JPXDecode");
+        assert_eq!(super::pdf_dimensions(test_pdf_extra("200", "100", "", &[image])).unwrap().len(), 2);
     }
 
     #[test]

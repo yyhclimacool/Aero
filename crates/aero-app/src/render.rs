@@ -118,6 +118,20 @@ pub enum State {
     Failed(SharedString),
 }
 
+/// 所有页面的逻辑渲染尺寸（含旋转），不依赖位图宽度或设备倍率。
+#[derive(Clone, Debug)]
+pub struct PdfInfo {
+    pub pages: Vec<Size<f32>>,
+    pub fingerprint: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum PdfInfoState {
+    Pending,
+    Ready(Arc<PdfInfo>),
+    Failed(SharedString),
+}
+
 /// 渲染器接口（9.9）：服务负责缓存、占位、失败回退，渲染器只管把源变成位图。
 trait Renderer {
     /// `bytes` 是源内容（图片文件的字节 / 公式的 UTF-8），`device` 是算好的设备像素尺寸。
@@ -319,10 +333,18 @@ pub enum Attachment {
     Ambiguous,
 }
 
+const PDF_PAGE_CACHE_LIMIT: usize = 12;
+
 pub struct RenderService {
     vault: Arc<Vault>,
     cache: PathBuf,
     entries: HashMap<Request, Entry>,
+    /// 元数据只按 vault 相对路径缓存，不随页面位图 LRU 淘汰。
+    pdf_infos: HashMap<VaultPath, PdfInfoEntry>,
+    pdf_access: HashMap<Request, u64>,
+    pdf_tick: u64,
+    pdf_eviction_scheduled: bool,
+    next_token: u64,
     /// 上次渲染出的像素尺寸，占位用；同一源换尺寸时也不用从零等
     pixels: HashMap<Source, Size<u32>>,
     /// 附件目录：与 `![[` 补全同一套解析规则，保证插进去的写法渲染时也能解析
@@ -330,9 +352,18 @@ pub struct RenderService {
     catalog_task: Option<Task<()>>,
 }
 
+enum PdfInfoEntry {
+    Pending { token: u64, _task: Task<()> },
+    Ready(Arc<PdfInfo>),
+    Failed(SharedString),
+}
+
 enum Entry {
     /// 持有任务句柄：服务被丢掉（关闭 / 切换 vault）时后台渲染随之取消
-    Pending(#[allow(dead_code, reason = "句柄只为持有任务，丢弃即取消")] Task<()>),
+    Pending {
+        token: u64,
+        _task: Task<()>,
+    },
     Ready {
         image: Arc<RenderImage>,
         pixels: Size<u32>,
@@ -347,6 +378,11 @@ impl RenderService {
             vault,
             cache,
             entries: HashMap::new(),
+            pdf_infos: HashMap::new(),
+            pdf_access: HashMap::new(),
+            pdf_tick: 0,
+            pdf_eviction_scheduled: false,
+            next_token: 0,
             pixels: HashMap::new(),
             catalog: None,
             catalog_task: None,
@@ -448,7 +484,83 @@ impl RenderService {
             size: width.max(1),
             scale: (scale.max(0.5) * 100.).round() as u32,
         };
-        self.state(request, cx)
+        let state = self.state(request.clone(), cx);
+        self.pdf_tick += 1;
+        self.pdf_access.insert(request.clone(), self.pdf_tick);
+        if !self.pdf_eviction_scheduled {
+            self.pdf_eviction_scheduled = true;
+            let active_since = self.pdf_tick;
+            let service = cx.weak_entity();
+            // 同一轮绘制的可见页不能互相淘汰，否则超过缓存容量时会一直重新排队。
+            cx.defer(move |cx| {
+                let _ = service.update(cx, |this, _| {
+                    this.pdf_eviction_scheduled = false;
+                    while this.pdf_access.len() > PDF_PAGE_CACHE_LIMIT {
+                        let Some(oldest) = this
+                            .pdf_access
+                            .iter()
+                            .filter(|(_, tick)| **tick < active_since)
+                            .min_by_key(|(_, tick)| **tick)
+                            .map(|(key, _)| key.clone())
+                        else {
+                            break;
+                        };
+                        this.pdf_access.remove(&oldest);
+                        this.entries.remove(&oldest);
+                        if !this.entries.keys().any(|key| key.source == oldest.source) {
+                            this.pixels.remove(&oldest.source);
+                        }
+                    }
+                });
+            });
+        }
+        state
+    }
+
+    /// 首次仅排队；读取、指纹与全页尺寸解析都在后台完成，不触发页面光栅化。
+    pub fn pdf_info(&mut self, path: VaultPath, cx: &mut Context<Self>) -> PdfInfoState {
+        match self.pdf_infos.get(&path) {
+            Some(PdfInfoEntry::Pending { .. }) => PdfInfoState::Pending,
+            Some(PdfInfoEntry::Ready(info)) => PdfInfoState::Ready(info.clone()),
+            Some(PdfInfoEntry::Failed(error)) => PdfInfoState::Failed(error.clone()),
+            None => {
+                let token = self.token();
+                let (vault, key) = (self.vault.clone(), path.clone());
+                let task = cx.spawn(async move |this, cx| {
+                    let read_path = key.clone();
+                    let result = cx
+                        .background_spawn(async move {
+                            let (bytes, stamp) =
+                                vault.read_bytes(&read_path).map_err(|e| format!("PDF 无法读取：{e}"))?;
+                            Ok::<_, String>(PdfInfo {
+                                pages: rich::pdf_dimensions(bytes)?,
+                                fingerprint: stamp.hash,
+                            })
+                        })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        if !matches!(this.pdf_infos.get(&key), Some(PdfInfoEntry::Pending { token: current, .. }) if *current == token) {
+                            return;
+                        }
+                        this.pdf_infos.insert(
+                            key,
+                            match result {
+                                Ok(info) => PdfInfoEntry::Ready(Arc::new(info)),
+                                Err(error) => PdfInfoEntry::Failed(error.into()),
+                            },
+                        );
+                        cx.notify();
+                    });
+                });
+                self.pdf_infos.insert(path, PdfInfoEntry::Pending { token, _task: task });
+                PdfInfoState::Pending
+            }
+        }
+    }
+
+    fn token(&mut self) -> u64 {
+        self.next_token = self.next_token.checked_add(1).expect("渲染任务 token 耗尽");
+        self.next_token
     }
 
     fn state(&mut self, request: Request, cx: &mut Context<Self>) -> State {
@@ -458,17 +570,18 @@ impl RenderService {
                 State::Ready { image: image.clone(), pixels: *pixels, pages: *pages }
             }
             Some(Entry::Failed(error)) => State::Failed(error.clone()),
-            Some(Entry::Pending(_)) => placeholder(),
+            Some(Entry::Pending { .. }) => placeholder(),
             None => {
                 let state = placeholder();
-                let task = self.render(request.clone(), cx);
-                self.entries.insert(request, Entry::Pending(task));
+                let token = self.token();
+                let task = self.render(request.clone(), token, cx);
+                self.entries.insert(request, Entry::Pending { token, _task: task });
                 state
             }
         }
     }
 
-    fn render(&self, request: Request, cx: &mut Context<Self>) -> Task<()> {
+    fn render(&self, request: Request, token: u64, cx: &mut Context<Self>) -> Task<()> {
         let (vault, cache, key) = (self.vault.clone(), self.cache.clone(), request.clone());
         let text_system = cx.text_system().clone();
         cx.spawn(async move |this, cx| {
@@ -476,6 +589,10 @@ impl RenderService {
                 .background_spawn(async move { produce_with_text(&vault, &cache, &key, Some(text_system)) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                // 淘汰 / 失效后的回调不能复活 entry，也不能覆盖同 key 的新任务。
+                if !matches!(this.entries.get(&request), Some(Entry::Pending { token: current, .. }) if *current == token) {
+                    return;
+                }
                 this.entries.insert(
                     request.clone(),
                     match produced {
@@ -510,6 +627,9 @@ impl RenderService {
             !request.source.file().is_some_and(|file| paths.contains(file))
                 && !matches!(entry, Entry::Failed(_))
         });
+        self.pdf_infos
+            .retain(|path, entry| !paths.contains(path) && !matches!(entry, PdfInfoEntry::Failed(_)));
+        self.pdf_access.retain(|request, _| self.entries.contains_key(request));
         self.pixels.retain(|source, _| !source.file().is_some_and(|file| paths.contains(file)));
         for path in paths {
             if let Some(catalog) = &mut self.catalog {
@@ -523,6 +643,8 @@ impl RenderService {
     /// 附件可能是在别处补上的（Finder 里放进去、同步下来），所以重试不限于某一个文件。
     pub fn retry(&mut self, cx: &mut Context<Self>) {
         self.entries.retain(|_, entry| !matches!(entry, Entry::Failed(_)));
+        self.pdf_infos.clear();
+        self.pdf_access.retain(|request, _| self.entries.contains_key(request));
         self.catalog = None;
         cx.notify();
     }
@@ -642,8 +764,8 @@ fn write_cache(file: &Path, rgba: &RgbaImage) -> Result<(), String> {
 mod tests {
     // 不能 `use super::*`：它会把 GPUI 的 `test` 属性宏带进作用域，遮住标准 `#[test]`
     use super::{
-        Attachment, Images, Kind, Math, Origin, RenderService, Renderer as _, Request, Source, State,
-        cache_file, produce, produced,
+        Attachment, Images, Kind, Math, Origin, PdfInfo, PdfInfoState, RenderService, Renderer as _, Request,
+        Source, State, cache_file, produce, produced,
     };
     use aero_core::{Vault, VaultPath};
     use gpui_kit::{AppContext as _, size};
@@ -990,6 +1112,306 @@ mod tests {
             std::fs::write(file.unwrap().path(), b"truncated").unwrap();
         }
         assert_eq!(render(&request).origin, Origin::Rendered);
+    }
+
+    fn ready_info(state: PdfInfoState) -> Arc<PdfInfo> {
+        let PdfInfoState::Ready(info) = state else { panic!("元数据应已完成：{state:?}") };
+        info
+    }
+
+    #[gpui_kit::test]
+    fn service_pdf_info_is_background_cached_and_uses_source_fingerprint(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) = vault_with(&super::two_page_pdf(), "assets/pages.pdf");
+        let fingerprint = vault.read_bytes(&path).unwrap().1.hash;
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        for _ in 0..2 {
+            assert!(matches!(
+                service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)),
+                PdfInfoState::Pending
+            ));
+        }
+        cx.run_until_parked();
+        let info = ready_info(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)));
+        assert_eq!(info.pages, vec![size(200., 100.); 2]);
+        assert_eq!(info.fingerprint, fingerprint);
+        let cached = ready_info(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)));
+        assert!(Arc::ptr_eq(&info, &cached));
+        service.update(cx, |s, _| assert!(s.entries.is_empty() && s.pixels.is_empty()));
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0, "元数据不生成任何位图或持久缓存");
+    }
+
+    #[gpui_kit::test]
+    fn service_pdf_info_invalidates_replacements_and_retries_failures(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) = vault_with(&super::two_page_pdf(), "assets/pages.pdf");
+        let other = VaultPath::new("other.pdf").unwrap();
+        std::fs::write(vault.fs_path(&other), super::two_page_pdf()).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let vault = Arc::new(vault);
+        let service = cx.new(|_| RenderService::new(vault.clone(), cache.path().to_path_buf()));
+        for path in [&path, &other] {
+            service.update(cx, |s, cx| s.pdf_info(path.clone(), cx));
+        }
+        cx.run_until_parked();
+        let old = ready_info(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)));
+        let untouched = ready_info(service.update(cx, |s, cx| s.pdf_info(other.clone(), cx)));
+        let replacement = super::rich::pages_pdf(&["/MediaBox [0 0 300 700] /Rotate 90"]);
+        std::fs::write(vault.fs_path(&path), replacement).unwrap();
+        service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+        assert!(Arc::ptr_eq(
+            &untouched,
+            &ready_info(service.update(cx, |s, cx| s.pdf_info(other.clone(), cx)))
+        ));
+        assert!(matches!(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)), PdfInfoState::Pending));
+        cx.run_until_parked();
+        let updated = ready_info(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)));
+        assert_eq!(updated.pages, vec![size(700., 300.)]);
+        assert_ne!(updated.fingerprint, old.fingerprint);
+        assert_eq!(updated.fingerprint, vault.read_bytes(&path).unwrap().1.hash);
+        assert!(!Arc::ptr_eq(&updated, &old));
+        for broken in [b"broken PDF".to_vec(), super::rich::pages_pdf(&[])] {
+            std::fs::write(vault.fs_path(&path), broken).unwrap();
+            service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+            assert!(matches!(
+                service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)),
+                PdfInfoState::Pending
+            ));
+            cx.run_until_parked();
+            assert!(matches!(
+                service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)),
+                PdfInfoState::Failed(_)
+            ));
+        }
+        std::fs::write(vault.fs_path(&path), super::two_page_pdf()).unwrap();
+        service.update(cx, |s, cx| s.retry(cx));
+        for path in [&path, &other] {
+            assert!(matches!(
+                service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)),
+                PdfInfoState::Pending
+            ));
+        }
+        cx.run_until_parked();
+        assert_eq!(ready_info(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx))).pages.len(), 2);
+        std::fs::remove_file(vault.fs_path(&path)).unwrap();
+        service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+        service.update(cx, |s, cx| s.pdf_info(path.clone(), cx));
+        cx.run_until_parked();
+        assert!(matches!(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)), PdfInfoState::Failed(_)));
+    }
+
+    /// 完成真实后台 I/O，但暂不运行已排队的 UI 回调；不靠 sleep 或假渲染器制造竞态。
+    fn park_background_reply(cx: &mut gpui_kit::TestAppContext) {
+        let executor = cx.executor();
+        let dispatcher = executor.dispatcher().as_test().unwrap();
+        while !dispatcher.tick(true) {
+            assert!(executor.tick(), "应有一个后台任务等待执行");
+        }
+        while dispatcher.tick(true) {}
+    }
+
+    fn finish_obsolete(task: &gpui_kit::Task<()>, cx: &mut gpui_kit::TestAppContext) {
+        while !task.is_ready() {
+            assert!(cx.executor().tick(), "旧任务回调应能执行完毕");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn service_pdf_info_stale_reply_cannot_replace_a_new_task(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) = vault_with(&super::two_page_pdf(), "pages.pdf");
+        let cache = tempfile::tempdir().unwrap();
+        let vault = Arc::new(vault);
+        let service = cx.new(|_| RenderService::new(vault.clone(), cache.path().to_path_buf()));
+        for (retry, broken) in [(false, false), (true, false), (false, true), (true, true)] {
+            service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+            let bytes = if broken { b"broken PDF".to_vec() } else { super::two_page_pdf() };
+            std::fs::write(vault.fs_path(&path), bytes).unwrap();
+            service.update(cx, |s, cx| s.pdf_info(path.clone(), cx));
+            park_background_reply(cx);
+            // 保留旧任务句柄模拟已无法取消的回调，失效仍走真实的公开接口。
+            let obsolete = service.update(cx, |s, _| {
+                let super::PdfInfoEntry::Pending { _task, .. } = s.pdf_infos.get_mut(&path).unwrap() else {
+                    panic!()
+                };
+                std::mem::replace(_task, gpui_kit::Task::ready(()))
+            });
+            std::fs::write(vault.fs_path(&path), super::rich::pages_pdf(&["/MediaBox [0 0 300 700]"]))
+                .unwrap();
+            let expected_hash = vault.read_bytes(&path).unwrap().1.hash;
+            service.update(cx, |s, cx| {
+                if retry {
+                    s.retry(cx);
+                } else {
+                    s.invalidate(&[path.clone()], cx);
+                }
+                assert!(matches!(s.pdf_info(path.clone(), cx), PdfInfoState::Pending));
+            });
+            finish_obsolete(&obsolete, cx);
+            let state = service.update(cx, |s, cx| s.pdf_info(path.clone(), cx));
+            assert!(
+                matches!(&state, PdfInfoState::Pending)
+                    || matches!(&state, PdfInfoState::Ready(info) if info.fingerprint == expected_hash),
+                "旧回调覆盖新任务：{state:?}"
+            );
+            cx.run_until_parked();
+            let info = ready_info(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)));
+            assert_eq!(info.fingerprint, expected_hash);
+            assert_eq!(info.pages, vec![size(300., 700.)]);
+        }
+    }
+
+    #[gpui_kit::test]
+    fn service_pdf_lru_stale_reply_cannot_resurrect_or_replace_entries(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) =
+            vault_with(&super::rich::pages_pdf(&["/MediaBox [0 0 200 100]"; 26]), "pages.pdf");
+        let cache = tempfile::tempdir().unwrap();
+        let vault = Arc::new(vault);
+        let service = cx.new(|_| RenderService::new(vault.clone(), cache.path().to_path_buf()));
+        let request = pdf_request(&path, 1, 100);
+        for rerequest in [false, true] {
+            service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+            std::fs::write(vault.fs_path(&path), super::rich::pages_pdf(&["/MediaBox [0 0 200 100]"; 26]))
+                .unwrap();
+            service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx));
+            park_background_reply(cx);
+            let obsolete = service.update(cx, |s, _| {
+                let super::Entry::Pending { _task, .. } = s.entries.get_mut(&request).unwrap() else {
+                    panic!()
+                };
+                std::mem::replace(_task, gpui_kit::Task::ready(()))
+            });
+            service.update(cx, |s, cx| {
+                for page in 2..=13 {
+                    s.pdf(path.clone(), page, 200, 1., cx);
+                }
+            });
+            service.update(cx, |s, _| assert!(!s.entries.contains_key(&request)));
+            if rerequest {
+                std::fs::write(
+                    vault.fs_path(&path),
+                    super::rich::pages_pdf(&["/MediaBox [0 0 200 300]"; 26]),
+                )
+                .unwrap();
+                service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx));
+            }
+            finish_obsolete(&obsolete, cx);
+            service.update(cx, |s, _| {
+                if rerequest {
+                    assert!(matches!(s.entries.get(&request), Some(super::Entry::Pending { .. }))
+                        || matches!(s.entries.get(&request), Some(super::Entry::Ready { pixels, .. }) if *pixels == size(200, 300)), "旧回调覆盖重新请求的页面");
+                } else {
+                    assert!(!s.entries.contains_key(&request), "旧回调不能复活已淘汰 entry");
+                    assert!(!s.pixels.contains_key(&request.source), "旧回调不能复活占位尺寸");
+                }
+            });
+            cx.run_until_parked();
+            service.update(cx, |s, _| assert_eq!(s.entries.len(), 12));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn service_pdf_keeps_simultaneously_visible_pages_across_documents(cx: &mut gpui_kit::TestAppContext) {
+        let bytes = super::rich::pages_pdf(&["/MediaBox [0 0 200 100]"; 7]);
+        let (_dir, vault, a) = vault_with(&bytes, "a.pdf");
+        let b = VaultPath::new("b.pdf").unwrap();
+        vault.create_bytes(&b, &bytes).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        service.update(cx, |s, cx| {
+            for path in [&a, &b] {
+                for page in 1..=7 {
+                    s.pdf(path.clone(), page, 200, 1., cx);
+                }
+            }
+        });
+        cx.run_until_parked();
+        for _ in 0..3 {
+            service.update(cx, |s, cx| {
+                for path in [&a, &b] {
+                    for page in 1..=7 {
+                        assert!(
+                            matches!(s.pdf(path.clone(), page, 200, 1., cx), State::Ready { .. }),
+                            "active pages must not evict one another"
+                        );
+                    }
+                }
+            });
+            cx.run_until_parked();
+        }
+        service.update(cx, |s, cx| {
+            s.pdf(b.clone(), 7, 200, 1., cx);
+        });
+        cx.run_until_parked();
+        service.update(cx, |s, _| assert_eq!(s.pdf_access.len(), 12));
+    }
+
+    #[gpui_kit::test]
+    fn service_pdf_lru_bounds_pending_without_evicting_other_kinds(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) =
+            vault_with(&super::rich::pages_pdf(&["/MediaBox [0 0 200 100]"; 26]), "pages.pdf");
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        service.update(cx, |s, cx| {
+            s.image(path.clone(), 200, 1., cx);
+            s.math("a", false, 16., 1., gpui_kit::black(), cx);
+            s.diagram("flowchart LR\n A --> B", 200, 1., false, "Arial", cx);
+        });
+        for page in 1..=26 {
+            service.update(cx, |s, cx| {
+                assert!(matches!(s.pdf(path.clone(), page, 200, 1., cx), State::Pending { .. }));
+            });
+            service.update(cx, |s, _| {
+                assert!(s.entries.contains_key(&pdf_request(&path, page, 100)), "不能淘汰刚请求的页面");
+                assert!(s.entries.keys().filter(|r| r.kind == Kind::Pdf).count() <= 12);
+                assert_eq!(s.entries.keys().filter(|r| r.kind != Kind::Pdf).count(), 3);
+            });
+        }
+        cx.run_until_parked();
+        service.update(cx, |s, _| {
+            assert_eq!(s.entries.keys().filter(|r| r.kind == Kind::Pdf).count(), 12);
+            assert_eq!(s.pixels.keys().filter(|source| matches!(source, Source::Pdf { .. })).count(), 12);
+            assert!(!s.entries.contains_key(&pdf_request(&path, 1, 100)));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn service_pdf_lru_updates_hits_prunes_pixels_and_keeps_disk_cache(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) =
+            vault_with(&super::rich::pages_pdf(&["/MediaBox [0 0 200 100]"; 26]), "pages.pdf");
+        let cache = tempfile::tempdir().unwrap();
+        let vault = Arc::new(vault);
+        let service = cx.new(|_| RenderService::new(vault.clone(), cache.path().to_path_buf()));
+        for page in 1..=12 {
+            service.update(cx, |s, cx| s.pdf(path.clone(), page, 200, 1., cx));
+        }
+        cx.run_until_parked();
+        assert!(matches!(
+            service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx)),
+            State::Ready { .. }
+        ));
+        service.update(cx, |s, cx| s.pdf(path.clone(), 13, 200, 1., cx));
+        service.update(cx, |s, _| {
+            assert!(s.entries.contains_key(&pdf_request(&path, 1, 100)), "访问命中必须刷新 LRU");
+            assert!(!s.entries.contains_key(&pdf_request(&path, 2, 100)));
+            assert!(!s.pixels.contains_key(&pdf_request(&path, 2, 100).source));
+        });
+        for page in 14..=26 {
+            service.update(cx, |s, cx| s.pdf(path.clone(), page, 200, 1., cx));
+            cx.run_until_parked();
+        }
+        service.update(cx, |s, _| {
+            assert_eq!(s.entries.len(), 12);
+            assert_eq!(s.pixels.len(), 12);
+        });
+        assert_eq!(produce(&vault, cache.path(), &pdf_request(&path, 2, 100)).unwrap().origin, Origin::Disk);
+        assert!(matches!(
+            service.update(cx, |s, cx| s.pdf(path.clone(), 2, 200, 1., cx)),
+            State::Pending { pixels: None }
+        ));
+        cx.run_until_parked();
+        assert!(matches!(
+            service.update(cx, |s, cx| s.pdf(path.clone(), 2, 200, 1., cx)),
+            State::Ready { pages: Some(26), .. }
+        ));
     }
 
     #[gpui_kit::test]

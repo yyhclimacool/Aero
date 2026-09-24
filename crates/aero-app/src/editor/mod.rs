@@ -26,6 +26,7 @@ mod math_ui;
 mod ops;
 mod pairs;
 mod pairs_ui;
+mod pdf_reader;
 mod presenter;
 mod preview;
 mod rich_ui;
@@ -3608,6 +3609,16 @@ impl Render for Editor {
         self.refresh_fragment_marks();
         self.sync_presenters(window, cx);
         self.sync_diagram_preview(false, cx);
+        self.rich.pdf_readers.borrow_mut().retain(|id, _| {
+            self.doc.blocks().roots.iter().any(|block| {
+                block.id == *id
+                    && block.kind == BlockKind::Paragraph
+                    && aero_core::rich_content::pdf_embed(
+                        &self.doc.slice(self.doc.content_range(block)).to_string(),
+                    )
+                    .is_some()
+            })
+        });
         self.scale = window.scale_factor();
         let (foreground, muted) = (cx.theme().foreground, cx.theme().muted_foreground);
         let roots = self.doc.blocks().roots.clone();

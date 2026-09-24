@@ -1,7 +1,8 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aero_core::rich_content::{mermaid_source, pdf_embed, pdf_source_with_page};
-use gpui_kit::base::Disableable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 
@@ -21,6 +22,7 @@ pub(super) struct RichUi {
     export_task: Option<Task<()>>,
     export_cancel: Option<Arc<AtomicBool>>,
     export_result: Option<(BlockId, Result<VaultPath, String>)>,
+    pub pdf_readers: RefCell<HashMap<BlockId, Entity<super::pdf_reader::PdfReader>>>,
 }
 
 struct DiagramPreview {
@@ -303,6 +305,44 @@ impl Editor {
         let Some(service) = &self.images else { return rich_source("pdf-source", source, cx) };
         let origin = origin.unwrap_or(&self.path);
         let width = embed.width.unwrap_or(WIDTH).clamp(24, 4096);
+        if interactive && self.pdf_root_source(block).as_deref() == Some(source) {
+            match service.update(cx, |s, cx| s.attachment(&embed.target, origin, cx)) {
+                Attachment::Found(path) => {
+                    let mut readers = self.rich.pdf_readers.borrow_mut();
+                    let reader = readers.entry(block).or_insert_with(|| {
+                        let editor = cx.weak_entity();
+                        cx.new(|cx| {
+                            super::pdf_reader::PdfReader::new(
+                                editor,
+                                block,
+                                path.clone(),
+                                source.to_owned(),
+                                page,
+                                width,
+                                service.clone(),
+                                cx,
+                            )
+                        })
+                    });
+                    reader.update(cx, |reader, cx| reader.sync(path, source.to_owned(), page, width, cx));
+                    return reader.clone().into_any_element();
+                }
+                Attachment::Loading => {
+                    return rich_placeholder("pdf-placeholder", width, None, self.scale, cx);
+                }
+                Attachment::Missing => {
+                    return self.rich_error("pdf", source, format!("找不到附件 {}", embed.target).into(), cx);
+                }
+                Attachment::Ambiguous => {
+                    return self.rich_error(
+                        "pdf",
+                        source,
+                        format!("有多个同名附件 {}，请写出所在目录", embed.target).into(),
+                        cx,
+                    );
+                }
+            }
+        }
         let state = service.update(cx, |s, cx| match s.attachment(&embed.target, origin, cx) {
             // 显示始终受正文列宽约束，不为 |4096 的预设分配不可见的 HiDPI 像素。
             Attachment::Found(path) => s.pdf(path, page, width.min(WIDTH), self.scale, cx),
@@ -317,43 +357,16 @@ impl Editor {
                 let logical = width as f32;
                 let height = logical * pixels.height as f32 / pixels.width as f32;
                 let (target, origin) = (embed.target.clone(), origin.clone());
-                let writable = interactive && self.pdf_root_source(block).as_deref() == Some(source);
-                let mut bar = h_flex().gap_2().child(
+                let bar = h_flex().gap_2().child(
                     div()
                         .debug_selector(move || format!("pdf-page-{page}-of-{}", pages.unwrap_or(0)))
                         .text_xs()
                         .child(format!("{page} / {}", pages.map_or("?".into(), |n| n.to_string()))),
                 );
-                if writable {
-                    for (id, label, delta, enabled) in [
-                        ("pdf-prev", "上一页", -1, page > 1),
-                        ("pdf-next", "下一页", 1, pages.is_some_and(|n| page < n)),
-                    ] {
-                        let expected = source.to_owned();
-                        bar = bar.child(
-                            div()
-                                .debug_selector(move || id.into())
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(
-                                    Button::new(id)
-                                        .ghost()
-                                        .xsmall()
-                                        .label(label)
-                                        .disabled(!enabled)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            if this.pdf_root_source(block).as_deref() == Some(&expected) {
-                                                this.select_block_by_id(block, window, cx);
-                                                this.step_pdf(block, delta, window, cx);
-                                            }
-                                        })),
-                                ),
-                        );
-                    }
-                }
                 v_flex()
                     .w_full()
                     .gap_1()
+                    .child(bar)
                     .child(
                         div()
                             .id(("pdf", block.0))
@@ -369,8 +382,6 @@ impl Editor {
                                 cx.stop_propagation();
                                 if matches!(event, ClickEvent::Mouse(click) if click.down.click_count >= 2) {
                                     this.open_pdf_target(&target, &origin, window, cx);
-                                } else if writable {
-                                    this.select_block_by_id(block, window, cx);
                                 }
                             }))
                             .child(
@@ -379,7 +390,6 @@ impl Editor {
                                     .size_full(),
                             ),
                     )
-                    .child(bar)
                     .into_any_element()
             }
             State::Pending { pixels } => rich_placeholder("pdf-placeholder", width, pixels, self.scale, cx),
@@ -407,35 +417,51 @@ impl Editor {
         Some(block)
     }
 
+    pub(super) fn commit_pdf_page(
+        &mut self,
+        block: BlockId,
+        page: u32,
+        total: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if page == 0 || page > total {
+            return false;
+        }
+        let Some(source) = self.pdf_root_source(block) else { return false };
+        let Some(embed) = pdf_embed(&source) else { return false };
+        let Some(service) = &self.images else { return false };
+        let info = service.update(cx, |s, cx| match s.attachment(&embed.target, &self.path, cx) {
+            Attachment::Found(path) => s.pdf_info(path, cx),
+            _ => crate::render::PdfInfoState::Pending,
+        });
+        let crate::render::PdfInfoState::Ready(info) = info else { return false };
+        if info.pages.len() != total as usize {
+            return false;
+        }
+        let Some(replacement) = pdf_source_with_page(&source, page) else { return false };
+        let Some(unit) = self.units.iter().find(|u| u.id == block) else { return false };
+        let edit = minimal_edit(unit.range.start, &source, &replacement);
+        self.select_block_by_id(block, window, cx);
+        let Some(edit) = edit else { return true };
+        if let Err(error) = self.doc.edit(edit) {
+            log::warn!("PDF 翻页失败：{error}");
+            return false;
+        }
+        self.last_edit_at = None;
+        self.after_doc_change(cx);
+        true
+    }
+
     fn step_pdf(&mut self, block: BlockId, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
         if self.focused.is_some() {
             return;
         }
-        let Some(source) = self.pdf_root_source(block) else { return };
-        let Some(embed) = pdf_embed(&source) else { return };
-        let Ok(page) = embed.page else { return };
-        let Some(next) = page.checked_add_signed(delta).filter(|n| *n > 0) else { return };
-        let Some(service) = &self.images else { return };
-        let width = embed.width.unwrap_or(WIDTH).clamp(24, WIDTH);
-        let state = service.update(cx, |s, cx| match s.attachment(&embed.target, &self.path, cx) {
-            Attachment::Found(path) => s.pdf(path, page, width, self.scale, cx),
-            _ => State::Pending { pixels: None },
-        });
-        let State::Ready { pages: Some(total), .. } = state else { return };
-        if next > total {
-            return;
-        }
-        let Some(replacement) = pdf_source_with_page(&source, next) else { return };
-        let Some(unit) = self.units.iter().find(|u| u.id == block) else { return };
-        let Some(edit) = minimal_edit(unit.range.start, &source, &replacement) else { return };
-        if let Err(error) = self.doc.edit(edit) {
-            log::warn!("PDF 翻页失败：{error}");
-            return;
-        }
-        self.last_edit_at = None;
-        self.after_doc_change(cx);
-        if let Some(ix) = self.unit_index(block) {
-            self.select_blocks(ix, ix, window, cx);
+        let Some(reader) = self.rich.pdf_readers.borrow().get(&block).cloned() else { return };
+        let Some(total) = reader.read(cx).page_count() else { return };
+        let Some(next) = reader.read(cx).current_page().checked_add_signed(delta) else { return };
+        if self.commit_pdf_page(block, next, total, window, cx) {
+            reader.update(cx, |reader, cx| reader.go_to_page(next, window, cx));
         }
     }
 
@@ -474,6 +500,16 @@ impl Editor {
         let Attachment::Found(path) = service.update(cx, |s, cx| s.attachment(target, origin, cx)) else {
             return;
         };
+        self.open_pdf_reader_source(&path, window, cx);
+    }
+
+    pub(super) fn open_pdf_reader_source(
+        &self,
+        path: &VaultPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = path.clone();
         let (vault, note) = (self.vault.clone(), self.path.clone());
         cx.spawn_in(window, async move |this, cx| {
             let v = vault.clone();
