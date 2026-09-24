@@ -2124,15 +2124,29 @@ impl Editor {
     }
 
     /// 点击正文下方空白：聚焦最后一个段落尾，或新建段落。
+    /// PDF 嵌入虽然是段落，点它后面不能打开 `![[…]]` 源码，否则和正在看的那一页对不上。
     fn on_click_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.units.last() {
-            Some(last) if last.is_text() && last.list.is_none() => {
-                let ix = self.units.len() - 1;
-                let len = last.range.len();
-                self.focus_unit(ix, len, window, cx);
-            }
-            _ => self.append_paragraph(window, cx),
+        let continue_text = self.units.len().checked_sub(1).is_some_and(|ix| {
+            let unit = &self.units[ix];
+            unit.is_text() && unit.list.is_none() && !self.unit_is_pdf_embed(unit.id)
+        });
+        if continue_text {
+            let ix = self.units.len() - 1;
+            let len = self.units[ix].range.len();
+            self.focus_unit(ix, len, window, cx);
+            return;
         }
+        self.append_paragraph(window, cx);
+        if self.focused_unit().is_some_and(|ix| self.unit_is_pdf_embed(self.units[ix].id)) {
+            self.exit_edit(cx);
+            self.focus_handle.focus(window, cx);
+        }
+    }
+
+    fn unit_is_pdf_embed(&self, id: BlockId) -> bool {
+        self.units.iter().find(|unit| unit.id == id).is_some_and(|unit| {
+            aero_core::rich_content::pdf_embed(&self.doc.slice(unit.range.clone()).to_string()).is_some()
+        })
     }
 
     // ---- 撤销 / 重做 ----
@@ -3379,6 +3393,12 @@ impl Editor {
         // 若 mouse down 就把块换成文本框，链接的 mouse up 落不到 TextView 上，点 wikilink 只会进编辑态。
         let focus = cx.listener(move |this: &mut Self, ev: &ClickEvent, window, cx| {
             if ev.is_right_click() {
+                return;
+            }
+            // PDF 块点在页面外的空白上也不进源码：预览始终是那一页，和渲染结果一样。
+            if this.unit_is_pdf_embed(id) {
+                cx.stop_propagation();
+                this.select_block_by_id(id, window, cx);
                 return;
             }
             this.focus_block_at(id, ev.position(), window, cx)

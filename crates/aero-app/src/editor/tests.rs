@@ -678,6 +678,29 @@ fn rich_pdf_paging_controls_keyboard_boundaries_and_undo(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
+fn clicking_below_a_pdf_keeps_the_rendered_page(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    let source = "# 标题\n\n![[paper.pdf#page=1]]\n\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+    rich_root(&editor, cx);
+    assert!(cx.debug_bounds("pdf-block").is_some() || cx.debug_bounds("pdf-reader").is_some());
+    let tail = cx.debug_bounds("editor-tail").expect("space below the note");
+    cx.simulate_click(tail.center(), Modifiers::default());
+    settle(cx);
+    assert!(
+        cx.debug_bounds("pdf-block").is_some() || cx.debug_bounds("pdf-reader").is_some(),
+        "the page stays rendered"
+    );
+    cx.update(|_, cx| {
+        let focused = editor.read(cx).focused.as_ref().map(|f| f.textarea.read(cx).value().to_string());
+        assert_ne!(focused.as_deref(), Some("![[paper.pdf#page=1]]"));
+    });
+    assert!(text(&editor, cx).contains("![[paper.pdf#page=1]]"));
+}
+
+#[gpui_kit::test]
 fn rich_pdf_opens_only_resolved_file_and_source_editing_stays_source(cx: &mut TestAppContext) {
     let source = "![[paper.pdf#page=2|240]]\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
