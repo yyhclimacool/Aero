@@ -17,6 +17,7 @@ license = "Apache-2.0"
 # 所有成员共用的依赖只在这里声明一次，成员内写 `name.workspace = true`。
 aero-core = { path = "crates/aero-core" }
 aero-index = { path = "crates/aero-index" }
+aero-embedding = { path = "crates/aero-embedding" }
 
 # UI 层唯一入口。gpui-kit 自带与之匹配的 GPUI（crates.io 上的 gpui-pre），
 # 所以不再需要 git 依赖；精确锁定版本，升级作为独立任务（见 project_plan.md 3.1）。

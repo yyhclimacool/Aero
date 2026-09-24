@@ -89,8 +89,8 @@ pub struct SyncPlan {
 
 /// 全量重建时每写多少块 `flush()` 一次（ADR 0003：不分批峰值内存 900 MB，分批 ≈ 280 MB）。
 const FLUSH_EVERY_BLOCKS: usize = 10_000;
-/// 4: separate indexed title + aliases + body from stored display fields.
-const FTS_VERSION: i64 = 4;
+/// 5: extract visible Markdown text while preserving code and escaped literals.
+const FTS_VERSION: i64 = 5;
 
 /// wikilink 解析用的笔记表：路径 / 文件名 / 标题 → 路径，以及路径 → `note_id`。
 /// 从 `notes` 表建一次，之后随每次入库 / 删除 / 改名增量维护，单篇保存不再全表重读、不再走 vault。

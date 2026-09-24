@@ -47,6 +47,7 @@ struct VaultSession {
     closed: Vec<VaultPath>,
     /// 全文索引（后台）；状态栏显示进度，搜索视图查询它
     search: Entity<SearchService>,
+    semantic: Entity<crate::semantic::SemanticService>,
     search_view: Entity<SearchView>,
     tags_view: Entity<TagsView>,
     backlinks: Entity<BacklinksView>,
@@ -208,7 +209,14 @@ impl Workspace {
                 let index_dir = self.data_dir.join("index");
                 let search = cx.new(|cx| SearchService::new(vault.clone(), index_dir, cx));
                 let search_sub = cx.observe(&search, |_, _, cx| cx.notify());
-                let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
+                let semantic = cx.new(|cx| {
+                    crate::semantic::SemanticService::new(vault.clone(), self.data_dir.clone(), cx)
+                });
+                let search_view = cx.new(|cx| {
+                    let mut view = SearchView::new(search.clone(), window, cx);
+                    view.connect_semantic(semantic.clone(), cx);
+                    view
+                });
                 let tags_view = cx.new(|cx| TagsView::new(search.clone(), vault.clone(), cx));
                 let backlinks = cx.new(|cx| BacklinksView::new(search.clone(), cx));
                 let backlinks_sub = self.subscribe_backlinks(&backlinks, window, cx);
@@ -217,6 +225,7 @@ impl Workspace {
                         SearchViewEvent::Open { path, block_ord, preview } => {
                             this.open_hit(path.clone(), *block_ord, *preview, window, cx)
                         }
+                        SearchViewEvent::Settings => this.on_search_settings(&OpenSearchSettings, window, cx),
                         SearchViewEvent::Dismiss => {
                             if let Some(editor) = this.open.as_ref().and_then(|o| o.editor().cloned()) {
                                 editor.update(cx, |e, cx| e.focus_browse(window, cx));
@@ -252,6 +261,7 @@ impl Workspace {
                     active: 0,
                     closed: Vec::new(),
                     search,
+                    semantic,
                     search_view,
                     tags_view,
                     backlinks,
@@ -476,6 +486,9 @@ impl Workspace {
     ) -> Subscription {
         cx.subscribe_in(editor, window, |this, editor, event, window, cx| match event {
             EditorEvent::Changed => {
+                if let Some(open) = &this.open {
+                    open.semantic.read(cx).touch_activity();
+                }
                 this.keep_preview_if_edited(editor, cx);
                 cx.notify()
             }
@@ -858,6 +871,14 @@ impl Workspace {
         }
     }
 
+    fn on_search_settings(&mut self, _: &OpenSearchSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(open) = &self.open {
+            crate::search_settings::open(open.semantic.clone(), window, cx);
+        } else {
+            window.push_notification(Notification::info("请先打开一个知识库，再设置搜索与隐私。"), cx);
+        }
+    }
+
     fn on_open_search(&mut self, _: &OpenSearch, window: &mut Window, cx: &mut Context<Self>) {
         if self.open.is_none() {
             return;
@@ -1227,6 +1248,7 @@ impl Workspace {
                         renamed = true;
                         let message = format!("已完成 {description}，更新 {} 处链接。", report.links_changed);
                         open.search.update(cx, |s, cx| s.notes_renamed(report, cx));
+                        open.semantic.update(cx, |s, cx| s.rescan(cx));
                         for editor in &editors {
                             editor.update(cx, |e, cx| {
                                 let mapped = moved_path(e.path(), &old, &target, directory);
@@ -1292,6 +1314,7 @@ impl Workspace {
             }
         }
         if let Some(open) = self.open.as_ref() {
+            open.semantic.read(cx).close_blocking();
             open.search.read(cx).close_blocking();
         }
     }
@@ -1330,6 +1353,7 @@ impl Workspace {
     fn index_editor(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_ref() else { return };
         let (path, text, stamp) = editor.read(cx).index_snapshot();
+        open.semantic.update(cx, |s, cx| s.note_changed(vec![path.clone()], cx));
         open.search.update(cx, |s, cx| s.note_saved(path, text, stamp, cx));
     }
 
@@ -1393,6 +1417,7 @@ impl Workspace {
         if notes_touched {
             open.recent.retain(|p| p != &current);
             open.recent.insert(0, current);
+            open.semantic.update(cx, |s, cx| s.note_changed(notes.clone(), cx));
             open.search.update(cx, |s, cx| s.notes_touched(notes, cx));
         }
         if !attachments.is_empty() {
@@ -1416,6 +1441,7 @@ impl Workspace {
             }
             cx.notify();
         });
+        open.semantic.update(cx, |s, cx| s.note_changed(vec![path.clone()], cx));
         open.search.update(cx, |s, cx| s.note_removed(path, cx));
         cx.notify();
     }
@@ -1435,6 +1461,12 @@ impl Workspace {
         }
         let mine = |p: &VaultPath| shown.contains(p);
         let changed: Vec<VaultPath> = batch.changed.iter().chain(&batch.removed).cloned().collect();
+        open.semantic.update(cx, |s, cx| {
+            s.note_changed(changed.clone(), cx);
+            if batch.rescan {
+                s.rescan(cx);
+            }
+        });
         for (editor, path) in editors.iter().zip(&shown) {
             if changed.contains(path) {
                 // 编辑器自己处理：重载 / 冲突副本 / 已删除，并通过事件把索引带上
@@ -1752,6 +1784,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_copy_note_path))
             .on_action(cx.listener(Self::on_save_now))
             .on_action(cx.listener(Self::on_open_search))
+            .on_action(cx.listener(Self::on_search_settings))
             .on_action(cx.listener(Self::on_open_files))
             .on_action(cx.listener(Self::on_open_tags))
             .on_action(cx.listener(Self::on_show_backlinks))
@@ -1780,6 +1813,7 @@ impl Render for Workspace {
             .text_color(foreground)
             .child(self.render_title_bar(window, cx))
             .child(body)
+            .children(gpui_kit::component::Root::render_dialog_layer(window, cx))
             .children(gpui_kit::component::Root::render_notification_layer(window, cx))
             .when_some(self.quick_open.as_ref().map(|(p, _)| p.clone()), |el, picker| {
                 // 遮罩 + 居中弹层（3.2）；点遮罩关闭
@@ -1894,6 +1928,33 @@ mod tests {
     use crate::watch::VaultWatcher;
     use gpui_kit::px;
 
+    #[gpui_kit::test]
+    fn search_settings_dialog_is_visible_from_workspace(cx: &mut TestAppContext) {
+        let (_dir, _data, workspace) = open(cx, Some("body\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.on_search_settings(&crate::actions::OpenSearchSettings, window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let visible = cx.debug_bounds("search-settings-panel");
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            open.semantic.read(cx).close_blocking();
+            open.search.read(cx).close_blocking();
+        });
+        assert!(
+            visible.is_some_and(|b| b.size.width > px(300.) && b.size.height > px(100.)),
+            "settings must render in the real workspace"
+        );
+    }
+
     pub(super) fn open(
         cx: &mut TestAppContext,
         source: Option<&str>,
@@ -1915,6 +1976,8 @@ mod tests {
                 let editor = cx.new(|cx| Editor::new(vault.clone(), path, doc, stamp, cx));
                 let tree = cx.new(|cx| FileTree::new(vault.clone(), cx));
                 let search = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+                let semantic =
+                    cx.new(|cx| crate::semantic::SemanticService::new(vault.clone(), data.path().into(), cx));
                 let search_view = cx.new(|cx| SearchView::new(search.clone(), window, cx));
                 let tags_view = cx.new(|cx| TagsView::new(search.clone(), vault.clone(), cx));
                 let backlinks = cx.new(|cx| BacklinksView::new(search.clone(), cx));
@@ -1934,6 +1997,7 @@ mod tests {
                     active: 0,
                     closed: vec![],
                     search,
+                    semantic,
                     search_view,
                     tags_view,
                     backlinks,

@@ -2,7 +2,7 @@
 //!
 //! 输入 150 ms 防抖后查全文索引，结果按笔记分组、块级命中、关键词高亮；
 //! `↑↓` 在命中间移动并让编辑区定位到该块，`⏎` 打开，`Esc` 回到编辑器。
-//! `#tag` / `tag:tag` 按笔记级标签过滤（父标签含子标签），`-#tag` 排除；语义开关、`path:` 与搜索历史随后续里程碑加入。
+//! `#tag` / `tag:tag` 按笔记级标签过滤（父标签含子标签），`-#tag` 排除；可选本地语义异步补充，不阻塞全文。
 
 use std::ops::Range;
 use std::time::Duration;
@@ -11,14 +11,16 @@ use aero_core::{FtsQuery, VaultPath};
 use aero_index::SearchHit;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::input::{InputEvent, InputState};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Input;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme as _, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::actions::{Dismiss, SelectNext, SelectPrev};
 use crate::search::{Phase, SearchService};
+use crate::semantic::{ModelStatus, SearchPreferences, SemanticPhase, SemanticService, SemanticStatus};
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
 const LIMIT: usize = 200;
@@ -31,6 +33,8 @@ pub enum SearchViewEvent {
     Open { path: VaultPath, block_ord: u32, preview: bool },
     /// Esc：把焦点交还给编辑器
     Dismiss,
+    /// 由 Workspace 打开搜索与隐私设置。
+    Settings,
 }
 
 impl EventEmitter<SearchViewEvent> for SearchView {}
@@ -42,8 +46,64 @@ struct Group {
     hits: Vec<usize>,
 }
 
+/// 两个独立的响应通道：语义先完成时暂存，全文先完成时立刻展示。
+#[derive(Default)]
+struct SearchResults {
+    fulltext: Option<Vec<SearchHit>>,
+    semantic: Option<Vec<SearchHit>>,
+    semantic_pending: bool,
+}
+
+impl SearchResults {
+    fn visible(&self) -> Option<Vec<SearchHit>> {
+        let fulltext = self.fulltext.as_ref()?;
+        Some(match &self.semantic {
+            Some(semantic) => aero_index::semantic::fuse_results(fulltext, semantic, LIMIT),
+            None => fulltext.clone(),
+        })
+    }
+}
+
+/// 只追踪影响查询的变化；下载字节数、逐篇索引进度不触发重复推理。
+#[derive(Default, PartialEq, Eq)]
+struct SemanticRefreshKey {
+    enabled: bool,
+    model_ready: bool,
+    completed: Option<(usize, usize, u64)>,
+    scope_revision: u64,
+}
+
+impl SemanticRefreshKey {
+    fn new(prefs: &SearchPreferences, status: &SemanticStatus) -> Self {
+        Self {
+            enabled: prefs.semantic_enabled,
+            model_ready: matches!(status.model, ModelStatus::Ready | ModelStatus::Loading),
+            scope_revision: status.scope_revision,
+            completed: match status.phase {
+                SemanticPhase::Ready { notes, chunks } => Some((notes, chunks, status.revision)),
+                _ => None,
+            },
+        }
+    }
+
+    fn needs_refresh(&self, next: &Self) -> bool {
+        self.enabled != next.enabled
+            || self.scope_revision != next.scope_revision
+            || self.model_ready != next.model_ready
+            || (next.completed.is_some() && self.completed != next.completed)
+    }
+}
+
 pub struct SearchView {
     service: Entity<SearchService>,
+    semantic_service: Option<Entity<SemanticService>>,
+    semantic_key: SemanticRefreshKey,
+    hybrid: bool,
+    results: SearchResults,
+    /// 保留包装任务的所有权；丢弃时连带取消 SemanticService::query。
+    semantic_task: Option<Task<()>>,
+    semantic_error: Option<String>,
+    _semantic_subscription: Option<Subscription>,
     input: Entity<InputState>,
     /// 最近一次真正发出的查询
     query: String,
@@ -67,7 +127,7 @@ impl SearchView {
         // 索引刚建好时把当前查询再跑一遍——用户可能在索引完成前就开始输入了
         let service_sub = cx.observe(&service, |this, service, cx| {
             let ready = matches!(service.read(cx).phase(), Phase::Idle);
-            if ready && !this.was_ready && !this.query.is_empty() {
+            if ready && !this.was_ready && this.debounce.is_none() && !this.query.is_empty() {
                 this.run_search(cx);
             }
             this.was_ready = ready;
@@ -76,6 +136,13 @@ impl SearchView {
         let was_ready = matches!(service.read(cx).phase(), Phase::Idle);
         SearchView {
             service,
+            semantic_service: None,
+            semantic_key: SemanticRefreshKey::default(),
+            hybrid: false,
+            results: SearchResults::default(),
+            semantic_task: None,
+            semantic_error: None,
+            _semantic_subscription: None,
             input,
             query: String::new(),
             hits: Vec::new(),
@@ -89,6 +156,50 @@ impl SearchView {
             scroll: ScrollHandle::new(),
             _subscriptions: vec![input_sub, service_sub],
         }
+    }
+
+    /// 单独接线，保留全文视图原有构造函数（包括无模型测试）。
+    pub fn connect_semantic(&mut self, service: Entity<SemanticService>, cx: &mut Context<Self>) {
+        let semantic = service.read(cx);
+        self.semantic_key = SemanticRefreshKey::new(semantic.preferences(), &semantic.status());
+        self.hybrid = self.semantic_key.enabled;
+        self._semantic_subscription = Some(cx.observe(&service, |this, service, cx| {
+            let semantic = service.read(cx);
+            let prefs = semantic.preferences().clone();
+            let status = semantic.status();
+            this.semantic_changed(&prefs, &status, cx);
+        }));
+        self.semantic_service = Some(service);
+        if self.debounce.is_none() && !self.query.is_empty() {
+            self.run_search(cx);
+        }
+        cx.notify();
+    }
+
+    fn semantic_changed(
+        &mut self,
+        prefs: &SearchPreferences,
+        status: &SemanticStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let mut next = SemanticRefreshKey::new(prefs, status);
+        // 输入活动会使 Ready 暂时变成 WaitingForIdle；保留上一次完成的索引身份。
+        next.completed = next.completed.or(self.semantic_key.completed);
+        if !next.enabled || !next.model_ready {
+            self.semantic_task = None;
+            self.results.semantic_pending = false;
+        }
+        let refresh = self.semantic_key.needs_refresh(&next)
+            && (self.hybrid || self.semantic_key.enabled != next.enabled);
+        if self.semantic_key.enabled != next.enabled {
+            self.hybrid = next.enabled;
+        }
+        self.semantic_key = next;
+        // 不绕过正在等待的输入防抖，也不因每次进度通知而重复搜索。
+        if refresh && self.debounce.is_none() && !self.query.is_empty() {
+            self.run_search(cx);
+        }
+        cx.notify();
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -139,52 +250,127 @@ impl SearchView {
 
     /// 防抖：停止输入 150 ms 后才真正查询。
     fn schedule(&mut self, cx: &mut Context<Self>) {
+        // 输入一变就丢弃两个通道的在途结果，不等下一次防抖真正发出查询。
+        self.semantic_task = None;
+        self.generation += 1;
+        self.debounce = None;
+        self.results = SearchResults::default();
+        self.error = None;
+        self.semantic_error = None;
+        if let Some(service) = &self.semantic_service {
+            service.read(cx).touch_activity();
+        }
         let text = self.input.read(cx).value().to_string();
-        if text.trim().is_empty() {
-            self.debounce = None;
-            self.generation += 1;
-            self.searching = false;
-            self.error = None;
+        self.searching = !text.trim().is_empty();
+        self.set_results(Vec::new(), cx);
+        if !self.searching {
             self.query.clear();
-            self.set_results(Vec::new(), cx);
             return;
         }
+        let generation = self.generation;
         self.debounce = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| this.run_search(cx));
+            let _ = this.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.debounce = None;
+                    this.run_search(cx);
+                }
+            });
         }));
     }
 
     fn run_search(&mut self, cx: &mut Context<Self>) {
+        self.semantic_task = None;
+        self.debounce = None;
+        self.generation += 1;
+        self.results = SearchResults::default();
+        self.error = None;
+        self.semantic_error = None;
         let text = self.input.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        self.searching = !text.is_empty();
+        if !self.searching {
+            self.query.clear();
+            self.set_results(Vec::new(), cx);
             return;
         }
+        if self.query != text {
+            self.selected = None;
+        }
         self.query = text.clone();
-        self.generation += 1;
         let generation = self.generation;
-        self.searching = true;
-        let task = self.service.read(cx).search(text, LIMIT, cx);
+        // 先发全文，再独立发语义；不要 join 或等待模型加载。
+        let task = self.service.read(cx).search(text.clone(), LIMIT, cx);
+        let semantic_task = self.semantic_service.as_ref().and_then(|service| {
+            (self.hybrid
+                && self.semantic_key.enabled
+                && self.semantic_key.model_ready
+                && !FtsQuery::parse(&text).text.trim().is_empty())
+            .then(|| service.read(cx).query(text, LIMIT, cx))
+        });
+        self.results = SearchResults { semantic_pending: semantic_task.is_some(), ..Default::default() };
         cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                this.searching = false;
-                match result {
-                    Ok(hits) => {
-                        this.error = None;
-                        this.set_results(hits, cx);
-                    }
-                    Err(e) => {
-                        this.error = Some(e);
-                        this.set_results(Vec::new(), cx);
-                    }
-                }
-            });
+            let _ = this.update(cx, |this, cx| this.receive_fulltext(generation, result, cx));
         })
         .detach();
+        if let Some(task) = semantic_task {
+            self.await_semantic(generation, task, cx);
+        }
+        cx.notify();
+    }
+
+    fn await_semantic(
+        &mut self,
+        generation: u64,
+        task: Task<Result<Vec<SearchHit>, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.semantic_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| this.receive_semantic(generation, result, cx));
+        }));
+    }
+
+    fn receive_fulltext(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<SearchHit>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.generation != generation {
+            return;
+        }
+        self.searching = false;
+        self.results.fulltext = Some(match result {
+            Ok(hits) => hits,
+            Err(error) => {
+                self.error = Some(error);
+                Vec::new()
+            }
+        });
+        if let Some(hits) = self.results.visible() {
+            self.set_results(hits, cx);
+        }
+    }
+
+    fn receive_semantic(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<SearchHit>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.generation != generation || !self.results.semantic_pending {
+            return;
+        }
+        self.semantic_task = None;
+        self.results.semantic_pending = false;
+        match result {
+            Ok(hits) => self.results.semantic = Some(hits),
+            Err(error) => self.semantic_error = Some(error),
+        }
+        if let Some(hits) = self.results.visible() {
+            self.set_results(hits, cx);
+        }
         cx.notify();
     }
 
@@ -196,9 +382,12 @@ impl SearchView {
                 None => groups.push(Group { path: h.path.clone(), title: h.title.clone(), hits: vec![i] }),
             }
         }
+        // 晚到的语义会重排结果，但不改变用户用 ↑↓ 选中的块。
+        self.selected = self.selected.and_then(|ix| self.hits.get(ix)).and_then(|previous| {
+            hits.iter().position(|hit| hit.path == previous.path && hit.block_ord == previous.block_ord)
+        });
         self.hits = hits;
         self.groups = groups;
-        self.selected = None;
         cx.notify();
     }
 
@@ -251,6 +440,29 @@ impl SearchView {
     fn emit_open(&mut self, ix: usize, preview: bool, cx: &mut Context<Self>) {
         if let Some(h) = self.hits.get(ix) {
             cx.emit(SearchViewEvent::Open { path: h.path.clone(), block_ord: h.block_ord, preview });
+        }
+    }
+
+    fn select_mode(&mut self, hybrid: bool, cx: &mut Context<Self>) {
+        if hybrid && (!self.semantic_key.enabled || !self.semantic_key.model_ready) {
+            cx.emit(SearchViewEvent::Settings);
+            return;
+        }
+        if self.hybrid != hybrid {
+            self.hybrid = hybrid;
+            self.schedule(cx);
+        }
+    }
+
+    fn semantic_hint(&self) -> Option<String> {
+        if self.results.semantic_pending {
+            Some("正在补充语义… 全文结果先行显示".into())
+        } else if let Some(error) = &self.semantic_error {
+            Some(format!("语义暂不可用，已保留全文结果：{error}"))
+        } else if self.hybrid && !self.semantic_key.model_ready {
+            Some("全文仍可用；本地模型未就绪，可前往设置查看或下载。".into())
+        } else {
+            None
         }
     }
 
@@ -421,6 +633,7 @@ impl Render for SearchView {
         let groups: Vec<AnyElement> = self.groups.iter().map(|g| self.render_group(g, &terms, cx)).collect();
         let empty_hint = if !self.query.is_empty()
             && !self.searching
+            && !self.results.semantic_pending
             && self.hits.is_empty()
             && self.error.is_none()
         {
@@ -440,6 +653,51 @@ impl Render for SearchView {
             .on_action(cx.listener(Self::on_select_next))
             .on_action(cx.listener(Self::on_dismiss))
             .size_full()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .px_2()
+                    .pb_1()
+                    .gap_1()
+                    .child(
+                        div().debug_selector(|| "semantic-mode-fts".into()).child(
+                            Button::new("semantic-mode-fts")
+                                .ghost()
+                                .xsmall()
+                                .label("全文")
+                                .selected(!self.hybrid)
+                                .on_click(cx.listener(|this, _, _, cx| this.select_mode(false, cx))),
+                        ),
+                    )
+                    .child(
+                        div().debug_selector(|| "semantic-mode-hybrid".into()).child(
+                            Button::new("semantic-mode-hybrid")
+                                .ghost()
+                                .xsmall()
+                                .label("混合")
+                                .selected(self.hybrid)
+                                .tooltip(if self.semantic_key.enabled && self.semantic_key.model_ready {
+                                    "全文优先，本地语义稍后补充"
+                                } else {
+                                    "在搜索与隐私中启用或下载本地模型"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.select_mode(true, cx))),
+                        ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div().debug_selector(|| "search-settings".into()).child(
+                            Button::new("search-settings")
+                                .ghost()
+                                .xsmall()
+                                .label("设置")
+                                .tooltip("搜索与隐私")
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(SearchViewEvent::Settings))),
+                        ),
+                    ),
+            )
             .child(
                 div().px_2().pb_1().child(
                     Input::new(&self.input)
@@ -448,6 +706,19 @@ impl Render for SearchView {
                 ),
             )
             .when_some(status, |el, s| el.child(div().px_3().py_1().text_xs().text_color(muted).child(s)))
+            .when_some(self.semantic_hint(), |el, hint| {
+                el.child(
+                    div()
+                        .debug_selector(|| "semantic-search-status".into())
+                        .w_full()
+                        .min_w_0()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(hint),
+                )
+            })
             .child(
                 v_flex()
                     .id("search-results")
@@ -510,6 +781,419 @@ mod tests {
         assert_eq!(r, vec![0..4]);
     }
 
+    fn hit(path: &str) -> aero_index::SearchHit {
+        aero_index::SearchHit {
+            path: aero_core::VaultPath::new(path).unwrap(),
+            title: path.into(),
+            block_ord: 0,
+            body: "normal body".into(),
+            score: 1.,
+        }
+    }
+
+    #[test]
+    fn fulltext_is_visible_while_semantic_is_pending() {
+        let results = super::SearchResults {
+            fulltext: Some(vec![hit("fts.md")]),
+            semantic_pending: true,
+            ..Default::default()
+        };
+        assert_eq!(results.visible(), Some(vec![hit("fts.md")]));
+        assert!(results.semantic_pending);
+    }
+
+    #[test]
+    fn early_semantic_waits_for_fulltext_then_fuses() {
+        let mut results = super::SearchResults {
+            semantic: Some(vec![hit("semantic.md"), hit("both.md")]),
+            ..Default::default()
+        };
+        assert!(results.visible().is_none());
+        results.fulltext = Some(vec![hit("both.md"), hit("fts.md")]);
+        let visible = results.visible().unwrap();
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible[0].path.as_str(), "both.md");
+    }
+
+    #[test]
+    fn loading_an_available_model_does_not_restart_the_current_query() {
+        use super::SemanticRefreshKey;
+        use crate::semantic::{ModelStatus, SearchPreferences, SemanticPhase, SemanticStatus};
+        let prefs = SearchPreferences { semantic_enabled: true, ..Default::default() };
+        let ready = SemanticRefreshKey::new(
+            &prefs,
+            &SemanticStatus {
+                scope_revision: 0,
+                revision: 0,
+                model: ModelStatus::Ready,
+                phase: SemanticPhase::Ready { notes: 4, chunks: 8 },
+            },
+        );
+        let loading = SemanticRefreshKey::new(
+            &prefs,
+            &SemanticStatus {
+                scope_revision: 0,
+                revision: 0,
+                model: ModelStatus::Loading,
+                phase: SemanticPhase::Ready { notes: 4, chunks: 8 },
+            },
+        );
+        assert!(!ready.needs_refresh(&loading));
+        assert!(!loading.needs_refresh(&ready));
+    }
+
+    #[test]
+    fn ignored_membership_refreshes_visible_results_even_while_paused() {
+        use crate::semantic::{ModelStatus, SearchPreferences, SemanticPhase, SemanticStatus};
+        let prefs = SearchPreferences { semantic_enabled: true, ..Default::default() };
+        let before =
+            SemanticStatus { model: ModelStatus::Ready, phase: SemanticPhase::Paused, ..Default::default() };
+        let after = SemanticStatus { scope_revision: 1, ..before.clone() };
+        let before = super::SemanticRefreshKey::new(&prefs, &before);
+        let after = super::SemanticRefreshKey::new(&prefs, &after);
+        assert!(before.needs_refresh(&after));
+        assert!(!after.needs_refresh(&after));
+    }
+
+    #[test]
+    fn updated_content_refreshes_even_when_index_counts_are_unchanged() {
+        use crate::semantic::{ModelStatus, SearchPreferences, SemanticPhase, SemanticStatus};
+        let prefs = SearchPreferences { semantic_enabled: true, ..Default::default() };
+        let first = SemanticStatus {
+            scope_revision: 0,
+            model: ModelStatus::Ready,
+            phase: SemanticPhase::Ready { notes: 4, chunks: 8 },
+            revision: 1,
+        };
+        let updated = SemanticStatus { scope_revision: 0, revision: 2, ..first.clone() };
+        let first = super::SemanticRefreshKey::new(&prefs, &first);
+        let updated = super::SemanticRefreshKey::new(&prefs, &updated);
+        assert!(first.needs_refresh(&updated));
+        assert!(!updated.needs_refresh(&updated));
+    }
+
+    #[test]
+    fn semantic_progress_does_not_trigger_repeated_queries() {
+        use crate::semantic::{ModelStatus, SearchPreferences, SemanticPhase, SemanticStatus};
+        let prefs = SearchPreferences { semantic_enabled: true, ..Default::default() };
+        let key = |phase| {
+            super::SemanticRefreshKey::new(
+                &prefs,
+                &SemanticStatus { scope_revision: 0, revision: 0, model: ModelStatus::Ready, phase },
+            )
+        };
+        let initial = key(SemanticPhase::WaitingForIdle);
+        let indexing = key(SemanticPhase::Indexing { done: 1, total: 100 });
+        assert!(!initial.needs_refresh(&indexing));
+        assert!(!indexing.needs_refresh(&key(SemanticPhase::Indexing { done: 99, total: 100 })));
+        assert!(!indexing.needs_refresh(&key(SemanticPhase::Paused)));
+        let complete = key(SemanticPhase::Ready { notes: 100, chunks: 200 });
+        assert!(indexing.needs_refresh(&complete));
+        assert!(!complete.needs_refresh(&complete));
+        let disabled = super::SemanticRefreshKey::new(
+            &SearchPreferences::default(),
+            &SemanticStatus {
+                scope_revision: 0,
+                revision: 0,
+                model: ModelStatus::Ready,
+                phase: SemanticPhase::Disabled,
+            },
+        );
+        assert!(complete.needs_refresh(&disabled));
+    }
+
+    struct CancelSentinel(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for CancelSentinel {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn assert_semantic_cancelled(
+        cx: &mut TestAppContext,
+        change: impl FnOnce(&mut SearchView, &mut gpui_kit::Window, &mut gpui_kit::Context<SearchView>),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault, data.path().into(), cx));
+        let (view, cx) = cx.add_window_view(|window, cx| SearchView::new(service.clone(), window, cx));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sentinel = CancelSentinel(cancelled.clone());
+        view.update_in(cx, |v, window, cx| {
+            v.input.update(cx, |s, cx| s.set_value("old", window, cx));
+            v.query = "old".into();
+            v.hybrid = true;
+            v.semantic_key.enabled = true;
+            v.semantic_key.model_ready = true;
+            v.results.semantic_pending = true;
+            // The real wrapper owns this pending task, just as it owns SemanticService::query.
+            let task = cx.background_spawn(async move {
+                let _sentinel = sentinel;
+                std::future::pending().await
+            });
+            v.await_semantic(v.generation, task, cx);
+        });
+        cx.run_until_parked();
+        assert!(!cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        view.update_in(cx, change);
+        cx.run_until_parked();
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "drop the semantic query immediately, without advancing the debounce clock"
+        );
+        cx.update(|_, cx| {
+            assert!(!view.read(cx).results.semantic_pending);
+            service.read(cx).close_blocking();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn input_changes_cancel_semantic_before_debounce(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for text in ["new", ""] {
+            assert_semantic_cancelled(cx, |v, window, cx| {
+                v.input.update(cx, |s, cx| s.set_value(text, window, cx));
+                v.on_input_event(&v.input.clone(), &super::InputEvent::Change, window, cx);
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn new_search_cancels_previous_semantic_even_when_empty(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for text in ["new", ""] {
+            assert_semantic_cancelled(cx, |v, window, cx| {
+                v.input.update(cx, |s, cx| s.set_value(text, window, cx));
+                v.run_search(cx);
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn mode_switch_cancels_semantic_even_when_empty(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for text in ["old", ""] {
+            for hybrid in [false, true] {
+                assert_semantic_cancelled(cx, |v, window, cx| {
+                    v.input.update(cx, |s, cx| s.set_value(text, window, cx));
+                    v.hybrid = !hybrid;
+                    v.select_mode(hybrid, cx);
+                });
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn disabling_or_losing_model_cancels_semantic_even_when_empty(cx: &mut TestAppContext) {
+        use crate::semantic::{ModelStatus, SearchPreferences, SemanticPhase, SemanticStatus};
+        cx.update(gpui_kit::init);
+        for text in ["old", ""] {
+            for (enabled, model) in [
+                (false, ModelStatus::Ready),
+                (true, ModelStatus::Missing),
+                (true, ModelStatus::Failed("unavailable".into())),
+            ] {
+                assert_semantic_cancelled(cx, |v, window, cx| {
+                    v.input.update(cx, |s, cx| s.set_value(text, window, cx));
+                    v.query = text.into();
+                    let generation = v.generation;
+                    let prefs = SearchPreferences { semantic_enabled: enabled, ..Default::default() };
+                    v.semantic_changed(
+                        &prefs,
+                        &SemanticStatus {
+                            scope_revision: 0,
+                            revision: 0,
+                            model,
+                            phase: SemanticPhase::WaitingForModel,
+                        },
+                        cx,
+                    );
+                    v.receive_semantic(generation, Ok(vec![hit("stale.md")]), cx);
+                    v.receive_semantic(generation, Err("stale error".into()), cx);
+                    assert!(v.results.semantic.is_none());
+                    assert!(v.semantic_error.is_none());
+                });
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    fn completed_identity_survives_transient_semantic_phases(cx: &mut TestAppContext) {
+        use crate::semantic::{ModelStatus, SearchPreferences, SemanticPhase, SemanticStatus};
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault, data.path().into(), cx));
+        let (view, cx) = cx.add_window_view(|window, cx| SearchView::new(service.clone(), window, cx));
+        let prefs = SearchPreferences { semantic_enabled: true, ..Default::default() };
+        view.update_in(cx, |v, window, cx| {
+            v.input.update(cx, |s, cx| s.set_value("meaning", window, cx));
+            v.query = "meaning".into();
+            let ready = SemanticStatus {
+                scope_revision: 0,
+                revision: 0,
+                model: ModelStatus::Ready,
+                phase: SemanticPhase::Ready { notes: 4, chunks: 8 },
+            };
+            v.semantic_changed(&prefs, &ready, cx);
+            let generation = v.generation;
+            for phase in [
+                SemanticPhase::WaitingForIdle,
+                SemanticPhase::Paused,
+                SemanticPhase::Indexing { done: 1, total: 4 },
+            ] {
+                v.semantic_changed(
+                    &prefs,
+                    &SemanticStatus { scope_revision: 0, revision: 0, model: ModelStatus::Loading, phase },
+                    cx,
+                );
+                assert_eq!(v.generation, generation, "transient status must not start inference");
+                v.semantic_changed(&prefs, &ready, cx);
+                assert_eq!(v.generation, generation, "the same completed index must not restart inference");
+                assert_eq!(v.semantic_key.completed, Some((4, 8, 0)));
+            }
+            v.semantic_changed(
+                &prefs,
+                &SemanticStatus {
+                    scope_revision: 0,
+                    revision: 0,
+                    model: ModelStatus::Ready,
+                    phase: SemanticPhase::Ready { notes: 4, chunks: 9 },
+                },
+                cx,
+            );
+            assert!(v.generation > generation, "a newly completed index still refreshes the query");
+        });
+        cx.update(|_, cx| service.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn asynchronous_fulltext_first_and_late_semantic_preserve_selection(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault, data.path().into(), cx));
+        let (view, cx) = cx.add_window_view(|window, cx| SearchView::new(service.clone(), window, cx));
+        view.update_in(cx, |v, _, cx| {
+            v.generation = 10;
+            v.query = "meaning".into();
+            v.searching = true;
+            v.results.semantic_pending = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(10)).await;
+                let _ = this
+                    .update(cx, |v, cx| v.receive_fulltext(10, Ok(vec![hit("fts.md"), hit("both.md")]), cx));
+            })
+            .detach();
+            let executor = cx.background_executor().clone();
+            let task = cx.background_spawn(async move {
+                executor.timer(Duration::from_millis(100)).await;
+                Ok(vec![hit("both.md"), hit("semantic.md")])
+            });
+            v.await_semantic(10, task, cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(20));
+        cx.run_until_parked();
+        view.update_in(cx, |v, _, _| {
+            assert_eq!(v.hits(), [hit("fts.md"), hit("both.md")]);
+            assert!(!v.searching);
+            assert!(v.results.semantic_pending);
+            assert!(v.semantic_task.is_some());
+            assert!(v.semantic_hint().unwrap().contains("正在补充语义"));
+            v.selected = Some(0);
+        });
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.hits().len(), 3);
+            assert_eq!(v.hits()[0].path.as_str(), "both.md");
+            assert_eq!(v.hits()[v.selected().unwrap()].path.as_str(), "fts.md");
+            assert!(!v.results.semantic_pending);
+            assert!(v.semantic_task.is_none());
+            service.read(cx).close_blocking();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn semantic_failure_keeps_fulltext_and_unavailable_mode_opens_settings(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault, data.path().into(), cx));
+        let (view, cx) = cx.add_window_view(|window, cx| SearchView::new(service.clone(), window, cx));
+        let settings = Rc::new(RefCell::new(0));
+        let sink = settings.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, event, _| {
+                if matches!(event, SearchViewEvent::Settings) {
+                    *sink.borrow_mut() += 1;
+                }
+            })
+            .detach();
+        });
+        view.update_in(cx, |v, _, cx| {
+            v.generation = 5;
+            v.results.semantic_pending = true;
+            v.receive_fulltext(5, Ok(vec![hit("fts.md")]), cx);
+            v.receive_semantic(5, Err("model unavailable".into()), cx);
+            assert_eq!(v.hits(), [hit("fts.md")]);
+            assert!(v.error.is_none());
+            assert!(!v.results.semantic_pending);
+            assert!(v.semantic_hint().unwrap().contains("已保留全文"));
+            v.select_mode(true, cx);
+            assert!(!v.hybrid);
+        });
+        assert_eq!(*settings.borrow(), 1, "unavailable mode is a settings entry, not a dead button");
+        cx.update(|_, cx| service.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn input_invalidates_in_flight_query_before_debounce(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault, data.path().into(), cx));
+        let (view, cx) = cx.add_window_view(|window, cx| SearchView::new(service.clone(), window, cx));
+        view.update_in(cx, |v, window, cx| {
+            v.input.update(cx, |s, cx| s.set_value("old", window, cx));
+            v.run_search(cx);
+        });
+        let previous = cx.update(|_, cx| view.read(cx).generation);
+        view.update_in(cx, |v, window, cx| {
+            v.input.update(cx, |s, cx| s.set_value("new", window, cx));
+            v.schedule(cx);
+            assert!(v.generation > previous, "invalidate on change, not 150 ms later");
+            assert_eq!(v.query(), "old", "replacement query is still debounced");
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(10)).await;
+                let _ = this.update(cx, |v, cx| {
+                    v.receive_fulltext(previous, Ok(vec![hit("stale-fts.md")]), cx);
+                    v.receive_semantic(previous, Ok(vec![hit("stale-semantic.md")]), cx);
+                    v.receive_semantic(previous, Err("stale error".into()), cx);
+                });
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(20));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            assert!(v.hits().is_empty(), "neither response may flash back while replacement is debounced");
+            assert!(v.semantic_error.is_none());
+            assert!(v.searching, "stale completion must not finish the replacement query");
+            service.read(cx).close_blocking();
+        });
+    }
+
     /// 打开索引 → 输入防抖 → 结果分组 → ↑↓ / ⏎ / Esc 事件。用真实 zvec 引擎，索引放临时目录。
     #[gpui_kit::test]
     fn search_view_end_to_end(cx: &mut TestAppContext) {
@@ -542,6 +1226,7 @@ mod tests {
                         format!("open {}#{block_ord}", path.as_str())
                     }
                     SearchViewEvent::Dismiss => "dismiss".into(),
+                    SearchViewEvent::Settings => "settings".into(),
                 });
             })
             .detach();

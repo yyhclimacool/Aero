@@ -194,7 +194,7 @@ fn encode_tag(tag: &str) -> String {
     format!("|{hex}|")
 }
 
-fn sql_literal(value: &str) -> Result<String, IndexError> {
+pub(crate) fn sql_literal(value: &str) -> Result<String, IndexError> {
     // zvec decodes backslash-escaped quotes only; doubling other backslashes changes the value.
     'delimiter: for quote in ['\'', '"'] {
         let mut literal = String::from(quote);

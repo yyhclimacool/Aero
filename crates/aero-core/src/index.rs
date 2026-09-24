@@ -225,11 +225,19 @@ pub trait VectorIndex: Send + Sync {
 /// 要进索引的叶子块：跳过 front matter、`^id` / 属性标记行、分割线，以及去掉标记后为空的块。
 /// 返回顺序即 `block_ord`——搜索结果用 ord 回到这里定位块。
 pub fn indexable_leaves(doc: &Document) -> Vec<&Block> {
-    doc.blocks()
-        .leaves()
-        .filter(|b| !matches!(b.kind, BlockKind::FrontMatter | BlockKind::Marker | BlockKind::ThematicBreak))
-        .filter(|b| !plain_text(&doc.slice(doc.content_range(b)).to_string(), &b.kind).trim().is_empty())
-        .collect()
+    indexable_bodies(doc).map(|(block, _)| block).collect()
+}
+
+/// 过滤和编号共用同一条路径；入库时复用正文，不再为每块解析两遍。
+pub fn indexable_bodies(doc: &Document) -> impl Iterator<Item = (&Block, String)> {
+    let mut extractor = extraction::Extractor::default();
+    doc.blocks().leaves().filter_map(move |block| {
+        if matches!(block.kind, BlockKind::FrontMatter | BlockKind::Marker | BlockKind::ThematicBreak) {
+            return None;
+        }
+        let body = extractor.plain_text(&doc.slice(doc.content_range(block)).to_string(), &block.kind);
+        (!body.trim().is_empty()).then_some((block, body))
+    })
 }
 
 /// 把一篇文档拆成索引文档（10.3：索引粒度到块）。`ord` 连续，删除旧块时只需知道旧的块数。
@@ -248,22 +256,17 @@ pub fn blocks_and_links_for_note(
     let (tag_sources, links) = crate::parse::inline_scan(&text);
     let tags = note_tags(doc, &tag_sources);
     let aliases: Arc<[String]> = doc.front_matter_aliases().into();
-    let mut blocks: Vec<_> = indexable_leaves(doc)
-        .into_iter()
+    let mut blocks: Vec<_> = indexable_bodies(doc)
         .enumerate()
-        .map(|(ord, b)| {
-            let src = doc.slice(doc.content_range(b)).to_string();
-            let body = plain_text(&src, &b.kind);
-            IndexBlock {
-                pk: IndexBlock::pk_of(note_id, ord as u32),
-                note_id: note_id.to_owned(),
-                block_ord: ord as u32,
-                path: path.to_owned(),
-                title: title.to_owned(),
-                aliases: aliases.clone(),
-                body,
-                tags: tags.clone(),
-            }
+        .map(|(ord, (_, body))| IndexBlock {
+            pk: IndexBlock::pk_of(note_id, ord as u32),
+            note_id: note_id.to_owned(),
+            block_ord: ord as u32,
+            path: path.to_owned(),
+            title: title.to_owned(),
+            aliases: aliases.clone(),
+            body,
+            tags: tags.clone(),
         })
         .collect();
     if blocks.is_empty() && !aliases.is_empty() {
@@ -446,142 +449,13 @@ pub fn tags_for_note(doc: &Document) -> Vec<String> {
     note_tags(doc, &sources)
 }
 
-/// 块源码去掉 Markdown 标记后的正文，供全文索引与结果摘要用。
-/// 不追求完备：去标题 `#`、代码围栏、表格竖线、强调 / 代码 / 高亮 / 删除线记号、链接语法、`{.attr}` 与 HTML 标签；
-/// `[[a|b]]` 留别名 `b`，`[t](url)` 留 `t`，`#tag` 原样保留。
+#[path = "index_text.rs"]
+mod extraction;
+
+/// 从 Markdown AST 抽取可见正文；代码、数学与转义字面不作标记清理。
+/// 链接保留 label / alt / alias，HTML 换行保留，元数据与不可见内容不进正文。
 pub fn plain_text(src: &str, kind: &BlockKind) -> String {
-    let src = match kind {
-        BlockKind::Heading { .. } => src.trim_start_matches('#').trim_start(),
-        BlockKind::CodeFence { .. } => strip_fence(src),
-        BlockKind::CodeBlock => {
-            return src.lines().map(|l| l.strip_prefix("    ").unwrap_or(l)).collect::<Vec<_>>().join("\n");
-        }
-        BlockKind::Table => {
-            return src
-                .lines()
-                .filter(|l| {
-                    !l.trim().trim_matches(['|', ' ']).chars().all(|c| matches!(c, '-' | ':' | '|' | ' '))
-                })
-                .map(|l| {
-                    l.trim()
-                        .trim_matches('|')
-                        .split('|')
-                        .map(|c| strip_inline(c.trim()))
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-        }
-        _ => src,
-    };
-    if matches!(kind, BlockKind::CodeFence { .. }) {
-        return src.to_owned();
-    }
-    // 引用 / callout 整体是一个叶子时去掉每行的 `> `
-    let lines: Vec<String> = src
-        .lines()
-        .map(|l| {
-            let mut l = l;
-            while let Some(rest) = l.trim_start().strip_prefix('>') {
-                l = rest.strip_prefix(' ').unwrap_or(rest);
-            }
-            strip_inline(l)
-        })
-        .collect();
-    lines.join("\n")
-}
-
-fn strip_fence(src: &str) -> &str {
-    let Some(first_nl) = src.find('\n') else { return "" };
-    let body = &src[first_nl + 1..];
-    let trimmed = body.trim_end_matches('\n');
-    match trimmed.rfind('\n') {
-        Some(i)
-            if trimmed[i + 1..].trim_start().starts_with("```")
-                || trimmed[i + 1..].trim_start().starts_with("~~~") =>
-        {
-            &trimmed[..i]
-        }
-        _ if trimmed.trim_start().starts_with("```") || trimmed.trim_start().starts_with("~~~") => "",
-        _ => trimmed,
-    }
-}
-
-/// 行内标记清理（单行）。
-fn strip_inline(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let b = line.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        let rest = &line[i..];
-        // 嵌入 / wikilink：![[x]] / [[a|b]] / [[a#h]]
-        if let Some(after) = rest.strip_prefix("![[").or_else(|| rest.strip_prefix("[["))
-            && let Some(end) = after.find("]]")
-        {
-            let inner = &after[..end];
-            // 链接 `|` 后是别名；嵌入 `|` 后是宽度之类的参数，留目标名
-            let shown = match inner.rsplit_once('|') {
-                Some((target, alias)) => {
-                    if rest.starts_with('!') {
-                        target
-                    } else {
-                        alias
-                    }
-                }
-                None => inner,
-            };
-            out.push_str(shown);
-            i += rest.len() - after.len() + end + 2;
-            continue;
-        }
-        // 图片 / 链接：![alt](url) / [text](url)
-        if (rest.starts_with("![") || rest.starts_with('['))
-            && let Some(close) = rest.find("](")
-            && let Some(paren_end) = rest[close + 2..].find(')')
-        {
-            let text_start = if rest.starts_with("![") { 2 } else { 1 };
-            out.push_str(&strip_inline(&rest[text_start..close]));
-            i += close + 2 + paren_end + 1;
-            continue;
-        }
-        // 自动链接 <http://…> 留 URL；其他 <tag> 丢掉
-        if rest.starts_with('<')
-            && let Some(end) = rest.find('>')
-        {
-            let inner = &rest[1..end];
-            if inner.starts_with("http://") || inner.starts_with("https://") {
-                out.push_str(inner);
-            }
-            i += end + 1;
-            continue;
-        }
-        // 属性列表 {.red key=v}
-        if rest.starts_with('{')
-            && let Some(end) = rest.find('}')
-            && rest[1..end].trim_start().starts_with(['.', '#'])
-        {
-            i += end + 1;
-            continue;
-        }
-        let c = rest.chars().next().unwrap();
-        match c {
-            // 强调 / 行内代码记号本身跳过；`~~` / `==` 只在成对记号形态下去掉，单个 `~` `=` 是正文
-            '*' | '`' => i += 1,
-            '~' | '=' if rest.starts_with("~~") || rest.starts_with("==") => i += 2,
-            '\\' if rest.len() > 1 => {
-                // 转义：保留被转义字符
-                let next = rest[1..].chars().next().unwrap();
-                out.push(next);
-                i += 1 + next.len_utf8();
-            }
-            _ => {
-                out.push(c);
-                i += c.len_utf8();
-            }
-        }
-    }
-    out
+    extraction::plain_text(src, kind)
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,6 +940,259 @@ mod tests {
         assert_eq!(plain_text("    x\n    y", &BlockKind::CodeBlock), "x\ny");
         assert_eq!(plain_text("| a | **b** |\n| --- | --- |\n| 1 | 2 |", &BlockKind::Table), "a  b\n1  2");
         assert_eq!(plain_text("> 引用\n> > 嵌套", &BlockKind::BlockQuote), "引用\n嵌套");
+    }
+
+    #[test]
+    fn plain_text_keeps_chinese_table_cells_breaks_and_escaped_pipes() {
+        let src = "| __中文表头__ | 说明 |\n| :--- | ---: |\n| 甲\\|乙 | **第一行**<br><br>第二行 |\n| `a\\|b` | [[目标\\|别名]] |";
+        assert_eq!(plain_text(src, &BlockKind::Table), "中文表头  说明\n甲|乙  第一行\n\n第二行\na|b  别名");
+    }
+
+    #[test]
+    fn plain_text_removes_only_paired_inline_markup() {
+        assert_eq!(
+            plain_text("__粗体__ _斜体_ ~~删除~~ ==高亮== 2 * 3 snake_case 未闭合`", &BlockKind::Paragraph),
+            "粗体 斜体 删除 高亮 2 * 3 snake_case 未闭合`"
+        );
+    }
+
+    #[test]
+    fn plain_text_links_keep_labels_not_destinations() {
+        assert_eq!(
+            plain_text(
+                "[__中文__](https://hidden.test/a_(b) \"secret title\") ![图 *说明*](image.png) [[目标#章节|显示别名]] ![[图片.png|400]]",
+                &BlockKind::Paragraph
+            ),
+            "中文 图 说明 显示别名 图片.png"
+        );
+    }
+
+    #[test]
+    fn plain_text_attributes_do_not_eat_literal_brackets_or_json() {
+        assert_eq!(
+            plain_text(
+                r#"[彩色]{.red} 正文 {#private title="*secret*"} [字面] [] {} {"a": [1, 2]} {1, 2} \{.literal} \[方括号\] ^block-id"#,
+                &BlockKind::Paragraph
+            ),
+            r#"彩色 正文  [字面] [] {} {"a": [1, 2]} {1, 2} {.literal} [方括号]"#
+        );
+    }
+
+    #[test]
+    fn plain_text_nested_json_braces_are_not_attributes() {
+        let src = r#"JSON {"pattern": "{.red}", "data": {"n": 1}} 尾部 {.blue}"#;
+        assert_eq!(
+            plain_text(src, &BlockKind::Paragraph),
+            r#"JSON {"pattern": "{.red}", "data": {"n": 1}} 尾部 "#
+        );
+    }
+
+    #[test]
+    fn plain_text_entity_decoded_attributes_remain_visible() {
+        for source in ["正文 &#123;.red}", "正文 &#x7b;.red}", "正文 &lbrace;.red}"] {
+            assert_eq!(plain_text(source, &BlockKind::Paragraph), "正文 {.red}", "{source}");
+            let doc = Document::from_text(source);
+            assert_eq!(blocks_for_note(&doc, "n", "n.md", "N")[0].body, "正文 {.red}");
+        }
+        assert_eq!(
+            plain_text(
+                r"&#123;.red} **粗体** {.blue} `&#123;.code}` \{.escaped} &#123;#literal} &#94;literal",
+                &BlockKind::Paragraph
+            ),
+            "{.red} 粗体  &#123;.code} {.escaped} {#literal} ^literal"
+        );
+        assert_eq!(plain_text("&#123;.red}", &BlockKind::Paragraph), "{.red}");
+        assert_eq!(plain_text("[正文]&#123;.red}", &BlockKind::Paragraph), "[正文]{.red}");
+        for source in ["正文 {&#46;red}", "正文 {.red&#125;", "正文 {.r&#101;d}"] {
+            assert_eq!(plain_text(source, &BlockKind::Paragraph), "正文 {.red}", "{source}");
+        }
+        assert_eq!(plain_text("正文 &#123;.red} {.blue} 尾部", &BlockKind::Paragraph), "正文 {.red}  尾部");
+        assert_eq!(plain_text("正文 &#123;.red} ^actual", &BlockKind::Paragraph), "正文 {.red}");
+        assert_eq!(
+            plain_text("| a\\|b &#123;.red} | {.blue} c |\n| --- | --- |", &BlockKind::Table),
+            "a|b {.red}   c"
+        );
+    }
+
+    #[test]
+    fn plain_text_code_and_math_are_literal() {
+        assert_eq!(
+            plain_text(r"`a * b **raw** {.red} <br> [[x]] \*` $x_{i} * y + \alpha$", &BlockKind::Paragraph),
+            r"a * b **raw** {.red} <br> [[x]] \* x_{i} * y + \alpha"
+        );
+        let code = "````rust\n```\nlet x = [1, 2]; // {.red} **raw**\n~~~~\n````";
+        assert_eq!(
+            plain_text(code, &BlockKind::CodeFence { info: "rust".into() }),
+            "```\nlet x = [1, 2]; // {.red} **raw**\n~~~~"
+        );
+        assert_eq!(plain_text("    a * b\n    {} []", &BlockKind::CodeBlock), "a * b\n{} []");
+    }
+
+    #[test]
+    fn plain_text_html_hides_comments_and_scripts_but_separates_breaks() {
+        assert_eq!(
+            plain_text(
+                "中文<br><BR />English<!-- hidden --> <script>secret **code**</script>可见",
+                &BlockKind::Paragraph
+            ),
+            "中文\n\nEnglish 可见"
+        );
+        assert_eq!(
+            plain_text(
+                "<div>甲<br>乙</div><style>.hidden { color: red }</style><p>丙 &amp; 丁</p>",
+                &BlockKind::HtmlBlock
+            ),
+            "甲\n乙\n丙 & 丁"
+        );
+        assert_eq!(plain_text(r"\<br> `<br>` a < b > c", &BlockKind::Paragraph), "<br> <br> a < b > c");
+    }
+
+    #[test]
+    fn plain_text_removes_block_structure() {
+        assert_eq!(plain_text("标题 __粗体__\n===", &BlockKind::Heading { level: 1 }), "标题 粗体");
+        assert_eq!(
+            plain_text("- [x] __任务__\n- 下一项", &BlockKind::List { ordered: false, start: 1 }),
+            "任务\n下一项"
+        );
+        let kind = BlockKind::Callout {
+            kind: crate::block::CalloutKind::Tip,
+            title: Some("提示".into()),
+            fold: crate::block::Fold::Collapsed,
+        };
+        assert_eq!(plain_text("> [!tip]- **提示**\n> 正文", &kind), "提示\n正文");
+        assert_eq!(plain_text("---\nsecret: hidden\n---", &BlockKind::FrontMatter), "");
+    }
+
+    #[test]
+    fn plain_text_respects_original_kind_and_literal_extension_markers() {
+        assert_eq!(plain_text("1. **标题**<br><br>2. **标题**", &BlockKind::Paragraph), "1. 标题\n\n2. 标题");
+        assert_eq!(plain_text("a * b\n    {} [] ^literal", &BlockKind::CodeBlock), "a * b\n{} [] ^literal");
+        assert_eq!(plain_text(r"> \[!tip] literal", &BlockKind::BlockQuote), "[!tip] literal");
+        assert_eq!(
+            plain_text(r"\![[image.png|400]] `![[image.png|400]]`", &BlockKind::Paragraph),
+            "![[image.png|400]] ![[image.png|400]]"
+        );
+        assert_eq!(plain_text(r"正文 \^literal", &BlockKind::Paragraph), "正文 ^literal");
+        assert_eq!(plain_text("[[note|{.literal}]]", &BlockKind::Paragraph), "{.literal}");
+        let doc = Document::from_text("- [x] __已完成__\n- [ ] 待办\n");
+        assert_eq!(
+            blocks_for_note(&doc, "n", "n.md", "N").iter().map(|b| b.body.as_str()).collect::<Vec<_>>(),
+            ["已完成", "待办"]
+        );
+    }
+
+    #[test]
+    fn plain_text_nested_invisible_html_stays_hidden() {
+        assert_eq!(
+            plain_text(
+                "<template><template>inner</template>secret</template><p>visible</p>",
+                &BlockKind::HtmlBlock
+            ),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn plain_text_html_comparisons_do_not_consume_closing_tags() {
+        assert_eq!(
+            plain_text("<script>if (a < b) secret();</script><p>a < b > c</p>", &BlockKind::HtmlBlock),
+            "a < b > c"
+        );
+    }
+
+    #[test]
+    fn plain_text_long_unpaired_syntax_is_preserved() {
+        let src = format!("<div>{}</div>", "&".repeat(20_000));
+        assert_eq!(plain_text(&src, &BlockKind::HtmlBlock), "&".repeat(20_000));
+        let src = format!("正文 {}", "{".repeat(20_000));
+        assert_eq!(plain_text(&src, &BlockKind::Paragraph), src);
+    }
+
+    #[test]
+    fn invisible_blocks_do_not_change_ord_alignment_or_source() {
+        let source = "---\ntitle: Display\naliases: [Alias]\n---\n\n<!-- hidden -->\n\n<script>secret</script>\n\n# __标题__\n\n{.red}\n\n正文 ^block\n\n[x]: https://hidden.test\n";
+        let doc = Document::from_text(source);
+        let (blocks, _) = blocks_and_links_for_note(&doc, "n", "n.md", "Display");
+        assert_eq!(blocks.iter().map(|b| b.body.as_str()).collect::<Vec<_>>(), ["标题", "正文"]);
+        let leaves = indexable_leaves(&doc);
+        assert_eq!(blocks.len(), leaves.len());
+        for (ord, (block, leaf)) in blocks.iter().zip(leaves).enumerate() {
+            assert_eq!(block.block_ord, ord as u32);
+            assert_eq!(block.pk, IndexBlock::pk_of("n", ord as u32));
+            assert_eq!(block.body, plain_text(&doc.slice(doc.content_range(leaf)).to_string(), &leaf.kind));
+            assert_eq!(block.title, "Display");
+            assert_eq!(&*block.aliases, &["Alias"]);
+        }
+        assert_eq!(doc.to_string(), source);
+    }
+
+    /// Check both extraction entry points and the exact source leaf behind every ord.
+    fn assert_visible_leaves(source: &str, expected: &[(&str, &str)]) {
+        let doc = Document::from_text(source);
+        let blocks = blocks_for_note(&doc, "n", "n.md", "N");
+        let (with_links, _) = blocks_and_links_for_note(&doc, "n", "n.md", "N");
+        assert_eq!(blocks, with_links);
+        assert_eq!(
+            blocks.iter().map(|b| b.body.as_str()).collect::<Vec<_>>(),
+            expected.iter().map(|(_, body)| *body).collect::<Vec<_>>()
+        );
+        let leaves = indexable_leaves(&doc);
+        assert_eq!(leaves.len(), blocks.len());
+        for (ord, ((block, leaf), (prefix, _))) in blocks.iter().zip(leaves).zip(expected).enumerate() {
+            assert_eq!(block.block_ord, ord as u32);
+            assert_eq!(block.pk, IndexBlock::pk_of("n", ord as u32));
+            assert_eq!(doc.content_range(leaf).start, source.find(prefix).unwrap());
+        }
+        let mut index = MemoryFullTextIndex::new();
+        index.upsert(&blocks).unwrap();
+        assert!(index.search(&FtsQuery::new("SECRET")).unwrap().is_empty());
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn index_hides_script_across_leaf_boundaries() {
+        assert_visible_leaves("正文<script>\n\nSECRET\n\n</script>", &[("正文", "正文")]);
+        assert_visible_leaves(
+            "正文<script>\n\nSECRET\n\n</script>\n\n结尾",
+            &[("正文", "正文"), ("结尾", "结尾")],
+        );
+        assert_visible_leaves("正文<script>\n\nSECRET", &[("正文", "正文")]);
+    }
+
+    #[test]
+    fn index_hides_style_across_leaf_boundaries() {
+        assert_visible_leaves(
+            "正文<StYlE>\r\n\r\nSECRET_STYLE\r\n\r\n</sTyLe>\r\n\r\n结尾",
+            &[("正文", "正文"), ("结尾", "结尾")],
+        );
+        assert_visible_leaves("正文<style>\n\nSECRET_STYLE", &[("正文", "正文")]);
+    }
+
+    #[test]
+    fn index_hidden_html_respects_code_and_escaped_tags() {
+        let source = concat!(
+            "行内 `<script>` 可见\n\n",
+            "\\<script>转义\n\n",
+            "&lt;style&gt;实体\n\n",
+            "```html\n<script>代码</script>\n```\n\n",
+            "    <style>缩进代码</style>\n\n",
+            "正文<script>\n\nSECRET **hidden**\n\n",
+            "`</script> SECRET_CODE`\n\n",
+            "\\</script> SECRET_ESCAPED\n\n",
+            "</script>\n\n结尾"
+        );
+        assert_visible_leaves(
+            source,
+            &[
+                ("行内", "行内 <script> 可见"),
+                ("\\<script>", "<script>转义"),
+                ("&lt;style&gt;", "<style>实体"),
+                ("```html", "<script>代码</script>"),
+                ("<style>缩进", "<style>缩进代码</style>"),
+                ("正文", "正文"),
+                ("结尾", "结尾"),
+            ],
+        );
     }
 
     #[test]

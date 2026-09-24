@@ -1,0 +1,18 @@
+[package]
+name = "aero-embedding"
+description = "Bounded, offline CPU embeddings and explicit pinned-model installation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls", "api-27"] }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+# 3.4.2 fixes header timeouts incorrectly expiring a progressing response body.
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls"] }
+url = "2"
+sha2 = "0.10"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

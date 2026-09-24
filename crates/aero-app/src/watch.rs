@@ -6,7 +6,7 @@
 //! - `removed`：已不在磁盘上的笔记（删除 / 重命名的来源 / 移出 vault）；
 //! - `rescan`：目录级变化或事件溢出——文件树整体重扫，索引做一次增量对齐。
 //!
-//! 隐藏路径（`.aero/`、`.git/`、临时文件）与 `*.assets/` 内的东西直接忽略。
+//! 隐藏路径通常忽略，但 `.aero/ignore` 与 `.gitignore` 的变化会触发重扫。
 //!
 //! 线程 → 前台不用通道唤醒而是前台定时取：与索引服务一致，GPUI 的测试调度器不允许外部线程唤醒任务。
 
@@ -136,6 +136,14 @@ fn interest(roots: &Roots, path: &Path) -> Interest {
         return Interest::Ignored;
     }
     let components: Vec<&str> = rel.split(std::path::MAIN_SEPARATOR).collect();
+    if components.as_slice() == [".aero", "ignore"]
+        || (components.last() == Some(&".gitignore")
+            && !components[..components.len() - 1]
+                .iter()
+                .any(|c| c.starts_with('.') || c.ends_with(".assets")))
+    {
+        return Interest::Other;
+    }
     if components.iter().any(|c| c.starts_with('.')) {
         return Interest::Ignored;
     }
@@ -262,6 +270,16 @@ mod tests {
     use super::{Batch, POLL, Roots, VaultWatcher, WatchEvent, classify};
 
     #[test]
+    fn ignore_rule_changes_request_a_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = Roots::of(dir.path());
+        for name in [".aero/ignore", ".gitignore", "sub/.gitignore"] {
+            let batch = classify(&roots, [dir.path().join(name)].iter().map(PathBuf::as_path), false);
+            assert!(batch.rescan, "ignore changes must invalidate indexed membership: {name}");
+        }
+    }
+
+    #[test]
     fn classify_splits_notes_by_existence_and_ignores_hidden() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -336,9 +354,9 @@ mod tests {
         std::fs::remove_file(dir.path().join("keep.md")).unwrap();
         wait_for(cx, &batches, |b| b.iter().any(|b| b.removed.contains(&VaultPath::new("keep.md").unwrap())));
 
-        // 隐藏文件不产生批
+        // 普通隐藏文件不产生批
         let before = batches.lock().unwrap().len();
-        std::fs::write(dir.path().join(".aero").join("ignore"), "").unwrap();
+        std::fs::write(dir.path().join(".aero").join("internal-state"), "").unwrap();
         std::thread::sleep(Duration::from_millis(800));
         cx.executor().advance_clock(POLL);
         cx.run_until_parked();

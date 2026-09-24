@@ -27,6 +27,8 @@ actions!(
         DeleteNote,
         /// ⌘⇧F：左侧栏切到搜索视图并聚焦输入框（`ui_design.md` 4.2）
         OpenSearch,
+        /// ⌘,：本地语义搜索、模型下载与隐私设置
+        OpenSearchSettings,
         /// ⌘⇧E：左侧栏切回文件视图，并在树里定位当前笔记
         OpenFiles,
         /// 左侧栏切到标签视图（`ui_design.md` 4.3）
@@ -214,6 +216,13 @@ pub fn commands() -> Vec<Command> {
         Command::new("quick-open", "快速打开笔记…", "quick open ksdk", Vault, QuickOpen),
         Command::new("search", "全文搜索", "search find qwss", Vault, OpenSearch),
         Command::new(
+            "search-settings",
+            "搜索与隐私…",
+            "search privacy semantic model settings ss ys",
+            Vault,
+            OpenSearchSettings,
+        ),
+        Command::new(
             "files",
             "在文件树中定位当前笔记",
             "files explorer reveal locate wjs dw",
@@ -308,6 +317,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-backspace", DeleteNote, Some("FileTree")),
         KeyBinding::new("f2", crate::file_tree::RenameSelection, Some("FileTree")),
         KeyBinding::new("cmd-shift-f", OpenSearch, None),
+        KeyBinding::new("cmd-,", OpenSearchSettings, None),
         KeyBinding::new("cmd-shift-e", OpenFiles, None),
         KeyBinding::new("cmd-p", QuickOpen, None),
         KeyBinding::new("cmd-shift-p", CommandPalette, None),
@@ -456,6 +466,7 @@ pub fn sync_menus(state: MenuState, cx: &mut App) {
         Menu::new("视图").items(vec![
             MenuItem::action("文件", OpenFiles),
             MenuItem::action("搜索", OpenSearch),
+            MenuItem::action("搜索与隐私…", OpenSearchSettings),
             MenuItem::action("标签", OpenTags),
             MenuItem::action("反链", ShowBacklinks),
             MenuItem::action("大纲", ShowOutline),
@@ -478,4 +489,17 @@ pub fn sync_menus(state: MenuState, cx: &mut App) {
             MenuItem::action("折叠 / 展开右侧面板", TogglePanel),
         ]),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn search_privacy_command_is_available_in_vault() {
+        let command = super::commands()
+            .into_iter()
+            .find(|c| c.id == "search-settings")
+            .expect("search privacy settings must be discoverable");
+        assert_eq!(command.label, "搜索与隐私…");
+        assert!(matches!(command.scope, super::CommandScope::Vault));
+    }
 }
