@@ -42,6 +42,169 @@ const NOTE: &str = "# 一级标题
 最后一段。
 ";
 
+const TABLE_WITH_BREAKS: &str = "| **分类** | **说明** |\n| --- | --- |\n| 第一项 | 1. **训练 内容：**第一行<br>    <br>2. **并行：**第二行 |\n| 第二项 | **加粗<br/>跨行**<BR />末行与 `<br>` |\n\n表格后的正文。\n";
+
+#[gpui_kit::test]
+fn table_html_breaks_keep_cell_editing_and_visual_lines(cx: &mut TestAppContext) {
+    let (_dir, editor) = open(cx, TABLE_WITH_BREAKS);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(1800.)));
+    draw(cx);
+    let id = cx.update(|_, cx| editor.read(cx).units[0].id);
+    let key = Key { id, part: Part::Cell(1, 1) };
+    assert!(
+        cx.update(|_, cx| editor.read(cx).presenters.contains_key(&key)),
+        "br must not disable cell presenters"
+    );
+    let before = rows(&editor, cx);
+    let (ta, first, second) = cx.update(|_, cx| {
+        let ta = editor.read(cx).presenters[&key].textarea.clone();
+        let text = ta.read(cx).value();
+        (ta.clone(), text.find("第一行").unwrap(), text.find("第二行").unwrap())
+    });
+    let (first_bounds, second_bounds) = cx.update(|_, cx| {
+        let ta = ta.read(cx);
+        (ta.range_to_bounds(&(first..first + 3)).unwrap(), ta.range_to_bounds(&(second..second + 3)).unwrap())
+    });
+    assert!(second_bounds.top() - first_bounds.top() >= px(40.), "two br tags preserve an empty visual line");
+    click(cx, second_bounds.center());
+    assert_eq!(rows(&editor, cx), before, "clicking a multiline cell must not relayout the table");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.focused.as_ref().unwrap().textarea, ta);
+        assert_eq!(e.presenter_key_of(&ta), Some(key));
+        let marker = ta.read(cx).value().find("**").unwrap();
+        assert_eq!(ta.read(cx).range_to_bounds(&(marker..marker + 2)).unwrap().size.width, px(0.));
+        assert_eq!(e.doc.to_string(), TABLE_WITH_BREAKS);
+    });
+    cx.simulate_input("改");
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.doc.to_string().matches("<br>").count(), TABLE_WITH_BREAKS.matches("<br>").count());
+        assert!(e.focused.as_ref().unwrap().range.len() < e.units[0].range.len());
+    });
+    cx.simulate_keystrokes("cmd-z escape escape");
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), TABLE_WITH_BREAKS);
+}
+
+#[gpui_kit::test]
+fn table_html_breaks_measure_aligned_cells_by_longest_visual_line(cx: &mut TestAppContext) {
+    let source = "| 居中 | 右对齐 |\n| :---: | ---: |\n| 第一行<br>末 | 第一行<br />末 |\n";
+    let (_dir, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    draw(cx);
+    cx.update(|window, cx| {
+        let e = editor.read(cx);
+        let style = window.text_style();
+        let run = gpui_kit::TextRun {
+            len: "第一行".len(),
+            font: style.font(),
+            color: style.color,
+            ..Default::default()
+        };
+        let expected = window
+            .text_system()
+            .shape_line("第一行".into(), style.font_size.to_pixels(window.rem_size()), &[run], None)
+            .width
+            + px(12.);
+        for col in [0, 1] {
+            let key = Key { id: e.units[0].id, part: Part::Cell(1, col) };
+            assert_eq!(e.presenters[&key].natural_width, Some(expected), "must measure lines separately");
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn table_html_breaks_allow_caret_on_empty_edge_lines(cx: &mut TestAppContext) {
+    let source = "| 分类 | 说明 |\n| --- | --- |\n| 甲 | <br>乙<br> |\n";
+    let (_dir, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    draw(cx);
+    let id = cx.update(|_, cx| editor.read(cx).units[0].id);
+    let key = Key { id, part: Part::Cell(1, 1) };
+    let (range, ta) = cx.update(|_, cx| {
+        let p = &editor.read(cx).presenters[&key];
+        (p.range.clone(), p.textarea.clone())
+    });
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_range(range, Some(id), false, 0, window, cx)));
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| ta.read(cx).selected_range()), 0..0);
+    cx.simulate_keystrokes("right");
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| ta.read(cx).selected_range()), 4..4);
+    cx.simulate_keystrokes("left");
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| ta.read(cx).selected_range()), 0..0);
+    cx.simulate_input("首行");
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source.replace("<br>乙", "首行<br>乙"));
+    cx.simulate_keystrokes("cmd-z");
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source);
+}
+
+#[gpui_kit::test]
+fn table_html_break_deletion_crosses_only_hidden_format_markers(cx: &mut TestAppContext) {
+    for (cell, caret, key, after) in [
+        ("**a**<br>b", 3, "delete", "**a**b"),
+        ("a<br>**b**", 7, "backspace", "a**b**"),
+        ("**a**<br><br>**b**", 3, "delete", "**a**<br>**b**"),
+    ] {
+        let source = format!("| 分类 | 说明 |\n| --- | --- |\n| 甲 | {cell} |\n");
+        let (_dir, editor) = open(cx, &source);
+        let handle = *cx.windows().last().unwrap();
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        draw(cx);
+        let (id, range) = cx.update(|_, cx| {
+            let e = editor.read(cx);
+            let id = e.units[0].id;
+            (id, e.presenters[&Key { id, part: Part::Cell(1, 1) }].range.clone())
+        });
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| e.focus_range(range, Some(id), false, caret, window, cx))
+        });
+        draw(cx);
+        cx.simulate_keystrokes(key);
+        draw(cx);
+        assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source.replace(cell, after));
+        cx.simulate_keystrokes("cmd-z");
+        draw(cx);
+        assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source);
+    }
+}
+
+#[gpui_kit::test]
+fn table_html_break_deletion_is_atomic_and_undoable(cx: &mut TestAppContext) {
+    let source = "| 分类 | 说明 |\n| --- | --- |\n| 甲 | 一<br />二<br><br>三 |\n";
+    let (_dir, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    draw(cx);
+    let id = cx.update(|_, cx| editor.read(cx).units[0].id);
+    let key = Key { id, part: Part::Cell(1, 1) };
+    for forward in [false, true] {
+        let (range, caret) = cx.update(|_, cx| {
+            let p = &editor.read(cx).presenters[&key];
+            let text = p.textarea.read(cx).value();
+            let start = text.find("<br />").unwrap();
+            (p.range.clone(), if forward { start } else { start + "<br />".len() })
+        });
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                e.focus_range(range, Some(id), false, caret, window, cx);
+            })
+        });
+        draw(cx);
+        cx.simulate_keystrokes(if forward { "delete" } else { "backspace" });
+        draw(cx);
+        assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source.replacen("<br />", "", 1));
+        cx.simulate_keystrokes("cmd-z");
+        draw(cx);
+        assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source);
+    }
+}
+
 fn open(cx: &mut TestAppContext, body: &str) -> (tempfile::TempDir, Entity<Editor>) {
     cx.update(|cx| {
         gpui_kit::init(cx);

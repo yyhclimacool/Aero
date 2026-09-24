@@ -49,6 +49,7 @@ struct Popup {
     /// 笔记片段是 Markdown 源码（浮层按预览渲染）；错误、外部链接、歧义是纯文本。
     body: String,
     rich: bool,
+    origin: Option<VaultPath>,
     bounds: Bounds<Pixels>,
 }
 
@@ -452,7 +453,9 @@ impl Editor {
     fn load_link_preview(&self, url: SharedString, bounds: Bounds<Pixels>, cx: &App) -> Task<Popup> {
         let Some((target, fragment)) = aero_core::links::decode_note_url(&url) else {
             return cx.background_spawn(async move {
-                Popup { title: "外部链接".into(), body: url.to_string(), rich: false, bounds }
+                Popup {
+                    title: "外部链接".into(), body: url.to_string(), rich: false, origin: None, bounds
+                }
             });
         };
         let resolution = if target.is_empty() {
@@ -461,7 +464,9 @@ impl Editor {
             resolver.resolve(&target, fragment.as_deref(), self.path.parent())
         } else {
             return cx.background_spawn(async move {
-                Popup { title: target, body: "正在读取笔记目录…".into(), rich: false, bounds }
+                Popup {
+                    title: target, body: "正在读取笔记目录…".into(), rich: false, origin: None, bounds
+                }
             });
         };
         match resolution {
@@ -471,7 +476,7 @@ impl Editor {
                     Ok(body) => (body, true),
                     Err(error) => (error, false),
                 };
-                cx.background_spawn(async move { Popup { title, body, rich, bounds } })
+                cx.background_spawn(async move { Popup { title, body, rich, origin: Some(path), bounds } })
             }
             Resolution::Resolved { path, fragment } => {
                 let vault = self.vault.clone();
@@ -483,12 +488,13 @@ impl Editor {
                                 Ok(body) => (body, true),
                                 Err(error) => (error, false),
                             };
-                            Popup { title, body, rich, bounds }
+                            Popup { title, body, rich, origin: Some(path), bounds }
                         }
                         Err(error) => Popup {
                             title: path.as_str().into(),
                             body: format!("无法读取笔记：{error}"),
                             rich: false,
+                            origin: None,
                             bounds,
                         },
                     }
@@ -496,7 +502,11 @@ impl Editor {
             }
             Resolution::Unresolved => cx.background_spawn(async move {
                 Popup {
-                    title: target, body: "未解析链接：目标笔记不存在".into(), rich: false, bounds
+                    title: target,
+                    body: "未解析链接：目标笔记不存在".into(),
+                    rich: false,
+                    origin: None,
+                    bounds,
                 }
             }),
             Resolution::Ambiguous { candidates } => cx.background_spawn(async move {
@@ -507,6 +517,7 @@ impl Editor {
                         candidates.iter().map(VaultPath::as_str).collect::<Vec<_>>().join("\n")
                     ),
                     rich: false,
+                    origin: None,
                     bounds,
                 }
             }),
@@ -560,6 +571,7 @@ impl Editor {
         &self,
         body: &str,
         rich: bool,
+        origin: Option<VaultPath>,
         max_h: Pixels,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -573,7 +585,7 @@ impl Editor {
             let style = self.text_view_style(cx).with_foreground(cx.theme().popover_foreground);
             frame
                 .debug_selector(|| "link-preview-rich".into())
-                .child(preview::markdown(
+                .child(preview::markdown_from(
                     format!("link-preview-{}", cx.entity_id()).into(),
                     aero_core::links::to_markdown(body).into(),
                     style,
@@ -582,6 +594,7 @@ impl Editor {
                     cx.entity(),
                     BlockId(u64::MAX),
                     0,
+                    origin,
                 ))
                 .into_any_element()
         } else {
@@ -595,9 +608,9 @@ impl Editor {
     }
 
     pub(super) fn render_link_preview(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
-        let (title, body, rich, bounds) = {
+        let (title, body, rich, origin, bounds) = {
             let popup = self.link_preview.popup.as_ref()?;
-            (popup.title.clone(), popup.body.clone(), popup.rich, popup.bounds)
+            (popup.title.clone(), popup.body.clone(), popup.rich, popup.origin.clone(), popup.bounds)
         };
         let caret = self.focused.as_ref().and_then(|focused| {
             let at = focused.textarea.read(cx).selected_range().start;
@@ -635,7 +648,7 @@ impl Editor {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(|_, _, cx| cx.stop_propagation())
                             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title))
-                            .child(self.render_link_preview_body(&body, rich, place.body_max, cx)),
+                            .child(self.render_link_preview_body(&body, rich, origin, place.body_max, cx)),
                     ),
             )
             .into_any_element(),

@@ -1208,6 +1208,7 @@ impl Workspace {
                             let editor = editor.read(cx);
                             editor.path() != path
                                 || editor.index_snapshot().2.hash != stamp.hash
+                                || editor.has_pending_export()
                                 || !matches!(editor.save_state(), SaveState::Clean | SaveState::Saved(_))
                         }
                     })
@@ -1367,7 +1368,7 @@ impl Workspace {
         );
     }
 
-    /// 编辑器在自己路径之外动了文件（冲突副本、另存为）：文件树重扫并跟住编辑器当前路径，索引对齐。
+    /// 编辑器改动了其他路径：笔记副本 / 另存为对齐索引与标签页；附件导出只刷新树、引用与渲染缓存。
     fn on_editor_touched_paths(
         &mut self,
         editor: &Entity<Editor>,
@@ -1375,19 +1376,32 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(open) = self.open.as_mut() else { return };
+        // 与 Vault::notes 一致：附件目录里的 .md 也不是笔记，不能送进文本索引。
+        let (notes, attachments): (Vec<_>, Vec<_>) = paths
+            .into_iter()
+            .partition(|p| p.is_note() && !p.parent().split('/').any(|part| part.ends_with(".assets")));
+        let notes_touched = !notes.is_empty();
         let current = editor.read(cx).path().clone();
         let active = open.editor() == Some(editor);
         open.tree.update(cx, |t, cx| {
             t.rescan();
-            if active && t.selected() != Some(&current) {
+            if notes_touched && active && t.selected() != Some(&current) {
                 t.select(Some(current.clone()), cx);
             }
             cx.notify();
         });
-        open.recent.retain(|p| p != &current);
-        open.recent.insert(0, current);
-        open.search.update(cx, |s, cx| s.notes_touched(paths, cx));
-        self.tabs_changed(cx);
+        if notes_touched {
+            open.recent.retain(|p| p != &current);
+            open.recent.insert(0, current);
+            open.search.update(cx, |s, cx| s.notes_touched(notes, cx));
+        }
+        if !attachments.is_empty() {
+            open.images.update(cx, |s, cx| s.invalidate(&attachments, cx));
+            self.refresh_attachment_references(cx);
+        }
+        if notes_touched {
+            self.tabs_changed(cx);
+        }
         cx.notify();
     }
 
@@ -2259,6 +2273,197 @@ mod tests {
         });
         cx.run_until_parked();
         result.borrow().clone().expect("search task finished")
+    }
+
+    fn catalog_paths(cx: &mut VisualTestContext, search: &Entity<SearchService>) -> Vec<String> {
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let sink = result.clone();
+        cx.update(|_, cx| {
+            let task = search.read(cx).note_summaries(cx);
+            cx.spawn(async move |_| {
+                let mut paths: Vec<_> = task.await.into_iter().map(|note| note.path.to_string()).collect();
+                paths.sort();
+                *sink.borrow_mut() = Some(paths);
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        result.borrow_mut().take().expect("catalog task finished")
+    }
+
+    fn check_export_paths_touched(cx: &mut TestAppContext, png: bool) {
+        let (dir, _data, workspace) = open(cx, Some("anchor\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let (editor, search) = cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.editor().cloned().unwrap(), open.search.clone())
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        let bytes = cx.update(|_, cx| {
+            crate::render::export_diagram(
+                "graph LR\n A[exportneedle] --> B[Done]",
+                false,
+                "Helvetica",
+                cx.text_system().clone(),
+                png,
+            )
+            .unwrap()
+        });
+        assert_eq!(std::str::from_utf8(&bytes).is_ok(), !png);
+        let path = VaultPath::new(if png { "a.assets/diagram.png" } else { "a.assets/diagram.svg" }).unwrap();
+        std::fs::create_dir_all(dir.path().join("a.assets")).unwrap();
+        std::fs::write(dir.path().join(path.as_str()), bytes).unwrap();
+
+        // Use the real editor subscription, without a watcher event or a direct handler call.
+        editor.update(cx, |_, cx| cx.emit(crate::editor::EditorEvent::PathsTouched(vec![path])));
+        cx.run_until_parked();
+        assert_eq!(catalog_paths(cx, &search), ["a.md"], "UTF-8 SVG is still an attachment, not a note");
+        cx.update(|_, cx| {
+            // Failed PNG reads count as writes too: an unchanged catalog alone would miss the bug.
+            assert_eq!(search.read(cx).writes_since_optimize(), 0, "exports must not attempt text indexing");
+            let w = workspace.read(cx);
+            let open = w.open.as_ref().unwrap();
+            assert!(open.recent.is_empty(), "export does not change recent notes");
+            assert_eq!(open.tree.read(cx).selected(), None, "export does not reselect the note");
+            assert!(w.state.vaults.is_empty(), "export does not persist tab state");
+            assert_eq!(open.tabs.len(), 1);
+            assert_eq!(open.editor(), Some(&editor));
+        });
+        assert!(hit_paths(cx, &search, "exportneedle").is_empty());
+        assert_eq!(hit_paths(cx, &search, "anchor"), ["a.md"]);
+        cx.update(|_, cx| search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn paths_touched_png_export_does_not_index_attachment(cx: &mut TestAppContext) {
+        check_export_paths_touched(cx, true);
+    }
+
+    #[gpui_kit::test]
+    fn paths_touched_svg_export_does_not_index_attachment(cx: &mut TestAppContext) {
+        check_export_paths_touched(cx, false);
+    }
+
+    #[gpui_kit::test]
+    fn paths_touched_mixed_event_indexes_only_notes(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("anchor\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let (editor, search, tree) = cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.editor().cloned().unwrap(), open.search.clone(), open.tree.clone())
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        std::fs::create_dir_all(dir.path().join("a.assets")).unwrap();
+        image::RgbaImage::new(2, 2).save(dir.path().join("a.assets/diagram.png")).unwrap();
+        std::fs::write(dir.path().join("a.assets/diagram.svg"), "<svg>exportneedle</svg>").unwrap();
+        std::fs::write(dir.path().join("a.assets/source.md"), "exportneedle\n").unwrap();
+        std::fs::write(dir.path().join("copy.md"), "mixedanchor\n").unwrap();
+        let copy = VaultPath::new("copy.md").unwrap();
+        editor.update(cx, |e, cx| {
+            e.set_path(copy.clone(), cx);
+            cx.emit(crate::editor::EditorEvent::PathsTouched(vec![
+                VaultPath::new("a.assets/diagram.png").unwrap(),
+                copy.clone(),
+                VaultPath::new("a.assets/diagram.svg").unwrap(),
+                VaultPath::new("a.assets/source.md").unwrap(),
+            ]));
+        });
+        cx.run_until_parked();
+        assert_eq!(catalog_paths(cx, &search), ["a.md", "copy.md"]);
+        assert_eq!(hit_paths(cx, &search, "mixedanchor"), ["copy.md"]);
+        assert!(hit_paths(cx, &search, "exportneedle").is_empty());
+        cx.update(|_, cx| {
+            assert!(tree.read(cx).contains(&copy));
+            assert_eq!(tree.read(cx).selected(), Some(&copy));
+            let w = workspace.read(cx);
+            let open = w.open.as_ref().unwrap();
+            assert_eq!(open.recent.first(), Some(&copy));
+            assert_eq!(w.state.vaults[open.vault.id()].tabs, ["copy.md"]);
+            search.read(cx).close_blocking();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn paths_touched_exports_refresh_tree_references_and_render_cache(cx: &mut TestAppContext) {
+        use crate::render::{Attachment, State};
+
+        let (dir, _data, workspace) = open(cx, Some("anchor\n\n![[used.png]]\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let (editor, search, images) = cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            (open.editor().cloned().unwrap(), open.search.clone(), open.images.clone())
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+        let note = VaultPath::new("a.md").unwrap();
+        let used = VaultPath::new("a.assets/used.png").unwrap();
+        let orphan = VaultPath::new("a.assets/orphan.svg").unwrap();
+        std::fs::create_dir_all(dir.path().join("a.assets")).unwrap();
+        image::RgbaImage::new(8, 4).save(dir.path().join(used.as_str())).unwrap();
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                images.update(cx, |s, cx| {
+                    let state = s.image(used.clone(), 100, 1., cx);
+                    matches!(state, State::Ready { pixels, .. } if pixels.width == 8)
+                })
+            })
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| images.update(cx, |s, cx| s.attachment("orphan.svg", &note, cx)))
+                == Attachment::Missing
+        });
+        // Cache a missing render as well as an existing image before export writes the files.
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                images.update(cx, |s, cx| matches!(s.image(orphan.clone(), 100, 1., cx), State::Failed(_)))
+            })
+        });
+        image::RgbaImage::new(16, 6).save(dir.path().join(used.as_str())).unwrap();
+        std::fs::write(
+            dir.path().join(orphan.as_str()),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="6"><rect width="12" height="6"/></svg>"#,
+        )
+        .unwrap();
+        editor.update(cx, |_, cx| {
+            cx.emit(crate::editor::EditorEvent::PathsTouched(vec![used.clone(), orphan.clone()]));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                images.update(cx, |s, cx| s.attachment("orphan.svg", &note, cx)),
+                Attachment::Found(orphan.clone()),
+                "export must refresh the cached attachment catalog"
+            );
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                images.update(cx, |s, cx| {
+                    let used_state = s.image(used.clone(), 100, 1., cx);
+                    let orphan_state = s.image(orphan.clone(), 100, 1., cx);
+                    matches!(used_state, State::Ready { pixels, .. } if pixels.width == 16)
+                        && matches!(orphan_state, State::Ready { .. })
+                })
+            })
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| workspace.read(cx).references_task.is_none()));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let clip = cx.debug_bounds("file-tree-clip:a.md").expect("export adds the attachment count badge");
+        cx.simulate_click(clip.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for selector in ["file-tree-attachment:a.assets/used.png", "file-tree-attachment:a.assets/orphan.svg"]
+        {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector} appears in tree");
+        }
+        assert!(cx.debug_bounds("file-tree-folder:a.assets").is_none());
+        assert!(
+            cx.debug_bounds("file-tree-orphan:a.assets/orphan.svg").is_some(),
+            "new export has no references"
+        );
+        assert!(
+            cx.debug_bounds("file-tree-orphan:a.assets/used.png").is_none(),
+            "existing embed remains referenced"
+        );
+        cx.update(|_, cx| search.read(cx).close_blocking());
     }
 
     /// 文件监听的一批变化：文件树重扫、打开中的那篇立刻重载 / 进入已删除态、其余按指纹对齐索引。

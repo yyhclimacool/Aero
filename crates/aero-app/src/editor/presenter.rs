@@ -113,7 +113,7 @@ impl Editor {
                 BlockKind::BlockQuote if simple_quote(&text) => {
                     specs.push(spec(key, range, true, Extra::default()))
                 }
-                BlockKind::CodeFence { .. } => {
+                BlockKind::CodeFence { .. } if aero_core::rich_content::mermaid_source(&text).is_none() => {
                     if let Some(inner) = fence_body(&text) {
                         let inner = unit.range.start + inner.start..unit.range.start + inner.end;
                         specs.push(spec(key, inner, true, Extra { code: true, ..Default::default() }));
@@ -126,7 +126,7 @@ impl Editor {
                     let title = base + parts.title.start..base + parts.title.end;
                     let extra = Extra { placeholder: Some(label.into()), ..Default::default() };
                     specs.push(spec(Key { id: unit.id, part: Part::CalloutTitle }, title, false, extra));
-                    if parts.simple_body {
+                    if parts.simple_body && !has_rich_block(&parts.body_text) {
                         let body = base + parts.body.start..base + parts.body.end;
                         specs.push(spec(
                             Key { id: unit.id, part: Part::CalloutBody },
@@ -164,6 +164,7 @@ impl Editor {
         let trimmed = text.trim();
         !preview::is_image_embed(trimmed)
             && !preview::is_note_embed(trimmed)
+            && aero_core::rich_content::pdf_embed(text).is_none()
             && !has_html_break(text)
             && !self.renders_inline_formulas(id, text, cx)
     }
@@ -235,9 +236,19 @@ impl Editor {
             let style = window.text_style();
             let mut font = style.font();
             font.weight = weight;
-            let run = TextRun { len: visible.len(), font, color: style.color, ..Default::default() };
             let size = style.font_size.to_pixels(window.rem_size());
-            let width = window.text_system().shape_line(visible.into(), size, &[run], None).width;
+            let width = visible
+                .split('\n')
+                .map(|line| {
+                    let run = TextRun {
+                        len: line.len(),
+                        font: font.clone(),
+                        color: style.color,
+                        ..Default::default()
+                    };
+                    window.text_system().shape_line(line.to_owned().into(), size, &[run], None).width
+                })
+                .fold(px(0.), Pixels::max);
             // 文字控件在右侧留了光标的余量，量出来的宽度要把它加上，否则会被折行
             p.natural_width = Some(width + px(12.));
         }
@@ -355,7 +366,13 @@ impl Editor {
             };
             styles.push((range.clone(), style));
         }
-        Markup { conceal: analysis.conceal.clone(), styles, fonts, dashed }
+        Markup {
+            conceal: analysis.conceal.clone(),
+            hard_breaks: analysis.hard_breaks.clone(),
+            styles,
+            fonts,
+            dashed,
+        }
     }
 
     /// 正在编辑代码块里的代码：不配对括号、不弹链接和标签补全，控件里的文字已经没有围栏可供判断。
@@ -575,20 +592,33 @@ pub(super) fn fence_body(src: &str) -> Option<Range<usize>> {
 
 /// 这张表按单元格画、按单元格编辑。
 pub(super) fn presents_table(text: &str) -> bool {
-    !has_html_break(text) && table::parse(text).is_some()
+    table::parse(text).is_some()
 }
 
-/// 行内的 `<br>` 在文字控件里画不出换行，这样的段落与表格仍用预览渲染、点进去编辑源码。
+/// 段落中的 HTML 换行仍走预览；表格单元格用 hard_breaks 保留源字节。
 fn has_html_break(text: &str) -> bool {
     text.to_ascii_lowercase().contains("<br")
 }
 
 /// 引用里只有段落（没有列表、代码、嵌套引用）时按文字画；复杂的仍用源码编辑。
 pub(super) fn simple_quote(text: &str) -> bool {
-    text.lines().all(|line| {
-        let body = line.trim_start().strip_prefix('>').unwrap_or(line);
-        let body = body.strip_prefix(' ').unwrap_or(body);
-        simple_body_line(body)
+    let body = text
+        .lines()
+        .map(|line| {
+            let body = line.trim_start().strip_prefix('>').unwrap_or(line);
+            body.strip_prefix(' ').unwrap_or(body)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    body.lines().all(simple_body_line) && !has_rich_block(&body)
+}
+
+/// 按段落判断独立嵌入，避免把与文字混排的 PDF 误当成渲染块。
+fn has_rich_block(text: &str) -> bool {
+    aero_core::parse(text).blocks.iter().any(|block| {
+        let source = &text[block.range.clone()];
+        aero_core::rich_content::pdf_embed(source).is_some()
+            || aero_core::rich_content::mermaid_source(source).is_some()
     })
 }
 

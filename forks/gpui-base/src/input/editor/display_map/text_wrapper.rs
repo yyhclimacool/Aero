@@ -35,6 +35,10 @@ pub(crate) struct LineItem {
     ///
     /// Zero when [`WrappingIndent::None`] is used or the line is not wrapped.
     pub(crate) indent: u32,
+    /// When hard breaks split a buffer line, each segment starts a fresh indent group:
+    /// (first visual row, leading characters reserved by its soft continuations).
+    /// Empty preserves the ordinary single-indent layout.
+    pub(crate) indent_segments: SmallVec<[(usize, u32); 1]>,
     /// The soft wrapped lines relative byte range (0..len) of this line (Include first line).
     ///
     /// Not contains the line end `\n`.
@@ -308,6 +312,8 @@ pub(crate) struct TextWrapper {
     /// Document ranges that are not drawn. They must not consume wrap width, or the
     /// visible line breaks diverge from a preview that never includes those bytes.
     conceal: Vec<Range<usize>>,
+    /// Concealed source ranges that end a visual line without changing the rope.
+    hard_breaks: Vec<Range<usize>>,
     /// Ranges drawn in another weight, slant or family than `font`.
     fonts: Vec<(Range<usize>, FontOverride)>,
     wrapping_indent: WrappingIndent,
@@ -326,6 +332,7 @@ impl TextWrapper {
             font_size,
             wrap_width,
             conceal: Vec::new(),
+            hard_breaks: Vec::new(),
             fonts: Vec::new(),
             wrapping_indent: WrappingIndent::default(),
             lines: SumTree::new(&()),
@@ -417,13 +424,18 @@ impl TextWrapper {
     pub(crate) fn set_conceal(
         &mut self,
         conceal: Vec<Range<usize>>,
+        mut hard_breaks: Vec<Range<usize>>,
         fonts: Vec<(Range<usize>, FontOverride)>,
         cx: &mut App,
     ) {
-        if conceal == self.conceal && fonts == self.fonts {
+        hard_breaks.retain(|range| !range.is_empty());
+        hard_breaks.sort_unstable_by_key(|range| (range.start, range.end));
+        hard_breaks.dedup();
+        if conceal == self.conceal && hard_breaks == self.hard_breaks && fonts == self.fonts {
             return;
         }
         self.conceal = conceal;
+        self.hard_breaks = hard_breaks;
         self.fonts = fonts;
         self.update_all(&self.text.clone(), cx);
     }
@@ -561,49 +573,71 @@ impl TextWrapper {
             let line = changed_text.slice_line(row);
             let line_start = changed_text.line_start_offset(row);
             let mut wrapped_lines = SmallVec::<[Range<usize>; 1]>::new();
-            let mut prev_boundary_ix = 0;
             let mut indent_chars = 0;
-
-            // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
-            if let Some(wrap_width) = wrap_width {
-                // Borrowed for lines within a single rope chunk.
-                let line_str: Cow<str> = line.into();
-                match self.wrapping_indent {
-                    WrappingIndent::Same => {
-                        // Here only have wrapped line, if there is no wrap meet, the `line_wraps`
-                        // result will empty.
-                        for boundary in wrap_line(&line_str, line_start, wrap_width) {
-                            wrapped_lines.push(prev_boundary_ix..boundary.ix);
-                            prev_boundary_ix = boundary.ix;
-                            indent_chars = boundary.next_indent;
+            // Keep each hard-break token on the preceding row in source coordinates.
+            // A trailing token also opens an empty final visual row. These boundaries are
+            // independent of soft wrapping, which may be disabled altogether.
+            let line_str: Cow<str> = line.into();
+            let mut hard_ends = Vec::new();
+            let mut previous_end = line_start;
+            for range in &self.hard_breaks {
+                if range.start >= previous_end && range.start < range.end
+                    && range.end <= line_start + line_str.len()
+                    && line_str.is_char_boundary(range.start - line_start)
+                    && line_str.is_char_boundary(range.end - line_start)
+                {
+                    hard_ends.push(range.end - line_start);
+                    previous_end = range.end;
+                }
+            }
+            let has_hard_breaks = !hard_ends.is_empty();
+            let mut indent_segments = SmallVec::new();
+            let mut segment_start = 0;
+            for segment_end in hard_ends.into_iter().chain(std::iter::once(line.len())) {
+                let first_visual_row = wrapped_lines.len();
+                indent_chars = 0;
+                let segment = &line_str[segment_start..segment_end];
+                let mut prev_boundary_ix = segment_start;
+                if let Some(wrap_width) = wrap_width {
+                    let boundaries = wrap_line(segment, line_start + segment_start, wrap_width);
+                    match self.wrapping_indent {
+                        WrappingIndent::Same => {
+                            for boundary in boundaries {
+                                let ix = segment_start + boundary.ix;
+                                if ix > prev_boundary_ix && ix < segment_end {
+                                    wrapped_lines.push(prev_boundary_ix..ix);
+                                    prev_boundary_ix = ix;
+                                    indent_chars = boundary.next_indent;
+                                }
+                            }
                         }
-                    }
-                    WrappingIndent::None => {
-                        // The first visual line keeps the line's leading indentation, so it is
-                        // wrapped as is.
-                        let boundaries = wrap_line(&line_str, line_start, wrap_width);
-                        if let Some(first_ix) = boundaries.first().map(|b| b.ix) {
-                            wrapped_lines.push(prev_boundary_ix..first_ix);
-                            prev_boundary_ix = first_ix;
-
-                            for boundary in
-                                wrap_line(&line_str[first_ix..], line_start + first_ix, wrap_width)
+                        WrappingIndent::None => {
+                            // Rewrap the continuation without reserving the first row's indent.
+                            if let Some(first_ix) = boundaries.iter().map(|b| b.ix)
+                                .find(|&ix| ix > 0 && ix < segment.len())
                             {
-                                let ix = first_ix + boundary.ix;
-                                wrapped_lines.push(prev_boundary_ix..ix);
-                                prev_boundary_ix = ix;
+                                let first = segment_start + first_ix;
+                                wrapped_lines.push(prev_boundary_ix..first);
+                                prev_boundary_ix = first;
+                                for boundary in wrap_line(&segment[first_ix..], line_start + first, wrap_width) {
+                                    let ix = first + boundary.ix;
+                                    if ix > prev_boundary_ix && ix < segment_end {
+                                        wrapped_lines.push(prev_boundary_ix..ix);
+                                        prev_boundary_ix = ix;
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                wrapped_lines.push(prev_boundary_ix..segment_end);
+                if has_hard_breaks {
+                    indent_segments.push((first_visual_row, indent_chars));
+                }
+                segment_start = segment_end;
             }
 
-            // Reset of the line
-            if prev_boundary_ix < line.len() || prev_boundary_ix == 0 {
-                wrapped_lines.push(prev_boundary_ix..line.len());
-            }
-
-            new_lines.push(LineItem { len: line.len(), indent: indent_chars, wrapped_lines });
+            new_lines.push(LineItem { len: line.len(), indent: indent_chars, indent_segments, wrapped_lines });
         }
 
         if self.lines.is_empty() {
@@ -660,9 +694,10 @@ impl TextWrapper {
         };
 
         let local_offset = offset.saturating_sub(start);
+        // Unlike a soft wrap, a hard break has distinct before/after source positions.
+        // Its end always belongs to the next row, even if the previous caret had affinity.
+        let line_end_affinity = line_end_affinity && !self.hard_breaks.iter().any(|range| range.end == offset);
         for (ix, range) in line.wrapped_lines.iter().enumerate() {
-            // With affinity the boundary offset closes the current row instead of opening the
-            // next one, so the range is matched inclusively.
             let matches = range.contains(&local_offset) || (line_end_affinity && local_offset == range.end);
             if matches {
                 return WrapDisplayPoint::new(wrapped_row + ix, ix, local_offset.saturating_sub(range.start));
@@ -691,7 +726,12 @@ impl TextWrapper {
         let line_start = self.text.line_start_offset(row);
         let local_row = point.row.saturating_sub(wrapped_row);
         if let Some(range) = line.wrapped_lines.get(local_row) {
-            line_start + (range.start + point.column).min(range.end)
+            let end = self.hard_breaks.iter()
+                .find(|hard_break| hard_break.end == line_start + range.end
+                    && hard_break.start >= line_start + range.start)
+                .map(|hard_break| hard_break.start - line_start)
+                .unwrap_or(range.end);
+            line_start + range.start.saturating_add(point.column).min(end)
         } else {
             // If not found, return the end of the line.
             line_start + line.len()
@@ -741,6 +781,8 @@ pub(crate) struct LineLayout {
     /// Extra left offset applied to continuation wrapped lines, used to reserve the first line's
     /// indentation when [`WrappingIndent::Same`] is used.
     pub(crate) wrap_indent: Pixels,
+    /// Per-visual-row indents when hard breaks reset continuation indentation.
+    wrap_indents: Vec<Pixels>,
     pub(crate) longest_width: Pixels,
     pub(crate) whitespace_indicators: Option<WhitespaceIndicators>,
     /// Whitespace indicators: (line_index, x_position, is_tab)
@@ -759,11 +801,18 @@ pub(crate) struct ConcealMap {
     to_display: Vec<usize>,
     /// Display byte index → buffer byte index. Length is display_len + 1.
     to_buffer: Vec<usize>,
+    /// This segment ends in a concealed newline, not a shared soft-wrap boundary.
+    hard_break: bool,
 }
 
 impl ConcealMap {
     pub(crate) fn new(to_display: Vec<usize>, to_buffer: Vec<usize>) -> Self {
-        Self { to_display, to_buffer }
+        Self { to_display, to_buffer, hard_break: false }
+    }
+
+    pub(crate) fn with_hard_break(mut self, hard_break: bool) -> Self {
+        self.hard_break = hard_break;
+        self
     }
 
     pub(crate) fn buffer_len(&self) -> usize {
@@ -786,6 +835,7 @@ impl LineLayout {
             longest_width: px(0.),
             wrapped_lines: SmallVec::new(),
             wrap_indent: px(0.),
+            wrap_indents: Vec::new(),
             whitespace_chars: Vec::new(),
             whitespace_indicators: None,
             has_background: false,
@@ -846,11 +896,17 @@ impl LineLayout {
         self
     }
 
-    /// The pixel indent applied to the given visual line, relative to the line's
-    /// leading text. Only continuation lines (index > 0) are indented.
+    pub(crate) fn with_wrap_indents(mut self, wrap_indents: Vec<Pixels>) -> Self {
+        self.wrap_indents = wrap_indents;
+        self
+    }
+
+    /// The pixel indent applied to a visual line. Hard breaks start fresh groups;
+    /// only soft continuations inherit the first row's indentation.
     #[inline]
-    fn line_indent(&self, line_index: usize) -> Pixels {
-        if line_index == 0 { px(0.) } else { self.wrap_indent }
+    pub(crate) fn line_indent(&self, line_index: usize) -> Pixels {
+        self.wrap_indents.get(line_index).copied()
+            .unwrap_or_else(|| if line_index == 0 { px(0.) } else { self.wrap_indent })
     }
 
     pub(crate) fn lines(mut self, wrapped_lines: SmallVec<[ShapedLine; 1]>) -> Self {
@@ -915,12 +971,13 @@ impl LineLayout {
         for (i, line) in self.wrapped_lines.iter().enumerate() {
             let is_last = i + 1 == self.wrapped_lines.len();
             let buf_len = self.segment_buffer_len(i);
+            let hard_break = self.conceal.get(i).and_then(|map| map.as_ref()).is_some_and(|map| map.hard_break);
 
             let matches = if buf_len == 0 {
                 // Empty visual lines still own their boundary offset.
                 offset == acc_len
-            } else if is_last || line_end_affinity {
-                // Inclusive: cursor can sit at end of this visual line.
+            } else if is_last || (line_end_affinity && !hard_break) {
+                // Only a soft wrap shares its end offset with the following row.
                 offset >= acc_len && offset <= acc_len + buf_len
             } else {
                 // Exclusive: boundary offset belongs to the next visual line.
@@ -1009,9 +1066,13 @@ impl LineLayout {
         let (i, offset, x) = self.wrapped_line_at(pos, last_layout)?;
         let line = &self.wrapped_lines[i];
         let display = line.closest_index_for_x(x);
-        let line_end_affinity = i + 1 < self.wrapped_lines.len() && display == line.len;
+        let buffer = self.buffer_index(i, display);
+        // A concealed hard break maps the last glyph (or an empty row) to the
+        // position before the token, not to the next row's source boundary.
+        let hard_break = self.conceal.get(i).and_then(|map| map.as_ref()).is_some_and(|map| map.hard_break);
+        let line_end_affinity = i + 1 < self.wrapped_lines.len() && display == line.len && !hard_break;
 
-        Some((offset + self.buffer_index(i, display), line_end_affinity))
+        Some((offset + buffer, line_end_affinity))
     }
 
     /// How many columns the given position sits past the end of the line under it.
@@ -1317,6 +1378,141 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn hard_breaks_keep_source_ranges_and_empty_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            for width in [None, Some(px(1000.))] {
+                for (source, breaks, expected) in [
+                    ("甲<br><br>乙", vec![3..7, 7..11], vec![0..7, 7..11, 11..14]),
+                    ("<br>甲<br>", vec![0..4, 7..11], vec![0..4, 4..11, 11..11]),
+                    ("<br><br>", vec![0..4, 4..8], vec![0..4, 4..8, 8..8]),
+                ] {
+                    let text = Rope::from(source);
+                    let mut wrapper = TextWrapper::new(test_font(), px(14.), width);
+                    wrapper.conceal = breaks.clone();
+                    wrapper.hard_breaks = breaks;
+                    wrapper.update_all(&text, cx);
+                    assert_eq!(wrapper.text().to_string(), source);
+                    assert_eq!(wrapper.lines_count(), 1);
+                    assert_eq!(wrapper.line(0).unwrap().wrapped_lines.as_slice(), expected);
+                    for (row, range) in expected.iter().enumerate() {
+                        for affinity in [false, true] {
+                            assert_eq!(
+                                wrapper.offset_to_display_point_with_affinity(range.start, affinity),
+                                WrapDisplayPoint::new(row, row, 0),
+                            );
+                        }
+                        assert_eq!(wrapper.display_point_to_offset(WrapDisplayPoint::new(row, 0, 0)), range.start);
+                    }
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn hard_breaks_clamp_display_columns_before_hidden_tokens(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+            let text = Rope::from("前\n甲<br><br>乙<br>\n后");
+            let breaks = vec![7..11, 11..15, 18..22];
+            wrapper.update_all(&text, cx);
+            wrapper.set_conceal(breaks.clone(), breaks.clone(), vec![], cx);
+            assert_eq!(wrapper.lines_count(), 3);
+            assert_eq!(wrapper.buffer_line_to_wrap_row_range(1), 1..5);
+            for (row, start, end) in [(1, 4, 7), (2, 11, 11), (3, 15, 18), (4, 22, 22)] {
+                assert_eq!(wrapper.display_point_to_offset(WrapDisplayPoint::new(row, 0, 0)), start);
+                for column in [3, 4, 5, 999] {
+                    assert_eq!(wrapper.display_point_to_offset(WrapDisplayPoint::new(row, 0, column)), end);
+                }
+            }
+            // Changing only hard breaks must invalidate the layout, even with wrapping off.
+            wrapper.set_conceal(breaks.clone(), vec![], vec![], cx);
+            assert_eq!(wrapper.len(), 3);
+            wrapper.set_conceal(breaks.clone(), breaks, vec![], cx);
+            assert_eq!(wrapper.len(), 6);
+            assert_eq!(wrapper.text().to_string(), text.to_string());
+        });
+    }
+
+    #[gpui::test]
+    fn hard_breaks_mix_with_measured_soft_wrap_and_fonts(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let source = "  甲乙丙丁<br><br>  戊己庚辛<br>";
+            let text = Rope::from(source);
+            let breaks = vec![14..18, 18..22, 36..40];
+            let fonts = vec![(2..14, FontOverride { weight: Some(FontWeight::BOLD), ..Default::default() })];
+            for indent in [WrappingIndent::Same, WrappingIndent::None] {
+                let mut wrapper = TextWrapper::new(test_font(), px(14.), Some(px(25.)));
+                wrapper.wrapping_indent = indent;
+                wrapper.conceal = breaks.clone();
+                wrapper.hard_breaks = breaks.clone();
+                wrapper.fonts = fonts.clone();
+                wrapper.update_all(&text, cx);
+
+                // Each hard-break segment must wrap exactly like an independent source line.
+                let mut expected = Vec::new();
+                for range in [0..18, 18..22, 22..40, 40..40] {
+                    let mut part = TextWrapper::new(test_font(), px(14.), Some(px(25.)));
+                    part.wrapping_indent = indent;
+                    part.conceal = breaks.iter().filter(|b| b.start >= range.start && b.end <= range.end)
+                        .map(|b| b.start - range.start..b.end - range.start).collect();
+                    part.fonts = fonts.iter().filter(|(r, _)| r.start >= range.start && r.end <= range.end)
+                        .map(|(r, f)| (r.start - range.start..r.end - range.start, f.clone())).collect();
+                    part.update_all(&Rope::from(text.slice(range.clone()).to_string()), cx);
+                    expected.extend(part.line(0).unwrap().wrapped_lines.iter()
+                        .map(|r| r.start + range.start..r.end + range.start));
+                }
+                assert!(expected.len() > 4, "test must exercise soft wrapping");
+                assert_eq!(wrapper.line(0).unwrap().wrapped_lines.as_slice(), expected);
+                assert_eq!(wrapper.text().to_string(), source);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn hard_breaks_many_empty_rows_survive_width_and_source_updates(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut text = Rope::from(format!("{}甲", "<br>".repeat(256)));
+            let breaks: Vec<_> = (0..256).map(|i| i * 4..i * 4 + 4).collect();
+            let mut wrapper = TextWrapper::new(test_font(), px(14.), Some(px(1.)));
+            wrapper.set_conceal(breaks.clone(), breaks.clone(), vec![], cx);
+            wrapper.update_all(&text, cx);
+            for indent in [WrappingIndent::Same, WrappingIndent::None] {
+                wrapper.set_wrapping_indent(indent, cx);
+                for width in [None, Some(px(1.)), Some(px(500.))] {
+                    wrapper.set_wrap_width(width, cx);
+                    assert_eq!(wrapper.len(), 257);
+                    assert_eq!(wrapper.line(0).unwrap().wrapped_lines.last(), Some(&(1024..1027)));
+                }
+            }
+            // The normal source edit API still takes original byte ranges.
+            text.replace(1024..1027, "乙丙");
+            wrapper.update(&text, &(1024..1027), &Rope::from("乙丙"), cx);
+            assert_eq!(wrapper.len(), 257);
+            assert_eq!(wrapper.line(0).unwrap().wrapped_lines.last(), Some(&(1024..1030)));
+            assert_eq!(wrapper.text().to_string(), format!("{}乙丙", "<br>".repeat(256)));
+        });
+    }
+
+    #[test]
+    fn hard_breaks_ignore_duplicate_soft_boundaries() {
+        for indent in [WrappingIndent::Same, WrappingIndent::None] {
+            let text = Rope::from("ab<br><br>");
+            let mut wrapper = TextWrapper::new(test_font(), px(14.), Some(px(10.)));
+            wrapper.wrapping_indent = indent;
+            wrapper.hard_breaks = vec![2..6, 6..10];
+            wrapper._update(&text, &(0..text.len()), &text, &mut |line, _, _| {
+                let mut boundaries = vec![Boundary { ix: 0, next_indent: 0 }];
+                if line.starts_with("ab") {
+                    boundaries.extend([Boundary { ix: 1, next_indent: 0 }, Boundary { ix: 1, next_indent: 0 }]);
+                }
+                boundaries.push(Boundary { ix: line.len(), next_indent: 0 });
+                boundaries
+            });
+            assert_eq!(wrapper.line(0).unwrap().wrapped_lines.as_slice(), [0..1, 1..6, 6..10, 10..10]);
+        }
+    }
+
     /// The longest-row summary stays exact when the previously-longest line is shrunk.
     #[test]
     fn test_longest_row_after_shrink() {
@@ -1368,9 +1564,9 @@ mod tests {
         wrapper.text = Rope::from("aa\nbbbb\nc");
         wrapper.lines = SumTree::from_iter(
             vec![
-                LineItem { len: 2, indent: 0, wrapped_lines: smallvec::smallvec![0..2] },
-                LineItem { len: 4, indent: 0, wrapped_lines: smallvec::smallvec![0..2, 2..4] },
-                LineItem { len: 1, indent: 0, wrapped_lines: smallvec::smallvec![0..1] },
+                LineItem { len: 2, indent: 0, indent_segments: SmallVec::new(), wrapped_lines: smallvec::smallvec![0..2] },
+                LineItem { len: 4, indent: 0, indent_segments: SmallVec::new(), wrapped_lines: smallvec::smallvec![0..2, 2..4] },
+                LineItem { len: 1, indent: 0, indent_segments: SmallVec::new(), wrapped_lines: smallvec::smallvec![0..1] },
             ],
             &(),
         );
@@ -1514,11 +1710,13 @@ mod tests {
                 LineItem {
                     len: Rope::from("first line").len(),
                     indent: 0,
+                    indent_segments: SmallVec::new(),
                     wrapped_lines: smallvec::smallvec![0..10],
                 },
                 LineItem {
                     len: Rope::from("this one wraps").len(),
                     indent: 0,
+                    indent_segments: SmallVec::new(),
                     wrapped_lines: smallvec::smallvec![0..9, 9..14],
                 },
             ],
@@ -1563,24 +1761,28 @@ mod tests {
                 LineItem {
                     len: Rope::from("Hello, 世界!\r").len(),
                     indent: 0,
+                    indent_segments: SmallVec::new(),
                     wrapped_lines: smallvec::smallvec![0..15],
                 },
                 // range: 16..36
                 LineItem {
                     len: Rope::from("This is second line.\n").len(),
                     indent: 0,
+                    indent_segments: SmallVec::new(),
                     wrapped_lines: smallvec::smallvec![0..10, 10..20],
                 },
                 // range: 37..56
                 LineItem {
                     len: Rope::from("This is third line.\n").len(),
                     indent: 0,
+                    indent_segments: SmallVec::new(),
                     wrapped_lines: smallvec::smallvec![0..9, 9..15, 15..20],
                 },
                 // range: 57..79
                 LineItem {
                     len: Rope::from("这里是第 4 行。").len(),
                     indent: 0,
+                    indent_segments: SmallVec::new(),
                     wrapped_lines: smallvec::smallvec![0..22],
                 },
             ],

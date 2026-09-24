@@ -162,6 +162,13 @@ impl<M: InputModeKind> InputBaseState<M> {
                     // last glyph of the target row, so the caret stays on that row.
                     new_affinity = line_end_affinity;
                 }
+            } else if self.display_map.line(next_point.row).is_some_and(|line| !line.indent_segments.is_empty()) {
+                // A source line may contain several hard-break rows, including empty ones.
+                // Without glyphs, still clamp to the target visual row, never to the end
+                // of the entire source line or the interior of a concealed break token.
+                new_offset = self.display_map.display_row_column_to_offset(target_display_row, column);
+                new_offset = self.cursor_boundary(new_offset, Bias::Left);
+                new_affinity = self.display_map.offset_to_wrap_display_point(new_offset).row != target_wrap_row;
             } else {
                 // Not in visible range, use column directly.
                 let max_line_len = self.text.slice_line(next_point.row).len();

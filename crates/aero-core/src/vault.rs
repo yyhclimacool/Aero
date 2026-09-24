@@ -251,6 +251,7 @@ impl Vault {
 
     /// 原子创建新文件；目标存在（含符号链接）时失败，绝不覆盖已有冲突副本。
     pub fn create_bytes(&self, p: &VaultPath, bytes: &[u8]) -> Result<FileStamp, VaultError> {
+        self.validate_local_path(p)?;
         self.write_bytes_impl(p, bytes, false)
     }
 
@@ -649,6 +650,18 @@ mod tests {
         );
         assert_eq!(fs::read(outside.path().join("n.md")).unwrap(), b"outside");
         assert!(!outside.path().join("new.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_refuses_symbolic_attachment_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("note.assets")).unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let path = VaultPath::new("note.assets/diagram.svg").unwrap();
+        assert!(vault.create_bytes(&path, b"<svg/>").is_err());
+        assert!(!outside.path().join("diagram.svg").exists());
     }
 
     #[test]

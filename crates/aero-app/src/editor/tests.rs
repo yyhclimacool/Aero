@@ -54,6 +54,676 @@ fn open_with_images(
     (dir, cache, vault, editor)
 }
 
+#[gpui_kit::test]
+fn rich_mermaid_bypasses_code_presenter_but_other_fences_do_not(cx: &mut TestAppContext) {
+    let source = "```mermaid\ngraph LR\n  A[中文] --> B[预览]\n```\n\n```rust\nlet x = 1;\n```\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(
+            !e.presenters.contains_key(&super::presenter::Key::unit(e.units[0].id)),
+            "Mermaid must not be swallowed by the ordinary code presenter"
+        );
+        assert!(e.presenters.contains_key(&super::presenter::Key::unit(e.units[1].id)));
+    });
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.focused.as_ref().unwrap().textarea.read(cx).value().starts_with("```mermaid"));
+    });
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_bypasses_text_presenter_including_invalid_pages(cx: &mut TestAppContext) {
+    let source = "![[paper.pdf]]\n\n![[paper.pdf#page=0|400]]\n\nordinary **text**\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        for unit in &e.units[..2] {
+            assert!(
+                !e.presenters.contains_key(&super::presenter::Key::unit(unit.id)),
+                "PDF source and errors must not be swallowed by a text presenter"
+            );
+        }
+        assert!(e.presenters.contains_key(&super::presenter::Key::unit(e.units[2].id)));
+    });
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        assert_eq!(editor.read(cx).focused.as_ref().unwrap().textarea.read(cx).value(), "![[paper.pdf]]");
+    });
+    assert_eq!(text(&editor, cx), source);
+}
+
+fn rich_root(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+}
+
+#[gpui_kit::test]
+fn rich_selection_and_highlight_keep_images_and_following_text_still(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, px, size};
+    for source in [
+        "```mermaid\nflowchart LR\n A[开始] --> B[结束]\n```\n\n后续正文\n",
+        "![[paper.pdf|400]]\n\n后续正文\n",
+        "![[paper.pdf|400]] {.bg-blue}\n\n后续正文\n",
+    ] {
+        let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+        std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+        let handle = *cx.windows().last().unwrap();
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        rich_root(&editor, cx);
+        let (id, following) = cx.update(|_, cx| {
+            let e = editor.read(cx);
+            (e.units[0].id, e.units[1].id)
+        });
+        let following: &'static str = Box::leak(format!("unit-{}", following.0).into_boxed_str());
+        let image = if source.starts_with("```") { "mermaid-image" } else { "pdf-image" };
+        for width in [600., 900.] {
+            cx.simulate_resize(size(px(width), px(1200.)));
+            settle(cx);
+            let before = (cx.debug_bounds(image).unwrap(), cx.debug_bounds(following).unwrap());
+            cx.simulate_click(before.0.center(), Modifiers::default());
+            settle(cx);
+            assert_eq!(cx.debug_bounds(image).unwrap(), before.0, "selection: {source}, width {width}");
+            assert_eq!(cx.debug_bounds(following).unwrap(), before.1, "following text must not move");
+            cx.simulate_keystrokes("escape");
+            settle(cx);
+            assert_eq!(cx.debug_bounds(image).unwrap(), before.0);
+            cx.update(|_, cx| {
+                editor.update(cx, |e, cx| {
+                    e.highlight = Some(id);
+                    cx.notify();
+                })
+            });
+            settle(cx);
+            assert_eq!(cx.debug_bounds(image).unwrap(), before.0, "highlight: {source}, width {width}");
+            assert_eq!(cx.debug_bounds(following).unwrap(), before.1);
+            cx.update(|_, cx| {
+                editor.update(cx, |e, cx| {
+                    e.highlight = None;
+                    cx.notify();
+                })
+            });
+            settle(cx);
+        }
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn rich_long_errors_keep_retry_visible_and_clickable(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, px, size};
+    let source = "```mermaid\nthis is not a diagram\n```\n";
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    let id = cx.update(|_, cx| editor.read(cx).units[0].id);
+    let unit: &'static str = Box::leak(format!("unit-{}", id.0).into_boxed_str());
+    for width in [360., 640.] {
+        cx.simulate_resize(size(px(width), px(1200.)));
+        settle(cx);
+        let frame = cx.debug_bounds(unit).unwrap();
+        let error = cx.debug_bounds("mermaid-error").unwrap();
+        let retry = cx.debug_bounds("mermaid-retry").unwrap();
+        assert!(
+            error.left() >= frame.left() && error.right() <= frame.right(),
+            "error: {error:?}, frame: {frame:?}"
+        );
+        assert!(
+            retry.left() >= error.right() && retry.right() <= frame.right(),
+            "retry: {retry:?}, frame: {frame:?}"
+        );
+        assert!(retry.size.width > px(20.));
+        cx.simulate_click(retry.center(), Modifiers::default());
+        settle(cx);
+        assert!(cx.update(|_, cx| editor.read(cx).focused.is_none()), "retry must not edit the source");
+        assert!(cx.debug_bounds("mermaid-error").is_some());
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn rich_mermaid_fits_narrow_and_wide_windows(cx: &mut TestAppContext) {
+    use gpui_kit::{px, size};
+    let source = "```mermaid\ngraph LR\n A[开始] --> B[处理] --> C[检查] --> D[完成]\n```\n";
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(1200.), px(1000.)));
+    rich_root(&editor, cx);
+    let natural = cx.debug_bounds("mermaid-block").unwrap().size;
+    for width in [360., 640., 1200.] {
+        cx.simulate_resize(size(px(width), px(1000.)));
+        settle(cx);
+        assert_rich_image_fits(cx, "mermaid-block", "mermaid-image", natural);
+    }
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_fits_narrow_and_wide_windows_even_at_4096(cx: &mut TestAppContext) {
+    use gpui_kit::{px, size};
+    for requested in [680, 4096, 240] {
+        let source = format!("![[paper.pdf|{requested}]]\n");
+        let (dir, _cache, _vault, editor) = open_with_images(cx, &source);
+        std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+        let window = *cx.windows().last().unwrap();
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        rich_root(&editor, cx);
+        for width in [360., 640., 1200.] {
+            cx.simulate_resize(size(px(width), px(1000.)));
+            settle(cx);
+            assert!(cx.debug_bounds("pdf-block").is_some(), "PDF width {requested}, window {width}");
+            assert_rich_image_fits(
+                cx,
+                "pdf-block",
+                "pdf-image",
+                size(px(requested as f32), px(requested as f32 / 2.)),
+            );
+        }
+        assert_eq!(text(&editor, cx), source);
+        let next = cx.debug_bounds("pdf-next").unwrap();
+        cx.simulate_click(next.center(), gpui_kit::Modifiers::default());
+        settle(cx);
+        assert!(cx.debug_bounds("pdf-page-2-of-2").is_some(), "width {requested} still supports paging");
+        assert_eq!(text(&editor, cx), source.replace("paper.pdf|", "paper.pdf#page=2|"));
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+fn assert_rich_image_fits(
+    cx: &mut VisualTestContext,
+    block: &'static str,
+    image: &'static str,
+    natural: gpui_kit::Size<gpui_kit::Pixels>,
+) {
+    use gpui_kit::px;
+    let bounds = cx.debug_bounds(block).expect("rendered block");
+    let expected_height = bounds.size.width * (natural.height / natural.width);
+    assert!(
+        (f32::from(bounds.size.height - expected_height)).abs() < 1.,
+        "{block} must shrink proportionally, not clip: {bounds:?}, natural {natural:?}"
+    );
+    let image = cx.debug_bounds(image).expect("rendered image bounds");
+    assert_eq!(image, bounds, "the bitmap must follow its container without clipping");
+    assert!(bounds.size.width > px(0.) && bounds.size.width <= natural.width + px(1.));
+    let viewport = cx.update(|window, _| window.viewport_size());
+    assert!(bounds.left() >= px(0.) && bounds.right() <= viewport.width);
+    assert!(bounds.top() >= px(0.) && bounds.bottom() <= viewport.height);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_next_click_commits_other_text_and_has_separate_undo(cx: &mut TestAppContext) {
+    let source = "正文\n\n![[paper.pdf|240]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("新增");
+    settle(cx);
+    let before_page = text(&editor, cx);
+    let caret =
+        cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.read(cx).selected_range());
+    cx.simulate_keystrokes("left");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_ne!(e.focused.as_ref().unwrap().textarea.read(cx).selected_range(), caret);
+    });
+    cx.simulate_keystrokes("right");
+    assert_eq!(text(&editor, cx), before_page, "text arrows must not page");
+    let next = cx.debug_bounds("pdf-next").unwrap();
+    cx.simulate_click(next.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    let page_two = before_page.replace("paper.pdf|", "paper.pdf#page=2|");
+    assert_eq!(text(&editor, cx), page_two, "a direct button click must leave editing and turn the page");
+    assert!(cx.debug_bounds("pdf-page-2-of-2").is_some());
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.focused.is_none());
+        assert_eq!(e.selected_blocks(), Some(1..2));
+    });
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), before_page);
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), before_page, "first undo only reverts paging");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source, "second undo reverts the text edit");
+    cx.simulate_keystrokes("cmd-shift-z cmd-shift-z");
+    assert_eq!(text(&editor, cx), page_two);
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(0, 1, window, cx)));
+    cx.simulate_keystrokes("left right");
+    assert_eq!(text(&editor, cx), page_two, "multi-block selection must not page");
+}
+
+#[gpui_kit::test]
+fn rich_nested_mermaid_uses_read_only_preview(cx: &mut TestAppContext) {
+    for source in [
+        "> ```mermaid\n> graph LR\n> A --> B\n> ```\n",
+        "> [!note] Diagram\n> ```mermaid\n> graph LR\n> A --> B\n> ```\n",
+    ] {
+        let (_dir, _cache, _vault, editor) = open_with_images(cx, source);
+        let window = *cx.windows().last().unwrap();
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        rich_root(&editor, cx);
+        let diagram = cx.debug_bounds("mermaid-block").expect("nested Mermaid must render");
+        double_click(cx, diagram.center());
+        settle(cx);
+        assert!(cx.debug_bounds("mermaid-export-menu").is_none());
+        assert!(cx.update(|_, cx| editor.read(cx).focused.is_none()));
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn rich_inline_pdf_keeps_quote_and_callout_text_presenters(cx: &mut TestAppContext) {
+    use super::presenter::{Key, Part};
+    let source = "> 普通 **引用**\n\n> [!note] 普通\n> 正文\n\n> 文字与 PDF 同一段\n> ![[paper.pdf]]\n\n> [!note] 混排\n> 文字与 PDF 同一段\n> ![[paper.pdf]]\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        for unit in &e.units {
+            let part = if matches!(unit.kind, aero_core::BlockKind::Callout { .. }) {
+                Part::CalloutBody
+            } else {
+                Part::Unit
+            };
+            assert!(e.presenters.contains_key(&Key { id: unit.id, part }));
+        }
+    });
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_quote_uses_read_only_preview(cx: &mut TestAppContext) {
+    assert_nested_pdf_read_only(cx, "> ![[paper.pdf|240]]\n");
+}
+
+#[gpui_kit::test]
+fn rich_pdf_callout_uses_read_only_preview(cx: &mut TestAppContext) {
+    assert_nested_pdf_read_only(cx, "> [!note] PDF\n> ![[paper.pdf|240]]\n");
+}
+
+fn assert_nested_pdf_read_only(cx: &mut TestAppContext, source: &str) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    let page = cx.debug_bounds("pdf-block").expect("nested PDF must reach the preview renderer");
+    assert!(cx.debug_bounds("pdf-page-1-of-2").is_some());
+    assert!(cx.debug_bounds("pdf-prev").is_none());
+    assert!(cx.debug_bounds("pdf-next").is_none());
+    cx.simulate_click(page.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    cx.update(|_, cx| {
+        assert!(editor.read(cx).focused.is_none(), "clicking a nested PDF must not edit its parent");
+        assert!(editor.read(cx).selection.is_none());
+    });
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(0, 0, window, cx)));
+    cx.simulate_keystrokes("left right");
+    double_click(cx, page.center());
+    settle(cx);
+    assert_eq!(
+        cx.opened_url(),
+        Some(crate::paths::file_url(&dir.path().join("paper.pdf").canonicalize().unwrap()))
+    );
+    assert_eq!(text(&editor, cx), source);
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_hover_uses_target_note_assets_and_stays_read_only(cx: &mut TestAppContext) {
+    use gpui_kit::{Bounds, point, px};
+    let source = "见 [[b]]\n";
+    let target = "![[paper.pdf#page=2|240]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("b.md"), target).unwrap();
+    for note in ["a", "b"] {
+        std::fs::create_dir(dir.path().join(format!("{note}.assets"))).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{note}.assets/paper.pdf")),
+            if note == "a" { b"wrong PDF".to_vec() } else { crate::render::two_page_pdf() },
+        )
+        .unwrap();
+    }
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.install_test_resolver(&[("a.md", None), ("b.md", None)], cx);
+            e.hover_link(
+                &aero_core::links::encode_note_url("b", None).into(),
+                true,
+                Bounds::from_corners(point(px(100.), px(150.)), point(px(180.), px(175.))),
+                window,
+                cx,
+            );
+        })
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(500));
+    settle(cx);
+    assert!(cx.debug_bounds("link-preview-rich").is_some());
+    let page = cx.debug_bounds("pdf-block").expect("hover PDF must resolve b.assets, not a.assets");
+    assert!(cx.debug_bounds("pdf-page-2-of-2").is_some());
+    assert!(cx.debug_bounds("pdf-next").is_none());
+    assert!(cx.debug_bounds("pdf-prev").is_none());
+    cx.simulate_click(page.center(), gpui_kit::Modifiers::default());
+    cx.simulate_keystrokes("left right");
+    settle(cx);
+    cx.update(|_, cx| {
+        assert!(editor.read(cx).focused.is_none());
+        assert!(editor.read(cx).selection.is_none());
+    });
+    assert_eq!(cx.opened_url(), None, "single click only previews");
+    double_click(cx, page.center());
+    settle(cx);
+    assert_eq!(
+        cx.opened_url(),
+        Some(crate::paths::file_url(&dir.path().join("b.assets/paper.pdf").canonicalize().unwrap()))
+    );
+    assert_eq!(text(&editor, cx), source);
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+    assert_eq!(std::fs::read_to_string(dir.path().join("b.md")).unwrap(), target);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_paging_controls_keyboard_boundaries_and_undo(cx: &mut TestAppContext) {
+    let source = "![[paper.pdf|240]]\n\n后文\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    let page = cx.debug_bounds("pdf-block").expect("PDF must render its first page");
+    assert!((f32::from(page.size.width) - 240.).abs() < 1.);
+    assert!(cx.debug_bounds("pdf-page-1-of-2").is_some());
+    cx.simulate_click(page.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    assert!(cx.update(|_, cx| editor.read(cx).selection.is_some()));
+    assert!(cx.update(|_, cx| editor.read(cx).focused.is_none()));
+    cx.simulate_keystrokes("left");
+    assert_eq!(text(&editor, cx), source, "first-page left is a no-op");
+    let prev = cx.debug_bounds("pdf-prev").unwrap();
+    cx.simulate_click(prev.center(), gpui_kit::Modifiers::default());
+    assert_eq!(text(&editor, cx), source, "first-page button is disabled");
+    cx.simulate_keystrokes("right");
+    settle(cx);
+    let second = "![[paper.pdf#page=2|240]]\n\n后文\n";
+    assert_eq!(text(&editor, cx), second);
+    assert!(cx.debug_bounds("pdf-page-2-of-2").is_some());
+    cx.simulate_keystrokes("right");
+    assert_eq!(text(&editor, cx), second, "last-page right is a no-op");
+    let next = cx.debug_bounds("pdf-next").unwrap();
+    cx.simulate_click(next.center(), gpui_kit::Modifiers::default());
+    assert_eq!(text(&editor, cx), second, "last-page button is disabled");
+    cx.simulate_keystrokes("cmd-z");
+    settle(cx);
+    assert_eq!(text(&editor, cx), source, "paging is one independent undo group");
+    cx.simulate_keystrokes("cmd-shift-z");
+    settle(cx);
+    assert_eq!(text(&editor, cx), second);
+    let prev = cx.debug_bounds("pdf-prev").unwrap();
+    cx.simulate_click(prev.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    assert_eq!(text(&editor, cx), "![[paper.pdf#page=1|240]]\n\n后文\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), second);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_opens_only_resolved_file_and_source_editing_stays_source(cx: &mut TestAppContext) {
+    let source = "![[paper.pdf#page=2|240]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    let page = cx.debug_bounds("pdf-block").unwrap();
+    cx.simulate_click(page.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    cx.simulate_keystrokes("cmd-enter");
+    settle(cx);
+    assert_eq!(
+        cx.opened_url(),
+        Some(crate::paths::file_url(&dir.path().join("paper.pdf").canonicalize().unwrap()))
+    );
+    double_click(cx, page.center());
+    settle(cx);
+    assert!(cx.update(|_, cx| editor.read(cx).focused.is_none()));
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    assert!(cx.debug_bounds("pdf-block").is_none(), "source mode does not render pages");
+    assert!(cx.debug_bounds("pdf-next").is_none());
+    cx.update(|_, cx| {
+        assert_eq!(editor.read(cx).focused.as_ref().unwrap().textarea.read(cx).value(), source.trim());
+    });
+    cx.simulate_keystrokes("left right");
+    assert_eq!(text(&editor, cx), source, "caret keys never page while editing");
+}
+
+#[gpui_kit::test]
+fn rich_pdf_errors_keep_source_and_retry_recovers_missing_and_corrupt_files(cx: &mut TestAppContext) {
+    let source = "![[paper.pdf]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    for bytes in [b"broken PDF".to_vec(), crate::render::two_page_pdf()] {
+        assert!(cx.debug_bounds("pdf-source").is_some());
+        assert!(cx.debug_bounds("pdf-error").is_some());
+        let retry = cx.debug_bounds("pdf-retry").expect("all PDF errors offer retry");
+        std::fs::write(dir.path().join("paper.pdf"), bytes).unwrap();
+        cx.simulate_click(retry.center(), gpui_kit::Modifiers::default());
+        settle(cx);
+    }
+    assert!(cx.debug_bounds("pdf-block").is_some());
+    assert!(cx.debug_bounds("pdf-error").is_none());
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_invalid_page_and_external_targets_never_open_urls(cx: &mut TestAppContext) {
+    let source = "![[https://example.com/paper.pdf#page=0]]\n";
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    assert!(cx.debug_bounds("pdf-source").is_some());
+    assert!(cx.debug_bounds("pdf-error").is_some());
+    assert!(cx.debug_bounds("pdf-retry").is_some());
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(0, 0, window, cx)));
+    cx.simulate_keystrokes("left right cmd-enter");
+    settle(cx);
+    assert_eq!(cx.opened_url(), None);
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn rich_mermaid_source_preview_is_debounced_and_stale_input_is_cancelled(cx: &mut TestAppContext) {
+    let source = "```mermaid\ngraph LR\n A[中文] --> B[预览]\n```\n";
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    assert!(cx.debug_bounds("mermaid-block").is_some());
+    focus_unit(&editor, 0, cx);
+    settle(cx);
+    assert!(cx.debug_bounds("mermaid-live-preview").is_some());
+    select_inline_text(&editor, "graph LR\n A[中文] --> B[预览]", cx);
+    cx.simulate_input("not a diagram");
+    settle(cx);
+    assert!(cx.debug_bounds("mermaid-block").is_some(), "typing keeps the previous bitmap");
+    assert!(cx.debug_bounds("mermaid-error").is_none());
+    cx.executor().advance_clock(Duration::from_millis(299));
+    settle(cx);
+    assert!(cx.debug_bounds("mermaid-error").is_none(), "no heavy render before 300 ms");
+    select_inline_text(&editor, "not a diagram", cx);
+    cx.simulate_input("graph TD\n C --> D");
+    cx.executor().advance_clock(Duration::from_millis(1));
+    settle(cx);
+    assert!(cx.debug_bounds("mermaid-error").is_none(), "old timer must not publish stale source");
+    cx.executor().advance_clock(Duration::from_millis(299));
+    settle(cx);
+    assert!(cx.debug_bounds("mermaid-block").is_some());
+    select_inline_text(&editor, "graph TD\n C --> D", cx);
+    cx.simulate_input("not a diagram");
+    cx.executor().advance_clock(Duration::from_millis(300));
+    settle(cx);
+    assert!(cx.debug_bounds("mermaid-error").is_some(), "current invalid source eventually renders an error");
+    assert!(cx.debug_bounds("mermaid-retry").is_some());
+}
+
+#[gpui_kit::test]
+fn rich_mermaid_export_requires_choice_preserves_source_and_never_overwrites(cx: &mut TestAppContext) {
+    let source = "```mermaid\ngraph LR\n A[中文] --> B[完成]\n```\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    let diagram = cx.debug_bounds("mermaid-block").unwrap();
+    cx.simulate_click(diagram.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    assert!(cx.update(|_, cx| editor.read(cx).selection.is_some()));
+    assert!(cx.update(|_, cx| editor.read(cx).focused.is_none()));
+    double_click(cx, diagram.center());
+    settle(cx);
+    assert!(cx.debug_bounds("mermaid-export-menu").is_some());
+    assert!(!dir.path().join("a.assets").exists(), "double click alone must not export");
+    let mut png_files = Vec::new();
+    for selector in ["mermaid-export-png", "mermaid-export-png", "mermaid-export-svg"] {
+        let choice = cx.debug_bounds(selector).unwrap();
+        cx.simulate_click(choice.center(), gpui_kit::Modifiers::default());
+        settle(cx);
+        assert_eq!(text(&editor, cx), source);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+        assert!(cx.debug_bounds("mermaid-export-result").is_some(), "show the exported path");
+        let entries = std::fs::read_dir(dir.path().join("a.assets")).unwrap();
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.extension().unwrap() == "png" && !png_files.iter().any(|(p, _)| p == &path) {
+                let bytes = std::fs::read(&path).unwrap();
+                image::load_from_memory(&bytes).unwrap();
+                png_files.push((path, bytes));
+            }
+        }
+        let diagram = cx.debug_bounds("mermaid-block").unwrap();
+        double_click(cx, diagram.center());
+        settle(cx);
+    }
+    assert_eq!(png_files.len(), 2, "second export allocates a distinct filename");
+    for (path, bytes) in png_files {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(std::fs::read_dir(dir.path().join("a.assets")).unwrap().count(), 3);
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source, "export adds no document undo entry");
+}
+
+#[gpui_kit::test]
+fn rich_mermaid_export_blocks_leaving_until_disk_write_finishes(cx: &mut TestAppContext) {
+    let source = "```mermaid\ngraph LR\n A --> B\n```\n";
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    let diagram = cx.debug_bounds("mermaid-block").unwrap();
+    double_click(cx, diagram.center());
+    settle(cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.export_diagram(e.units[0].id, false, window, cx);
+            assert!(e.flush_sync().is_err(), "cannot rename or close a vault while exporting");
+        })
+    });
+    settle(cx);
+    assert!(cx.update(|_, cx| editor.update(cx, |e, _| e.flush_sync().is_ok())));
+}
+
+#[gpui_kit::test]
+fn rich_mermaid_export_cancelled_by_rename_does_not_write_to_either_note(cx: &mut TestAppContext) {
+    let source = "```mermaid\ngraph LR\n A --> B\n```\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    let diagram = cx.debug_bounds("mermaid-block").unwrap();
+    double_click(cx, diagram.center());
+    settle(cx);
+    assert!(cx.debug_bounds("mermaid-export-svg").is_some());
+    // simulate_click drains the executor; start and rename in the same update to keep export pending.
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.export_diagram(e.units[0].id, false, window, cx);
+            e.set_path(VaultPath::new("renamed.md").unwrap(), cx);
+        })
+    });
+    settle(cx);
+    assert!(!dir.path().join("a.assets").exists());
+    assert!(!dir.path().join("renamed.assets").exists());
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_nested_note_preview_is_read_only_and_resolves_its_own_assets(cx: &mut TestAppContext) {
+    let source = "![[b]]\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("b.md"), "![[paper.pdf#page=2|240]]\n").unwrap();
+    for note in ["a", "b"] {
+        std::fs::create_dir(dir.path().join(format!("{note}.assets"))).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{note}.assets/paper.pdf")),
+            if note == "a" { b"wrong PDF".to_vec() } else { crate::render::two_page_pdf() },
+        )
+        .unwrap();
+    }
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| e.install_test_resolver(&[("a.md", None), ("b.md", None)], cx))
+    });
+    rich_root(&editor, cx);
+    settle(cx);
+    let page = cx.debug_bounds("pdf-block").expect("embedded PDF resolves b.assets, not a.assets");
+    assert!(cx.debug_bounds("pdf-page-2-of-2").is_some());
+    assert!(cx.debug_bounds("pdf-next").is_none());
+    assert!(cx.debug_bounds("pdf-prev").is_none());
+    cx.simulate_click(page.center(), gpui_kit::Modifiers::default());
+    cx.simulate_keystrokes("left right");
+    settle(cx);
+    assert_eq!(text(&editor, cx), source);
+    double_click(cx, page.center());
+    settle(cx);
+    assert_eq!(
+        cx.opened_url(),
+        Some(crate::paths::file_url(&dir.path().join("b.assets/paper.pdf").canonicalize().unwrap()))
+    );
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn rich_pdf_page_edit_preserves_raw_target_width_and_separate_undo(cx: &mut TestAppContext) {
+    let source = "![[ paper\\#v1.pdf #page=1 | 240 ]]\r\n\r\n正文\r\n";
+    let (dir, _cache, _vault, editor) = open_with_images(cx, source);
+    std::fs::write(dir.path().join("paper#v1.pdf"), crate::render::two_page_pdf()).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    focus_unit(&editor, 1, cx);
+    cx.simulate_input("新增");
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    let before_page = text(&editor, cx);
+    let page = cx.debug_bounds("pdf-block").unwrap();
+    cx.simulate_click(page.center(), gpui_kit::Modifiers::default());
+    cx.simulate_keystrokes("right");
+    settle(cx);
+    assert_eq!(text(&editor, cx), before_page.replace("#page=1", "#page=2"));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), before_page);
+    cx.simulate_keystrokes("cmd-z");
+    // Document uses LF internally; save restores the original file's CRLF.
+    assert_eq!(text(&editor, cx), source.replace("\r\n", "\n"));
+}
+
 /// 纯色 PNG，宽高可控。
 fn image_bytes(width: u32, height: u32) -> Vec<u8> {
     let image = image::RgbaImage::from_pixel(width, height, image::Rgba([20, 40, 60, 255]));
@@ -984,10 +1654,21 @@ fn highlight_table_preserves_hard_breaks_and_empty_rows(cx: &mut TestAppContext)
     assert_eq!(quads.len(), 2);
     assert_eq!(quads[0].bounds.right(), quads[1].bounds.right());
     assert!(quads[1].bounds.top() >= quads[0].bounds.bottom() + quads[0].bounds.size.height);
-    let empty_row = cx.debug_bounds("highlight-cell-1-0").unwrap();
-    let body = cx.debug_bounds("highlight-cell-2-1").unwrap();
+    let empty_row = cx.debug_bounds("table-cell-1-0").unwrap();
+    let body = cx.debug_bounds("table-cell-2-1").unwrap();
     assert!(empty_row.size.height > gpui_kit::px(0.));
     assert!(body.top() >= empty_row.bottom());
+    cx.simulate_click(body.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    assert_eq!(cx.debug_bounds("table-cell-2-1").unwrap(), body);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let focused = e.focused.as_ref().unwrap();
+        assert!(matches!(
+            e.presenter_key_of(&focused.textarea).unwrap().part,
+            super::presenter::Part::Cell(2, 1)
+        ));
+    });
     assert_eq!(text(&editor, cx), source);
 }
 

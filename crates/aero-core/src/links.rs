@@ -513,7 +513,7 @@ fn anchor(src: &str, cand: Range<usize>) -> Option<Range<usize>> {
 
 /// 按第一个 `|` 切出别名。`\|` 同样算分隔符（表格单元格里必须这样写，Obsidian 同），
 /// 切出来的 target 不带那个反斜杠。
-fn split_alias(s: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_alias(s: &str) -> (&str, Option<&str>) {
     match s.find('|') {
         Some(i) => {
             let head = s[..i].strip_suffix('\\').unwrap_or(&s[..i]);
@@ -524,7 +524,7 @@ fn split_alias(s: &str) -> (&str, Option<&str>) {
 }
 
 /// 按未转义的 `sep` 切分（`\` 转义的 `sep` 不算分隔符）。
-fn split_unescaped(s: &str, sep: char) -> (&str, Option<&str>) {
+pub(crate) fn split_unescaped(s: &str, sep: char) -> (&str, Option<&str>) {
     let bytes = s.as_bytes();
     let mut backslashes = 0usize;
     for (i, &b) in bytes.iter().enumerate() {

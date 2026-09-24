@@ -236,10 +236,11 @@ impl DisplayMap {
     pub(crate) fn set_conceal(
         &mut self,
         conceal: Vec<Range<usize>>,
+        hard_breaks: Vec<Range<usize>>,
         fonts: Vec<(Range<usize>, super::FontOverride)>,
         cx: &mut App,
     ) {
-        self.wrap_map.set_conceal(conceal, fonts, cx);
+        self.wrap_map.set_conceal(conceal, hard_breaks, fonts, cx);
         self.rebuild_fold_projection();
     }
 

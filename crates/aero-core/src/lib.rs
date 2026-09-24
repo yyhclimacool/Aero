@@ -28,6 +28,7 @@ mod markdown_links;
 pub mod markup;
 pub mod parse;
 pub mod rename;
+pub mod rich_content;
 pub mod tags;
 pub mod text;
 pub mod vault;

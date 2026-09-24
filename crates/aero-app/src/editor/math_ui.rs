@@ -23,7 +23,7 @@ impl super::Editor {
         let scale = self.scale;
         let state = service.update(cx, |service, cx| service.math(&latex, true, em, scale, foreground, cx));
         match state {
-            State::Ready { image, pixels } => {
+            State::Ready { image, pixels, .. } => {
                 let (width, height) = (pixels.width as f32 / scale, pixels.height as f32 / scale);
                 // 比正文列宽的公式横向滚动，不缩小、也不把滚轮交给文档
                 div()
@@ -260,7 +260,7 @@ fn inline_text(id: SharedString, text: &str, style: TextViewStyle) -> AnyElement
 fn inline_math_part(ix: usize, latex: &str, state: State, scale: f32, em: f32, cx: &App) -> AnyElement {
     let selector = move || format!("math-inline-{ix}");
     match state {
-        State::Ready { image, pixels } => {
+        State::Ready { image, pixels, .. } => {
             let (width, height) = (pixels.width as f32 / scale, pixels.height as f32 / scale);
             div()
                 .flex_none()

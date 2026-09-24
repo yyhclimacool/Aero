@@ -26,6 +26,7 @@ pub enum Mark {
 
 pub struct Analysis {
     pub conceal: Vec<Range<usize>>,
+    pub hard_breaks: Vec<Range<usize>>,
     pub styles: Vec<(Range<usize>, Mark)>,
     /// 链接文字的区间与地址。笔记链接的地址是 [`crate::links::encode_note_url`] 的结果。
     pub links: Vec<(Range<usize>, String)>,
@@ -39,7 +40,15 @@ impl Analysis {
 
     /// 源码去掉隐藏字节后显示出来的文字。
     pub fn visible_text(&self, src: &str) -> String {
-        src.char_indices().filter(|(i, _)| !self.conceals(*i)).map(|(_, c)| c).collect()
+        src.char_indices()
+            .filter_map(|(i, c)| {
+                if self.hard_breaks.iter().any(|range| range.start == i) {
+                    Some('\n')
+                } else {
+                    (!self.conceals(i)).then_some(c)
+                }
+            })
+            .collect()
     }
 
     /// 成对标记包住的正文区间（加粗、链接文字等）。删字删到只剩标记时要连标记一起删。
@@ -58,7 +67,8 @@ pub fn analyze_editing(src: &str, selection: Option<Range<usize>>) -> Analysis {
     let root = parse_document(&arena, src, &parse::comrak_options());
     let positions = SourceMap::new(src);
     let wikilinks = crate::links::scan(src);
-    let mut out = Analysis { conceal: Vec::new(), styles: Vec::new(), links: Vec::new() };
+    let mut out =
+        Analysis { conceal: Vec::new(), hard_breaks: Vec::new(), styles: Vec::new(), links: Vec::new() };
     let mut code = Vec::new();
 
     for node in root.descendants() {
@@ -120,6 +130,17 @@ fn mark_node(
         NodeValue::WikiLink(_) => mark_wikilink(range, text, wikilinks, out),
         NodeValue::Link(link) => mark_link(range, text, &link.url, selection, out),
         NodeValue::Image(link) => mark_link(range, text, &link.url, selection, out),
+        NodeValue::HtmlInline(_) | NodeValue::HtmlBlock(_) => {
+            let tag = text.trim();
+            if tag.strip_prefix('<').and_then(|s| s.strip_suffix('>')).is_some_and(|name| {
+                name.trim_end().strip_suffix('/').unwrap_or(name).trim_end().eq_ignore_ascii_case("br")
+            }) {
+                let start = range.start + text.len() - text.trim_start().len();
+                let range = start..start + tag.len();
+                out.conceal.push(range.clone());
+                out.hard_breaks.push(range);
+            }
+        }
         _ => {}
     }
 }
@@ -376,6 +397,19 @@ mod tests {
             ),
             "第一段有 加粗文字、斜体、行内代码、删除线、高亮，以及 双链别名 和 外部链接，还有 红色文字 这种颜色。"
         );
+    }
+
+    #[test]
+    fn html_breaks_are_displayed_as_newlines_without_exposing_tags() {
+        let source = "**第一行<br>第二行**<BR/><br />末行";
+        assert_eq!(hidden(source), "第一行\n第二行\n\n末行");
+        assert_eq!(hidden("<br>末行<br>"), "\n末行\n");
+        assert_eq!(hidden("1. **标题**<br>    <br>2. **标题**"), "1. 标题\n    \n2. 标题");
+    }
+
+    #[test]
+    fn break_like_literals_do_not_turn_into_newlines() {
+        assert_eq!(hidden("`<br>` 与 \\<br> 与 <bracket>"), "<br> 与 <br> 与 <bracket>");
     }
 
     #[test]

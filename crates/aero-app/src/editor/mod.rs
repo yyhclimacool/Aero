@@ -28,6 +28,7 @@ mod pairs;
 mod pairs_ui;
 mod presenter;
 mod preview;
+mod rich_ui;
 mod slash;
 mod table;
 mod tags;
@@ -249,6 +250,7 @@ pub struct Editor {
     /// 重内容渲染服务（9.9）；没连上时图片按源码显示
     images: Option<Entity<crate::render::RenderService>>,
     images_subscription: Option<Subscription>,
+    rich: rich_ui::RichUi,
     /// 全屏看图：双击图片打开，`Space` / `Esc` / 点击关闭
     viewer: Option<ImageViewer>,
     /// 上一帧的 HiDPI 倍率：图片 / 公式按它算设备像素（渲染块时拿不到 `Window`）
@@ -352,6 +354,7 @@ impl Editor {
             embeds: embeds_ui::Embeds::default(),
             images: None,
             images_subscription: None,
+            rich: Default::default(),
             viewer: None,
             scale: 1.,
             focused: None,
@@ -452,6 +455,7 @@ impl Editor {
     pub fn set_path(&mut self, path: VaultPath, cx: &mut Context<Self>) {
         self.wiki = None;
         self.tag_menu = None;
+        self.rich.cancel_export();
         let old_path = std::mem::replace(&mut self.path, path);
         self.repath_link_preview(&old_path, cx);
         cx.emit(EditorEvent::Changed);
@@ -880,7 +884,7 @@ impl Editor {
         // 表格和 callout 按格子 / 标题与正文分别编辑，键盘进来时落到光标所在的那一格
         if self.hides_markers(cx) && !self.block_shows_source(unit_id) {
             match kind {
-                BlockKind::CodeFence { .. } => {
+                BlockKind::CodeFence { .. } if aero_core::rich_content::mermaid_source(&text).is_none() => {
                     if let Some(inner) = presenter::fence_body(&text) {
                         let local = cursor.clamp(inner.start, inner.end) - inner.start;
                         let abs = range.start + inner.start..range.start + inner.end;
@@ -1089,6 +1093,7 @@ impl Editor {
             _subscription: subscription,
             _cursor_subscription: cursor_subscription,
         });
+        self.sync_diagram_preview(true, cx);
         self.refresh_markup(cx);
         cx.notify();
     }
@@ -1155,7 +1160,7 @@ impl Editor {
             return false;
         }
         let text = self.doc.slice(self.doc.content_range(block)).to_string();
-        !preview::is_image_embed(text.trim())
+        !preview::is_image_embed(text.trim()) && aero_core::rich_content::pdf_embed(&text).is_none()
     }
 
     fn refresh_markup(&mut self, cx: &mut Context<Self>) {
@@ -1188,8 +1193,14 @@ impl Editor {
         }
         let text = ta.value().to_string();
         let caret = selection.start;
-        let conceal = aero_core::markup::analyze_editing(&text, Some(selection)).conceal;
-        let target = text_ops::settle_caret(&conceal, &text, caret);
+        let analysis = aero_core::markup::analyze_editing(&text, Some(selection));
+        let conceal: Vec<_> =
+            analysis.conceal.iter().filter(|range| !analysis.hard_breaks.contains(range)).cloned().collect();
+        let target = analysis
+            .hard_breaks
+            .iter()
+            .find(|range| range.start < caret && caret < range.end)
+            .map_or_else(|| text_ops::settle_caret(&conceal, &text, caret), |range| range.end);
         if target == caret {
             return false;
         }
@@ -1227,6 +1238,7 @@ impl Editor {
         self.wiki = None;
         self.tag_menu = None;
         self.table_frozen = None;
+        self.rich.clear_preview();
         if self.focused.take().is_some() {
             self.last_edit_at = None;
             self.save_now(cx);
@@ -1708,6 +1720,8 @@ impl Editor {
                 .map(|ix| self.units[ix].id);
         }
         self.clamp_selection();
+        self.rich.export_menu = None;
+        self.sync_diagram_preview(false, cx);
         self.dirty = true;
         self.save_state = SaveState::Dirty;
         self.schedule_save(cx);
@@ -1865,7 +1879,23 @@ impl Editor {
         let text = ta.value().to_string();
         let analysis = aero_core::markup::analyze_editing(&text, Some(selection.clone()));
         let spans: Vec<Range<usize>> = analysis.spans().cloned().collect();
-        let plan = if forward {
+        let hidden_between = |start: usize, end: usize| {
+            text[start..end].char_indices().all(|(offset, _)| analysis.conceals(start + offset))
+        };
+        let line_break = if forward {
+            analysis.hard_breaks.iter().find(|range| {
+                selection.start < range.end
+                    && (range.start <= selection.start || hidden_between(selection.start, range.start))
+            })
+        } else {
+            analysis.hard_breaks.iter().rev().find(|range| {
+                range.start < selection.start
+                    && (selection.start <= range.end || hidden_between(range.end, selection.start))
+            })
+        };
+        let plan = if let Some(range) = line_break {
+            Deletion::Range { range: range.clone(), caret: range.start }
+        } else if forward {
             plan_delete(&text, &analysis.conceal, &spans, selection.start)
         } else {
             plan_backspace(&text, &analysis.conceal, &spans, selection.start)
@@ -2229,9 +2259,19 @@ impl Editor {
         .detach();
     }
 
+    pub fn has_pending_export(&self) -> bool {
+        self.rich.export_in_progress()
+    }
+
     /// 同步落盘（切换笔记、退出前）。有外部修改时同样先留冲突副本，返回其路径。
     /// 文件已在外部被删时不写回（与 [`Self::save_now`] 一致），未保存内容随编辑器丢弃。
     pub fn flush_sync(&mut self) -> Result<Option<VaultPath>, VaultError> {
+        if self.has_pending_export() {
+            return Err(VaultError::Io {
+                path: self.vault.fs_path(&self.path),
+                source: std::io::Error::other("正在导出图表，请完成后再试"),
+            });
+        }
         if !self.dirty || self.is_deleted() {
             return Ok(None);
         }
@@ -3316,6 +3356,13 @@ impl Editor {
                     .child(textarea)
                     .child(self.render_math_block(&source, cx))
                     .into_any_element()
+            } else if aero_core::rich_content::mermaid_source(&full).is_some() {
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(textarea)
+                    .child(self.render_diagram_preview(b.id, cx))
+                    .into_any_element()
             } else {
                 textarea.into_any_element()
             };
@@ -3338,6 +3385,12 @@ impl Editor {
         });
 
         let body: AnyElement = match &b.kind {
+            BlockKind::CodeFence { .. } if aero_core::rich_content::mermaid_source(&text).is_some() => {
+                self.render_diagram(&text, id, true, cx)
+            }
+            BlockKind::Paragraph if aero_core::rich_content::pdf_embed(&text).is_some() => {
+                self.render_pdf(&text, id, Some(&self.path), true, cx)
+            }
             BlockKind::ThematicBreak => div().w_full().h(px(1.)).my_3().bg(theme.border).into_any_element(),
             BlockKind::MathBlock => self.render_math_block(&text, cx),
             BlockKind::FrontMatter | BlockKind::HtmlBlock | BlockKind::Raw => div()
@@ -3404,8 +3457,13 @@ impl Editor {
         let theme = cx.theme();
         let highlighted = self.highlight == Some(id);
         let selected = self.is_selected_block(id);
-        let transient = highlighted || selected;
-        let (accent, selection) = (theme.accent, theme.selection);
+        let background = if highlighted {
+            Some(theme.accent)
+        } else if selected {
+            Some(theme.selection)
+        } else {
+            paint.background
+        };
         // 定位中的块：多套一层拿子元素布局（`on_children_prepainted` 只在无状态 div 上有）
         let body: AnyElement = if self.reveal == Some(id) {
             div().w_full().on_children_prepainted(self.reveal_listener(id, cx)).child(body).into_any_element()
@@ -3426,16 +3484,25 @@ impl Editor {
         div()
             .id(("unit", id.0))
             .debug_selector(|| format!("unit-{}", id.0))
+            .relative()
             .w_full()
             .min_h(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT))
             .when(is_heading, |el| el.pt_2())
             .cursor_text()
-            // 定位高亮与块选中是临时状态，背景压过块颜色；块的文字色照常
-            .map(|el| {
-                Self::painted(el, Paint { background: paint.background.filter(|_| !transient), ..paint })
+            .when_some(paint.text, |el, color| el.text_color(color))
+            // 背景向两侧延伸，但不能用 padding 挤窄自适应内容。
+            .when_some(background, |el, color| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(-8.))
+                        .right(px(-8.))
+                        .rounded(px(6.))
+                        .bg(color),
+                )
             })
-            .when(highlighted, |el| el.bg(accent).rounded(px(6.)).mx(px(-8.)).px(px(8.)))
-            .when(selected && !highlighted, |el| Self::selected_style(el, selection))
             .child(body)
     }
 
@@ -3540,6 +3607,7 @@ impl Render for Editor {
         self.validate_link_preview_scroll(cx);
         self.refresh_fragment_marks();
         self.sync_presenters(window, cx);
+        self.sync_diagram_preview(false, cx);
         self.scale = window.scale_factor();
         let (foreground, muted) = (cx.theme().foreground, cx.theme().muted_foreground);
         let roots = self.doc.blocks().roots.clone();
@@ -3577,6 +3645,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_extend_up))
             .on_action(cx.listener(Self::on_extend_down))
             .on_action(cx.listener(Self::on_edit_selected))
+            .on_action(cx.listener(Self::on_pdf_previous))
+            .on_action(cx.listener(Self::on_pdf_next))
+            .on_action(cx.listener(Self::on_open_pdf))
             .on_action(cx.listener(Self::on_delete_selected))
             .on_action(cx.listener(Self::on_copy_selected))
             .on_action(cx.listener(Self::on_cut_selected))

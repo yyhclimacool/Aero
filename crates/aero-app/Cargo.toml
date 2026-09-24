@@ -37,6 +37,11 @@ ratex-layout = "0.1.14"
 ratex-types = "0.1.14"
 # embed-fonts：内嵌 KaTeX 字体，运行时不依赖 font_dir，打进 .app 即可用
 ratex-render = { version = "0.1.14", features = ["embed-fonts"] }
+# Mermaid 排版使用宿主 GPUI 文本测量，光栅化复用上面的 resvg。
+merman = { version = "=0.7.0", default-features = false, features = ["render"] }
+merman-render = { version = "=0.7.0", default-features = false }
+# 原生 PDF 页面渲染，无浏览器或外部进程。
+hayro = "=0.7.1"
 # 索引被图形界面锁住时，CLI 把全文索引复制到临时目录再打开，进程结束时删掉
 tempfile = "3"
 

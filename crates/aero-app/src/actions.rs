@@ -130,6 +130,10 @@ actions!(
         ExtendBlockDown,
         /// ⏎：编辑选中的块（光标在块末）
         EditSelectedBlock,
+        /// PDF 块选中时左右翻页，⌘⏎ 在系统阅读器打开。
+        PdfPreviousPage,
+        PdfNextPage,
+        OpenPdf,
         /// ⌫ / ⌦：删除选中的块（可撤销）
         DeleteSelectedBlocks,
         /// ⌘C / ⌘X：把选中的块作为 Markdown 源码复制 / 剪切
@@ -371,6 +375,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("shift-up", ExtendBlockUp, Some("Editor")),
         KeyBinding::new("shift-down", ExtendBlockDown, Some("Editor")),
         KeyBinding::new("enter", EditSelectedBlock, Some("Editor")),
+        KeyBinding::new("left", PdfPreviousPage, Some("Editor")),
+        KeyBinding::new("right", PdfNextPage, Some("Editor")),
+        KeyBinding::new("cmd-enter", OpenPdf, Some("Editor")),
         KeyBinding::new("backspace", DeleteSelectedBlocks, Some("Editor")),
         KeyBinding::new("delete", DeleteSelectedBlocks, Some("Editor")),
         KeyBinding::new("cmd-c", CopySelectedBlocks, Some("Editor")),

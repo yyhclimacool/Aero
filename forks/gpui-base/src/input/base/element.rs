@@ -683,7 +683,7 @@ impl<M: InputModeKind> TextElement<M> {
 
                 // wrapped lines
                 for i in 1..=wrapped_lines {
-                    let indent = line.wrap_indent;
+                    let indent = line.line_indent((start.y / line_height) as usize + i);
                     let start = point(indent, start.y + i as f32 * line_height);
                     let mut end = point(end.x, end.y + i as f32 * line_height);
                     if i < wrapped_lines {
@@ -1429,7 +1429,16 @@ impl<M: InputModeKind> TextElement<M> {
             cursor += n;
         }
 
-        let map = (display.len() != segment.len()).then(|| ConcealMap::new(to_display, to_buffer));
+        let hard_break = markup.hard_breaks.iter().find(|range| range.start >= abs_start && range.end == abs_end);
+        if display.is_empty() {
+            if let Some(range) = hard_break {
+                // An empty visual row still has its own editable source position,
+                // immediately before its newline (not after a concealed prefix).
+                to_buffer[0] = range.start - abs_start;
+            }
+        }
+        let map = (display.len() != segment.len())
+            .then(|| ConcealMap::new(to_display, to_buffer).with_hard_break(hard_break.is_some()));
         let text: SharedString = display.into();
         let shaped_runs = if text.is_empty() {
             vec![TextRun {
@@ -1603,9 +1612,29 @@ impl<M: InputModeKind> TextElement<M> {
                 px(0.)
             };
 
+            let mut wrap_indents = Vec::new();
+            if !line_item.indent_segments.is_empty() {
+                wrap_indents.resize(wrapped_lines.len(), px(0.));
+                for (group, &(first, indent)) in line_item.indent_segments.iter().enumerate() {
+                    if indent == 0 {
+                        continue;
+                    }
+                    let start = line_item.wrapped_lines[first].start;
+                    let indent_bytes = line_text[start..].char_indices().nth(indent as usize)
+                        .map(|(ix, _)| ix).unwrap_or(line_text.len() - start);
+                    let display = conceal_maps[first].as_ref()
+                        .map(|map| map.to_display(indent_bytes)).unwrap_or(indent_bytes);
+                    let width = wrapped_lines[first].x_for_index(display);
+                    let end = line_item.indent_segments.get(group + 1)
+                        .map(|&(row, _)| row).unwrap_or(wrapped_lines.len());
+                    wrap_indents[first + 1..end].fill(width);
+                }
+            }
+
             let line_layout = LineLayout::new()
                 .lines(wrapped_lines)
                 .wrap_indent(wrap_indent)
+                .with_wrap_indents(wrap_indents)
                 .with_background(line_has_background)
                 .with_whitespaces(whitespace_indicators.clone())
                 .with_conceal(conceal_maps);

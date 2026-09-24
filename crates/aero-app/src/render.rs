@@ -11,8 +11,8 @@
 //! 首帧用上次已知的像素尺寸占位，渲染完成后替换，列表不抖动。渲染失败不写文件、不碰笔记，
 //! 块元素显示源码 + 一行错误 + 重试。磁盘缓存是可删除的缓存，删掉只会重新渲染。
 //!
-//! 具体格式藏在 [`Renderer`] 后面：之后的数学（RaTeX）、图表（merman）、PDF（hayro）各加一个
-//! [`Kind`] 与实现即可，缓存、占位、失败回退与取消都不用再写一遍。
+//! 图片与数学使用 [`Renderer`]；图表（merman）与 PDF（hayro）封装在 `rich` 中，
+//! 共用请求、缓存、占位、失败回退与取消流程。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,11 +23,19 @@ use gpui_kit::*;
 use image::imageops::FilterType;
 use image::{Frame, RgbaImage};
 
+#[path = "rich_render.rs"]
+mod rich;
+pub use rich::export_diagram;
+#[cfg(test)]
+pub(crate) use rich::two_page_pdf;
+
 /// 渲染种类：决定用哪个渲染器，也决定磁盘缓存的子目录。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Kind {
     Image,
     Math,
+    Diagram,
+    Pdf,
 }
 
 impl Kind {
@@ -35,6 +43,8 @@ impl Kind {
         match self {
             Kind::Image => "images",
             Kind::Math => "math",
+            Kind::Diagram => "diagrams",
+            Kind::Pdf => "pdf",
         }
     }
 }
@@ -45,14 +55,28 @@ pub enum Source {
     /// 图片等附件：磁盘缓存按文件内容指纹命中
     File(VaultPath),
     /// 数学公式：磁盘缓存按源码 + 行间 / 行内 + 颜色指纹命中
-    Formula { latex: String, display: bool, color: u32 },
+    Formula {
+        latex: String,
+        display: bool,
+        color: u32,
+    },
+    Diagram {
+        source: String,
+        dark: bool,
+        font: String,
+    },
+    /// page 从 1 开始，文件失效必须涵盖所有页码。
+    Pdf {
+        path: VaultPath,
+        page: u32,
+    },
 }
 
 impl Source {
     fn file(&self) -> Option<&VaultPath> {
         match self {
-            Source::File(path) => Some(path),
-            Source::Formula { .. } => None,
+            Source::File(path) | Source::Pdf { path, .. } => Some(path),
+            Source::Formula { .. } | Source::Diagram { .. } => None,
         }
     }
 }
@@ -62,6 +86,8 @@ impl std::fmt::Display for Source {
         match self {
             Source::File(path) => write!(f, "{path}"),
             Source::Formula { latex, .. } => write!(f, "${latex}$"),
+            Source::Diagram { source, .. } => write!(f, "Mermaid {source}"),
+            Source::Pdf { path, page } => write!(f, "{path} 第 {page} 页"),
         }
     }
 }
@@ -83,6 +109,7 @@ pub enum State {
     Ready {
         image: Arc<RenderImage>,
         pixels: Size<u32>,
+        pages: Option<u32>,
     },
     /// 已知上次的像素尺寸时按它占位；第一次见到的内容没有尺寸可用
     Pending {
@@ -282,13 +309,6 @@ fn hbox(children: Vec<ratex_layout::LayoutBox>, color: ratex_types::Color) -> ra
     }
 }
 
-fn renderer(kind: Kind) -> &'static dyn Renderer {
-    match kind {
-        Kind::Image => &Images,
-        Kind::Math => &Math,
-    }
-}
-
 /// `![[target]]` 指向的附件。目录在后台枚举，加载完成后通知重绘。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Attachment {
@@ -316,6 +336,7 @@ enum Entry {
     Ready {
         image: Arc<RenderImage>,
         pixels: Size<u32>,
+        pages: Option<u32>,
     },
     Failed(SharedString),
 }
@@ -393,10 +414,49 @@ impl RenderService {
         self.state(request, cx)
     }
 
+    /// 源码、主题、字体变化都是新请求；解析、测量和光栅化只在后台执行。
+    pub fn diagram(
+        &mut self,
+        source: &str,
+        width: u32,
+        scale: f32,
+        dark: bool,
+        font: &str,
+        cx: &mut Context<Self>,
+    ) -> State {
+        let request = Request {
+            kind: Kind::Diagram,
+            source: Source::Diagram { source: source.to_owned(), dark, font: font.to_owned() },
+            size: width.max(1),
+            scale: (scale.max(0.5) * 100.).round() as u32,
+        };
+        self.state(request, cx)
+    }
+
+    /// page 为 1-based；非法页码在后台返回错误，绝不改成另一页。
+    pub fn pdf(
+        &mut self,
+        path: VaultPath,
+        page: u32,
+        width: u32,
+        scale: f32,
+        cx: &mut Context<Self>,
+    ) -> State {
+        let request = Request {
+            kind: Kind::Pdf,
+            source: Source::Pdf { path, page },
+            size: width.max(1),
+            scale: (scale.max(0.5) * 100.).round() as u32,
+        };
+        self.state(request, cx)
+    }
+
     fn state(&mut self, request: Request, cx: &mut Context<Self>) -> State {
         let placeholder = || State::Pending { pixels: self.pixels.get(&request.source).copied() };
         match self.entries.get(&request) {
-            Some(Entry::Ready { image, pixels }) => State::Ready { image: image.clone(), pixels: *pixels },
+            Some(Entry::Ready { image, pixels, pages }) => {
+                State::Ready { image: image.clone(), pixels: *pixels, pages: *pages }
+            }
             Some(Entry::Failed(error)) => State::Failed(error.clone()),
             Some(Entry::Pending(_)) => placeholder(),
             None => {
@@ -410,13 +470,16 @@ impl RenderService {
 
     fn render(&self, request: Request, cx: &mut Context<Self>) -> Task<()> {
         let (vault, cache, key) = (self.vault.clone(), self.cache.clone(), request.clone());
+        let text_system = cx.text_system().clone();
         cx.spawn(async move |this, cx| {
-            let produced = cx.background_spawn(async move { produce(&vault, &cache, &key) }).await;
+            let produced = cx
+                .background_spawn(async move { produce_with_text(&vault, &cache, &key, Some(text_system)) })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 this.entries.insert(
                     request.clone(),
                     match produced {
-                        Ok(Produced { frame, pixels, origin }) => {
+                        Ok(Produced { frame, pixels, origin, pages }) => {
                             log::debug!(
                                 "render {} {}×{} ({origin:?})",
                                 request.source,
@@ -424,7 +487,7 @@ impl RenderService {
                                 pixels.height
                             );
                             this.pixels.insert(request.source, pixels);
-                            Entry::Ready { image: Arc::new(RenderImage::new(vec![frame])), pixels }
+                            Entry::Ready { image: Arc::new(RenderImage::new(vec![frame])), pixels, pages }
                         }
                         Err(error) => {
                             log::debug!("render {}: {error}", request.source);
@@ -447,8 +510,8 @@ impl RenderService {
             !request.source.file().is_some_and(|file| paths.contains(file))
                 && !matches!(entry, Entry::Failed(_))
         });
+        self.pixels.retain(|source, _| !source.file().is_some_and(|file| paths.contains(file)));
         for path in paths {
-            self.pixels.remove(&Source::File(path.clone()));
             if let Some(catalog) = &mut self.catalog {
                 catalog.update(path, aero_core::attachments::available(&self.vault, path));
             }
@@ -469,6 +532,7 @@ struct Produced {
     frame: Frame,
     pixels: Size<u32>,
     origin: Origin,
+    pages: Option<u32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -477,17 +541,38 @@ enum Origin {
     Rendered,
 }
 
-/// 磁盘缓存文件：内容指纹 + 目标宽度 + 倍率。主题相关的渲染（数学）之后在这里加主题段。
+/// 磁盘缓存文件：源内容指纹（含主题、字体、页码、渲染版本）+ 目标宽度 + 倍率。
 fn cache_file(cache: &Path, request: &Request, hash: u64) -> PathBuf {
     cache.join(request.kind.dir()).join(format!("{hash:016x}-w{}@{}.png", request.size, request.scale))
 }
 
-/// 磁盘缓存命中就只解码缓存；否则渲染原文件并写回缓存。缓存写失败只影响下次的速度，不影响这次显示。
+#[cfg(test)]
 fn produce(vault: &Vault, cache: &Path, request: &Request) -> Result<Produced, String> {
+    produce_with_text(vault, cache, request, None)
+}
+
+/// 磁盘命中解码缓存；PDF 仍校验元数据以可靠返回总页数。所有 I/O 和渲染都由后台调用。
+fn produce_with_text(
+    vault: &Vault,
+    cache: &Path,
+    request: &Request,
+    text: Option<Arc<TextSystem>>,
+) -> Result<Produced, String> {
     let (bytes, hash) = match &request.source {
         Source::File(path) => {
             let (bytes, stamp) = vault.read_bytes(path).map_err(|e| e.to_string())?;
             (bytes, stamp.hash)
+        }
+        Source::Pdf { path, page } => {
+            let (bytes, stamp) = vault.read_bytes(path).map_err(|e| format!("PDF 无法读取：{e}"))?;
+            let key =
+                serde_json::to_vec(&(rich::PDF_VERSION, stamp.hash, page)).map_err(|e| e.to_string())?;
+            (bytes, aero_core::hash_bytes(&key))
+        }
+        Source::Diagram { source, dark, font } => {
+            let key = serde_json::to_vec(&(rich::DIAGRAM_VERSION, source, dark, font))
+                .map_err(|e| e.to_string())?;
+            (source.as_bytes().to_vec(), aero_core::hash_bytes(&key))
         }
         // 公式没有磁盘文件：指纹取源码 + 行间 / 行内 + 颜色
         Source::Formula { latex, display, color } => {
@@ -496,19 +581,35 @@ fn produce(vault: &Vault, cache: &Path, request: &Request) -> Result<Produced, S
             (latex.clone().into_bytes(), aero_core::hash_bytes(key.as_bytes()))
         }
     };
+    let device =
+        u32::try_from(u64::from(request.size) * u64::from(request.scale) / 100).unwrap_or(u32::MAX).max(1);
+    let pdf = if let Source::Pdf { page, .. } = &request.source {
+        Some(rich::PdfPage::new(bytes.clone(), *page, device)?)
+    } else {
+        None
+    };
+    let pages = pdf.as_ref().map(|pdf| pdf.pages);
     let file = cache_file(cache, request, hash);
     // 缓存被截断 / 手工改过不能让图打不开：当作未命中重新渲染。
     if let Ok(cached) = std::fs::read(&file)
         && let Ok(rgba) = image::load_from_memory(&cached).map(|image| image.to_rgba8())
+        && pdf.as_ref().is_none_or(|pdf| rgba.dimensions() == pdf.size)
     {
-        return Ok(produced(rgba, Origin::Disk));
+        return Ok(Produced { pages, ..produced(rgba, Origin::Disk) });
     }
-    let device = u32::try_from(u64::from(request.size) * u64::from(request.scale) / 100).unwrap_or(u32::MAX);
-    let rgba = renderer(request.kind).rasterize(request, &bytes, device.max(1))?;
+    let rgba = match (&request.kind, &request.source) {
+        (Kind::Image, _) => Images.rasterize(request, &bytes, device)?,
+        (Kind::Math, _) => Math.rasterize(request, &bytes, device)?,
+        (Kind::Diagram, Source::Diagram { source, dark, font }) => {
+            rich::diagram(source, *dark, font, text.ok_or("Mermaid 缺少宿主文本系统")?, device)?
+        }
+        (Kind::Pdf, Source::Pdf { .. }) => pdf.as_ref().ok_or("PDF 页面不可用")?.rasterize()?,
+        _ => return Err("渲染种类与源内容不匹配".into()),
+    };
     if let Err(error) = write_cache(&file, &rgba) {
         log::warn!("render cache {}: {error}", file.display());
     }
-    Ok(produced(rgba, Origin::Rendered))
+    Ok(Produced { pages, ..produced(rgba, Origin::Rendered) })
 }
 
 fn produced(rgba: RgbaImage, origin: Origin) -> Produced {
@@ -518,7 +619,7 @@ fn produced(rgba: RgbaImage, origin: Origin) -> Produced {
     for pixel in rgba.as_flat_samples_mut().samples.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    Produced { frame: Frame::new(rgba), pixels, origin }
+    Produced { frame: Frame::new(rgba), pixels, origin, pages: None }
 }
 
 /// 先写临时文件再 rename：并发渲染同一张图不会读到半个 PNG。
@@ -794,6 +895,179 @@ mod tests {
         std::fs::remove_file(dir.path().join(imported.as_str())).unwrap();
         service.update(cx, |s, cx| s.invalidate(&[imported.clone()], cx));
         assert_eq!(resolve(cx, "new.png", &note), Attachment::Missing);
+    }
+
+    fn pdf_request(path: &VaultPath, page: u32, scale: u32) -> Request {
+        Request { kind: Kind::Pdf, source: Source::Pdf { path: path.clone(), page }, size: 200, scale }
+    }
+
+    fn diagram_request(source: &str, dark: bool, font: &str, scale: u32) -> Request {
+        Request {
+            kind: Kind::Diagram,
+            source: Source::Diagram { source: source.into(), dark, font: font.into() },
+            size: 200,
+            scale,
+        }
+    }
+
+    #[test]
+    fn pdf_disk_cache_keeps_page_count_and_keys_content_page_and_density() {
+        let (_dir, vault, path) = vault_with(&super::two_page_pdf(), "pages.pdf");
+        let cache = tempfile::tempdir().unwrap();
+        let one = pdf_request(&path, 1, 100);
+        let first = produce(&vault, cache.path(), &one).unwrap();
+        assert_eq!(first.pages, Some(2));
+        assert_eq!(first.origin, Origin::Rendered);
+        let fingerprint = aero_core::hash_bytes(
+            &serde_json::to_vec(&(super::rich::PDF_VERSION, vault.read_bytes(&path).unwrap().1.hash, 1u32))
+                .unwrap(),
+        );
+        assert!(cache_file(cache.path(), &one, fingerprint).is_file(), "PDF 渲染版本与页码必须进入指纹");
+        let disk = produce(&vault, cache.path(), &one).unwrap();
+        assert_eq!(disk.origin, Origin::Disk);
+        assert_eq!(disk.pages, Some(2), "新调用从磁盘命中时仍有总页数");
+        let second = produce(&vault, cache.path(), &pdf_request(&path, 2, 100)).unwrap();
+        assert_eq!(second.origin, Origin::Rendered);
+        assert_ne!(first.frame.buffer(), second.frame.buffer());
+        let retina = produce(&vault, cache.path(), &pdf_request(&path, 1, 200)).unwrap();
+        assert_eq!(retina.pixels, size(400, 200));
+        assert_eq!(retina.pages, Some(2));
+        assert_eq!(std::fs::read_dir(cache.path().join("pdf")).unwrap().count(), 3);
+        let renamed = VaultPath::new("renamed.pdf").unwrap();
+        std::fs::copy(vault.fs_path(&path), vault.fs_path(&renamed)).unwrap();
+        assert_eq!(
+            produce(&vault, cache.path(), &pdf_request(&renamed, 1, 100)).unwrap().origin,
+            Origin::Disk
+        );
+        // 修改页面内容后不能取旧像素；再损坏 PDF 也不能绕过元数据验证复用 PNG。
+        let changed = String::from_utf8(super::two_page_pdf()).unwrap().replace("1 0 0 rg", "0 1 0 rg");
+        std::fs::write(vault.fs_path(&path), changed).unwrap();
+        let new = produce(&vault, cache.path(), &one).unwrap();
+        assert_eq!(new.origin, Origin::Rendered);
+        assert_ne!(new.frame.buffer(), first.frame.buffer());
+        std::fs::write(vault.fs_path(&path), b"broken PDF").unwrap();
+        assert!(produce(&vault, cache.path(), &one).is_err());
+        for page in [0, 3] {
+            assert!(produce(&vault, cache.path(), &pdf_request(&renamed, page, 100)).is_err());
+        }
+    }
+
+    #[gpui_kit::test]
+    fn diagram_disk_cache_keys_source_theme_font_and_hidpi(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, _) = vault_with(b"unused", "a.txt");
+        let cache = tempfile::tempdir().unwrap();
+        let request = diagram_request("flowchart LR\n A[中文] --> B[完成]", false, "PingFang SC", 100);
+        let render = |request: &Request| {
+            super::produce_with_text(&vault, cache.path(), request, Some(cx.text_system().clone())).unwrap()
+        };
+        let first = render(&request);
+        assert_eq!(first.origin, Origin::Rendered);
+        assert_eq!(first.pages, None);
+        let fingerprint = aero_core::hash_bytes(
+            &serde_json::to_vec(&(
+                super::rich::DIAGRAM_VERSION,
+                "flowchart LR\n A[中文] --> B[完成]",
+                false,
+                "PingFang SC",
+            ))
+            .unwrap(),
+        );
+        assert!(cache_file(cache.path(), &request, fingerprint).is_file(), "Mermaid 渲染版本必须进入指纹");
+        assert_eq!(render(&request).origin, Origin::Disk);
+        for other in [
+            diagram_request("flowchart LR\n A[改动] --> B[完成]", false, "PingFang SC", 100),
+            diagram_request("flowchart LR\n A[中文] --> B[完成]", true, "PingFang SC", 100),
+            diagram_request("flowchart LR\n A[中文] --> B[完成]", false, "Arial", 100),
+            diagram_request("flowchart LR\n A[中文] --> B[完成]", false, "PingFang SC", 200),
+        ] {
+            assert_eq!(render(&other).origin, Origin::Rendered);
+        }
+        assert_eq!(std::fs::read_dir(cache.path().join("diagrams")).unwrap().count(), 5);
+        let retina = render(&Request { scale: 200, ..request.clone() });
+        assert_eq!(retina.pixels.width, first.pixels.width * 2);
+        // 截断的磁盘缓存会自愈。
+        for file in std::fs::read_dir(cache.path().join("diagrams")).unwrap() {
+            std::fs::write(file.unwrap().path(), b"truncated").unwrap();
+        }
+        assert_eq!(render(&request).origin, Origin::Rendered);
+    }
+
+    #[gpui_kit::test]
+    fn service_pdf_caches_and_invalidates_every_page_and_placeholder(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) = vault_with(&super::two_page_pdf(), "pages.pdf");
+        let cache = tempfile::tempdir().unwrap();
+        let vault = Arc::new(vault);
+        let service = cx.new(|_| RenderService::new(vault.clone(), cache.path().to_path_buf()));
+        for page in [1, 2] {
+            assert!(matches!(
+                service.update(cx, |s, cx| s.pdf(path.clone(), page, 200, 1., cx)),
+                State::Pending { pixels: None }
+            ));
+        }
+        cx.run_until_parked();
+        let first = service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx));
+        let State::Ready { image, pages, .. } = first else { panic!("{first:?}") };
+        assert_eq!(pages, Some(2));
+        let again = service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx));
+        let State::Ready { image: cached, .. } = again else { panic!("{again:?}") };
+        assert!(Arc::ptr_eq(&image, &cached), "内存命中复用 RenderImage");
+        service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+        for page in [1, 2] {
+            assert!(matches!(
+                service.update(cx, |s, cx| s.pdf(path.clone(), page, 200, 1., cx)),
+                State::Pending { pixels: None }
+            ));
+        }
+        cx.run_until_parked();
+        std::fs::remove_file(vault.fs_path(&path)).unwrap();
+        service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+        service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx));
+        cx.run_until_parked();
+        assert!(matches!(service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx)), State::Failed(_)));
+    }
+
+    #[gpui_kit::test]
+    fn service_pdf_rejects_invalid_pages_without_clamping_or_caching(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) = vault_with(&super::two_page_pdf(), "pages.pdf");
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        for page in [0, 3, u32::MAX] {
+            service.update(cx, |s, cx| s.pdf(path.clone(), page, 200, 1., cx));
+        }
+        cx.run_until_parked();
+        for page in [0, 3, u32::MAX] {
+            let result = service.update(cx, |s, cx| s.pdf(path.clone(), page, 200, 1., cx));
+            assert!(matches!(result, State::Failed(ref error) if error.contains("页码")), "{result:?}");
+        }
+        assert!(!cache.path().join("pdf").exists(), "非法页码不写入缓存");
+    }
+
+    #[gpui_kit::test]
+    fn service_diagram_reacts_to_live_source_and_reports_errors(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, _) = vault_with(b"unused", "a.txt");
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        let source = "flowchart LR\n A --> B";
+        assert!(matches!(
+            service.update(cx, |s, cx| s.diagram(source, 200, 2., false, "Arial", cx)),
+            State::Pending { .. }
+        ));
+        cx.run_until_parked();
+        let first = service.update(cx, |s, cx| s.diagram(source, 200, 2., false, "Arial", cx));
+        assert!(
+            matches!(first, State::Ready { pages: None, pixels, .. } if pixels.width == 400),
+            "{first:?}"
+        );
+        assert!(matches!(
+            service.update(cx, |s, cx| s.diagram("flowchart LR\n A --> C", 200, 2., false, "Arial", cx)),
+            State::Pending { .. }
+        ));
+        service.update(cx, |s, cx| s.diagram("invalid mermaid", 200, 1., false, "Arial", cx));
+        cx.run_until_parked();
+        assert!(matches!(
+            service.update(cx, |s, cx| s.diagram("invalid mermaid", 200, 1., false, "Arial", cx)),
+            State::Failed(_)
+        ));
     }
 
     #[gpui_kit::test]

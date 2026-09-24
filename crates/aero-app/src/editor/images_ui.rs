@@ -357,7 +357,7 @@ impl super::Editor {
             Attachment::Missing | Attachment::Ambiguous => State::Failed("附件已不在".into()),
         });
         let body: AnyElement = match state {
-            State::Ready { image, pixels } => {
+            State::Ready { image, pixels, .. } => {
                 let (width, height) = (pixels.width as f32 / scale, pixels.height as f32 / scale);
                 // 等比缩放到视口内，小图不放大
                 let fit = (max_width / width).min(max_height / height).min(1.);

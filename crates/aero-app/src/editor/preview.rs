@@ -48,6 +48,22 @@ pub(super) fn markdown(
     block: aero_core::BlockId,
     depth: u8,
 ) -> TextView {
+    markdown_from(id, text, style, reveal, state, editor, block, depth, None)
+}
+
+pub(super) fn markdown_from(
+    id: SharedString,
+    text: SharedString,
+    style: TextViewStyle,
+    reveal: u64,
+    state: Entity<PreviewState>,
+    editor: Entity<super::Editor>,
+    block: aero_core::BlockId,
+    depth: u8,
+    origin: Option<aero_core::VaultPath>,
+) -> TextView {
+    let rich_editor = editor.clone();
+    let rich_origin = origin.clone();
     let block_editor = editor.clone();
     let embed_editor = editor.clone();
     let embed_style = style.clone();
@@ -61,6 +77,34 @@ pub(super) fn markdown(
     with_links(TextView::markdown(id.clone(), text), &editor)
         .style(style.clone())
         .selectable(false)
+        .markdown_block_parser(|node, cx| {
+            let source = cx.node_source(node)?;
+            let is_pdf = matches!(node, markdown_ast::Node::Paragraph(_))
+                && aero_core::rich_content::pdf_embed(source).is_some();
+            let rendered = if is_pdf {
+                source.to_owned()
+            } else if let markdown_ast::Node::Code(code) = node
+                && code.lang.as_deref() == Some("mermaid")
+            {
+                // AST 的代码正文已去掉祖先引用 / 列表前缀；直接解析原始切片会把 > 当成图表源码。
+                let fence: String =
+                    source.trim_start().chars().take_while(|c| matches!(c, '`' | '~')).collect();
+                format!("{fence}mermaid\n{}\n{fence}", code.value)
+            } else {
+                return None;
+            };
+            Some(MarkdownNode::new("rich-content", (is_pdf, rendered)).markdown(source.to_owned()))
+        })
+        .markdown_block_renderer("rich-content", move |node, _, cx| {
+            let (pdf, source) = node.data::<(bool, String)>().expect("rich content parser data");
+            rich_editor.update(cx, |editor, cx| {
+                if *pdf {
+                    editor.render_pdf(source, block, rich_origin.as_ref(), false, cx)
+                } else {
+                    editor.render_diagram(source, block, false, cx)
+                }
+            })
+        })
         .markdown_block_parser(|node, cx| {
             if !matches!(node, markdown_ast::Node::Paragraph(_)) {
                 return None;
@@ -107,7 +151,18 @@ pub(super) fn markdown(
         .markdown_block_renderer("callout", move |node, _, cx| {
             let callout = node.data::<Callout>().expect("callout parser data");
             let id: SharedString = format!("{id}-callout-{}", callout.offset).into();
-            render_callout(id, callout, style.clone(), reveal, &state, &block_editor, block, depth, cx)
+            render_callout(
+                id,
+                callout,
+                style.clone(),
+                reveal,
+                &state,
+                &block_editor,
+                block,
+                depth,
+                origin.clone(),
+                cx,
+            )
         })
         .markdown_block_parser(|node, cx| {
             if !matches!(
@@ -286,9 +341,8 @@ fn render_note_embed(
                 Some(f) if !f.is_empty() => format!("{title} › {f}"),
                 _ => title,
             };
-            let _ = path;
             let content: AnyElement = if depth < EMBED_DEPTH {
-                markdown(
+                markdown_from(
                     format!("{id}-body").into(),
                     aero_core::links::to_markdown(&source).into(),
                     style.clone(),
@@ -297,6 +351,7 @@ fn render_note_embed(
                     editor.clone(),
                     block,
                     depth + 1,
+                    Some(path),
                 )
                 .into_any_element()
             } else {
@@ -376,7 +431,7 @@ fn render_image(
         move || format!("image-placeholder-{target}")
     };
     match state {
-        State::Ready { image, pixels } => {
+        State::Ready { image, pixels, .. } => {
             // 原图比目标窄时按自然宽度显示，不放大
             let logical = (pixels.width as f32 / scale).min(width as f32);
             let height = logical * pixels.height as f32 / pixels.width as f32;
@@ -736,6 +791,7 @@ fn render_callout(
     editor: &Entity<super::Editor>,
     block: aero_core::BlockId,
     depth: u8,
+    origin: Option<aero_core::VaultPath>,
     cx: &mut App,
 ) -> AnyElement {
     let (label, icon, color) = appearance(&callout.kind, cx);
@@ -821,7 +877,7 @@ fn render_callout(
         .child(header)
         .when(open && !callout.body.is_empty(), |el| {
             el.child(div().debug_selector(move || format!("callout-body-{title}")).w_full().min_w_0().child(
-                markdown(
+                markdown_from(
                     format!("{id}-body").into(),
                     aero_core::links::to_markdown(&callout.body).into(),
                     style,
@@ -830,6 +886,7 @@ fn render_callout(
                     editor.clone(),
                     block,
                     depth,
+                    origin,
                 ),
             ))
         })

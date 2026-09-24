@@ -122,10 +122,11 @@ impl WrapMap {
     pub(super) fn set_conceal(
         &mut self,
         conceal: Vec<Range<usize>>,
+        hard_breaks: Vec<Range<usize>>,
         fonts: Vec<(Range<usize>, super::text_wrapper::FontOverride)>,
         cx: &mut App,
     ) {
-        self.wrapper.set_conceal(conceal, fonts, cx);
+        self.wrapper.set_conceal(conceal, hard_breaks, fonts, cx);
     }
 
     /// Ensure text is prepared (initializes wrapper if needed)
