@@ -24,18 +24,33 @@ impl Editor {
         Some(id.into())
     }
 
-    pub(super) fn render_backlink_count(&self, cx: &Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn reference_snapshot(&self) -> (FileStamp, aero_core::Snapshot) {
+        (self.stamp, self.doc.snapshot())
+    }
+
+    pub fn show_references(&mut self, cx: &mut Context<Self>) {
+        self.reveal = None;
+        if let Some(bounds) = self.references_bounds.get() {
+            let offset = self.scroll.offset();
+            let delta = bounds.top() - self.scroll.bounds().top() - px(16.);
+            self.scroll.set_offset(point(offset.x, (offset.y - delta).min(px(0.))));
+        }
+        cx.notify();
+    }
+
+    pub(super) fn render_references(&self) -> Option<AnyElement> {
         let view = self.backlinks.as_ref()?;
+        let bounds = self.references_bounds.clone();
         Some(
             div()
-                .id("backlink-count")
-                .debug_selector(|| "backlink-count".into())
-                .mb_3()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .cursor_pointer()
-                .child(view.read(cx).count_label(cx))
-                .on_click(cx.listener(|_, _, _, cx| cx.emit(EditorEvent::BacklinksRequested)))
+                .on_children_prepainted(move |children, _, _| bounds.set(children.first().copied()))
+                .id("document-references")
+                .debug_selector(|| "document-references".into())
+                .w_full()
+                .min_w_0()
+                .pt_4()
+                .pb_8()
+                .child(view.clone())
                 .into_any_element(),
         )
     }

@@ -44,6 +44,65 @@ fn close_index(cx: &mut VisualTestContext, workspace: &Entity<Workspace>) {
 }
 
 #[gpui_kit::test]
+fn document_references_follow_body_instead_of_header_or_sidebar(cx: &mut TestAppContext) {
+    let (_dir, _data, workspace) = open(cx, Some("# A\n\n正文尾部\n"));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    with_root(cx, &workspace);
+    draw(cx);
+    let footer = cx.debug_bounds("document-references");
+    let old_count = cx.debug_bounds("backlink-count");
+    let last_block = cx.debug_bounds("unit-2").unwrap();
+    close_index(cx, &workspace);
+    assert!(old_count.is_none(), "no backlink count above the document");
+    let footer = footer.expect("reference information belongs below the document");
+    assert!(footer.top() >= last_block.bottom());
+    assert!(cx.debug_bounds("outline-rows").is_some(), "the right pane is only an outline");
+}
+
+#[gpui_kit::test]
+fn long_document_scrolls_to_references_and_opens_outgoing_note(cx: &mut TestAppContext) {
+    let source = format!("# A\n\n{}[去目标](b.md#目标:说明)\n", "正文段落\n\n".repeat(40));
+    let (dir, _data, workspace) = open(cx, Some(&source));
+    std::fs::write(dir.path().join("b.md"), "# 目标:说明\n\n[[a]]\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    with_root(cx, &workspace);
+    cx.simulate_resize(size(px(1100.), px(640.)));
+    draw(cx);
+    let (search, backlinks) = cx.update(|_, cx| {
+        let open = workspace.read(cx).open.as_ref().unwrap();
+        (open.search.clone(), open.backlinks.clone())
+    });
+    wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
+    cx.update(|_, cx| search.update(cx, |search, cx| search.note_changed(note("b.md"), cx)));
+    wait_until(cx, |cx| cx.update(|_, cx| backlinks.read(cx).total() == Some(1)));
+    draw(cx);
+    let viewport = cx.debug_bounds("editor").unwrap();
+    let footer = cx.debug_bounds("document-references").unwrap();
+    assert!(footer.top() > viewport.bottom(), "long notes keep references below the fold");
+    workspace.update_in(cx, |w, window, cx| w.on_show_backlinks(&crate::actions::ShowBacklinks, window, cx));
+    draw(cx);
+    let footer = cx.debug_bounds("document-references").unwrap();
+    assert!(footer.top() < viewport.bottom() && footer.top() >= viewport.top());
+    let tab = cx.debug_bounds("references-tab-outgoing").unwrap();
+    cx.simulate_click(tab.center(), Modifiers::default());
+    wait_until(cx, |cx| {
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        draw(cx);
+        cx.debug_bounds("outgoing-link-0").is_some()
+    });
+    let outgoing = cx.debug_bounds("outgoing-link-0").unwrap();
+    assert!(outgoing.top() < viewport.bottom());
+    cx.simulate_click(outgoing.center(), Modifiers::default());
+    wait_until(cx, |cx| {
+        cx.update(|_, cx| {
+            workspace.read(cx).open.as_ref().unwrap().editor().unwrap().read(cx).path() == &note("b.md")
+        })
+    });
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+    close_index(cx, &workspace);
+}
+
+#[gpui_kit::test]
 fn status_vault_path_click_copies_the_full_directory(cx: &mut TestAppContext) {
     let (dir, _data, workspace) = open(cx, Some("# A\n"));
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);

@@ -133,7 +133,6 @@ pub enum EditorEvent {
     /// 工作区提供本次菜单的笔记目录；返回时按 generation 丢弃旧请求。
     LinkCompletionRequested(u64),
     TagCompletionRequested(u64),
-    BacklinksRequested,
     /// 异步保存成功落盘；工作区据此增量更新索引
     Saved,
 }
@@ -246,6 +245,7 @@ pub struct Editor {
     link_preview: link_preview::LinkPreview,
     backlinks: Option<Entity<crate::backlinks::BacklinksView>>,
     backlinks_subscription: Option<Subscription>,
+    references_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// 嵌入内容缓存（`![[笔记]]` / `#章节` / `^块`）
     embeds: embeds_ui::Embeds,
     /// 重内容渲染服务（9.9）；没连上时图片按源码显示
@@ -352,6 +352,7 @@ impl Editor {
             link_preview: link_preview::LinkPreview::default(),
             backlinks: None,
             backlinks_subscription: None,
+            references_bounds: Rc::default(),
             embeds: embeds_ui::Embeds::default(),
             images: None,
             images_subscription: None,
@@ -3714,21 +3715,22 @@ impl Render for Editor {
                     .text_color(foreground)
                     .children(self.render_banner(cx))
                     .child(self.render_title(cx))
-                    .children(self.render_backlink_count(cx))
                     .child(v_flex().w_full().gap(px(8.)).children(blocks))
                     .when(empty, |el| el.child(div().text_color(muted).child("点击这里开始写，或按 ⏎")))
                     .child(
                         div()
                             .id("editor-tail")
+                            .debug_selector(|| "editor-tail".into())
                             .w_full()
-                            .min_h(px(240.))
+                            .min_h(px(if self.backlinks.is_some() { 48. } else { 240. }))
                             .flex_1()
                             .cursor_text()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, window, cx| this.on_click_tail(window, cx)),
                             ),
-                    ),
+                    )
+                    .children(self.render_references()),
             )
             .vertical_scrollbar(&self.scroll)
             .children(self.render_link_preview(window, cx))

@@ -236,7 +236,7 @@ impl super::Editor {
     }
 
     /// 预览里点到的不是笔记链接：网页原样打开；相对路径按附件找真实文件，避免把 `notes.zip` 交给系统报 -50。
-    pub(super) fn open_external_link(&self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_external_link(&self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         let url = url.trim();
         if remote_scheme(url) {
             cx.open_url(url);

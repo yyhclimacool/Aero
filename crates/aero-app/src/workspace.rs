@@ -23,7 +23,7 @@ use gpui_kit::*;
 
 use crate::actions::QuickOpen as QuickOpen_;
 use crate::actions::*;
-use crate::backlinks::{BacklinkOpened, BacklinksView};
+use crate::backlinks::{BacklinksView, ReferenceOpened};
 use crate::branding;
 use crate::editor::{Editor, EditorEvent, SaveState};
 use crate::file_tree::{FileTree, FileTreeEvent, unique_note_name};
@@ -68,12 +68,6 @@ enum SidebarTab {
     Tags,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ContextTab {
-    Backlinks,
-    Outline,
-}
-
 pub struct Workspace {
     /// 应用数据目录：状态文件、索引缓存与默认示例库都在这里
     data_dir: PathBuf,
@@ -84,7 +78,6 @@ pub struct Workspace {
     picker_focus: Option<FocusHandle>,
     recent_commands: Vec<&'static str>,
     sidebar_tab: SidebarTab,
-    context_tab: ContextTab,
     rename_pending: bool,
     sidebar_visible: bool,
     panel_visible: bool,
@@ -158,7 +151,6 @@ impl Workspace {
             picker_focus: None,
             recent_commands: Vec::new(),
             sidebar_tab: SidebarTab::Files,
-            context_tab: ContextTab::Backlinks,
             rename_pending: false,
             sidebar_visible: state.sidebar_visible.unwrap_or(true),
             panel_visible: state.panel_visible.unwrap_or(true),
@@ -433,17 +425,33 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Subscription {
-        cx.subscribe_in(view, window, |this, _, event: &BacklinkOpened, window, cx| {
-            let hit = &event.0;
-            this.open_note(hit.path.clone(), window, cx);
-            if let Some(editor) = this.open.as_ref().and_then(|o| o.editor().cloned())
-                && editor.read(cx).path() == &hit.path
-                && !editor.update(cx, |e, cx| e.reveal_backlink(hit, cx))
-            {
-                window.push_notification(
-                    Notification::info("来源笔记已变化，已打开笔记；反链将在索引更新后刷新。"),
-                    cx,
-                );
+        cx.subscribe_in(view, window, |this, _, event: &ReferenceOpened, window, cx| match event {
+            ReferenceOpened::Backlink(hit) => {
+                this.open_note(hit.path.clone(), window, cx);
+                if let Some(editor) = this.open.as_ref().and_then(|o| o.editor().cloned())
+                    && editor.read(cx).path() == &hit.path
+                    && !editor.update(cx, |e, cx| e.reveal_backlink(hit, cx))
+                {
+                    window.push_notification(
+                        Notification::info("来源笔记已变化，已打开笔记；反链将在索引更新后刷新。"),
+                        cx,
+                    );
+                }
+            }
+            ReferenceOpened::Outgoing(url) => {
+                let path = url.split('#').next().unwrap_or(url);
+                let note_url = if !path.contains(':')
+                    && (path.to_ascii_lowercase().ends_with(".md") || url.starts_with('#'))
+                {
+                    format!("{}{}", aero_core::links::NOTE_URL_PREFIX, url.strip_prefix("./").unwrap_or(url))
+                } else {
+                    url.clone()
+                };
+                if let Some((target, fragment)) = aero_core::links::decode_note_url(&note_url) {
+                    this.on_link_clicked(target, fragment, window, cx);
+                } else if let Some(editor) = this.open.as_ref().and_then(|open| open.editor().cloned()) {
+                    editor.update(cx, |editor, cx| editor.open_external_link(url, window, cx));
+                }
             }
         })
     }
@@ -492,7 +500,6 @@ impl Workspace {
                 this.keep_preview_if_edited(editor, cx);
                 cx.notify()
             }
-            EditorEvent::BacklinksRequested => this.show_panel(ContextTab::Backlinks, cx),
             EditorEvent::Saved | EditorEvent::Reloaded => {
                 this.index_editor(editor, cx);
                 cx.notify();
@@ -1609,17 +1616,13 @@ impl Workspace {
 
     fn render_context(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
         let (background, border) = (cx.theme().sidebar, cx.theme().sidebar_border);
-        let (title, body) = match self.context_tab {
-            ContextTab::Backlinks => ("反链", open.backlinks.clone().into_any_element()),
-            ContextTab::Outline => ("大纲", self.render_outline(open, cx).into_any_element()),
-        };
         v_flex()
             .size_full()
             .bg(background)
             .border_l_1()
             .border_color(border)
-            .child(self.render_pane_header(title, Vec::new(), cx))
-            .child(div().flex_1().min_h(px(0.)).child(body))
+            .child(self.render_pane_header("大纲", Vec::new(), cx))
+            .child(div().flex_1().min_h(px(0.)).child(self.render_outline(open, cx)))
     }
 
     fn render_outline(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1660,6 +1663,7 @@ impl Workspace {
         v_flex().size_full().child(
             v_flex()
                 .id("outline-rows")
+                .debug_selector(|| "outline-rows".into())
                 .flex_1()
                 .min_h(px(0.))
                 .px_1()
@@ -1938,7 +1942,7 @@ mod tests {
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 
-    use super::{ContextTab, SidebarTab, Tab, VaultSession, Workspace};
+    use super::{SidebarTab, Tab, VaultSession, Workspace};
     use crate::backlinks::BacklinksView;
     use crate::editor::Editor;
     use crate::file_tree::FileTree;
@@ -2038,7 +2042,6 @@ mod tests {
                 picker_focus: None,
                 recent_commands: vec![],
                 sidebar_tab: SidebarTab::Files,
-                context_tab: ContextTab::Backlinks,
                 rename_pending: false,
                 sidebar_visible: true,
                 panel_visible: true,
@@ -3421,10 +3424,16 @@ mod tests {
             cx.notify();
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let count = cx.debug_bounds("backlink-count").unwrap();
-        cx.simulate_click(count.center(), gpui_kit::Modifiers::default());
+        assert!(cx.debug_bounds("backlink-count").is_none());
+        workspace
+            .update_in(cx, |w, window, cx| w.on_show_backlinks(&crate::actions::ShowBacklinks, window, cx));
         cx.run_until_parked();
-        cx.update(|_, cx| assert!(workspace.read(cx).panel_visible));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            assert!(!workspace.read(cx).panel_visible, "references no longer open a side panel")
+        });
+        let footer = cx.debug_bounds("document-references").unwrap();
+        assert!(footer.top() < cx.debug_bounds("editor").unwrap().bottom());
         workspace.update_in(cx, |w, window, cx| w.rename_current("renamed".into(), window, cx));
         wait_until(cx, |cx| {
             cx.update(|_, cx| {
@@ -3483,7 +3492,8 @@ mod tests {
         cx.update(|_, cx| search.update(cx, |s, cx| s.note_changed(b.clone(), cx)));
         wait_until(cx, |cx| cx.update(|_, cx| view.read(cx).hits().len() == 2));
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("backlink-rich-0").is_some(), "反链行应渲染来源块");
+        assert!(cx.debug_bounds("backlink-0").is_some(), "反链列表显示来源文档");
+        assert!(cx.debug_bounds("backlink-rich-0").is_none(), "列表不再展开正文摘要");
 
         // 从真实面板行点击到来源标题块。
         cx.update(|window, cx| window.draw(cx).clear(cx));
