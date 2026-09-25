@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use gpui_kit::StatefulInteractiveElement as _;
+
 use super::*;
 
 const MAX_MARKS: usize = 80;
@@ -32,6 +34,8 @@ pub(super) struct Navigation {
     task: Option<Task<()>>,
     preview: Option<NavigationPreview>,
     motion: RefCell<HashMap<u64, MarkMotion>>,
+    /// 固定后刻度展开成标题列表；换文档时保留，不跟缩略图的悬停一起清掉。
+    pinned: bool,
 }
 
 struct MarkMotion {
@@ -142,8 +146,28 @@ impl Editor {
     pub(super) fn sync_navigation(&mut self) {
         let key = (self.doc.version(), self.stamp);
         if self.navigation.key != Some(key) {
-            self.navigation = Navigation { key: Some(key), ..Default::default() };
+            let pinned = self.navigation.pinned;
+            self.navigation = Navigation { key: Some(key), pinned, ..Default::default() };
         }
+    }
+
+    pub(super) fn navigation_pinned(&self) -> bool {
+        self.navigation.pinned
+    }
+
+    pub(crate) fn show_navigation_outline(&mut self, cx: &mut Context<Self>) {
+        if self.navigation.pinned {
+            return;
+        }
+        self.set_navigation_pinned(true, cx);
+    }
+
+    fn set_navigation_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        self.navigation.pinned = pinned;
+        self.navigation.task = None;
+        self.navigation.hovered = None;
+        self.navigation.preview = None;
+        cx.notify();
     }
 
     pub(super) fn clear_navigation(&mut self, cx: &mut Context<Self>) {
@@ -161,6 +185,9 @@ impl Editor {
         anchor: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        if self.navigation.pinned {
+            return;
+        }
         if !hovered {
             if self.navigation.hovered == Some(id) {
                 self.clear_navigation(cx);
@@ -269,15 +296,7 @@ impl Editor {
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         this.hover_navigation(id, *hovered, bounds.get(), cx)
                     }))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.clear_navigation(cx);
-                        this.exit_edit(cx);
-                        this.selection = None;
-                        this.focus_handle.focus(window, cx);
-                        if this.unit_index(id).is_some() {
-                            this.reveal_block(id, cx);
-                        }
-                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| this.jump_from_navigation(id, window, cx)))
                     .into_any_element()
             })
             .collect();
@@ -287,19 +306,133 @@ impl Editor {
             window.request_animation_frame();
         }
         Some(
+            // 铺满编辑区但不接鼠标：只有刻度和「固定」自己接收点击。
             div()
-                .id("document-navigator")
-                .debug_selector(|| "document-navigator".into())
                 .absolute()
-                .top_0()
-                .bottom_0()
-                .right(px(12.))
-                .w(px(24.))
-                .flex()
-                .items_center()
-                .child(v_flex().w_full().children(marks))
+                .inset_0()
+                .child(
+                    div()
+                        .id("document-navigator")
+                        .debug_selector(|| "document-navigator".into())
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right(px(12.))
+                        .w(px(24.))
+                        .flex()
+                        .items_center()
+                        .child(v_flex().w_full().children(marks)),
+                )
+                .child(self.navigation_pin(false, cx))
                 .into_any_element(),
         )
+    }
+
+    fn jump_from_navigation(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_navigation(cx);
+        self.exit_edit(cx);
+        self.selection = None;
+        self.focus_handle.focus(window, cx);
+        if self.unit_index(id).is_some() {
+            self.reveal_block(id, cx);
+        }
+    }
+
+    fn navigation_pin(&self, pinned: bool, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (border, background, muted, foreground, hover) =
+            (theme.border, theme.background, theme.muted_foreground, theme.foreground, theme.list_hover);
+        div()
+            .id("navigation-pin")
+            .debug_selector(|| "navigation-pin".into())
+            .when(!pinned, |el| el.absolute().top(px(8.)).right(px(8.)))
+            .px_1()
+            .py(px(2.))
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(background)
+            .text_xs()
+            .text_color(muted)
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover).text_color(foreground))
+            .child(if pinned { "缩略图" } else { "固定" })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.set_navigation_pinned(!pinned, cx);
+            }))
+            .into_any_element()
+    }
+
+    pub(super) fn pinned_outline(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (foreground, muted, hover, active_bg) =
+            (theme.foreground, theme.muted_foreground, theme.list_hover, theme.list_active);
+        let headings = self.headings();
+        let empty = headings.is_empty();
+        let highlight = self.highlight;
+        let rows = headings.into_iter().map(move |(level, text, id)| {
+            let active = highlight == Some(id);
+            let label = if text.is_empty() { "（空标题）".to_owned() } else { text };
+            let color = if active || level < 3 { foreground } else { muted };
+            div()
+                .id(("navigation-heading", id.0))
+                .debug_selector(move || format!("navigation-heading-{}", id.0))
+                .w_full()
+                .pl(px(8. + (level.saturating_sub(1)) as f32 * 12.))
+                .pr_2()
+                .py_1()
+                .rounded_md()
+                .text_sm()
+                .truncate()
+                .cursor_pointer()
+                .text_color(color)
+                .when(level == 1, |el| el.font_weight(FontWeight::MEDIUM))
+                .when(active, |el| el.bg(active_bg))
+                .hover(move |style| style.bg(hover))
+                .child(label)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.jump_from_navigation(id, window, cx);
+                }))
+                .into_any_element()
+        });
+        v_flex()
+            .id("navigation-outline")
+            .debug_selector(|| "navigation-outline".into())
+            .flex_none()
+            .h_full()
+            .w(px(220.))
+            .bg(theme.sidebar)
+            .border_l_1()
+            .border_color(theme.sidebar_border)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                h_flex()
+                    .flex_none()
+                    .px_2()
+                    .h(px(36.))
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_xs().text_color(theme.muted_foreground).child("大纲"))
+                    .child(self.navigation_pin(true, cx)),
+            )
+            .child(
+                v_flex()
+                    .id("navigation-outline-rows")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .px_1()
+                    .pb_2()
+                    .overflow_y_scroll()
+                    .children(rows)
+                    .when(empty, |el| {
+                        el.child(div().px_2().py_2().text_xs().text_color(muted).child("这篇还没有标题。"))
+                    }),
+            )
+            .into_any_element()
     }
 
     pub(super) fn render_navigation_preview(

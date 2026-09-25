@@ -110,16 +110,16 @@ pub(super) fn markdown_from(
                 return None;
             }
             let source = cx.node_source(node)?;
-            let embed = image_embed(source)?;
+            let embeds = image_row(source)?;
             Some(
-                MarkdownNode::new("image", (node.position()?.start.offset, embed))
+                MarkdownNode::new("image", (node.position()?.start.offset, embeds))
                     .markdown(source.to_owned()),
             )
         })
         .markdown_block_renderer("image", move |node, window, cx| {
-            let (offset, embed) = node.data::<(usize, ImageEmbed)>().expect("image parser data");
+            let (offset, embeds) = node.data::<(usize, Vec<ImageEmbed>)>().expect("image parser data");
             let id: SharedString = format!("{image_id}-image-{offset}").into();
-            render_image(id, embed, &image_style, &image_editor, block, window, cx)
+            render_images(id, embeds, &image_style, &image_editor, block, window, cx)
         })
         .markdown_block_parser(|node, cx| {
             if !matches!(node, markdown_ast::Node::Paragraph(_)) {
@@ -207,51 +207,67 @@ pub(super) fn markdown_from(
 }
 
 /// 图片嵌入块（`ui_design.md` 5.6）：`![[x.png]]` / `![[x.png|400]]`。
+/// 一段里可以连续放多张，它们并排，并按宽度比例分掉这一行。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ImageEmbed {
     target: String,
-    /// `|400` 的显示宽度；`|小` 之类的非数字参数忽略，按默认宽度显示
+    /// `|400` 的显示宽度；在并排时当作相对宽度
     width: Option<u32>,
+    /// 在整段源码里的字节区间
+    range: std::ops::Range<usize>,
     source: String,
 }
 
 /// 正文列宽内的默认显示宽度（正文列 720，两侧留白）。
 const IMAGE_WIDTH: u32 = 680;
-/// 块菜单宽度预设（`ui_design.md` 5.6）。像素值设计里没有规定，中档对齐文档示例 `|400`，大档等于正文列宽。
-pub(super) const IMAGE_WIDTH_SMALL: u32 = 240;
-pub(super) const IMAGE_WIDTH_MEDIUM: u32 = 400;
-pub(super) const IMAGE_WIDTH_LARGE: u32 = IMAGE_WIDTH;
 
-/// 把独占一段的图片嵌入改成指定宽度；`None` 去掉 `|宽度`，按原图尺寸显示。
-pub(super) fn image_source_with_width(source: &str, width: Option<u32>) -> Option<String> {
-    let embed = image_embed(source)?;
+/// 改这一段里第 `index` 张图的 `|宽度`。一段可以有多张图。
+pub(super) fn image_source_set_width(source: &str, index: usize, width: u32) -> Option<String> {
+    let row = image_row(source)?;
+    let embed = row.get(index)?;
     let target = aero_core::links::escape_target(&embed.target)?;
-    Some(match width {
-        Some(width) => format!("![[{target}|{width}]]"),
-        None => format!("![[{target}]]"),
-    })
+    let mut out = source.to_owned();
+    out.replace_range(embed.range.clone(), &format!("![[{target}|{width}]]"));
+    Some(out)
 }
 
-/// 整段只有一个图片嵌入时才当图片块渲染；与文字混排的嵌入仍按源码显示。
-fn image_embed(source: &str) -> Option<ImageEmbed> {
+/// 整段只有图片嵌入（空白隔开）时才当图片块；和文字混在一起仍按源码显示。
+fn image_row(source: &str) -> Option<Vec<ImageEmbed>> {
+    let lead = source.len() - source.trim_start().len();
     let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     let embeds = aero_core::links::scan_embeds(trimmed);
-    let [embed] = embeds.as_slice() else { return None };
-    if embed.range != (0..trimmed.len()) || embed.fragment.is_some() {
+    if embeds.is_empty() {
         return None;
     }
-    if aero_core::attachments::Kind::for_path(&embed.target) != Some(aero_core::attachments::Kind::Image) {
-        return None;
+    let mut at = 0;
+    let mut row = Vec::with_capacity(embeds.len());
+    for embed in embeds {
+        if embed.range.start < at || !trimmed[at..embed.range.start].chars().all(char::is_whitespace) {
+            return None;
+        }
+        if embed.fragment.is_some()
+            || aero_core::attachments::Kind::for_path(&embed.target) != Some(aero_core::attachments::Kind::Image)
+        {
+            return None;
+        }
+        let start = lead + embed.range.start;
+        let end = lead + embed.range.end;
+        row.push(ImageEmbed {
+            target: embed.target.clone(),
+            width: embed.parameter.as_deref().and_then(|p| p.trim().parse().ok()),
+            range: start..end,
+            source: source[start..end].to_owned(),
+        });
+        at = embed.range.end;
     }
-    Some(ImageEmbed {
-        target: embed.target.clone(),
-        width: embed.parameter.as_deref().and_then(|p| p.trim().parse().ok()),
-        source: trimmed.to_owned(),
-    })
+    trimmed[at..].chars().all(char::is_whitespace).then_some(row)
 }
 
 pub(super) fn is_image_embed(source: &str) -> bool {
-    image_embed(source).is_some()
+    image_row(source).is_some()
 }
 
 pub(super) fn is_note_embed(source: &str) -> bool {
@@ -394,10 +410,102 @@ fn embed_source(id: SharedString, source: &str, cx: &App) -> Stateful<Div> {
         .child(source.to_owned())
 }
 
+/// 一段里的图片。一张时按自身宽度；多张并排，按 `|宽度` 或原图宽度的比例分掉行宽。
+fn render_images(
+    id: SharedString,
+    embeds: &[ImageEmbed],
+    style: &TextViewStyle,
+    editor: &Entity<super::Editor>,
+    block: aero_core::BlockId,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    if embeds.len() <= 1 {
+        let Some(embed) = embeds.first() else {
+            return div().into_any_element();
+        };
+        return render_image(id, embed, 0, None, style, editor, block, window, cx);
+    }
+    let slots = image_row_slots(embeds, editor, block, window, cx);
+    h_flex()
+        .w_full()
+        .gap(px(8.))
+        .items_start()
+        .pb(rems(0.5))
+        .children(embeds.iter().zip(slots).enumerate().map(|(index, (embed, slot))| {
+            div().w(px(slot)).flex_shrink(1.).min_w(px(0.)).child(render_image(
+                SharedString::from(format!("{id}-{index}")),
+                embed,
+                index,
+                Some(slot),
+                style,
+                editor,
+                block,
+                window,
+                cx,
+            ))
+        }))
+        .into_any_element()
+}
+
+/// 并排时每张图分到的宽度。比例来自 `|宽度`，没有就用原图像素宽；拖动中的那张用实时宽度。
+fn image_row_slots(
+    embeds: &[ImageEmbed],
+    editor: &Entity<super::Editor>,
+    block: aero_core::BlockId,
+    window: &Window,
+    cx: &mut App,
+) -> Vec<f32> {
+    let n = embeds.len().max(1) as f32;
+    let gap = 8. * (embeds.len().saturating_sub(1) as f32);
+    let inner = (IMAGE_WIDTH as f32 - gap).max(48. * n);
+    let weights: Vec<f32> = embeds
+        .iter()
+        .enumerate()
+        .map(|(index, embed)| {
+            editor.read(cx).image_drag_width(block, index).unwrap_or_else(|| {
+                embed
+                    .width
+                    .map(|width| width as f32)
+                    .or_else(|| image_natural_width(editor, embed, window, cx))
+                    .unwrap_or(inner / n)
+                    .max(1.)
+            })
+        })
+        .collect();
+    let sum = weights.iter().sum::<f32>().max(1.);
+    weights.into_iter().map(|weight| inner * weight / sum).collect()
+}
+
+fn image_natural_width(
+    editor: &Entity<super::Editor>,
+    embed: &ImageEmbed,
+    window: &Window,
+    cx: &mut App,
+) -> Option<f32> {
+    use crate::render::{Attachment, State};
+    let (path, service) = {
+        let editor = editor.read(cx);
+        (editor.path.clone(), editor.images.clone()?)
+    };
+    let scale = window.scale_factor();
+    let state = service.update(cx, |service, cx| match service.attachment(&embed.target, &path, cx) {
+        Attachment::Found(file) => service.image(file, IMAGE_WIDTH, scale, cx),
+        _ => State::Pending { pixels: None },
+    });
+    match state {
+        State::Ready { pixels, .. } => Some(pixels.width as f32 / scale),
+        _ => None,
+    }
+}
+
 /// 位图 / 占位 / 源码 + 错误 + 重试（9.9 的统一表现）；渲染永远不改文件。
+/// `slot` 是并排时分到的宽度；单独一张时按原图尺寸，不超过默认行宽。
 fn render_image(
     id: SharedString,
     embed: &ImageEmbed,
+    index: usize,
+    slot: Option<f32>,
     style: &TextViewStyle,
     editor: &Entity<super::Editor>,
     block: aero_core::BlockId,
@@ -432,35 +540,50 @@ fn render_image(
     };
     match state {
         State::Ready { image, pixels, .. } => {
-            // 原图比目标窄时按自然宽度显示，不放大
-            let logical = (pixels.width as f32 / scale).min(width as f32);
-            let height = logical * pixels.height as f32 / pixels.width as f32;
-            let click = image_click(editor, block, embed.target.clone());
-            let selected = editor.read(cx).is_selected_block(block);
-            v_flex()
-                .w_full()
-                .gap_1()
-                .pb(rems(0.5))
+            let natural = pixels.width as f32 / scale;
+            let aspect = pixels.height as f32 / pixels.width.max(1) as f32;
+            // 并排时用分到的宽度。单独一张：拖动中用实时宽度，否则不放大超过原图。
+            let logical = slot.unwrap_or_else(|| {
+                editor
+                    .read(cx)
+                    .image_drag_width(block, index)
+                    .unwrap_or_else(|| natural.min(width as f32))
+            });
+            let height = logical * aspect;
+            let click = image_click(editor, block, index, embed.target.clone());
+            let selected = editor.read(cx).selected_image_index(block) == Some(index);
+            let resizing = editor.read(cx).image_drag_width(block, index).is_some();
+            let max_width = if slot.is_some() { IMAGE_WIDTH as f32 } else { natural.max(logical) };
+            let frame = cx.theme().selection;
+            let tile = div()
+                .relative()
+                .w(px(logical))
+                .h(px(height))
+                .max_w_full()
                 .child(
                     div()
                         .id(id.clone())
                         .debug_selector(selector)
-                        .w(px(logical))
-                        .h(px(height))
-                        .max_w_full()
-                        // 窗口窄时裁掉而不是压扁
+                        .size_full()
                         .overflow_hidden()
                         .rounded(px(6.))
+                        .when(selected || resizing, |el| el.border_1().border_color(frame))
                         .cursor_pointer()
                         .on_click(click)
-                        .child(img(ImageSource::Render(image)).w(px(logical)).h(px(height))),
+                        .child(img(ImageSource::Render(image)).size_full()),
                 )
-                .when(selected, |el| el.child(image_width_bar(editor, block, embed.width, cx)))
-                .into_any_element()
+                .when(selected || resizing, |el| {
+                    el.child(image_resize_chrome(editor, block, index, logical, max_width, aspect, cx))
+                });
+            if slot.is_some() {
+                tile.into_any_element()
+            } else {
+                v_flex().w_full().gap_1().pb(rems(0.5)).child(tile).into_any_element()
+            }
         }
         // 首帧占位用上次已知比例，渲染完成后替换，列表不抖动
         State::Pending { pixels } => {
-            let logical = (width as f32).min(IMAGE_WIDTH as f32);
+            let logical = slot.unwrap_or_else(|| (width as f32).min(IMAGE_WIDTH as f32));
             let ratio = pixels.map_or(0.5625, |p| p.height as f32 / p.width.max(1) as f32);
             div()
                 .w_full()
@@ -512,41 +635,100 @@ fn render_image(
     }
 }
 
-/// 选中图片后出现的宽度预设（小 / 中 / 大 / 原始）。点按钮只改 `|宽度`，不进入编辑态。
-fn image_width_bar(
+const IMAGE_RESIZE_MIN: f32 = 48.;
+
+struct ResizeGhost;
+
+impl Render for ResizeGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// 选中后的四角手柄和实时尺寸。拖动只改显示宽度，高度按原图比例跟着变，松手写回 `|宽度`。
+fn image_resize_chrome(
     editor: &Entity<super::Editor>,
     block: aero_core::BlockId,
-    current: Option<u32>,
+    index: usize,
+    logical: f32,
+    max_width: f32,
+    aspect: f32,
     cx: &App,
 ) -> AnyElement {
-    let presets = [
-        ("image-width-small", "小", Some(IMAGE_WIDTH_SMALL)),
-        ("image-width-medium", "中", Some(IMAGE_WIDTH_MEDIUM)),
-        ("image-width-large", "大", Some(IMAGE_WIDTH_LARGE)),
-        ("image-width-original", "原始", None),
+    let theme = cx.theme();
+    let frame = theme.selection;
+    let max_width = max_width.max(logical).max(1.);
+    let min_width = IMAGE_RESIZE_MIN.min(max_width);
+    // 变体名字才是箭头方向：左上↔右下、左下↔右上。注释里的 nwse/nesw 写反了。
+    let corners = [
+        ("nw", false, false, CursorStyle::ResizeUpLeftDownRight),
+        ("ne", true, false, CursorStyle::ResizeUpRightDownLeft),
+        ("sw", false, true, CursorStyle::ResizeUpRightDownLeft),
+        ("se", true, true, CursorStyle::ResizeUpLeftDownRight),
     ];
-    h_flex()
-        .gap_1()
-        .children(presets.map(|(id, label, width)| {
-            let editor = editor.clone();
-            let active = current == width;
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .child(
             div()
-                .debug_selector(|| id.to_owned())
+                .absolute()
+                .bottom(px(8.))
+                .right(px(8.))
+                .debug_selector(|| "image-size".into())
+                .px(px(6.))
+                .py(px(2.))
                 .rounded(px(4.))
-                .when(active, |el| el.bg(cx.theme().accent.opacity(0.16)))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(Button::new(id).ghost().xsmall().label(label).on_click(move |_, window, cx| {
+                .bg(theme.foreground.opacity(0.82))
+                .text_color(theme.background)
+                .text_size(px(12.))
+                .line_height(relative(1.3))
+                .child(format!("{} × {}", logical.round().max(1.) as u32, (logical * aspect).round().max(1.) as u32)),
+        )
+        .children(corners.map(|(name, east, bottom, cursor)| {
+            let editor = editor.clone();
+            let drag = super::images_ui::ImageResizeDrag {
+                block,
+                index,
+                east,
+                start_width: logical,
+                min_width,
+                max_width,
+            };
+            div()
+                .id(SharedString::from(format!("image-resize-{name}-{}", block.0)))
+                .debug_selector(move || format!("image-resize-{name}"))
+                .absolute()
+                .size(px(16.))
+                .when(east, |el| el.right(px(-8.)))
+                .when(!east, |el| el.left(px(-8.)))
+                .when(bottom, |el| el.bottom(px(-8.)))
+                .when(!bottom, |el| el.top(px(-8.)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor(cursor)
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
                     cx.stop_propagation();
-                    editor.update(cx, |editor, cx| editor.set_image_width(block, width, window, cx));
-                }))
+                    window.prevent_default();
+                })
+                .on_drag(drag, move |drag, _, window, cx| {
+                    let x = window.mouse_position().x;
+                    editor.update(cx, |editor, cx| editor.start_image_resize(drag, x, cx));
+                    cx.new(|_| ResizeGhost)
+                })
+                .child(div().size(px(8.)).rounded(px(4.)).bg(frame).border_1().border_color(theme.background))
         }))
         .into_any_element()
 }
 
-/// 单击选中这一块并打开宽度预设，双击全屏看图。
+/// 单击选中这一块，双击全屏看图。
 fn image_click(
     editor: &Entity<super::Editor>,
     block: aero_core::BlockId,
+    index: usize,
     target: String,
 ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     let editor = editor.clone();
@@ -561,7 +743,7 @@ fn image_click(
             if double {
                 editor.open_image_viewer(target, window, cx);
             } else {
-                editor.select_block_by_id(block, window, cx);
+                editor.select_image(block, index, window, cx);
             }
         });
     }

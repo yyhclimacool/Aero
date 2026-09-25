@@ -274,12 +274,78 @@ impl super::Editor {
             file.is_file().then_some(file)
         })
     }
+}
 
-    /// 选中图片后改 `|宽度`。块 id 按同类型就近匹配沿用，改完仍保持选中。
+/// 四角拖动手柄。`east` 为右侧两角：向右拖变宽；左侧两角相反。
+#[derive(Clone)]
+pub(super) struct ImageResizeDrag {
+    pub block: aero_core::BlockId,
+    pub index: usize,
+    pub east: bool,
+    pub start_width: f32,
+    pub min_width: f32,
+    pub max_width: f32,
+}
+
+pub(super) struct ImageResize {
+    block: aero_core::BlockId,
+    index: usize,
+    east: bool,
+    start_x: f32,
+    start_width: f32,
+    min_width: f32,
+    max_width: f32,
+    current: f32,
+}
+
+impl super::Editor {
+    pub(super) fn image_drag_width(&self, block: aero_core::BlockId, index: usize) -> Option<f32> {
+        self.image_resize
+            .as_ref()
+            .filter(|drag| drag.block == block && drag.index == index)
+            .map(|drag| drag.current)
+    }
+
+    pub(super) fn start_image_resize(&mut self, drag: &ImageResizeDrag, x: Pixels, cx: &mut Context<Self>) {
+        let start_width = drag.start_width.clamp(drag.min_width, drag.max_width);
+        self.image_resize = Some(ImageResize {
+            block: drag.block,
+            index: drag.index,
+            east: drag.east,
+            start_x: f32::from(x),
+            start_width,
+            min_width: drag.min_width,
+            max_width: drag.max_width,
+            current: start_width,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn track_image_resize(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.image_resize.as_mut() else { return };
+        let delta = f32::from(x) - drag.start_x;
+        let signed = if drag.east { delta } else { -delta };
+        drag.current = (drag.start_width + signed).clamp(drag.min_width, drag.max_width);
+        cx.notify();
+    }
+
+    /// 松手把当前宽度写进 `|宽度`。一次撤销。
+    pub(super) fn finish_image_resize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(drag) = self.image_resize.take() else { return };
+        cx.notify();
+        let width = drag.current.round().max(1.) as u32;
+        if (width as f32 - drag.start_width).abs() < 1. {
+            return;
+        }
+        self.set_image_width(drag.block, drag.index, width, window, cx);
+    }
+
+    /// 选中图片后改 `|宽度`。并排时只改这一张，改完仍选中它。
     pub(super) fn set_image_width(
         &mut self,
         block: aero_core::BlockId,
-        width: Option<u32>,
+        index: usize,
+        width: u32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -293,19 +359,17 @@ impl super::Editor {
             return;
         };
         let source = self.doc.slice(range.clone()).to_string();
-        let Some(next) = super::preview::image_source_with_width(source.trim(), width) else { return };
-        if next == source.trim() {
+        let Some(next) = super::preview::image_source_set_width(&source, index, width) else { return };
+        if next == source {
             return;
         }
-        let start = range.start + source.len() - source.trim_start().len();
-        let end = range.end - (source.len() - source.trim_end().len());
-        if let Err(err) = self.doc.edit(Edit::replace(start..end, next)) {
+        if let Err(err) = self.doc.edit(Edit::replace(range, next)) {
             log::warn!("改图片宽度失败: {err}");
             return;
         }
         self.after_doc_change(cx);
-        if let Some(ix) = self.unit_index(block) {
-            self.select_blocks(ix, ix, window, cx);
+        if self.unit_index(block).is_some() {
+            self.select_image(block, index, window, cx);
         }
     }
 

@@ -343,7 +343,7 @@ mod tests {
                 assert_eq!(editor.read(cx).title(), title);
                 assert_eq!(editor.read(cx).index_snapshot().2.hash, stamp.hash);
             });
-            assert!(visual.debug_bounds("editor-title").is_some());
+            assert!(visual.debug_bounds("editor-title").is_none(), "正文不显示文件名");
         }
     }
 

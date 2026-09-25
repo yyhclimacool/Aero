@@ -1340,6 +1340,38 @@ fn navigation_marks_magnify_around_the_pointer_then_settle_back(cx: &mut TestApp
     assert!(back < rest + 1.5, "the mark shrinks back: {back} toward {rest}");
 }
 
+#[gpui_kit::test]
+fn navigation_pins_into_an_outline_and_jumps_to_the_heading(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+    let source = "# 甲\n\n正文\n\n## 乙\n\n更多\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size_of_navigation());
+    settle(cx);
+    let second = cx.update(|_, cx| editor.read(cx).headings()[1].2);
+    let pin = cx.debug_bounds("navigation-pin").expect("pin control on the minimap");
+    cx.simulate_click(pin.center(), Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("navigation-outline").is_some(), "pinned ticks become an outline");
+    assert!(cx.debug_bounds("document-navigator").is_none(), "the thumbnail rail steps aside");
+    let row = cx
+        .debug_bounds(Box::leak(format!("navigation-heading-{}", second.0).into_boxed_str()))
+        .expect("heading row");
+    cx.simulate_click(row.center(), Modifiers::default());
+    settle(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.focused.is_none(), "jumping from the outline does not open source");
+        assert_eq!(e.highlighted_block(), Some(second));
+    });
+    assert_eq!(text(&editor, cx), source);
+    let pin = cx.debug_bounds("navigation-pin").unwrap();
+    cx.simulate_click(pin.center(), Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("navigation-outline").is_none());
+    assert!(cx.debug_bounds("document-navigator").is_some());
+}
+
 fn size_of_navigation() -> gpui_kit::Size<gpui_kit::Pixels> {
     gpui_kit::size(gpui_kit::px(1000.), gpui_kit::px(700.))
 }
@@ -3837,10 +3869,9 @@ fn list_items_continue_and_exit(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("enter enter");
     cx.simulate_input("para");
     assert_eq!(text(&editor, cx), "- one\n- two\n\npara\n");
-    // 段首 ⌫：并入上一块？上一块是列表项，不能合并，只移动光标；再输入落在 two 之后
+    // 段首 ⌫：并回上一行。上一行是列表项时，这段文字接到列表项末尾
     cx.simulate_keystrokes("home backspace");
-    cx.simulate_input("!");
-    assert_eq!(text(&editor, cx), "- one\n- two!\n\npara\n");
+    assert_eq!(text(&editor, cx), "- one\n- twopara\n");
 }
 
 /// `/` 菜单（7.1）：块首输入 `/` 打开、继续输入过滤、↑↓ 选择、⏎ 确认 = 转换当前块并删掉命令；
@@ -3915,6 +3946,32 @@ fn slash_menu_converts_block(cx: &mut TestAppContext) {
     assert_eq!(text(&editor, cx), "## hello\n\n- [ ] buy milk\n");
 }
 
+#[gpui_kit::test]
+fn typing_hashes_and_a_space_on_a_heading_sets_that_level(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "# 沙箱限制\n\n### 三级\n\n正文\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_unit(0, 2, window, cx)));
+    cx.simulate_input("## ");
+    assert_eq!(text(&editor, cx), "## 沙箱限制\n\n### 三级\n\n正文\n");
+    cx.update(|_, cx| {
+        assert!(matches!(editor.read(cx).units[0].kind, aero_core::BlockKind::Heading { level: 2 }));
+    });
+    // 没有空格时，井号留在标题文字里
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_unit(0, 3, window, cx)));
+    cx.simulate_input("##");
+    assert_eq!(text(&editor, cx), "## ##沙箱限制\n\n### 三级\n\n正文\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "## 沙箱限制\n\n### 三级\n\n正文\n");
+    // 三级标题输入 "## " 改成二级
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_unit(1, 4, window, cx)));
+    cx.simulate_input("## ");
+    assert_eq!(text(&editor, cx), "## 沙箱限制\n\n## 三级\n\n正文\n");
+    // 普通段落输入 "## " 仍然变成二级标题
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_unit(2, 0, window, cx)));
+    cx.simulate_input("## ");
+    assert_eq!(text(&editor, cx), "## 沙箱限制\n\n## 三级\n\n## 正文\n");
+}
+
 /// `⌘⌥0–8` 直接转换当前块。
 #[gpui_kit::test]
 fn convert_shortcuts(cx: &mut TestAppContext) {
@@ -3936,89 +3993,6 @@ fn convert_shortcuts(cx: &mut TestAppContext) {
     assert_eq!(text(&editor, cx), "a\n\nb2\n");
     cx.simulate_keystrokes("cmd-alt-7");
     assert_eq!(text(&editor, cx), "a\n\n> b2\n");
-}
-
-/// 标题编辑（5.1）：没有 front matter 时提交 = 请工作区重命名；有 `title:` 时直接改文档。
-#[gpui_kit::test]
-fn title_edit_renames_or_edits_front_matter(cx: &mut TestAppContext) {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    let (_dir, _vault, _path, editor) = open(cx, "body\n");
-    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
-    let renames: Rc<RefCell<Vec<String>>> = Rc::default();
-    let sink = renames.clone();
-    cx.update(|_, cx| {
-        cx.subscribe(&editor, move |_, ev, _| {
-            if let super::EditorEvent::RenameRequested(name) = ev {
-                sink.borrow_mut().push(name.clone());
-            }
-        })
-        .detach();
-    });
-
-    // 文件名即标题；全选后输入替换，⏎ 提交
-    cx.update(|_, cx| assert_eq!(editor.read(cx).title(), "a"));
-    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
-    cx.run_until_parked();
-    cx.simulate_input("新名字");
-    cx.simulate_keystrokes("enter");
-    assert_eq!(renames.borrow().as_slice(), ["新名字".to_string()]);
-    cx.update(|_, cx| assert!(editor.read(cx).title_edit.is_none()));
-    // 文档没被动
-    assert_eq!(text(&editor, cx), "body\n");
-
-    // Esc 取消：不发事件
-    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
-    cx.run_until_parked();
-    cx.simulate_input("x");
-    cx.simulate_keystrokes("escape");
-    assert_eq!(renames.borrow().len(), 1);
-}
-
-#[gpui_kit::test]
-fn title_edit_waits_for_transaction_before_changing_document(cx: &mut TestAppContext) {
-    let source = "---\ntitle: Old\n---\nbody\n";
-    let (_dir, _vault, _path, editor) = open(cx, source);
-    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
-    cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
-    cx.run_until_parked();
-    cx.simulate_input("New");
-    cx.simulate_keystrokes("enter");
-    assert_eq!(
-        text(&editor, cx),
-        source,
-        "the workspace must confirm and commit title and incoming links together"
-    );
-}
-
-#[gpui_kit::test]
-fn title_edit_with_front_matter_requests_transaction(cx: &mut TestAppContext) {
-    use std::{cell::RefCell, rc::Rc};
-    let source = "---\ntitle: 旧题\ntags: [x]\n---\n\nbody\n";
-    let (dir, _vault, _path, editor) = open(cx, source);
-    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
-    let requests = Rc::new(RefCell::new(Vec::new()));
-    cx.update(|_, cx| {
-        let sink = requests.clone();
-        cx.subscribe(&editor, move |_, event, _| {
-            if let super::EditorEvent::RetitleRequested(title) = event {
-                sink.borrow_mut().push(title.clone());
-            }
-        })
-        .detach();
-    });
-    for title in ["新题", "a: b", "plain"] {
-        cx.update(|window, cx| editor.update(cx, |e, cx| e.start_title_edit(window, cx)));
-        cx.run_until_parked();
-        cx.simulate_input(title);
-        cx.simulate_keystrokes("enter");
-        assert_eq!(requests.borrow().last().map(String::as_str), Some(title));
-        assert_eq!(text(&editor, cx), source);
-    }
-    cx.executor().advance_clock(Duration::from_millis(600));
-    cx.run_until_parked();
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
 }
 
 /// 点击浏览态的块：画这一块的就是文本控件，按下的那一刻光标就落在点击处，不等下一帧。
@@ -4745,6 +4719,34 @@ fn image_embeds_render_as_bitmaps_and_honour_the_width_parameter(cx: &mut TestAp
     assert!(cx.debug_bounds("image-retry").is_some(), "以及重试入口");
 }
 
+/// 同一段里的多张图并排，按宽度比例分掉行宽，不叠成上下两张。
+#[gpui_kit::test]
+fn images_in_one_paragraph_share_the_line(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "![[wide.png|400]] ![[tall.png|200]]\n");
+    write_attachment(&dir, "a.assets/wide.png", 400, 200);
+    write_attachment(&dir, "a.assets/tall.png", 200, 400);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+    let wide = cx.debug_bounds("image-wide.png").expect("wide image");
+    let tall = cx.debug_bounds("image-tall.png").expect("tall image");
+    assert!(tall.origin.x >= wide.right() - gpui_kit::px(2.), "两张图在同一行: {wide:?} {tall:?}");
+    assert!((f32::from(tall.origin.y) - f32::from(wide.origin.y)).abs() < 2., "顶部对齐");
+    let ratio = f32::from(wide.size.width) / f32::from(tall.size.width);
+    assert!((ratio - 2.).abs() < 0.15, "400:200 的宽度比: {ratio} {wide:?} {tall:?}");
+    cx.simulate_click(tall.center(), gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        assert!(editor.selection.is_none(), "并排时也不选中整块");
+        assert_eq!(editor.selected_image_index(editor.units[0].id), Some(1));
+    });
+    assert!(cx.debug_bounds("image-resize-se").is_some(), "只给点中的那张画选中框");
+}
+
 /// 附件是后来才放进来的：点「重试」就能出图，不用重开笔记。
 #[gpui_kit::test]
 fn image_failures_recover_after_retry(cx: &mut TestAppContext) {
@@ -4762,7 +4764,52 @@ fn image_failures_recover_after_retry(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("image-error").is_none(), "错误提示应消失");
 }
 
-/// 单击图片选中所在块（不进编辑态，图片不会被源码顶掉）；双击全屏看图，`Esc` / `Space` 关掉。
+/// 点图片旁边、按回车、或在文末空白处点击，都继续显示同一张图，不露出 `![[…]]`。
+#[gpui_kit::test]
+fn editing_an_image_keeps_the_preview_size(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, point, px};
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "正文\n\n![[photo.png]]\n");
+    write_attachment(&dir, "a.assets/photo.png", 200, 100);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    settle(cx);
+    let before = cx.debug_bounds("image-photo.png").expect("预览应画出图片");
+    let id = cx.update(|_, cx| editor.read(cx).units[1].id);
+    let selector: &'static str = Box::leak(format!("unit-{}", id.0).into_boxed_str());
+    let unit = cx.debug_bounds(selector).expect("image unit");
+    let beside = point(unit.right() - px(4.), before.center().y);
+    assert!(beside.x > before.right(), "图片右侧还有可点的空白");
+    cx.simulate_click(beside, Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let after = cx.debug_bounds("image-photo.png").expect("点进块后图片还在");
+    assert!((f32::from(after.size.width) - f32::from(before.size.width)).abs() < 1.);
+    assert!((f32::from(after.size.height) - f32::from(before.size.height)).abs() < 1.);
+    cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        assert!(editor.focused.is_none(), "不打开源码框");
+        assert!(editor.selection.is_none(), "不给整块上选中底色");
+        assert!(editor.selected_image_index(id).is_some());
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let entered = cx.debug_bounds("image-photo.png").expect("回车后仍是图片");
+    assert!((f32::from(entered.size.width) - f32::from(before.size.width)).abs() < 1.);
+    cx.update(|_, cx| assert!(editor.read(cx).focused.is_none()));
+    let tail = cx.debug_bounds("editor-tail").expect("文末空白");
+    cx.simulate_click(tail.center(), Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("image-photo.png").is_some(), "点文末空白也不换成源码");
+    cx.update(|_, cx| {
+        let focused = editor.read(cx).focused.as_ref().map(|f| f.textarea.read(cx).value().to_string());
+        assert_ne!(focused.as_deref(), Some("![[photo.png]]"));
+    });
+}
+
+/// 单击图片只选中这张图（不进编辑态，也不给整块上底色）；双击全屏看图，`Esc` / `Space` 关掉。
 #[gpui_kit::test]
 fn clicking_an_image_selects_its_block_and_double_click_opens_the_viewer(cx: &mut TestAppContext) {
     let (dir, _cache, _vault, editor) = open_with_images(cx, "![[photo.png]]\n");
@@ -4778,7 +4825,8 @@ fn clicking_an_image_selects_its_block_and_double_click_opens_the_viewer(cx: &mu
     cx.update(|_, cx| {
         let editor = editor.read(cx);
         assert!(editor.focused.is_none(), "单击不进编辑态");
-        assert!(editor.selection.is_some(), "单击选中这一块");
+        assert!(editor.selection.is_none(), "不选中整块");
+        assert_eq!(editor.selected_image_index(editor.units[0].id), Some(0));
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(cx.debug_bounds("image-photo.png").is_some(), "选中后图片仍在");
@@ -4801,9 +4849,10 @@ fn clicking_an_image_selects_its_block_and_double_click_opens_the_viewer(cx: &mu
     assert!(cx.debug_bounds("image-viewer").is_none(), "Space 关闭看图");
 }
 
-/// 选中图片后，宽度预设写回 `|宽度`；原始去掉参数。
+/// 选中图片后拖右下角，按原图比例改宽度，松手写回 `|宽度`，一次撤销。
 #[gpui_kit::test]
-fn image_width_presets_rewrite_the_embed_parameter(cx: &mut TestAppContext) {
+fn dragging_an_image_corner_rewrites_the_width(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, point, px};
     let (dir, _cache, _vault, editor) = open_with_images(cx, "![[photo.png]]\n");
     write_attachment(&dir, "a.assets/photo.png", 800, 400);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -4811,24 +4860,38 @@ fn image_width_presets_rewrite_the_embed_parameter(cx: &mut TestAppContext) {
         window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
     });
     settle(cx);
-    assert!(cx.debug_bounds("image-width-medium").is_none(), "没选中时不显示宽度预设");
+    assert!(cx.debug_bounds("image-resize-se").is_none(), "没选中时没有手柄");
     let image = cx.debug_bounds("image-photo.png").unwrap();
-    cx.simulate_click(image.center(), gpui_kit::Modifiers::default());
+    let before = f32::from(image.size.width);
+    cx.simulate_click(image.center(), Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let medium = cx.debug_bounds("image-width-medium").expect("选中后应有宽度预设");
-    cx.simulate_click(medium.center(), gpui_kit::Modifiers::default());
-    settle(cx);
-    assert!(text(&editor, cx).contains("![[photo.png|400]]"), "中档写入文档示例的 |400");
-    let shown = cx.debug_bounds("image-photo.png").expect("改宽度后图片仍在");
-    assert!((f32::from(shown.size.width) - 400.).abs() < 1., "应按 |400 显示: {:?}", shown.size);
-    assert!(cx.update(|_, cx| editor.read(cx).selection.is_some()), "改完仍保持选中");
-    let original = cx.debug_bounds("image-width-original").expect("选中态还在，原始预设可见");
-    cx.simulate_click(original.center(), gpui_kit::Modifiers::default());
+    let handle = cx.debug_bounds("image-resize-se").expect("选中后有右下角手柄");
+    assert!(cx.debug_bounds("image-size").is_some(), "选中后显示尺寸");
+    let start = handle.center();
+    let end = start - point(px(160.), px(0.));
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(start + point(px(12.), px(0.)), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let live = cx.debug_bounds("image-photo.png").expect("拖动中图片还在");
+    assert!(f32::from(live.size.width) < before - 40., "拖动时宽度跟着变: {:?}", live.size);
+    let ratio = f32::from(live.size.height) / f32::from(live.size.width);
+    assert!((ratio - 0.5).abs() < 0.05, "拖动时保持原图比例: {:?}", live.size);
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
     settle(cx);
     let body = text(&editor, cx);
-    assert!(body.contains("![[photo.png]]"), "原始去掉宽度参数: {body}");
-    assert!(!body.contains('|'), "不应残留 |宽度: {body}");
+    let width: u32 = body
+        .split_once("|")
+        .and_then(|(_, rest)| rest.split("]]").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("应写回宽度: {body}"));
+    assert!(width < before as u32 - 40, "松手写入更小的宽度: {body}");
+    let shown = cx.debug_bounds("image-photo.png").unwrap();
+    assert!((f32::from(shown.size.width) - width as f32).abs() < 2., "显示宽度与源码一致: {:?}", shown.size);
+    cx.simulate_keystrokes("cmd-z");
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "![[photo.png]]\n");
 }
 
 /// 粘贴位图：写进 `<note>.assets/`、插入嵌入、单步撤销；纯文字粘贴仍走文本控件。

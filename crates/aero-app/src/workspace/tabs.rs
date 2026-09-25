@@ -6,8 +6,19 @@
 //! 没显示的标签页保留自己的编辑器：撤销历史、滚动位置、自动保存和外部修改检查都照常。
 //! 恢复会话时只记路径，切到那一页才加载。
 
+use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::Input;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex};
+
+/// 标签页标题处的输入：重命名文件，或改 front matter 的 `title`。
+pub(super) struct TabNameEdit {
+    tab: u64,
+    retitle: bool,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
 
 use super::*;
 
@@ -458,6 +469,69 @@ impl Workspace {
         self.close_tab(open.active, window, cx);
     }
 
+    pub(super) fn on_rename_active_tab(
+        &mut self,
+        _: &RenameActiveTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_tab_name_edit(false, window, cx);
+    }
+
+    pub(super) fn on_retitle_active_tab(
+        &mut self,
+        _: &RetitleActiveTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_tab_name_edit(true, window, cx);
+    }
+
+    /// `retitle` 时改 front matter 标题，否则重命名文件。输入框画在标签页上。
+    pub(super) fn begin_tab_name_edit(&mut self, retitle: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else { return };
+        let tab = &open.tabs[open.active];
+        let Some(editor) = tab.editor.clone() else { return };
+        if retitle && !editor.read(cx).has_front_matter_title() {
+            return;
+        }
+        let id = tab.id;
+        let initial = if retitle { editor.read(cx).title() } else { editor.read(cx).path().stem().to_owned() };
+        let input = cx.new(|cx| InputState::new(window, cx));
+        input.update(cx, |state, cx| {
+            state.set_value(initial.clone(), window, cx);
+            state.set_selected_range(0..initial.len(), cx);
+            state.focus(window, cx);
+        });
+        let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
+            InputEvent::PressEnter { .. } => this.commit_tab_name_edit(window, cx),
+            InputEvent::Blur => {
+                this.tab_name_edit = None;
+                cx.notify();
+            }
+            _ => {}
+        });
+        self.tab_name_edit = Some(TabNameEdit { tab: id, retitle, input, _subscription: subscription });
+        cx.notify();
+    }
+
+    fn commit_tab_name_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.tab_name_edit.take() else { return };
+        let new = edit.input.read(cx).value().trim().to_owned();
+        cx.notify();
+        if new.is_empty() {
+            return;
+        }
+        if edit.retitle {
+            let current = self.open.as_ref().and_then(|open| open.editor()).map(|editor| editor.read(cx).title());
+            if current.as_deref() != Some(new.as_str()) {
+                self.retitle_current(new, window, cx);
+            }
+        } else {
+            self.rename_current(new, window, cx);
+        }
+    }
+
     pub(super) fn on_close_other_tabs(
         &mut self,
         _: &CloseOtherTabs,
@@ -603,7 +677,7 @@ impl Workspace {
                 }
             })
             .when_some(marker, |el, color| el.child(div().flex_none().size(px(6.)).rounded_full().bg(color)))
-            .child(div().flex_1().min_w_0().truncate().when(tab.preview, |s| s.italic()).child(title.clone()))
+            .child(self.render_tab_label(id, &title, tab.preview))
             .child(
                 div()
                     .id(("tab-close", id))
@@ -648,6 +722,16 @@ impl Workspace {
                 }),
             )
             .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, window, cx| {
+                    if let Some(ix) = this.open.as_ref().and_then(|open| open.tabs.iter().position(|tab| tab.id == id))
+                        && this.open.as_ref().is_some_and(|open| open.active != ix)
+                    {
+                        this.activate_tab(ix, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
@@ -664,6 +748,47 @@ impl Workspace {
                 },
             )
             .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| this.move_tab(drag.id, id, cx)))
+            .context_menu({
+                let path = tab.path(cx).map(|path| path.as_str().to_owned());
+                let retitle = tab.editor.as_ref().is_some_and(|editor| editor.read(cx).has_front_matter_title());
+                move |menu, _, _| {
+                    let mut menu = menu;
+                    if path.is_some() {
+                        menu = menu.menu("重命名", Box::new(RenameActiveTab));
+                        if retitle {
+                            menu = menu.menu("修改标题", Box::new(RetitleActiveTab));
+                        }
+                        menu = menu.separator();
+                    }
+                    menu = menu.menu("关闭", Box::new(CloseTab)).menu("关闭其他标签页", Box::new(CloseOtherTabs));
+                    if let Some(path) = path.clone() {
+                        menu = menu
+                            .separator()
+                            .menu("在 Finder 中显示", Box::new(RevealInFinder(path.clone())))
+                            .menu("复制路径", Box::new(CopyNotePath(path)));
+                    }
+                    menu
+                }
+            })
+            .into_any_element()
+    }
+
+    fn render_tab_label(&self, id: u64, title: &str, preview: bool) -> AnyElement {
+        if let Some(edit) = self.tab_name_edit.as_ref().filter(|edit| edit.tab == id) {
+            return div()
+                .id(("tab-rename", id))
+                .debug_selector(|| "tab-rename".into())
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(&edit.input))
+                .into_any_element();
+        }
+        div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .when(preview, |el| el.italic())
+            .child(title.to_owned())
             .into_any_element()
     }
 }

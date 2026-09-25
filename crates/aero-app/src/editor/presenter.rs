@@ -405,9 +405,6 @@ impl Editor {
         }
         let Some(p) = self.presenters.get(&key).filter(|p| p.textarea == *textarea) else { return };
         let (range, enter_newline) = (p.range.clone(), p.enter_newline);
-        if self.title_edit.is_some() {
-            self.title_edit = None;
-        }
         self.exit_edit(cx);
         self.selection = None;
         self.install_focus(range, Some(key.id), enter_newline, textarea.clone(), window, cx);

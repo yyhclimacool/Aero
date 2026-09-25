@@ -1,7 +1,7 @@
 //! 窗口外框（`ui_design.md` 2.1 / 2.3）：标题栏、三栏与分割线、编辑区顶部的路径、侧栏与面板的标题行。
 //!
 //! 标题栏与下面三栏对齐：左侧栏上方是 文件 / 搜索 / 标签 三个视图按钮和折叠按钮，中间是标签条，
-//! 右侧面板显示大纲；收起的一侧只留折叠按钮。
+//! 右侧面板先空着；收起的一侧只留折叠按钮。
 //! 两侧宽度固定，窗口变宽变窄只改编辑区；窗口太窄时先压右侧面板、再压左侧栏，都不小于各自的最小宽度，
 //! 存下来的宽度不变，窗口放大后原样回来。
 //! 拖分割线时整个窗口保持左右调整的光标、编辑区不响应悬停；往里拖过最小宽度一段就收起，拖回来再展开；
@@ -62,14 +62,6 @@ impl Workspace {
         self.sidebar_tab = tab;
         if !self.sidebar_visible {
             self.sidebar_visible = true;
-            self.save_layout();
-        }
-        cx.notify();
-    }
-
-    pub(super) fn show_panel(&mut self, cx: &mut Context<Self>) {
-        if !self.panel_visible {
-            self.panel_visible = true;
             self.save_layout();
         }
         cx.notify();
@@ -334,19 +326,10 @@ impl Workspace {
                 .px_1()
                 .gap_0p5()
                 .items_center()
+                .justify_end()
                 .bg(sidebar_bg)
                 .border_l_1()
                 .border_color(sidebar_border)
-                .child(stop_title_drag(
-                    Button::new("panel-outline")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::TableOfContents)
-                        .selected(true)
-                        .tooltip_with_action("大纲", &ShowOutline, None)
-                        .on_click(cx.listener(|this, _, _, cx| this.show_panel(cx))),
-                ))
-                .child(div().flex_1())
                 .child(panel_toggle)
         } else {
             h_flex().flex_none().h_full().px_1().items_center().child(panel_toggle)
@@ -613,6 +596,8 @@ impl Workspace {
     }
 
     pub(super) fn on_show_outline(&mut self, _: &ShowOutline, _: &mut Window, cx: &mut Context<Self>) {
-        self.show_panel(cx);
+        if let Some(editor) = self.open.as_ref().and_then(|open| open.editor().cloned()) {
+            editor.update(cx, |editor, cx| editor.show_navigation_outline(cx));
+        }
     }
 }

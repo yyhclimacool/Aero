@@ -71,9 +71,6 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.title_edit.is_some() {
-            return false;
-        }
         if let Some(color) = color {
             crate::colors::remember(slot, color, cx);
         }
@@ -197,9 +194,6 @@ impl Editor {
     /// 打开颜色菜单。编辑态有选区就改那段文字，没有选区就改当前块；块选中态改选中的块。
     /// 菜单开着时再按一次就关掉（`⌘/` 是开关）。
     pub(super) fn open_color_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.title_edit.is_some() {
-            return false;
-        }
         // ⌘/ 是开关：已经开着就关掉
         if self.close_color_menu(window, cx) {
             return true;

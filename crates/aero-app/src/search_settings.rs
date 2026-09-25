@@ -9,9 +9,13 @@ use gpui_kit::*;
 
 use crate::semantic::{ModelStatus, SearchPreferences, SemanticPhase, SemanticService};
 
+pub(crate) fn view(service: Entity<SemanticService>, cx: &mut App) -> Entity<SearchSettings> {
+    cx.new(|cx| SearchSettings::new(service, cx))
+}
+
 /// 独立实体观察服务，下载进度与开关不依赖对话框重新打开。
 pub fn open(service: Entity<SemanticService>, window: &mut Window, cx: &mut App) {
-    let view = cx.new(|cx| SearchSettings::new(service, cx));
+    let view = view(service, cx);
     window.open_dialog(cx, move |dialog, window, _| {
         dialog
             .title("搜索与隐私")
@@ -25,7 +29,7 @@ pub fn open(service: Entity<SemanticService>, window: &mut Window, cx: &mut App)
     });
 }
 
-struct SearchSettings {
+pub(crate) struct SearchSettings {
     service: Entity<SemanticService>,
     _subscription: Subscription,
 }

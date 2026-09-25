@@ -21,6 +21,7 @@ mod render;
 mod search;
 mod search_view;
 mod search_settings;
+mod settings;
 mod semantic;
 mod semantic_policy;
 mod tag_tree;

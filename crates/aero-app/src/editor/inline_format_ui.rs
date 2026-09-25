@@ -19,7 +19,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.focused.is_none() || self.title_edit.is_some() {
+        if self.focused.is_none() {
             return false;
         }
         let f = self.focused.as_ref().expect("已确认在编辑态");

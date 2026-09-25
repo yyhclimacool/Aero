@@ -56,7 +56,8 @@ fn document_references_follow_body_instead_of_header_or_sidebar(cx: &mut TestApp
     assert!(old_count.is_none(), "no backlink count above the document");
     let footer = footer.expect("reference information belongs below the document");
     assert!(footer.top() >= last_block.bottom());
-    assert!(cx.debug_bounds("outline-rows").is_some(), "the right pane is only an outline");
+    assert!(cx.debug_bounds("context-blank").is_some(), "the right pane stays, with nothing in it yet");
+    assert!(cx.debug_bounds("outline-rows").is_none(), "the outline list has moved off this pane");
 }
 
 #[gpui_kit::test]

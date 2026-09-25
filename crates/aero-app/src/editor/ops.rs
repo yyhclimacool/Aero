@@ -73,8 +73,9 @@ pub enum Backspace {
     Nothing,
 }
 
-/// ⌫ 在单位开头：列表项脱离列表；段落 / 标题并入上一个文本块（保留其类型，标题去掉 `#`）；
-/// 上一块不是文本时只移动光标。
+/// ⌫ 在单位开头：列表项的第一行脱离列表；其余段落 / 标题并入上一行
+/// （上一行可以是段落、标题、列表项正文、引用或 callout，标题自己的 `#` 会去掉）。
+/// 上一块是代码、数学、表格这类不能接文字的块时，只把光标移过去。
 pub fn backspace_at_start(doc: &Document, units: &[Unit], ix: usize) -> Backspace {
     let unit = &units[ix];
     let doc_text = doc.to_string();
@@ -95,7 +96,8 @@ pub fn backspace_at_start(doc: &Document, units: &[Unit], ix: usize) -> Backspac
         return Backspace::Nothing;
     }
     let prev = &units[ix - 1];
-    let mergeable = unit.is_text() && prev.is_text() && prev.list.is_none() && unit.list.is_none();
+    // 列表项的第一行已经在上面脱离列表。这里的段落即使跟在列表项、引用后面，也要并回上一行。
+    let mergeable = unit.is_text() && accepts_joined_text(prev);
     if mergeable {
         let strip = if matches!(unit.kind, BlockKind::Heading { .. }) {
             heading_prefix_len(&doc_text[unit.range.clone()])
@@ -641,8 +643,13 @@ pub fn toggle_task(item_src: &str, base: usize) -> Option<Edit> {
     Some(Edit::replace(base + box_at + 1..base + box_at + 2, mark))
 }
 
+/// 上一行还能接着写字：段落、标题、列表项正文、引用和 callout。
+fn accepts_joined_text(unit: &Unit) -> bool {
+    unit.is_text() || matches!(unit.kind, BlockKind::BlockQuote | BlockKind::Callout { .. })
+}
+
 /// `- `、`3) `、`- [x] `（可带缩进）是否只是列表标记。
-pub fn is_list_marker(s: &str) -> bool {
+fn is_list_marker(s: &str) -> bool {
     let s = s.trim_start_matches([' ', '\t']);
     let rest = if let Some(r) = s.strip_prefix(['-', '*', '+']) {
         r
@@ -908,13 +915,42 @@ mod tests {
     }
 
     #[test]
-    fn backspace_after_code_fence_only_moves() {
-        let doc = Document::from_text("```\nx\n```\n\npara\n");
+    fn backspace_joins_a_paragraph_onto_the_previous_line() {
+        let cases = [
+            ("- 除非你接受相关风险，\n\n否则不要。\n", "- 除非你接受相关风险，否则不要。\n"),
+            ("- [ ] 先做\n\n再做\n", "- [ ] 先做再做\n"),
+            ("1. 第一\n\n接着\n", "1. 第一接着\n"),
+            ("- 甲\n\n  乙\n", "- 甲乙\n"),
+            ("# 标题\n\n正文\n", "# 标题正文\n"),
+            ("> 引用\n\n下一段\n", "> 引用下一段\n"),
+            ("> 一\n> 二\n\n三段\n", "> 一\n> 二三段\n"),
+            ("> [!note] 提示\n> 正文\n\n接着\n", "> [!note] 提示\n> 正文接着\n"),
+        ];
+        for (src, expected) in cases {
+            let mut doc = Document::from_text(src);
+            let us = units(&doc);
+            let Backspace::Edit(plan) = backspace_at_start(&doc, &us, us.len() - 1) else {
+                panic!("expected a join for {src:?}");
+            };
+            let (text, _) = apply(&mut doc, plan);
+            assert_eq!(text, expected, "{src:?}");
+        }
+    }
+
+    #[test]
+    fn backspace_after_code_or_math_only_moves() {
+        for src in ["```\nx\n```\n\npara\n", "$$\nE\n$$\n\npara\n"] {
+            let doc = Document::from_text(src);
+            let us = units(&doc);
+            assert!(us.len() >= 2, "{src:?} -> {}", us.len());
+            assert_eq!(
+                backspace_at_start(&doc, &us, us.len() - 1),
+                Backspace::MoveTo { unit: us.len() - 2, cursor: us[us.len() - 2].range.len() },
+                "{src:?}"
+            );
+        }
+        let doc = Document::from_text("```\nx\n```\n");
         let us = units(&doc);
-        assert_eq!(
-            backspace_at_start(&doc, &us, 1),
-            Backspace::MoveTo { unit: 0, cursor: us[0].range.len() }
-        );
         assert_eq!(backspace_at_start(&doc, &us, 0), Backspace::Nothing);
     }
 

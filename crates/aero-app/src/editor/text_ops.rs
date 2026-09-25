@@ -114,6 +114,27 @@ fn is_cjk(c: char) -> bool {
         0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0x3040..=0x30FF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF)
 }
 
+/// 已经是标题时，正文开头再打 `## `（井号后必须有一个空格）就改成对应级别。
+/// 返回新的整段源码，以及光标应停的位置（新前缀之后）。
+pub fn typed_heading_rewrite(text: &str, cursor: usize) -> Option<(String, usize)> {
+    let structural = heading_prefix_len(text);
+    if structural == 0 {
+        return None;
+    }
+    let body = &text[structural..];
+    let hashes = body.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) || body.as_bytes().get(hashes) != Some(&b' ') {
+        return None;
+    }
+    let typed_end = structural + hashes + 1;
+    if cursor != typed_end {
+        return None;
+    }
+    let content = &body[hashes + 1..];
+    let next = format!("{} {}", "#".repeat(hashes), content);
+    Some((next, hashes + 1))
+}
+
 /// 标题前缀 `#{1,6} ` 的长度（字节），不是标题时为 0。
 pub fn heading_prefix_len(text: &str) -> usize {
     let hashes = text.bytes().take_while(|b| *b == b'#').count();
@@ -303,6 +324,10 @@ mod tests {
         assert_eq!(word_count(""), 0);
         assert_eq!(line_col("ab\ncd", 4), (1, 1));
         assert_eq!(line_count("a\nb\n"), 3);
+        assert_eq!(typed_heading_rewrite("# ## 沙箱限制", 5), Some(("## 沙箱限制".into(), 3)));
+        assert_eq!(typed_heading_rewrite("## ### 沙箱限制", 7), Some(("### 沙箱限制".into(), 4)));
+        assert_eq!(typed_heading_rewrite("# ##沙箱限制", 4), None);
+        assert_eq!(typed_heading_rewrite("# 沙## 箱", 6), None);
         assert_eq!(heading_prefix_len("## x"), 3);
         assert_eq!(heading_prefix_len("#"), 1);
         assert_eq!(heading_prefix_len("#x"), 0);

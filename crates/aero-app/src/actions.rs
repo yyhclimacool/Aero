@@ -10,6 +10,18 @@ actions!(
     aero,
     [
         Quit,
+        /// 关于 Aero
+        About,
+        /// 检查这个构建是否带更新渠道
+        CheckForUpdates,
+        /// ⌘,：设置
+        OpenSettings,
+        /// ⌘H：隐藏 Aero
+        Hide,
+        /// ⌥⌘H：隐藏其他应用
+        HideOthers,
+        /// 全部显示
+        ShowAll,
         /// 打开文件夹作为 vault
         OpenVault,
         /// 新建 vault（选位置，创建 daily/ 与欢迎笔记）
@@ -27,7 +39,7 @@ actions!(
         DeleteNote,
         /// ⌘⇧F：左侧栏切到搜索视图并聚焦输入框（`ui_design.md` 4.2）
         OpenSearch,
-        /// ⌘,：本地语义搜索、模型下载与隐私设置
+        /// 本地语义搜索、模型下载与隐私设置
         OpenSearchSettings,
         /// ⌘⇧E：左侧栏切回文件视图，并在树里定位当前笔记
         OpenFiles,
@@ -48,6 +60,10 @@ actions!(
         CloseTab,
         /// 关闭当前之外的所有标签页
         CloseOtherTabs,
+        /// 标签页右键：重命名当前笔记的文件
+        RenameActiveTab,
+        /// 标签页右键：改 front matter 里的 title，不改文件名
+        RetitleActiveTab,
         /// ⌘⇧T：重新打开最近关闭的标签页
         ReopenClosedTab,
         /// ⌘⇧] / ⌃⇥：下一个标签页
@@ -206,6 +222,9 @@ impl Command {
 pub fn commands() -> Vec<Command> {
     use CommandScope::*;
     let mut commands = vec![
+        Command::new("settings", "设置…", "settings preferences sz", Global, OpenSettings),
+        Command::new("about", "关于 Aero", "about version gy", Global, About),
+        Command::new("check-updates", "检查更新", "update jcgx", Global, CheckForUpdates),
         Command::new("open-vault", "打开 Vault…", "open folder dkwjk", Global, OpenVault),
         Command::new("new-vault", "新建 Vault…", "new vault xj", Global, NewVault),
         Command::new("close-vault", "关闭 Vault", "close vault gb", Vault, CloseVault),
@@ -316,6 +335,9 @@ pub fn init(cx: &mut App) {
     use aero_core::inline_format::Format;
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("cmd-alt-h", HideOthers, None),
         KeyBinding::new("cmd-o", OpenVault, None),
         KeyBinding::new("cmd-n", NewNote, None),
         KeyBinding::new("cmd-shift-d", OpenDaily, None),
@@ -323,7 +345,6 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-backspace", DeleteNote, Some("FileTree")),
         KeyBinding::new("f2", crate::file_tree::RenameSelection, Some("FileTree")),
         KeyBinding::new("cmd-shift-f", OpenSearch, None),
-        KeyBinding::new("cmd-,", OpenSearchSettings, None),
         KeyBinding::new("cmd-shift-e", OpenFiles, None),
         KeyBinding::new("cmd-p", QuickOpen, None),
         KeyBinding::new("cmd-shift-p", CommandPalette, None),
@@ -408,8 +429,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&format!("cmd-{n}"), ActivateTab(if n == 9 { usize::MAX } else { n - 1 }), None)
     }));
 
-    // 窗口里没人处理时的兜底
+    // 窗口里没人处理时的兜底。隐藏类动作走系统，不经过编辑器。
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    cx.on_action(|_: &Hide, cx: &mut App| cx.hide());
+    cx.on_action(|_: &HideOthers, cx: &mut App| cx.hide_other_apps());
+    cx.on_action(|_: &ShowAll, cx: &mut App| cx.unhide_other_apps());
 
     sync_menus(
         MenuState {
@@ -419,6 +443,23 @@ pub fn init(cx: &mut App) {
         },
         cx,
     );
+}
+
+/// 应用菜单，顺序与 macOS 的应用菜单一致。
+fn application_menu() -> Menu {
+    Menu::new("Aero").items(vec![
+        MenuItem::action("关于 Aero", About),
+        MenuItem::action("检查更新", CheckForUpdates),
+        MenuItem::action("设置…", OpenSettings),
+        MenuItem::separator(),
+        MenuItem::os_submenu("服务", SystemMenuType::Services),
+        MenuItem::separator(),
+        MenuItem::action("隐藏 Aero", Hide),
+        MenuItem::action("隐藏其他", HideOthers),
+        MenuItem::action("全部显示", ShowAll),
+        MenuItem::separator(),
+        MenuItem::action("退出 Aero", Quit),
+    ])
 }
 
 pub struct MenuState {
@@ -433,7 +474,7 @@ pub fn sync_menus(state: MenuState, cx: &mut App) {
     use crate::paths::LinkPreviewMode;
     use aero_core::inline_format::Format;
     cx.set_menus(vec![
-        Menu::new("Aero").items(vec![MenuItem::action("退出 Aero", Quit)]),
+        application_menu(),
         Menu::new("文件").items(vec![
             MenuItem::action("打开 Vault…", OpenVault),
             MenuItem::action("新建 Vault…", NewVault),
@@ -507,5 +548,31 @@ mod tests {
             .expect("search privacy settings must be discoverable");
         assert_eq!(command.label, "搜索与隐私…");
         assert!(matches!(command.scope, super::CommandScope::Vault));
+    }
+
+    #[test]
+    fn application_menu_follows_the_platform_order() {
+        let labels: Vec<_> = super::application_menu()
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                super::MenuItem::Action { name, .. } => Some(name.to_string()),
+                super::MenuItem::SystemMenu(menu) => Some(menu.name.to_string()),
+                super::MenuItem::Separator | super::MenuItem::Submenu(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "关于 Aero",
+                "检查更新",
+                "设置…",
+                "服务",
+                "隐藏 Aero",
+                "隐藏其他",
+                "全部显示",
+                "退出 Aero",
+            ]
+        );
     }
 }

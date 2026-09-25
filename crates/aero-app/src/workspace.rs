@@ -1,4 +1,4 @@
-//! 主窗口：标题栏 + 三栏 + 状态栏（`ui_design.md` 第 2 节）、首次运行页（第 11 节）、右侧大纲（4.x / 8）。
+//! 主窗口：标题栏 + 三栏 + 状态栏（`ui_design.md` 第 2 节）、首次运行页（第 11 节）。右侧面板先空着。
 //!
 //! Workspace 持有当前 vault、文件树与各标签页的编辑器，并处理应用级动作（打开 / 新建 vault、新建笔记、
 //! 折叠面板、保存）。编辑器与文件树之间不直接通信，都经由这里转发。
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use aero_core::{BlockId, Vault, VaultPath};
+use aero_core::{Vault, VaultPath};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
@@ -91,6 +91,8 @@ pub struct Workspace {
     references_again: bool,
     next_tab_id: u64,
     tab_scroll: ScrollHandle,
+    /// 标签页上的重命名 / 修改标题输入框
+    tab_name_edit: Option<tabs::TabNameEdit>,
     /// 上次交给系统的窗口标题（窗口菜单、调度中心里显示）
     window_title: String,
     focus_handle: FocusHandle,
@@ -161,6 +163,7 @@ impl Workspace {
             references_again: false,
             next_tab_id: 0,
             tab_scroll: ScrollHandle::new(),
+            tab_name_edit: None,
             window_title: String::new(),
             state,
             open: None,
@@ -509,8 +512,6 @@ impl Workspace {
             }
             EditorEvent::PathsTouched(paths) => this.on_editor_touched_paths(editor, paths.clone(), cx),
             EditorEvent::Deleted => this.on_editor_deleted(editor, cx),
-            EditorEvent::RenameRequested(name) => this.rename_current(name.clone(), window, cx),
-            EditorEvent::RetitleRequested(title) => this.retitle_current(title.clone(), window, cx),
             EditorEvent::OpenRequested(path) => this.open_note(path.clone(), window, cx),
             EditorEvent::LinkClicked { target, fragment } => {
                 this.on_link_clicked(target.clone(), fragment.clone(), window, cx)
@@ -878,6 +879,18 @@ impl Workspace {
         }
     }
 
+    fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        crate::settings::open(cx.entity(), window, cx);
+    }
+
+    fn on_about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
+        crate::settings::open_about(window, cx);
+    }
+
+    fn on_check_updates(&mut self, _: &CheckForUpdates, window: &mut Window, cx: &mut Context<Self>) {
+        crate::settings::open_updates(window, cx);
+    }
+
     fn on_search_settings(&mut self, _: &OpenSearchSettings, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(open) = &self.open {
             crate::search_settings::open(open.semantic.clone(), window, cx);
@@ -907,7 +920,32 @@ impl Workspace {
         }
     }
 
-    fn set_link_preview(&mut self, mode: LinkPreviewMode, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_shows_source(&self) -> bool {
+        self.state.focus_shows_source
+    }
+
+    pub(crate) fn link_preview(&self) -> LinkPreviewMode {
+        self.state.link_preview
+    }
+
+    pub(crate) fn semantic_service(&self) -> Option<Entity<crate::semantic::SemanticService>> {
+        self.open.as_ref().map(|open| open.semantic.clone())
+    }
+
+    pub(crate) fn set_focus_shows_source(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.state.focus_shows_source == on {
+            return;
+        }
+        self.state.focus_shows_source = on;
+        self.state.save(&self.data_dir);
+        crate::editor::set_focus_shows_source(on, cx);
+        for editor in self.open.iter().flat_map(|o| o.editors().cloned()).collect::<Vec<_>>() {
+            editor.update(cx, |editor, cx| editor.sync_presentation(cx));
+        }
+        self.sync_editor_menus(cx);
+    }
+
+    pub(crate) fn set_link_preview(&mut self, mode: LinkPreviewMode, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.link_preview == mode {
             return;
         }
@@ -955,13 +993,7 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.state.focus_shows_source = !self.state.focus_shows_source;
-        self.state.save(&self.data_dir);
-        crate::editor::set_focus_shows_source(self.state.focus_shows_source, cx);
-        for editor in self.open.iter().flat_map(|o| o.editors().cloned()).collect::<Vec<_>>() {
-            editor.update(cx, |editor, cx| editor.sync_presentation(cx));
-        }
-        self.sync_editor_menus(cx);
+        self.set_focus_shows_source(!self.state.focus_shows_source, cx);
     }
 
     fn on_link_preview_hover(&mut self, _: &LinkPreviewHover, window: &mut Window, cx: &mut Context<Self>) {
@@ -1614,65 +1646,16 @@ impl Workspace {
             .child(div().flex_1().min_h(px(0.)).child(body))
     }
 
-    fn render_context(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_context(&self, _open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
         let (background, border) = (cx.theme().sidebar, cx.theme().sidebar_border);
-        v_flex()
+        // 大纲先拿掉，这块先空着。
+        div()
+            .id("context-blank")
+            .debug_selector(|| "context-blank".into())
             .size_full()
             .bg(background)
             .border_l_1()
             .border_color(border)
-            .child(self.render_pane_header("大纲", Vec::new(), cx))
-            .child(div().flex_1().min_h(px(0.)).child(self.render_outline(open, cx)))
-    }
-
-    fn render_outline(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let hover = theme.list_hover;
-        let headings: Vec<(u8, String, BlockId)> =
-            open.editor().map(|e| e.read(cx).headings()).unwrap_or_default();
-        let editor = open.editor().cloned();
-        let rows: Vec<AnyElement> = headings
-            .into_iter()
-            .enumerate()
-            .map(|(ix, (level, text, id))| {
-                let editor = editor.clone();
-                div()
-                    .id(("heading", ix))
-                    .w_full()
-                    .pl(px(12. + (level.saturating_sub(1)) as f32 * 12.))
-                    .pr_3()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover))
-                    .text_sm()
-                    .when(level == 1, |s| s.font_weight(FontWeight::MEDIUM))
-                    .when(level >= 3, |s| s.text_color(muted))
-                    .truncate()
-                    .child(if text.is_empty() { "（空标题）".to_owned() } else { text })
-                    .on_click(move |_, window, cx| {
-                        if let Some(editor) = &editor {
-                            editor.update(cx, |e, cx| e.focus_block(id, window, cx));
-                        }
-                    })
-                    .into_any_element()
-            })
-            .collect();
-        let empty = rows.is_empty();
-        v_flex().size_full().child(
-            v_flex()
-                .id("outline-rows")
-                .debug_selector(|| "outline-rows".into())
-                .flex_1()
-                .min_h(px(0.))
-                .px_1()
-                .overflow_y_scroll()
-                .children(rows)
-                .when(empty, |el| {
-                    el.child(div().px_3().py_2().text_xs().text_color(muted).child("文档里还没有标题。"))
-                }),
-        )
     }
 
     fn render_editor_area(&self, open: &VaultSession, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1809,6 +1792,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_copy_note_path))
             .on_action(cx.listener(Self::on_save_now))
             .on_action(cx.listener(Self::on_open_search))
+            .on_action(cx.listener(Self::on_open_settings))
+            .on_action(cx.listener(Self::on_about))
+            .on_action(cx.listener(Self::on_check_updates))
             .on_action(cx.listener(Self::on_search_settings))
             .on_action(cx.listener(Self::on_open_files))
             .on_action(cx.listener(Self::on_open_tags))
@@ -1826,6 +1812,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_close_other_tabs))
+            .on_action(cx.listener(Self::on_rename_active_tab))
+            .on_action(cx.listener(Self::on_retitle_active_tab))
             .on_action(cx.listener(Self::on_reopen_closed_tab))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
@@ -1954,6 +1942,41 @@ mod tests {
     use gpui_kit::px;
 
     #[gpui_kit::test]
+    fn settings_dialog_opens_editor_search_and_about(cx: &mut TestAppContext) {
+        use gpui_kit::Modifiers;
+        let (_dir, _data, workspace) = open(cx, Some("body\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        workspace.update_in(cx, |w, window, cx| w.on_open_settings(&crate::actions::OpenSettings, window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("settings-panel").is_some());
+        assert!(cx.debug_bounds("settings-editor").is_some());
+        let about = cx.debug_bounds("settings-nav-about").unwrap();
+        cx.simulate_click(about.center(), Modifiers::default());
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("settings-about").is_some());
+        let search = cx.debug_bounds("settings-nav-search").unwrap();
+        cx.simulate_click(search.center(), Modifiers::default());
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("settings-search").is_some());
+        assert!(cx.debug_bounds("search-settings-panel").is_some(), "search preferences sit inside settings");
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            open.semantic.read(cx).close_blocking();
+            open.search.read(cx).close_blocking();
+        });
+    }
+
+    #[gpui_kit::test]
     fn search_settings_dialog_is_visible_from_workspace(cx: &mut TestAppContext) {
         let (_dir, _data, workspace) = open(cx, Some("body\n"));
         let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -2052,6 +2075,7 @@ mod tests {
                 references_again: false,
                 next_tab_id: 1,
                 tab_scroll: gpui_kit::ScrollHandle::new(),
+                tab_name_edit: None,
                 window_title: String::new(),
                 focus_handle,
                 error: None,
@@ -3355,6 +3379,35 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn tab_menu_renames_the_file_without_showing_it_as_a_heading(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# 安全\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("editor-title").is_none(), "正文从一级标题开始，不另画文件名");
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::actions::RenameActiveTab), cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("tab-rename").is_some());
+        cx.simulate_input("笔记");
+        cx.simulate_keystrokes("enter");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));
+        assert!(dir.path().join("笔记.md").is_file());
+        assert!(!dir.path().join("a.md").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("笔记.md")).unwrap(), "# 安全\n");
+        cx.update(|_, cx| {
+            let editor = workspace.read(cx).open.as_ref().unwrap().editor().unwrap().read(cx);
+            assert_eq!(editor.title(), "笔记");
+            workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking();
+        });
+    }
+
+    #[gpui_kit::test]
     fn retitle_transaction_updates_incoming_links_without_renaming_file(cx: &mut TestAppContext) {
         let (dir, _data, workspace) = open(cx, Some("---\ntitle: Old title\n---\nbody\n"));
         let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -3370,10 +3423,13 @@ mod tests {
         });
         std::fs::write(dir.path().join("b.md"), "[[Old title]] [path](a.md)\n").unwrap();
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let title = cx.debug_bounds("editor-title").unwrap();
-        cx.simulate_click(title.center(), gpui_kit::Modifiers::default());
+        assert!(cx.debug_bounds("editor-title").is_none(), "正文不显示文件名或 front matter 标题");
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(crate::actions::RetitleActiveTab), cx);
+        });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("tab-rename").is_some(), "修改标题在标签页上输入");
         cx.simulate_input("New title");
         cx.simulate_keystrokes("enter");
         wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).rename_pending));

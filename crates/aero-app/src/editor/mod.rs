@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use aero_core::{Block, BlockId, BlockKind, Document, Edit, FileStamp, Vault, VaultError, VaultPath};
 use gpui_kit::base::input::{
-    Backspace, Delete, Escape, Input, InputEvent, InputState, Textarea, TextareaState,
+    Backspace, Delete, Escape, InputEvent, Textarea, TextareaState,
 };
 use gpui_kit::base::text::TextViewStyle;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -119,9 +119,6 @@ pub enum EditorEvent {
     PathsTouched(Vec<VaultPath>),
     /// 文件已在外部被删除：编辑器停止自动保存并显示横幅；工作区让文件树与索引跟上
     Deleted,
-    /// 用户在标题处输入了新文件名（不含 `.md`）：真正的重命名由工作区做，文件树与路径要一起变
-    RenameRequested(String),
-    RetitleRequested(String),
     /// 横幅上的"打开副本"
     OpenRequested(VaultPath),
     /// 预览里点了 wikilink：已解码的目标与可选片段（`target` 为空 = 同篇锚点 `[[#h]]`），工作区负责解析与打开
@@ -180,12 +177,6 @@ struct SlashMenu {
     /// 过滤后的候选（固定条目或 7.7 的颜色）
     matches: Vec<slash::Match>,
     selected: usize,
-}
-
-/// 标题编辑态（5.1）：单行输入框替换标题；⏎ 提交、Esc / 失焦取消。
-struct TitleEdit {
-    input: Entity<InputState>,
-    _subscription: Subscription,
 }
 
 /// 块选中态（`ui_design.md` 6）：连续几个编辑单位被整块选中，没有文本光标。
@@ -260,8 +251,9 @@ pub struct Editor {
     focused: Option<Focused>,
     /// 块选中态；与 `focused` 互斥
     selection: Option<BlockSelection>,
+    /// 点在图片上：`(块, 这一段里的第几张)`。只给这张图画选中框，不给整块上底色
+    selected_image: Option<(BlockId, usize)>,
     picker_open: bool,
-    title_edit: Option<TitleEdit>,
     slash: Option<SlashMenu>,
     /// 颜色菜单（7.7）；开着时焦点在它的过滤输入框上
     color_menu: Option<colors_ui::ColorMenu>,
@@ -287,6 +279,8 @@ pub struct Editor {
     /// 上一帧每张表表头各格的矩形（拖列宽、冻结列宽用）
     table_layout: Rc<std::cell::RefCell<std::collections::HashMap<BlockId, Vec<Bounds<Pixels>>>>>,
     table_resize: Option<table::ResizeState>,
+    /// 拖图片四角时的实时宽度；松手才写回 `|宽度`
+    image_resize: Option<images_ui::ImageResize>,
     /// 正在编辑的那张表的列宽比例：打字时列宽不跟着内容伸缩
     table_frozen: Option<(BlockId, Vec<f32>)>,
     /// 选区浮动工具条（5.9）与它的延迟出现计时
@@ -363,8 +357,8 @@ impl Editor {
             scale: 1.,
             focused: None,
             selection: None,
+            selected_image: None,
             picker_open: false,
-            title_edit: None,
             slash: None,
             color_menu: None,
             block_menu: None,
@@ -380,6 +374,7 @@ impl Editor {
             callout_folds: Default::default(),
             table_layout: Rc::default(),
             table_resize: None,
+            image_resize: None,
             table_frozen: None,
             toolbar: None,
             toolbar_task: None,
@@ -443,7 +438,7 @@ impl Editor {
         } else if action.as_any().is::<DocRedo>() {
             self.doc.can_redo()
         } else if action.as_any().is::<EditLink>() || action.as_any().is::<FormatInline>() {
-            self.focused.is_some() && self.title_edit.is_none()
+            self.focused.is_some()
         } else if let Some(action) = action.as_any().downcast_ref::<ConvertBlock>() {
             let Some(focused) = &self.focused else { return false };
             let Some(target) = BlockType::from_shortcut(action.0) else { return false };
@@ -467,71 +462,18 @@ impl Editor {
         cx.notify();
     }
 
-    /// 标题：front matter 的 `title`，没有则是文件名（5.1）。
+    /// 标签页和窗口用的名字：front matter 的 `title`，没有则是文件名。正文里不画这一行。
     pub fn title(&self) -> String {
         self.front_matter_title().map(|(_, t)| t).unwrap_or_else(|| self.path.stem().to_owned())
+    }
+
+    pub(crate) fn has_front_matter_title(&self) -> bool {
+        self.front_matter_title().is_some()
     }
 
     /// front matter 里 `title:` 值在文档中的区间与文本。
     fn front_matter_title(&self) -> Option<(Range<usize>, String)> {
         self.doc.front_matter_title()
-    }
-
-    // ---- 标题编辑（5.1） ----
-
-    /// 点击标题：换成单行输入框，全选当前标题。
-    fn start_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.exit_edit(cx);
-        self.selection = None;
-        let title = self.title();
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("未命名"));
-        let subscription = cx.subscribe_in(&input, window, Self::on_title_input_event);
-        input.update(cx, |st, cx| {
-            st.set_value(title.clone(), window, cx);
-            st.set_selected_range(0..title.len(), cx);
-            st.focus(window, cx);
-        });
-        self.title_edit = Some(TitleEdit { input, _subscription: subscription });
-        cx.notify();
-    }
-
-    fn on_title_input_event(
-        &mut self,
-        _: &Entity<InputState>,
-        event: &InputEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            InputEvent::PressEnter { .. } => self.commit_title(window, cx),
-            InputEvent::Blur => self.cancel_title_edit(false, window, cx),
-            InputEvent::Change | InputEvent::Focus => {}
-        }
-    }
-
-    fn cancel_title_edit(&mut self, refocus: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.title_edit.take().is_some() {
-            if refocus {
-                self.focus_handle.focus(window, cx);
-            }
-            cx.notify();
-        }
-    }
-
-    /// 提交标题：有 front matter `title` 时改它；否则请工作区重命名文件。
-    fn commit_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(edit) = self.title_edit.take() else { return };
-        let new = edit.input.read(cx).value().trim().to_owned();
-        self.focus_handle.focus(window, cx);
-        cx.notify();
-        if new.is_empty() || new == self.title() {
-            return;
-        }
-        if self.front_matter_title().is_some() {
-            cx.emit(EditorEvent::RetitleRequested(new));
-        } else {
-            cx.emit(EditorEvent::RenameRequested(new));
-        }
     }
 
     pub fn save_state(&self) -> &SaveState {
@@ -714,7 +656,7 @@ impl Editor {
         }
     }
 
-    /// 标题树（右侧大纲面板）：`(level, 文本, 块 id)`。
+    /// 标题树（刻度固定成大纲时用）：`(level, 文本, 块 id)`。
     pub fn headings(&self) -> Vec<(u8, String, BlockId)> {
         aero_core::headings::list(&self.doc).into_iter().map(|h| (h.level, h.text, h.id)).collect()
     }
@@ -877,6 +819,13 @@ impl Editor {
     // ---- 聚焦 ----
 
     fn focus_unit(&mut self, ix: usize, cursor: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.units[ix].id;
+        // 独占一段的图片：只选中这张图，不给整块上底色，也不打开源码。
+        if self.keeps_rendered_image(id, cx) {
+            self.select_image(id, 0, window, cx);
+            return;
+        }
+        self.selected_image = None;
         let unit = &self.units[ix];
         if matches!(unit.kind, BlockKind::MathBlock) {
             let (range, id) = (unit.range.clone(), unit.id);
@@ -1213,6 +1162,36 @@ impl Editor {
         true
     }
 
+    /// 标题正文开头再打 `## `（井号和文字之间有空格）时，改这一级标题，不把符号留在标题里。
+    fn retarget_typed_heading(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.hides_markers(cx) {
+            return false;
+        }
+        let Some(focused) = &self.focused else { return false };
+        let textarea = focused.textarea.clone();
+        let text = textarea.read(cx).value().to_string();
+        let cursor = textarea.read(cx).selected_range().start;
+        let Some((rewritten, new_cursor)) = text_ops::typed_heading_rewrite(&text, cursor) else { return false };
+        let Some(ix) = self.focused_unit() else { return false };
+        if !matches!(self.units[ix].kind, BlockKind::Heading { .. }) {
+            return false;
+        }
+        let start = self.units[ix].range.start;
+        let end = self.units[ix].range.end;
+        if self.doc.slice(start..end).to_string() != text {
+            return false;
+        }
+        if let Err(err) = self.doc.edit_coalescing(Edit::replace(start..end, rewritten)) {
+            log::error!("heading retarget rejected: {err}");
+            return false;
+        }
+        // 区间还指着替换前的字节，缩短后会落进后面的汉字中间
+        self.focused = None;
+        self.after_doc_change(cx);
+        self.focus_at(start + new_cursor, None, window, cx);
+        true
+    }
+
     /// `- ` / `1. ` 打完后，解析已经把它变成列表；把控件收成列表项正文，标记留给列表容器画。
     fn promote_typed_prefix(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.hides_markers(cx) {
@@ -1280,11 +1259,11 @@ impl Editor {
             cx.notify();
             return;
         }
-        if self.title_edit.is_some() {
-            self.cancel_title_edit(true, window, cx);
+        if self.slash.take().is_some() {
+            cx.notify();
             return;
         }
-        if self.slash.take().is_some() {
+        if self.focused.is_none() && self.selected_image.take().is_some() {
             cx.notify();
             return;
         }
@@ -1303,10 +1282,7 @@ impl Editor {
         if self.cancel_block_drag(window, cx) {
             return;
         }
-        let busy = self.title_edit.is_some()
-            || self.slash.is_some()
-            || self.focused.is_some()
-            || self.selection.is_some();
+        let busy = self.slash.is_some() || self.focused.is_some() || self.selection.is_some();
         if busy {
             self.blur_to_browse(window, cx);
         } else {
@@ -1328,10 +1304,6 @@ impl Editor {
     fn blur_to_browse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tag_menu.take().is_some() || self.wiki.take().is_some() {
             cx.notify();
-            return;
-        }
-        if self.title_edit.is_some() {
-            self.cancel_title_edit(true, window, cx);
             return;
         }
         if self.slash.take().is_some() {
@@ -1362,6 +1334,7 @@ impl Editor {
         let (anchor, head) = (anchor.min(last), head.min(last));
         self.slash = None;
         self.exit_edit(cx);
+        self.selected_image = None;
         self.selection = Some(BlockSelection { anchor, head });
         self.reveal = Some(self.units[head].id);
         self.reveal_mode = RevealMode::Visible;
@@ -1457,6 +1430,12 @@ impl Editor {
     }
 
     fn on_delete_selected(&mut self, _: &DeleteSelectedBlocks, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_none()
+            && let Some((id, _)) = self.selected_image.take()
+            && let Some(ix) = self.unit_index(id)
+        {
+            self.selection = Some(BlockSelection { anchor: ix, head: ix });
+        }
         if self.selection.is_some() {
             self.delete_selected(window, cx);
         } else {
@@ -1468,6 +1447,19 @@ impl Editor {
 
     fn unit_index(&self, id: BlockId) -> Option<usize> {
         self.units.iter().position(|u| u.id == id)
+    }
+
+    /// 点图片：只记住这张图，方便画选中框和 ⌫ 删除，不给整块上选中底色。
+    pub(super) fn select_image(&mut self, id: BlockId, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.exit_edit(cx);
+        self.selection = None;
+        self.selected_image = Some((id, index));
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn selected_image_index(&self, id: BlockId) -> Option<usize> {
+        self.selected_image.and_then(|(block, index)| (block == id).then_some(index))
     }
 
     /// gutter 的 `⠿`：进入块选中态；拖动走 `on_drag`。
@@ -1551,9 +1543,23 @@ impl Editor {
         self.update_wiki(cx);
         self.update_tags(cx);
         self.update_slash(cx);
-        if !self.promote_typed_prefix(window, cx) {
+        if !self.promote_typed_prefix(window, cx) && !self.retarget_typed_heading(window, cx) {
             self.refresh_markup(cx);
         }
+        self.settle_image_embed(window, cx);
+    }
+
+    /// 这一段已经变成整段图片嵌入时，退出文本框，改回和预览同一张图。
+    fn settle_image_embed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.focused_unit() else { return };
+        if self.keeps_rendered_image(self.units[ix].id, cx) {
+            self.select_blocks(ix, ix, window, cx);
+        }
+    }
+
+    /// 实时预览里，整段只有图片嵌入时不进源码框。显式「查看源码」仍打开文本。
+    fn keeps_rendered_image(&self, id: BlockId, cx: &App) -> bool {
+        self.hides_markers(cx) && !self.block_shows_source(id) && self.unit_is_image_embed(id)
     }
 
     // ---- `/` 菜单（7.1） ----
@@ -2124,11 +2130,11 @@ impl Editor {
     }
 
     /// 点击正文下方空白：聚焦最后一个段落尾，或新建段落。
-    /// PDF 嵌入虽然是段落，点它后面不能打开 `![[…]]` 源码，否则和正在看的那一页对不上。
+    /// 图片和 PDF 虽然是段落，点它后面不能打开 `![[…]]` 源码，否则和正在看的画面对不上。
     fn on_click_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let continue_text = self.units.len().checked_sub(1).is_some_and(|ix| {
             let unit = &self.units[ix];
-            unit.is_text() && unit.list.is_none() && !self.unit_is_pdf_embed(unit.id)
+            unit.is_text() && unit.list.is_none() && !self.unit_is_fixed_embed(unit.id)
         });
         if continue_text {
             let ix = self.units.len() - 1;
@@ -2137,10 +2143,20 @@ impl Editor {
             return;
         }
         self.append_paragraph(window, cx);
-        if self.focused_unit().is_some_and(|ix| self.unit_is_pdf_embed(self.units[ix].id)) {
+        if self.focused_unit().is_some_and(|ix| self.unit_is_fixed_embed(self.units[ix].id)) {
             self.exit_edit(cx);
             self.focus_handle.focus(window, cx);
         }
+    }
+
+    fn unit_is_fixed_embed(&self, id: BlockId) -> bool {
+        self.unit_is_pdf_embed(id) || self.unit_is_image_embed(id)
+    }
+
+    fn unit_is_image_embed(&self, id: BlockId) -> bool {
+        self.units.iter().find(|unit| unit.id == id).is_some_and(|unit| {
+            preview::is_image_embed(self.doc.slice(unit.range.clone()).to_string().trim())
+        })
     }
 
     fn unit_is_pdf_embed(&self, id: BlockId) -> bool {
@@ -2152,20 +2168,12 @@ impl Editor {
     // ---- 撤销 / 重做 ----
 
     fn on_undo(&mut self, _: &DocUndo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.title_edit.is_some() {
-            cx.propagate();
-            return;
-        }
         if let Some(affected) = self.doc.undo() {
             self.after_history(affected, window, cx);
         }
     }
 
     fn on_redo(&mut self, _: &DocRedo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.title_edit.is_some() {
-            cx.propagate();
-            return;
-        }
         if let Some(affected) = self.doc.redo() {
             self.after_history(affected, window, cx);
         }
@@ -2650,30 +2658,6 @@ impl Editor {
                 .child(h_flex().flex_none().gap_1().children(buttons))
                 .into_any_element(),
         )
-    }
-
-    /// 文档标题（5.1）：浏览时是大字，点击变成单行输入框。
-    fn render_title(&self, cx: &mut Context<Self>) -> AnyElement {
-        let base = div()
-            .pb_4()
-            .mb_2()
-            .text_size(px(28.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .line_height(relative(1.3));
-        match &self.title_edit {
-            Some(edit) => base.w_full().child(Input::new(&edit.input)).into_any_element(),
-            None => base
-                .id("title")
-                .debug_selector(|| "editor-title".into())
-                .cursor_text()
-                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                    if !event.is_right_click() {
-                        this.start_title_edit(window, cx);
-                    }
-                }))
-                .child(self.title())
-                .into_any_element(),
-        }
     }
 
     fn text_view_style(&self, cx: &App) -> TextViewStyle {
@@ -3395,10 +3379,15 @@ impl Editor {
             if ev.is_right_click() {
                 return;
             }
-            // PDF 块点在页面外的空白上也不进源码：预览始终是那一页，和渲染结果一样。
+            // 图片和 PDF 点在画面外的空白上也不进源码：视图和尺寸与预览保持一致。
             if this.unit_is_pdf_embed(id) {
                 cx.stop_propagation();
                 this.select_block_by_id(id, window, cx);
+                return;
+            }
+            if this.keeps_rendered_image(id, cx) {
+                cx.stop_propagation();
+                this.select_image(id, 0, window, cx);
                 return;
             }
             this.focus_block_at(id, ev.position(), window, cx)
@@ -3625,6 +3614,9 @@ impl Render for Editor {
         if self.table_resize.is_some() && !cx.has_active_drag() {
             self.finish_table_resize(cx);
         }
+        if self.image_resize.is_some() && !cx.has_active_drag() {
+            self.finish_image_resize(window, cx);
+        }
         self.validate_link_preview_scroll(cx);
         self.refresh_fragment_marks();
         self.sync_presenters(window, cx);
@@ -3699,10 +3691,17 @@ impl Render for Editor {
                     || value.downcast_ref::<crate::file_tree::TreeDrag>().is_some_and(|drag| !drag.directory)
                     || value.downcast_ref::<block_menu::BlockDrag>().is_some()
                     || value.downcast_ref::<table::TableResize>().is_some()
+                    || value.downcast_ref::<images_ui::ImageResizeDrag>().is_some()
             })
             .on_drop(cx.listener(|this, _: &table::TableResize, _, cx| this.finish_table_resize(cx)))
             .on_drag_move(cx.listener(|this, event: &DragMoveEvent<table::TableResize>, _, cx| {
                 this.track_table_resize(event.event.position.x, cx);
+            }))
+            .on_drop(cx.listener(|this, _: &images_ui::ImageResizeDrag, window, cx| {
+                this.finish_image_resize(window, cx);
+            }))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<images_ui::ImageResizeDrag>, _, cx| {
+                this.track_image_resize(event.event.position.x, cx);
             }))
             .on_drop(cx.listener(|this, drag: &block_menu::BlockDrag, window, cx| {
                 this.finish_block_drag(drag, window, cx);
@@ -3714,7 +3713,9 @@ impl Render for Editor {
             .drag_over::<crate::file_tree::TreeDrag>(|style, drag, _, cx| {
                 if drag.directory { style } else { style.bg(cx.theme().list_active) }
             })
-            .size_full()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
             .overflow_y_scroll()
             // 横向滑动留给宽表格自己滚，不折算成正文的上下滚动
             .restrict_scroll_to_axis()
@@ -3741,7 +3742,6 @@ impl Render for Editor {
                     .line_height(relative(BODY_LINE_HEIGHT))
                     .text_color(foreground)
                     .children(self.render_banner(cx))
-                    .child(self.render_title(cx))
                     .child(v_flex().w_full().gap(px(8.)).children(blocks))
                     .when(empty, |el| el.child(div().text_color(muted).child("点击这里开始写，或按 ⏎")))
                     .child(
@@ -3768,11 +3768,13 @@ impl Render for Editor {
             // 颜色菜单画在编辑器根上：块选中态没有控件可挂，位置由 `color_menu_position` 给
             .children(self.color_menu.is_some().then(|| self.render_color_menu(cx)))
             .children(self.render_image_viewer(window, cx));
-        div()
+        let pinned = self.navigation_pinned();
+        h_flex()
             .relative()
             .size_full()
             .child(body)
-            .children(self.render_navigation(window, cx))
+            .when(pinned, |el| el.child(self.pinned_outline(cx)))
+            .when(!pinned, |el| el.children(self.render_navigation(window, cx)))
             .children(self.render_navigation_preview(window, cx))
     }
 }

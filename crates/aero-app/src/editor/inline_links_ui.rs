@@ -14,7 +14,7 @@ impl Editor {
     /// ⌘K / 工具条的 🔗：选区变行内链接，已有链接选中地址，无选区打开笔记补全。
     /// 返回是否由编辑器处理。
     pub(super) fn edit_link(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.focused.is_none() || self.title_edit.is_some() {
+        if self.focused.is_none() {
             return false;
         }
         let f = self.focused.as_ref().expect("已确认在编辑态");

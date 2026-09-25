@@ -12,7 +12,7 @@ impl Editor {
         }
         let Some(f) = &mut self.focused else { return };
         f.pairs.pending = None;
-        if !f.textarea.focus_handle(cx).is_focused(window) || self.picker_open || self.title_edit.is_some() {
+        if !f.textarea.focus_handle(cx).is_focused(window) || self.picker_open {
             return;
         }
         let modifiers = event.keystroke.modifiers;

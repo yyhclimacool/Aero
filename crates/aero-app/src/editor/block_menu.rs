@@ -281,12 +281,6 @@ impl Editor {
         }
     }
 
-    fn block_menu_width(&mut self, width: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.block_menu.as_ref().map(|menu| menu.block) else { return };
-        self.set_image_width(id, width, window, cx);
-        self.block_menu = None;
-    }
-
     pub(super) fn render_block_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.block_menu.as_ref()?;
         let theme = cx.theme().clone();
@@ -337,10 +331,6 @@ impl Editor {
                             "id" => this.block_menu_add_id(window, cx),
                             "duplicate" => this.block_menu_duplicate(window, cx),
                             "delete" => this.block_menu_delete(window, cx),
-                            "small" => this.block_menu_width(Some(preview::IMAGE_WIDTH_SMALL), window, cx),
-                            "medium" => this.block_menu_width(Some(preview::IMAGE_WIDTH_MEDIUM), window, cx),
-                            "large" => this.block_menu_width(Some(preview::IMAGE_WIDTH_LARGE), window, cx),
-                            "original" => this.block_menu_width(None, window, cx),
                             _ => {}
                         }
                     }),
@@ -360,12 +350,6 @@ impl Editor {
             row("block-menu-duplicate", "复制块".into(), "duplicate"),
             row("block-menu-delete", "删除".into(), "delete"),
         ]);
-        if image {
-            rows.push(row("block-menu-width-small", "宽度 · 小".into(), "small"));
-            rows.push(row("block-menu-width-medium", "宽度 · 中".into(), "medium"));
-            rows.push(row("block-menu-width-large", "宽度 · 大".into(), "large"));
-            rows.push(row("block-menu-width-original", "宽度 · 原始".into(), "original"));
-        }
         let convert = menu.submenu == Some(Submenu::Convert);
         Some(
             deferred(
