@@ -1,6 +1,6 @@
 //! 默认示例库（`ui_design.md` 11：库选择页上的一个入口，不在启动时自动打开）。
 //!
-//! 六篇笔记的源码在 `assets/demo-vault/`，编译期嵌入二进制，运行时不读安装包里的文件，
+//! 示例笔记的源码在 `assets/demo-vault/`，编译期嵌入二进制，运行时不读安装包里的文件，
 //! 所以每个 `.dmg` 带的就是那次构建的示例。用户每次从库选择页进来都会走 [`prepare`]：
 //! - 目录不存在：先在同级临时目录写完整副本再整体 `rename` 发布，中途失败只留错误，不把半个库交给用户；
 //! - 目录已存在：按 `.aero/demo.toml` 里记录的"上次交付指纹"增量更新。文件还是我们上次写进去的样子
@@ -17,8 +17,15 @@ use serde::{Deserialize, Serialize};
 
 pub const WELCOME: &str = "00-欢迎.md";
 const DIR: &str = "demo-vault";
+
+/// 内嵌示例的篇数。测试用它，避免各处再写一个会过期的数字。
+#[cfg(test)]
+pub(crate) fn note_count() -> usize {
+    NOTES.len()
+}
 const NOTES: &[(&str, &str)] = &[
     (WELCOME, include_str!("../../../assets/demo-vault/00-欢迎.md")),
+    ("体验/使用方法.md", include_str!("../../../assets/demo-vault/体验/使用方法.md")),
     ("体验/Markdown 排版.md", include_str!("../../../assets/demo-vault/体验/Markdown 排版.md")),
     ("体验/双链与别名.md", include_str!("../../../assets/demo-vault/体验/双链与别名.md")),
     ("体验/标题与块引用.md", include_str!("../../../assets/demo-vault/体验/标题与块引用.md")),
@@ -163,7 +170,7 @@ fn existing_directory(path: &Path) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Manifest, NOTES, WELCOME, prepare};
+    use super::{Manifest, NOTES, WELCOME, note_count, prepare};
     use aero_core::{
         Vault, VaultPath,
         links::{Resolution, Resolver},
@@ -204,13 +211,13 @@ mod tests {
     }
 
     #[test]
-    fn demo_vault_initializes_six_connected_notes() {
+    fn demo_vault_initializes_connected_notes() {
         let dir = tempfile::tempdir().unwrap();
         let root = prepare(dir.path()).unwrap();
         assert_eq!(root, dir.path().join("demo-vault"));
         let vault = Vault::open(&root).unwrap();
         let notes = vault.notes().unwrap();
-        assert_eq!(notes.len(), 6);
+        assert_eq!(notes.len(), note_count());
         assert!(notes.contains(&VaultPath::new(WELCOME).unwrap()));
         let mut resolver = Resolver::new();
         for path in &notes {
@@ -252,7 +259,7 @@ mod tests {
         }
         assert_eq!(missing, ["下一篇灵感笔记"]);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no staging leftovers");
-        assert_eq!(Manifest::load(&root).unwrap().delivered.len(), 6, "交付记录覆盖全部示例");
+        assert_eq!(Manifest::load(&root).unwrap().delivered.len(), note_count(), "交付记录覆盖全部示例");
     }
 
     #[test]

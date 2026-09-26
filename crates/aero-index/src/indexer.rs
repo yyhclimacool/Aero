@@ -817,6 +817,7 @@ impl Indexer {
                     target: target.clone(),
                     alias: None,
                     fragment: None,
+                    pointer: None,
                 };
                 let range = aero_core::links::target_range(&text, &span);
                 let replacement = if target.contains('/') {

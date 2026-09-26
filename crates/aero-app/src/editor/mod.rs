@@ -52,9 +52,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aero_core::{Block, BlockId, BlockKind, Document, Edit, FileStamp, Vault, VaultError, VaultPath};
-use gpui_kit::base::input::{
-    Backspace, Delete, Escape, InputEvent, Textarea, TextareaState,
-};
+use gpui_kit::base::input::{Backspace, Delete, Escape, InputEvent, Textarea, TextareaState};
 use gpui_kit::base::text::TextViewStyle;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -124,6 +122,11 @@ pub enum EditorEvent {
     /// 预览里点了 wikilink：已解码的目标与可选片段（`target` 为空 = 同篇锚点 `[[#h]]`），工作区负责解析与打开
     LinkClicked {
         target: String,
+        fragment: Option<String>,
+    },
+    /// `[[显示名]](相对路径)`：路径相对当前笔记目录，不创建缺失目标。
+    VaultLink {
+        path: String,
         fragment: Option<String>,
     },
     /// 横幅上的"关闭"：工作区丢掉这个编辑器
@@ -1171,7 +1174,9 @@ impl Editor {
         let textarea = focused.textarea.clone();
         let text = textarea.read(cx).value().to_string();
         let cursor = textarea.read(cx).selected_range().start;
-        let Some((rewritten, new_cursor)) = text_ops::typed_heading_rewrite(&text, cursor) else { return false };
+        let Some((rewritten, new_cursor)) = text_ops::typed_heading_rewrite(&text, cursor) else {
+            return false;
+        };
         let Some(ix) = self.focused_unit() else { return false };
         if !matches!(self.units[ix].kind, BlockKind::Heading { .. }) {
             return false;
@@ -1450,7 +1455,13 @@ impl Editor {
     }
 
     /// 点图片：只记住这张图，方便画选中框和 ⌫ 删除，不给整块上选中底色。
-    pub(super) fn select_image(&mut self, id: BlockId, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn select_image(
+        &mut self,
+        id: BlockId,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.exit_edit(cx);
         self.selection = None;
         self.selected_image = Some((id, index));

@@ -63,9 +63,9 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_embedded_demo_vault_matches_the_repository(self):
-        """示例库随可执行文件分发：每个 .dmg 带的都是仓库里当前的六篇示例。"""
+        """示例库随可执行文件分发：每个 .dmg 带的都是仓库里当前的示例。"""
         notes = sorted((ROOT / "assets/demo-vault").rglob("*.md"))
-        self.assertEqual(len(notes), 6, "demo vault must ship six notes")
+        self.assertEqual(len(notes), 7, "demo vault note count drifted; update NOTES and this check together")
         with (self.contents / "MacOS/aero").open("rb") as executable:
             image = mmap.mmap(executable.fileno(), 0, access=mmap.ACCESS_READ)
         try:

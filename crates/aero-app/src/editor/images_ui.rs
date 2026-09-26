@@ -5,34 +5,10 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use aero_core::{Edit, VaultPath};
+use aero_core::Edit;
 
 use crate::actions::{CloseImageViewer, PasteAttachment};
 use crate::render::{Attachment, RenderService, State};
-
-fn remote_scheme(url: &str) -> bool {
-    let Some((scheme, _)) = url.split_once(':') else { return false };
-    matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https" | "mailto" | "ftp")
-}
-
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
-}
 
 /// 剪贴板位图的落地后缀；GPUI 在 macOS 上给的是 PNG / TIFF 等有限几种。
 fn image_extension(image: &gpui_kit::Image) -> &'static str {
@@ -212,9 +188,13 @@ impl super::Editor {
         let target = aero_core::links::escape_target(file.file_name())
             .ok_or_else(|| format!("文件名 {} 无法写进链接", file.file_name()))?;
         Ok(match aero_core::attachments::Kind::for_path(file.as_str()) {
-            // 图片 / PDF 用嵌入；其他文件按设计插普通链接
             Some(_) => format!("![[{target}]]"),
-            None => format!("[{}]({target})", file.file_name()),
+            None => {
+                let relative = relative_to_note(&self.path, file.as_str());
+                let destination =
+                    if relative.contains([' ', ')', '<', '>']) { format!("<{relative}>") } else { relative };
+                format!("[[{target}]]({destination})")
+            }
         })
     }
 
@@ -235,44 +215,27 @@ impl super::Editor {
         self.structural_edit(Edit::replace(range, text), at, window, cx);
     }
 
-    /// 预览里点到的不是笔记链接：网页原样打开；相对路径按附件找真实文件，避免把 `notes.zip` 交给系统报 -50。
-    pub(crate) fn open_external_link(&self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// 单方括号链接一律交给浏览器。没有协议时补上 `http://`。
+    pub(crate) fn open_external_link(&self, url: &str, _window: &mut Window, cx: &mut Context<Self>) {
         let url = url.trim();
-        if remote_scheme(url) {
-            cx.open_url(url);
-            return;
-        }
-        if let Some(path) = self.local_file(url) {
-            cx.open_url(&crate::paths::file_url(&path));
-            return;
-        }
-        if url.split_once(':').is_some_and(|(scheme, _)| scheme.bytes().all(|b| b.is_ascii_alphabetic())) {
-            cx.open_url(url);
-            return;
-        }
-        window.push_notification(Notification::error(format!("找不到文件 {url}")).title("打开文件"), cx);
+        let url = if has_scheme(url) { url.to_owned() } else { format!("http://{url}") };
+        cx.open_url(&url);
     }
+}
 
-    fn local_file(&self, url: &str) -> Option<std::path::PathBuf> {
-        let target = url.trim().trim_matches(|c| c == '<' || c == '>');
-        let target = percent_decode(target);
-        let target = target.trim_start_matches("./");
-        if target.is_empty() || target.contains("..") {
-            return None;
-        }
-        let mut candidates = Vec::new();
-        if let Some(name) = std::path::Path::new(&target).file_name() {
-            if let Some(assets) = self.path.assets_dir() {
-                candidates.push(format!("{}/{}", assets.as_str(), name.to_string_lossy()));
-            }
-        }
-        let parent = self.path.parent();
-        candidates.push(if parent.is_empty() { target.to_owned() } else { format!("{parent}/{target}") });
-        candidates.into_iter().find_map(|rel| {
-            let path = VaultPath::new(&rel).ok()?;
-            let file = self.vault.fs_path(&path);
-            file.is_file().then_some(file)
-        })
+fn has_scheme(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(scheme, rest)| {
+        !scheme.is_empty() && !rest.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphabetic())
+    })
+}
+
+/// 附件相对当前笔记所在目录的路径。笔记在库根时就是库内路径。
+fn relative_to_note(note: &aero_core::VaultPath, file: &str) -> String {
+    let parent = note.parent();
+    if parent.is_empty() {
+        file.to_owned()
+    } else {
+        file.strip_prefix(&format!("{parent}/")).unwrap_or(file).to_owned()
     }
 }
 

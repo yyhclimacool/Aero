@@ -482,7 +482,10 @@ impl RewriteContext<'_> {
         // 先用一次解析拿到的地址看有没有要改的：多数笔记一个都没有，省掉每个链接一次的整篇重解析。
         // 判断条件与下面循环里的跳过条件相同。
         let needs_rewrite = |url: &str| {
-            if url.is_empty() || url.starts_with(['#', '?']) || url.starts_with("//") || url::Url::parse(url).is_ok()
+            if url.is_empty()
+                || url.starts_with(['#', '?'])
+                || url.starts_with("//")
+                || url::Url::parse(url).is_ok()
             {
                 return false;
             }

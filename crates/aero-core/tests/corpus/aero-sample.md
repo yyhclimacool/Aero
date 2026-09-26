@@ -7,6 +7,12 @@ tags: [tool, rust]
 
 # 安装 ripgrep
 
+# 安装ripgrep
+
+安装ripgrep 的方法有两种，推荐`brew install ripgrep`。参考[rust cli](www.rustup.rs)，与别名
+
+安装ripgrep 的方法有两种，推荐`brew install ripgrep`。参考[rust cli](www.rustup.rs)，与别名
+
 安装 ripgrep 的方法有两种，推荐 `brew install ripgrep`。参考 [[Rust CLI]] 与 [[Rust CLI|别名]]，以及 [[note#标题]] 和 [[note#^block-id]]。
 
 中英文混排：**粗体中文**、*斜体 English*、~~删除线~~、==高亮==、%%注释%%、`行内代码`。行内公式 $E = mc^2$ 与 #工具 #中文/嵌套 标签。

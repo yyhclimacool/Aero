@@ -108,7 +108,7 @@ fn rich_root(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
 
 #[gpui_kit::test]
 fn rich_selection_and_highlight_keep_images_and_following_text_still(cx: &mut TestAppContext) {
-    use gpui_kit::{px, size, Modifiers};
+    use gpui_kit::{Modifiers, px, size};
     for source in [
         "```mermaid\nflowchart LR\n A[开始] --> B[结束]\n```\n\n后续正文\n",
         "![[paper.pdf|400]]\n\n后续正文\n",
@@ -159,7 +159,7 @@ fn rich_selection_and_highlight_keep_images_and_following_text_still(cx: &mut Te
 
 #[gpui_kit::test]
 fn rich_long_errors_keep_retry_visible_and_clickable(cx: &mut TestAppContext) {
-    use gpui_kit::{px, size, Modifiers};
+    use gpui_kit::{Modifiers, px, size};
     let source = "```mermaid\nthis is not a diagram\n```\n";
     let (_dir, _cache, _vault, editor) = open_with_images(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -381,7 +381,7 @@ fn assert_nested_pdf_read_only(cx: &mut TestAppContext, source: &str) {
 
 #[gpui_kit::test]
 fn rich_pdf_hover_uses_target_note_assets_and_stays_read_only(cx: &mut TestAppContext) {
-    use gpui_kit::{point, px, Bounds};
+    use gpui_kit::{Bounds, point, px};
     let source = "见 [[b]]\n";
     let target = "![[paper.pdf#page=2|240]]\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
@@ -437,7 +437,7 @@ fn rich_pdf_hover_uses_target_note_assets_and_stays_read_only(cx: &mut TestAppCo
 
 #[gpui_kit::test]
 fn pdf_reader_toolbar_and_page_input_are_above_the_viewport(cx: &mut TestAppContext) {
-    use gpui_kit::{px, size, Modifiers};
+    use gpui_kit::{Modifiers, px, size};
     let source = "![[paper.pdf#page=1|400]]\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
     std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
@@ -478,7 +478,7 @@ fn pdf_reader_toolbar_and_page_input_are_above_the_viewport(cx: &mut TestAppCont
 
 #[gpui_kit::test]
 fn pdf_reader_scrolls_across_pages_without_scrolling_or_editing_the_note(cx: &mut TestAppContext) {
-    use gpui_kit::{point, px, size, Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase};
+    use gpui_kit::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px, size};
     let source = "![[paper.pdf|400]]\n\n正文\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
     let pdf = String::from_utf8(crate::render::two_page_pdf()).unwrap().replace("200 100", "200 500");
@@ -506,7 +506,7 @@ fn pdf_reader_scrolls_across_pages_without_scrolling_or_editing_the_note(cx: &mu
 
 #[gpui_kit::test]
 fn pdf_reader_input_does_not_edit_the_previously_focused_note_text(cx: &mut TestAppContext) {
-    use gpui_kit::{px, size, Modifiers};
+    use gpui_kit::{Modifiers, px, size};
     let source = "正文\n\n![[paper.pdf|400]]\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
     std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
@@ -572,7 +572,7 @@ fn pdf_reader_input_undo_never_undoes_note_edits(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn pdf_reader_resizes_from_both_edges_without_changing_the_note(cx: &mut TestAppContext) {
-    use gpui_kit::{point, px, size, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    use gpui_kit::{Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, point, px, size};
     let source = "![[paper.pdf|400]]\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
     std::fs::write(dir.path().join("paper.pdf"), crate::render::two_page_pdf()).unwrap();
@@ -1262,7 +1262,7 @@ fn open_color_menu(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
 
 #[gpui_kit::test]
 fn navigation_marks_preview_and_jump_without_entering_edit_mode(cx: &mut TestAppContext) {
-    use gpui_kit::{point, px, size, Modifiers};
+    use gpui_kit::{Modifiers, point, px, size};
     let source =
         format!("# 导航标题\n\n{}最后一段 **保留内容**。\n", "正文段落，保持编辑行为不变。\n\n".repeat(30));
     let (_dir, _vault, _path, editor) = open(cx, &source);
@@ -1297,7 +1297,7 @@ fn navigation_marks_preview_and_jump_without_entering_edit_mode(cx: &mut TestApp
 
 #[gpui_kit::test]
 fn navigation_marks_magnify_around_the_pointer_then_settle_back(cx: &mut TestAppContext) {
-    use gpui_kit::{point, px, Modifiers};
+    use gpui_kit::{Modifiers, point, px};
     let source = format!("# 标题\n\n{}最后一段。\n", "段落。\n\n".repeat(11));
     let (_dir, _vault, _path, editor) = open(cx, &source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -1423,7 +1423,7 @@ fn block_handle_click_selects_without_opening_menu(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn block_menu_dismisses_on_outside_click_and_keeps_submenu_clicks(cx: &mut TestAppContext) {
-    use gpui_kit::{point, px, Modifiers, MouseButton};
+    use gpui_kit::{Modifiers, MouseButton, point, px};
     let source = "first\n\nsecond\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -1458,7 +1458,7 @@ fn block_menu_dismisses_on_outside_click_and_keeps_submenu_clicks(cx: &mut TestA
 
 #[gpui_kit::test]
 fn block_menu_dismisses_when_an_outside_link_captures_the_click(cx: &mut TestAppContext) {
-    use gpui_kit::{point, px, Modifiers, MouseButton};
+    use gpui_kit::{Modifiers, MouseButton, point, px};
     let source = "[外部链接](https://example.com)\n\n正文\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -1480,7 +1480,7 @@ fn block_menu_dismisses_when_an_outside_link_captures_the_click(cx: &mut TestApp
 
 #[gpui_kit::test]
 fn block_menu_right_click_retargets_and_outside_click_reaches_content(cx: &mut TestAppContext) {
-    use gpui_kit::{point, px, Modifiers, MouseButton};
+    use gpui_kit::{Modifiers, MouseButton, point, px};
     let source = "first\n\nsecond\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -2817,10 +2817,11 @@ fn block_ref_mouse_writes_external_id_and_undo_keeps_it(cx: &mut TestAppContext)
     let changed = std::fs::read_to_string(&target).unwrap();
     let doc = aero_core::Document::from_text(&changed);
     let block = aero_core::block_refs::resolve(&doc, &id).unwrap();
-    assert!(doc
-        .blocks()
-        .iter()
-        .any(|(_, b)| b.id == block && matches!(b.kind, aero_core::BlockKind::CodeFence { .. })));
+    assert!(
+        doc.blocks()
+            .iter()
+            .any(|(_, b)| b.id == block && matches!(b.kind, aero_core::BlockKind::CodeFence { .. }))
+    );
     cx.simulate_input("!");
     assert_eq!(text(&editor, cx), completed.replace("]] after", "]]! after"));
     cx.simulate_keystrokes("cmd-z");
@@ -3710,7 +3711,7 @@ fn table_preview_enables_horizontal_overflow(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn wide_table_scroll_keeps_vertical_document_navigation(cx: &mut TestAppContext) {
-    use gpui_kit::{point, px, Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase};
+    use gpui_kit::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
     let mut source = format!(
         "| {} |\n| {} |\n| {} |\n\n",
         ["Heading"; 12].join(" | "),
@@ -4928,28 +4929,26 @@ fn pasting_a_bitmap_imports_it_and_leaves_text_paste_alone(cx: &mut TestAppConte
     assert!(text(&editor, cx).contains("粘来的文字"), "{:?}", text(&editor, cx));
 }
 
-/// 点导入进来的普通文件链接，要打开 `.assets/` 里的真实文件，而不是把相对路径交给系统。
+/// 单方括号链接交给浏览器；没有协议时补上 `http://`。
 #[gpui_kit::test]
-fn clicking_an_imported_file_link_opens_the_asset(cx: &mut TestAppContext) {
-    let (dir, _cache, _vault, editor) = open_with_images(cx, "[notes.zip](notes.zip)\n");
-    std::fs::create_dir_all(dir.path().join("a.assets")).unwrap();
-    std::fs::write(dir.path().join("a.assets/我的 notes.zip"), b"archive").unwrap();
+fn markdown_links_open_in_the_browser(cx: &mut TestAppContext) {
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, "[url](www.google.com)\n");
     let visual = &mut VisualTestContext::from_window(cx.windows()[0], cx);
     visual.update(|window, cx| {
         editor.update(cx, |e, cx| e.open_external_link("https://example.com", window, cx));
     });
     assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
     visual.update(|window, cx| {
-        editor.update(cx, |e, cx| e.open_external_link("我的%20notes.zip", window, cx));
+        editor.update(cx, |e, cx| e.open_external_link("www.google.com", window, cx));
     });
-    let url = cx.opened_url().unwrap();
-    assert!(url.starts_with("file:///"), "{url}");
-    assert!(url.contains("%20"), "{url}");
-    assert!(url.contains("notes.zip"), "{url}");
-    assert!(!url.contains('我') && !url.contains(' '), "{url}");
+    assert_eq!(cx.opened_url().as_deref(), Some("http://www.google.com"));
+    visual.update(|window, cx| {
+        editor.update(cx, |e, cx| e.open_external_link("rustup.rs", window, cx));
+    });
+    assert_eq!(cx.opened_url().as_deref(), Some("http://rustup.rs"));
 }
 
-/// 拖到编辑区的文件和 `⌘V` 同一套规则：图片变嵌入，其他文件变链接（`ui_design.md` 7.6）。
+/// 拖到编辑区的文件和 `⌘V` 同一套规则：图片变嵌入，其他文件变库内指针。
 #[gpui_kit::test]
 fn dropping_files_onto_the_editor_imports_them(cx: &mut TestAppContext) {
     let (dir, _cache, _vault, editor) = open_with_images(cx, "正文\n");
@@ -4970,13 +4969,13 @@ fn dropping_files_onto_the_editor_imports_them(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let body = text(&editor, cx);
     assert!(body.contains("![[shot.png]]"), "{body}");
-    assert!(body.contains("[notes.zip](notes.zip)"), "{body}");
+    assert!(body.contains("[[notes.zip]](a.assets/notes.zip)"), "{body}");
     assert!(!body.contains("跳过"), "文件夹不导入: {body}");
     assert_eq!(std::fs::read(dir.path().join("a.assets/shot.png")).unwrap(), image_bytes(8, 8));
     assert_eq!(std::fs::read(dir.path().join("a.assets/notes.zip")).unwrap(), b"archive");
 }
 
-/// Finder 里复制的文件：图片 / PDF 变嵌入，其他文件变普通链接，原名保留且不覆盖同名文件。
+/// Finder 里复制的文件：图片 / PDF 变嵌入，其他文件变库内指针，原名保留且不覆盖同名文件。
 #[gpui_kit::test]
 fn pasting_external_files_imports_them_with_their_names(cx: &mut TestAppContext) {
     let (dir, _cache, _vault, editor) = open_with_images(cx, "正文\n");
@@ -4999,7 +4998,7 @@ fn pasting_external_files_imports_them_with_their_names(cx: &mut TestAppContext)
     cx.run_until_parked();
     let body = text(&editor, cx);
     assert!(body.contains("![[图 1-2.png]]"), "同名不覆盖，改名导入: {body:?}");
-    assert!(body.contains("[notes.zip](notes.zip)"), "非附件类型插普通链接: {body:?}");
+    assert!(body.contains("[[notes.zip]](a.assets/notes.zip)"), "非图片 / PDF 插入库内指针: {body:?}");
     assert_eq!(std::fs::read(dir.path().join("a.assets/图 1.png")).unwrap(), b"already here");
     assert_eq!(std::fs::read(dir.path().join("a.assets/图 1-2.png")).unwrap(), image_bytes(10, 10));
     assert_eq!(std::fs::read(dir.path().join("a.assets/notes.zip")).unwrap(), b"archive");
@@ -5156,7 +5155,7 @@ fn inline_math_renders_inside_a_paragraph(cx: &mut TestAppContext) {
 /// 点进标题、段落、引用或列表时，其它块的位置不能变。
 #[gpui_kit::test]
 fn focusing_a_block_keeps_the_following_block_in_place(cx: &mut TestAppContext) {
-    use gpui_kit::{px, size, Bounds, Pixels};
+    use gpui_kit::{Bounds, Pixels, px, size};
     let source = "# 标题一\n\n这是一段很长的正文，用来看点击之后会不会跳。这是一段很长的正文，用来看点击之后会不会跳。这是一段很长的正文，用来看点击之后会不会跳。这是一段很长的正文，用来看点击之后会不会跳。\n\n## 小标题\n\n> 引用一行\n\n- 列表项\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);

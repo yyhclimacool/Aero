@@ -296,7 +296,9 @@ impl Editor {
                     .on_hover(cx.listener(move |this, hovered, _, cx| {
                         this.hover_navigation(id, *hovered, bounds.get(), cx)
                     }))
-                    .on_click(cx.listener(move |this, _, window, cx| this.jump_from_navigation(id, window, cx)))
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.jump_from_navigation(id, window, cx)),
+                    )
                     .into_any_element()
             })
             .collect();

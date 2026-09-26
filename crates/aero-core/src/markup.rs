@@ -67,6 +67,7 @@ pub fn analyze_editing(src: &str, selection: Option<Range<usize>>) -> Analysis {
     let root = parse_document(&arena, src, &parse::comrak_options());
     let positions = SourceMap::new(src);
     let wikilinks = crate::links::scan(src);
+    let pointers = crate::links::pointers(src);
     let mut out =
         Analysis { conceal: Vec::new(), hard_breaks: Vec::new(), styles: Vec::new(), links: Vec::new() };
     let mut code = Vec::new();
@@ -85,7 +86,7 @@ pub fn analyze_editing(src: &str, selection: Option<Range<usize>>) -> Analysis {
         if matches!(node.data().value, NodeValue::Code(_)) {
             code.push(range.clone());
         }
-        mark_node(src, &range, node, &wikilinks, selection.as_ref(), &mut out);
+        mark_node(src, &range, node, &wikilinks, &pointers, selection.as_ref(), &mut out);
     }
     line_prefixes(src, &code, &mut out.conceal);
     color_marks(src, &code, &mut out);
@@ -99,6 +100,7 @@ fn mark_node(
     range: &Range<usize>,
     node: &AstNode,
     wikilinks: &[crate::links::LinkSpan],
+    pointers: &[crate::links::LinkSpan],
     selection: Option<&Range<usize>>,
     out: &mut Analysis,
 ) {
@@ -127,7 +129,7 @@ fn mark_node(
                 out.styles.push((inner, Mark::Code));
             }
         }
-        NodeValue::WikiLink(_) => mark_wikilink(range, text, wikilinks, out),
+        NodeValue::WikiLink(_) => mark_wikilink(range, text, wikilinks, pointers, selection, out),
         NodeValue::Link(link) => mark_link(range, text, &link.url, selection, out),
         NodeValue::Image(link) => mark_link(range, text, &link.url, selection, out),
         NodeValue::HtmlInline(_) | NodeValue::HtmlBlock(_) => {
@@ -178,7 +180,14 @@ fn code_delimiters(range: &Range<usize>, text: &str) -> Option<(Range<usize>, Ra
     ))
 }
 
-fn mark_wikilink(range: &Range<usize>, text: &str, wikilinks: &[crate::links::LinkSpan], out: &mut Analysis) {
+fn mark_wikilink(
+    range: &Range<usize>,
+    text: &str,
+    wikilinks: &[crate::links::LinkSpan],
+    pointers: &[crate::links::LinkSpan],
+    selection: Option<&Range<usize>>,
+    out: &mut Analysis,
+) {
     let bang = text.starts_with("![[");
     let open = if bang { "![[" } else { "[[" };
     if !text.starts_with(open) || !text.ends_with("]]") {
@@ -194,6 +203,21 @@ fn mark_wikilink(range: &Range<usize>, text: &str, wikilinks: &[crate::links::Li
     };
     out.conceal.push(range.start..label_start);
     out.conceal.push(label_end..range.end);
+    if let Some(span) = pointers.iter().find(|span| span.range.start == range.start)
+        && let Some(pointer) = &span.pointer
+    {
+        let editing_destination =
+            selection.is_some_and(|selection| selection.end > range.end && selection.start < span.range.end);
+        if !editing_destination {
+            out.conceal.push(range.end..span.range.end);
+        }
+        if label_start < label_end {
+            out.styles.push((label_start..label_end, Mark::Link));
+            let url = crate::links::encode_vault_url(&pointer.path, pointer.fragment.as_deref());
+            out.links.push((label_start..label_end, url));
+        }
+        return;
+    }
     if label_start < label_end {
         out.styles.push((label_start..label_end, Mark::Link));
         let span = wikilinks.iter().find(|span| {

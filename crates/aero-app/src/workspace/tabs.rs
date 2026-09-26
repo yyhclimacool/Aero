@@ -496,7 +496,8 @@ impl Workspace {
             return;
         }
         let id = tab.id;
-        let initial = if retitle { editor.read(cx).title() } else { editor.read(cx).path().stem().to_owned() };
+        let initial =
+            if retitle { editor.read(cx).title() } else { editor.read(cx).path().stem().to_owned() };
         let input = cx.new(|cx| InputState::new(window, cx));
         input.update(cx, |state, cx| {
             state.set_value(initial.clone(), window, cx);
@@ -523,7 +524,8 @@ impl Workspace {
             return;
         }
         if edit.retitle {
-            let current = self.open.as_ref().and_then(|open| open.editor()).map(|editor| editor.read(cx).title());
+            let current =
+                self.open.as_ref().and_then(|open| open.editor()).map(|editor| editor.read(cx).title());
             if current.as_deref() != Some(new.as_str()) {
                 self.retitle_current(new, window, cx);
             }
@@ -724,7 +726,8 @@ impl Workspace {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, window, cx| {
-                    if let Some(ix) = this.open.as_ref().and_then(|open| open.tabs.iter().position(|tab| tab.id == id))
+                    if let Some(ix) =
+                        this.open.as_ref().and_then(|open| open.tabs.iter().position(|tab| tab.id == id))
                         && this.open.as_ref().is_some_and(|open| open.active != ix)
                     {
                         this.activate_tab(ix, window, cx);
@@ -750,7 +753,8 @@ impl Workspace {
             .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| this.move_tab(drag.id, id, cx)))
             .context_menu({
                 let path = tab.path(cx).map(|path| path.as_str().to_owned());
-                let retitle = tab.editor.as_ref().is_some_and(|editor| editor.read(cx).has_front_matter_title());
+                let retitle =
+                    tab.editor.as_ref().is_some_and(|editor| editor.read(cx).has_front_matter_title());
                 move |menu, _, _| {
                     let mut menu = menu;
                     if path.is_some() {
@@ -760,7 +764,9 @@ impl Workspace {
                         }
                         menu = menu.separator();
                     }
-                    menu = menu.menu("关闭", Box::new(CloseTab)).menu("关闭其他标签页", Box::new(CloseOtherTabs));
+                    menu = menu
+                        .menu("关闭", Box::new(CloseTab))
+                        .menu("关闭其他标签页", Box::new(CloseOtherTabs));
                     if let Some(path) = path.clone() {
                         menu = menu
                             .separator()

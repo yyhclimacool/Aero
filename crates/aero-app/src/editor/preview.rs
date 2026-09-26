@@ -110,6 +110,22 @@ pub(super) fn markdown_from(
                 return None;
             }
             let source = cx.node_source(node)?;
+            let chip = file_chip(source)?;
+            Some(MarkdownNode::new("file-chip", chip).markdown(source.to_owned()))
+        })
+        .markdown_block_renderer("file-chip", {
+            let editor = editor.clone();
+            move |node, _, cx| {
+                let (label, path, fragment) =
+                    node.data::<(String, String, Option<String>)>().expect("file chip data");
+                render_file_chip(label, path, fragment.clone(), &editor, cx)
+            }
+        })
+        .markdown_block_parser(|node, cx| {
+            if !matches!(node, markdown_ast::Node::Paragraph(_)) {
+                return None;
+            }
+            let source = cx.node_source(node)?;
             let embeds = image_row(source)?;
             Some(
                 MarkdownNode::new("image", (node.position()?.start.offset, embeds))
@@ -202,6 +218,9 @@ pub(super) fn markdown_from(
             LinkClick::Note { target, fragment } => editor.update(cx, |_, cx| {
                 cx.emit(super::EditorEvent::LinkClicked { target, fragment });
             }),
+            LinkClick::Vault { path, fragment } => editor.update(cx, |_, cx| {
+                cx.emit(super::EditorEvent::VaultLink { path, fragment });
+            }),
         })
         .w_full()
 }
@@ -249,7 +268,8 @@ fn image_row(source: &str) -> Option<Vec<ImageEmbed>> {
             return None;
         }
         if embed.fragment.is_some()
-            || aero_core::attachments::Kind::for_path(&embed.target) != Some(aero_core::attachments::Kind::Image)
+            || aero_core::attachments::Kind::for_path(&embed.target)
+                != Some(aero_core::attachments::Kind::Image)
         {
             return None;
         }
@@ -544,10 +564,7 @@ fn render_image(
             let aspect = pixels.height as f32 / pixels.width.max(1) as f32;
             // 并排时用分到的宽度。单独一张：拖动中用实时宽度，否则不放大超过原图。
             let logical = slot.unwrap_or_else(|| {
-                editor
-                    .read(cx)
-                    .image_drag_width(block, index)
-                    .unwrap_or_else(|| natural.min(width as f32))
+                editor.read(cx).image_drag_width(block, index).unwrap_or_else(|| natural.min(width as f32))
             });
             let height = logical * aspect;
             let click = image_click(editor, block, index, embed.target.clone());
@@ -685,7 +702,11 @@ fn image_resize_chrome(
                 .text_color(theme.background)
                 .text_size(px(12.))
                 .line_height(relative(1.3))
-                .child(format!("{} × {}", logical.round().max(1.) as u32, (logical * aspect).round().max(1.) as u32)),
+                .child(format!(
+                    "{} × {}",
+                    logical.round().max(1.) as u32,
+                    (logical * aspect).round().max(1.) as u32
+                )),
         )
         .children(corners.map(|(name, east, bottom, cursor)| {
             let editor = editor.clone();
@@ -808,6 +829,9 @@ fn highlight_html(
                 LinkClick::Note { target, fragment } => editor.update(cx, |_, cx| {
                     cx.emit(super::EditorEvent::LinkClicked { target, fragment });
                 }),
+                LinkClick::Vault { path, fragment } => editor.update(cx, |_, cx| {
+                    cx.emit(super::EditorEvent::VaultLink { path, fragment });
+                }),
             })
             .max_w_full(),
         )
@@ -910,15 +934,65 @@ fn highlight_table(
         .into_any_element()
 }
 
+/// 整段只有一个非笔记的库内指针时，画成文件图标加名字。
+fn file_chip(source: &str) -> Option<(String, String, Option<String>)> {
+    let trimmed = source.trim();
+    let rest = trimmed.strip_prefix('[')?;
+    let (label, rest) = rest.split_once("](")?;
+    let url = rest.strip_suffix(')')?;
+    if label.is_empty() || rest.len() != url.len() + 1 {
+        return None;
+    }
+    let (path, fragment) = aero_core::links::decode_vault_url(url)?;
+    if path.to_ascii_lowercase().ends_with(".md") {
+        return None;
+    }
+    Some((label.to_owned(), path, fragment))
+}
+
+fn render_file_chip(
+    label: &str,
+    path: &str,
+    fragment: Option<String>,
+    editor: &Entity<super::Editor>,
+    cx: &mut App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let (label, path) = (label.to_owned(), path.to_owned());
+    h_flex()
+        .id("file-chip")
+        .debug_selector(|| "file-chip".to_owned())
+        .gap_2()
+        .items_center()
+        .cursor_pointer()
+        .text_color(theme.link)
+        .child(Icon::new(IconName::FileText).size(px(16.)).text_color(theme.link))
+        .child(label)
+        .on_click({
+            let editor = editor.clone();
+            move |event: &ClickEvent, _, cx| {
+                if event.is_right_click() {
+                    return;
+                }
+                cx.stop_propagation();
+                let (path, fragment) = (path.clone(), fragment.clone());
+                editor.update(cx, |_, cx| cx.emit(super::EditorEvent::VaultLink { path, fragment }));
+            }
+        })
+        .into_any_element()
+}
+
 /// 预览里一次链接点击该怎么处理。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LinkClick {
     /// 右键 / 长按等不算"打开"
     Ignore,
-    /// 不是 `aero://note/`：交给系统
+    /// 不是笔记链接或库内指针：交给浏览器
     External,
     /// wikilink：已解码的目标与片段，发给工作区解析
     Note { target: String, fragment: Option<String> },
+    /// `[[显示名]](相对路径)`
+    Vault { path: String, fragment: Option<String> },
 }
 
 /// 与 TextView 无 handler 时的默认判定一致：左键 / 中键 / 键盘 / 非长按触摸才算点击。
@@ -931,6 +1005,9 @@ pub(super) fn link_click(url: &str, event: &ClickEvent) -> LinkClick {
     };
     if !actionable {
         return LinkClick::Ignore;
+    }
+    if let Some((path, fragment)) = aero_core::links::decode_vault_url(url) {
+        return LinkClick::Vault { path, fragment };
     }
     match aero_core::links::decode_note_url(url) {
         Some((target, fragment)) => LinkClick::Note { target, fragment },

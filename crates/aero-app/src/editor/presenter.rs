@@ -554,8 +554,12 @@ impl Editor {
         self.hovered_link = hit;
     }
 
-    /// 打开链接：笔记链接交给工作区，其他地址交给系统。
+    /// 打开链接：库内指针和笔记链接交给工作区，单方括号地址交给浏览器。
     fn follow_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((path, fragment)) = aero_core::links::decode_vault_url(url) {
+            cx.emit(EditorEvent::VaultLink { path, fragment });
+            return;
+        }
         match aero_core::links::decode_note_url(url) {
             Some((target, fragment)) => cx.emit(EditorEvent::LinkClicked { target, fragment }),
             None if url.starts_with(aero_core::links::NOTE_URL_PREFIX) => {}

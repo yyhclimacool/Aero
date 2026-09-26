@@ -276,6 +276,16 @@ impl Editor {
     }
 
     pub(super) fn preview_link_style(&self, url: &str, cx: &App) -> LinkStyle {
+        if let Some((path, _)) = aero_core::links::decode_vault_url(url) {
+            let exists = aero_core::links::resolve_relative(self.path.parent(), &path)
+                .and_then(|full| aero_core::VaultPath::new(&full).ok())
+                .is_some_and(|path| self.vault.fs_path(&path).is_file());
+            return if exists {
+                LinkStyle { color: Some(cx.theme().link), underline: LinkUnderline::Solid }
+            } else {
+                LinkStyle { color: Some(cx.theme().muted_foreground), underline: LinkUnderline::Dashed }
+            };
+        }
         let Some((target, fragment)) = aero_core::links::decode_note_url(url) else {
             return LinkStyle { color: Some(cx.theme().link), underline: LinkUnderline::Solid };
         };
@@ -451,6 +461,21 @@ impl Editor {
     }
 
     fn load_link_preview(&self, url: SharedString, bounds: Bounds<Pixels>, cx: &App) -> Task<Popup> {
+        if let Some((path, fragment)) = aero_core::links::decode_vault_url(&url) {
+            let title = match &fragment {
+                Some(fragment) => format!("{path}#{fragment}"),
+                None => path,
+            };
+            return cx.background_spawn(async move {
+                Popup {
+                    title: title.into(),
+                    body: "库内链接。单击打开笔记，或在访达中定位文件。".into(),
+                    rich: false,
+                    origin: None,
+                    bounds,
+                }
+            });
+        }
         let Some((target, fragment)) = aero_core::links::decode_note_url(&url) else {
             return cx.background_spawn(async move {
                 Popup {

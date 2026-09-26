@@ -6,7 +6,7 @@
 
 - 无参数启动恢复最近打开且目录还在的库，失效条目跳过且不弹错误；首次运行或没有可恢复的库时停在库选择页，此时磁盘上不创建任何东西（连应用数据目录都不建）。命令行给了路径则直接打开该库，既不碰示例库也不恢复最近列表。
 - 库选择页的「查看示例库」按需交付并打开示例库，停在 `00-欢迎.md`。示例库进入最近列表；从最近列表点进去、或启动时自动恢复到它，都走同一条路径（按实际目录比较，规范化后的路径也能认出来），因此落点始终是欢迎页而不是最近改过的那篇。
-- 六篇中文示例的源码在 `assets/demo-vault/`，用 `include_str!` 在编译期嵌入可执行文件：运行时不读安装包内的文件，`.app` 被移动或挂在只读镜像上也能交付；每个 `.dmg` 带的就是那次构建的示例。
+- 中文示例的源码在 `assets/demo-vault/`，用 `include_str!` 在编译期嵌入可执行文件：运行时不读安装包内的文件，`.app` 被移动或挂在只读镜像上也能交付；每个 `.dmg` 带的就是那次构建的示例。其中 `体验/使用方法.md` 是写法与快捷键说明。
 - 首次交付：先在应用数据目录下的 `.demo-vault-<pid>-<nonce>/` 里写完整副本（含交付记录），再 `rename` 整体发布。准备中失败会删掉临时目录、在选择页报错，不会留下半个库。
 - 再次进入（含应用升级后示例内容变化）按 `.aero/demo.toml` 里每篇最近一次交付的内容指纹增量更新：
   - 指纹吻合（用户没动过）且内容与这一版不同 → 换成这一版；
@@ -16,7 +16,7 @@
   - 目录里没有 `.aero/demo.toml` → 不是我们交付的示例库（用户自己建的同名文件夹），一个字都不写。
 - 交付记录放在 `.aero/` 下，不出现在文件树、笔记枚举与索引里。读不到或读不懂都当作"没有记录"，宁可不更新也不冒覆盖用户笔记的风险。
 - 示例库是笔记而不是缓存：与 `index/`、`cache/` 同在应用数据目录，但删除它会丢用户内容。只重装应用保留，清空应用数据才重新初始化。
-- 示例内容覆盖 M1 / M2 已实现的能力：标题与列表、任务、表格、callout（含折叠）、代码块、行内格式与高亮、`[[双链]]`、显示别名 `|`、front matter `aliases` / `tags`、`#章节` 与 `#^块` 引用、反链与「此块的引用」、普通 Markdown 链接与引用式定义（供改名练习观察路径改写）。故意留一个未解析链接 `[[下一篇灵感笔记]]`。
+- 示例内容只演示当前已经接上的能力：标题与列表、任务、表格、callout（含折叠）、代码块、行内格式与高亮、文字色 / 块颜色、行内与块级公式、mermaid、笔记嵌入、`[[双链]]`、显示别名 `|`、front matter `aliases` / `tags` 与正文标签、`#章节` 与 `#^块` 引用、反链与「此块的引用」、普通 Markdown 链接与引用式定义（供改名练习观察路径改写）。故意留一个未解析链接 `[[下一篇灵感笔记]]`。不放没有文件的图片或 PDF，也不把 `/` 菜单里还没有的块类型写成“输入斜杠就能插入”。
 
 ## 自动化
 
@@ -32,7 +32,7 @@ bash scripts/bundle-macos.sh debug && python3 scripts/test_bundle_macos.py Bundl
 `demo_vault.rs`：
 
 - `bundled_notes_match_the_repository_assets`：内嵌表与 `assets/demo-vault/` 下的 `.md` 逐个对应且内容逐字节一致——漏登记一篇新示例在这里就失败，不会等到用户装完才发现少一篇。
-- `demo_vault_initializes_six_connected_notes`：六篇齐全；用 resolver 走一遍全部链接，只允许 `下一篇灵感笔记` 未解析，`#章节` 必须命中真实标题、`#^id` 必须能定位到块；交付记录覆盖全部六篇；应用数据目录里没有临时目录残留。
+- `demo_vault_initializes_connected_notes`：示例齐全；用 resolver 走一遍全部链接，只允许 `下一篇灵感笔记` 未解析且只出现一次，`#章节` 必须命中真实标题、`#^id` 必须能定位到块；交付记录覆盖全部示例；应用数据目录里没有临时目录残留。
 - `demo_vault_reopen_preserves_edits_deletions_and_renames`：改写欢迎页、删一篇、改名一篇后再次进入，内容与结构原样保留，vault id 不变；`state.toml` 里的其他 vault 不影响结果。
 - `demo_vault_update_delivers_new_content_without_touching_user_notes`：把库改成"上一版"的样子后再次进入——没动过的示例换成当前版本，用户改过的保留（再进一次也不会被覆盖），交付记录里没有的那篇作为"新增示例"补写。
 - `demo_vault_never_populates_a_directory_it_did_not_deliver`：没有交付记录的同名目录（哪怕只有用户自己的一个文件）不写入任何示例。
@@ -50,7 +50,7 @@ bash scripts/bundle-macos.sh debug && python3 scripts/test_bundle_macos.py Bundl
 
 `scripts/test_bundle_macos.py`：
 
-- `BundleTests.test_embedded_demo_vault_matches_the_repository`：`Aero.app` 的可执行文件里逐字节包含仓库当前的六篇示例，即"每次打包都带最新示例"这条要求的实际检查。
+- `BundleTests.test_embedded_demo_vault_matches_the_repository`：`Aero.app` 的可执行文件里逐字节包含仓库当前的全部示例，即"每次打包都带最新示例"这条要求的实际检查。
 
 为了让这些测试可复现，`Workspace` 持有应用数据目录（`Workspace::new(initial_vault, data_dir, …)`，`PersistedState::load/save` 同样按目录取），测试用临时目录，不写入真实的 `~/Library/Application Support/Aero`。
 

@@ -27,9 +27,7 @@ pub fn open(workspace: Entity<Workspace>, window: &mut Window, cx: &mut App) {
             .width(px(680.).min(window.viewport_size().width - px(32.)))
             .child(view.clone())
             .footer(
-                Button::new("close-settings")
-                    .label("完成")
-                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                Button::new("close-settings").label("完成").on_click(|_, window, cx| window.close_dialog(cx)),
             )
     });
 }
@@ -41,10 +39,7 @@ pub fn open_about(window: &mut Window, cx: &mut App) {
             .width(px(360.))
             .child(info_panel(
                 "about-panel",
-                vec![
-                    format!("Aero {}", env!("CARGO_PKG_VERSION")),
-                    "本地 Markdown 笔记。".into(),
-                ],
+                vec![format!("Aero {}", env!("CARGO_PKG_VERSION")), "本地 Markdown 笔记。".into()],
             ))
             .footer(Button::new("close-about").label("好").on_click(|_, window, cx| window.close_dialog(cx)))
     });
@@ -99,7 +94,13 @@ impl Settings {
         self.search.as_ref().map(|(_, view)| view.clone())
     }
 
-    fn nav(&self, id: &'static str, label: &'static str, section: Section, cx: &mut Context<Self>) -> AnyElement {
+    fn nav(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        section: Section,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let selected = self.section == section;
         let hover = cx.theme().list_hover;
         let active = cx.theme().accent.opacity(0.16);
@@ -168,9 +169,7 @@ impl Render for Settings {
                         let accent = cx.theme().accent;
                         el.child(editor_section(focus_source, preview, muted, border, accent, workspace))
                     })
-                    .when(self.section == Section::Search, |el| {
-                        el.child(search_section(search, muted))
-                    })
+                    .when(self.section == Section::Search, |el| el.child(search_section(search, muted)))
                     .when(self.section == Section::About, |el| el.child(about_section())),
             )
     }

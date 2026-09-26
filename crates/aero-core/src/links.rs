@@ -23,6 +23,16 @@ pub struct LinkSpan {
     pub alias: Option<String>,
     /// target 中 `#` 后的 fragment（trim 后）；无则 None
     pub fragment: Option<String>,
+    /// `[[显示名]](相对路径)`：方括号里只是显示名，路径在 `pointer` 里。
+    /// 有它时 `target` 为空，不参与笔记名解析，也不会创建笔记。
+    pub pointer: Option<Pointer>,
+}
+
+/// 库内指针的相对路径和可选片段（`#标题` / `#^块`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pointer {
+    pub path: String,
+    pub fragment: Option<String>,
 }
 
 /// 解析结果：命中一篇笔记（带 fragment）、多篇同名候选（歧义，交给用户消歧）、或不存在。
@@ -40,6 +50,7 @@ pub enum Resolution {
 }
 
 pub const NOTE_URL_PREFIX: &str = "aero://note/";
+pub const VAULT_URL_PREFIX: &str = "aero://vault/";
 
 /// Shared catalog entry: display title is separate from alternate lookup names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,12 +286,41 @@ fn escapes(target: &str) -> bool {
 /// 链接文本内的 wikilink 在这里排除。区间用文本锚定修正 comrak 的 sourcepos
 /// 缺陷（表格单元格等）。跨行的 `[[...]]` 不算链接（Obsidian 同）。
 pub fn scan(src: &str) -> Vec<LinkSpan> {
+    raw_spans(src).into_iter().filter(|span| span.pointer.is_none()).collect()
+}
+
+/// `[[显示名]](相对路径)`。`scan` 不返回这些，避免把显示名当成笔记去解析。
+pub fn pointers(src: &str) -> Vec<LinkSpan> {
+    raw_spans(src).into_iter().filter(|span| span.pointer.is_some()).collect()
+}
+
+fn raw_spans(src: &str) -> Vec<LinkSpan> {
     if !src.contains("[[") {
         return Vec::new();
     }
     let arena = Arena::new();
     let root = parse_document(&arena, src, &crate::parse::comrak_options());
     scan_tree(root, src)
+}
+
+/// 把相对于笔记所在目录的路径收成库内路径。`..` 越过库根时返回 `None`。
+pub fn resolve_relative(note_dir: &str, target: &str) -> Option<String> {
+    let target = target.trim().replace('\\', "/");
+    if target.is_empty() || target.starts_with('/') {
+        return None;
+    }
+    let mut segments: Vec<&str> = note_dir.split('/').filter(|segment| !segment.is_empty()).collect();
+    for segment in target.split('/') {
+        match segment {
+            "." | "" => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    let joined = segments.join("/");
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// 嵌入语法。区间含前导 `!`；`parameter` 是 `|` 后的宽度等参数，不是链接显示别名。
@@ -366,12 +406,24 @@ fn scan_tree_impl<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str, embeds: b
         if target.is_empty() && fragment.is_none() {
             continue;
         }
-        out.push(LinkSpan {
-            range,
-            target,
-            alias: alias.map(|a| unescape(a.trim())).filter(|a| !a.is_empty()),
-            fragment,
-        });
+        let alias = alias.map(|a| unescape(a.trim())).filter(|a| !a.is_empty());
+        let mut span = LinkSpan { range, target, alias, fragment, pointer: None };
+        let embed = span.range.start > 0 && src.as_bytes()[span.range.start - 1] == b'!';
+        if !embed
+            && let Some((raw, consumed)) = attached_destination(&src[span.range.end..])
+            && !raw.contains('\n')
+        {
+            let (path, fragment) = split_hash(&raw);
+            if !path.is_empty() {
+                let label = span.alias.clone().unwrap_or_else(|| span.target.clone());
+                span.range.end += consumed;
+                span.pointer = Some(Pointer { path, fragment });
+                span.alias = (!label.is_empty()).then_some(label);
+                span.target.clear();
+                span.fragment = None;
+            }
+        }
+        out.push(span);
     }
     out.sort_by_key(|s| s.range.start);
     out.dedup_by_key(|s| s.range.start);
@@ -416,6 +468,67 @@ pub fn creation_path(note_dir: &str, target: &str) -> Option<VaultPath> {
 }
 
 /// `aero://note/<target>#<fragment>`（percent 编码，`/` 保留）。
+pub fn encode_vault_url(path: &str, fragment: Option<&str>) -> String {
+    let mut url = String::from(VAULT_URL_PREFIX);
+    push_encoded(&mut url, path);
+    if let Some(fragment) = fragment {
+        url.push('#');
+        push_encoded(&mut url, fragment);
+    }
+    url
+}
+
+pub fn decode_vault_url(url: &str) -> Option<(String, Option<String>)> {
+    let rest = url.strip_prefix(VAULT_URL_PREFIX)?;
+    let (path, fragment) = match rest.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment)),
+        None => (rest, None),
+    };
+    let path = decode_component(path)?;
+    let fragment = match fragment {
+        Some(fragment) => Some(decode_component(fragment)?),
+        None => None,
+    };
+    (!path.is_empty()).then_some((path, fragment))
+}
+
+/// `]]` 后面紧挨的 `(相对路径)` 或 `(<相对路径>)`。返回路径原文和消耗的字节数（含括号）。
+fn attached_destination(src: &str) -> Option<(String, usize)> {
+    let body = src.strip_prefix('(')?;
+    if let Some(rest) = body.strip_prefix('<') {
+        let end = rest.find('>')?;
+        let after = &rest[end + 1..];
+        let trimmed = after.trim_start();
+        if !trimmed.starts_with(')') {
+            return None;
+        }
+        let raw = rest[..end].to_owned();
+        if raw.is_empty() {
+            return None;
+        }
+        let consumed = 1 + 1 + end + 1 + (after.len() - trimmed.len()) + 1;
+        return Some((raw, consumed));
+    }
+    let end = body.find(|c: char| c == ')' || c.is_whitespace())?;
+    if !body[end..].starts_with(')') {
+        return None;
+    }
+    let raw = body[..end].to_owned();
+    if raw.is_empty() {
+        return None;
+    }
+    Some((raw, 1 + end + 1))
+}
+
+fn split_hash(dest: &str) -> (String, Option<String>) {
+    match dest.split_once('#') {
+        Some((path, fragment)) if !path.is_empty() && !fragment.is_empty() => {
+            (path.to_owned(), Some(fragment.to_owned()))
+        }
+        _ => (dest.to_owned(), None),
+    }
+}
+
 pub fn encode_note_url(target: &str, fragment: Option<&str>) -> String {
     let mut url = String::from(NOTE_URL_PREFIX);
     push_encoded(&mut url, target);
@@ -444,22 +557,40 @@ pub fn decode_note_url(url: &str) -> Option<(String, Option<String>)> {
 /// 预览预处理：`[[a|别名]]` → `[别名](aero://note/a)`，`[[a#h]]` → `[a > h](aero://note/a#h)`，
 /// `[[#h]]` → `[h](aero://note/#h)`。只替换扫描到的区间，区间外字节原样；没有 `[[` 的文本零拷贝以外不做事。
 pub fn to_markdown(src: &str) -> String {
-    let spans = scan(src);
+    let mut spans = raw_spans(src);
     if spans.is_empty() {
         return src.to_owned();
     }
+    spans.sort_by_key(|span| span.range.start);
     let mut out = String::with_capacity(src.len() + spans.len() * 16);
     let mut pos = 0;
-    for s in &spans {
-        out.push_str(&src[pos..s.range.start]);
-        let display = match (&s.alias, &s.fragment) {
-            (Some(alias), _) => escape_link_text(alias),
-            (None, Some(f)) if s.target.is_empty() => escape_link_text(f),
-            (None, Some(f)) => format!("{} > {}", escape_link_text(&s.target), escape_link_text(f)),
-            (None, None) => escape_link_text(&s.target),
-        };
-        out.push_str(&format!("[{display}]({})", encode_note_url(&s.target, s.fragment.as_deref())));
-        pos = s.range.end;
+    for span in &spans {
+        if span.range.start < pos {
+            continue;
+        }
+        out.push_str(&src[pos..span.range.start]);
+        if let Some(pointer) = &span.pointer {
+            let display = span.alias.as_deref().unwrap_or("");
+            out.push_str(&format!(
+                "[{}]({})",
+                escape_link_text(display),
+                encode_vault_url(&pointer.path, pointer.fragment.as_deref())
+            ));
+        } else {
+            let display = match (&span.alias, &span.fragment) {
+                (Some(alias), _) => escape_link_text(alias),
+                (None, Some(fragment)) if span.target.is_empty() => escape_link_text(fragment),
+                (None, Some(fragment)) => {
+                    format!("{} > {}", escape_link_text(&span.target), escape_link_text(fragment))
+                }
+                (None, None) => escape_link_text(&span.target),
+            };
+            out.push_str(&format!(
+                "[{display}]({})",
+                encode_note_url(&span.target, span.fragment.as_deref())
+            ));
+        }
+        pos = span.range.end;
     }
     out.push_str(&src[pos..]);
     out
@@ -617,6 +748,24 @@ mod tests {
         let spans = scan(src);
         assert_eq!(spans.len(), 1, "{src:?}");
         spans.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn vault_pointer_keeps_the_label_out_of_note_resolution() {
+        let src = "[[notes.zip]](../dir1/dir2/notes.zip) [[项目清单的下一步]](../项目/项目清单.md#下一步)";
+        assert!(scan(src).is_empty(), "显示名不是笔记目标");
+        let pointers = pointers(src);
+        assert_eq!(pointers.len(), 2);
+        assert_eq!(&src[pointers[0].range.clone()], "[[notes.zip]](../dir1/dir2/notes.zip)");
+        assert_eq!(pointers[0].alias.as_deref(), Some("notes.zip"));
+        assert_eq!(pointers[0].pointer.as_ref().map(|p| p.path.as_str()), Some("../dir1/dir2/notes.zip"));
+        assert_eq!(pointers[1].pointer.as_ref().map(|p| p.fragment.as_deref()), Some(Some("下一步")));
+        assert_eq!(resolve_relative("练习", "../项目/项目清单.md").as_deref(), Some("项目/项目清单.md"));
+        assert_eq!(resolve_relative("", "../../outside"), None);
+        let rendered = to_markdown("见 [[备份]](<a.assets/我的 notes.zip>)");
+        let url = encode_vault_url("a.assets/我的 notes.zip", None);
+        assert!(rendered.contains(&format!("[备份]({url})")), "{rendered}");
+        assert_eq!(decode_vault_url(&url), Some(("a.assets/我的 notes.zip".into(), None)));
     }
 
     #[test]
