@@ -4,6 +4,7 @@ use crate::search::SearchService;
 use aero_core::links::{Resolution, Resolver};
 use gpui_kit::base::text::{LinkStyle, LinkUnderline};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 当前的链接预览设置。工作区从 `state.toml` 写入；编辑器悬停时读取。
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,13 +36,90 @@ pub(super) struct LinkPreview {
     in_popup: bool,
     /// 最近一次见到的 ⌘ 状态。按住 ⌘ 才预览时，目录刷新不能在没按键时把浮层打开。
     platform_down: bool,
-    /// 跨篇 `#标题` / `#^块` 是否还在。键是目标路径和片段，值带文件指纹，改了才重读。
+    /// 跨篇片段的已完成结果；刷新期间保留，避免虚线随后台任务闪烁。
     fragments: HashMap<(VaultPath, String), FragmentMark>,
+    fragment_request: Option<FragmentRequest>,
+    fragment_generation: u64,
+    fragment_cancel: Option<CancelFragmentScan>,
+    fragment_task: Option<Task<()>>,
+    #[cfg(test)]
+    fragment_reads: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    fragment_scans: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// 丢弃 Task 无法打断已开始的同步读取；失效、替换请求和编辑器销毁都要通知后台停止。
+#[derive(Default)]
+struct CancelFragmentScan(Arc<AtomicBool>);
+
+impl Drop for CancelFragmentScan {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FragmentRequest {
+    version: u64,
+    resolver_generation: u64,
+    /// 重载可把文档版本归零；取消后相同版本也不能接收旧结果。
+    generation: u64,
 }
 
 struct FragmentMark {
-    hash: u64,
     exists: bool,
+}
+
+/// 只在后台运行：同一路径的所有片段共用一次读取和解析。取消时不返回部分结果。
+fn load_fragment_marks(
+    source: &str,
+    resolver: &Resolver,
+    current_path: &VaultPath,
+    cancelled: &AtomicBool,
+    mut read: impl FnMut(&VaultPath) -> Option<Document>,
+) -> Option<HashMap<(VaultPath, String), FragmentMark>> {
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut needed = Vec::new();
+    for span in aero_core::links::scan(source) {
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        let Some(fragment) = span.fragment.as_deref().filter(|fragment| !fragment.is_empty()) else {
+            continue;
+        };
+        if span.target.is_empty() {
+            continue;
+        }
+        if let Resolution::Resolved { path, .. } =
+            resolver.resolve(&span.target, Some(fragment), current_path.parent())
+            && path != *current_path
+        {
+            needed.push((path, fragment.to_owned()));
+        }
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    needed.sort();
+    needed.dedup();
+    let mut marks = HashMap::new();
+    for group in needed.chunk_by(|a, b| a.0 == b.0) {
+        // 最多让正在读取的一个目标完成，不再读下一个；主线程不用等旧任务退出。
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        let doc = read(&group[0].0);
+        for key in group {
+            if cancelled.load(Ordering::Acquire) {
+                return None;
+            }
+            let exists = doc.as_ref().is_some_and(|doc| fragment_range(doc, Some(&key.1)).is_ok());
+            marks.insert(key.clone(), FragmentMark { exists });
+        }
+    }
+    (!cancelled.load(Ordering::Acquire)).then_some(marks)
 }
 
 struct Popup {
@@ -187,6 +265,8 @@ impl Editor {
     }
 
     fn refresh_link_resolver(&mut self, service: &Entity<SearchService>, cx: &mut Context<Self>) {
+        // 保存 / watch 通知也包括目标正文变化，不能只比较目录中的路径和别名。
+        self.invalidate_fragment_marks();
         // 目录一变，之前"解析不到"的嵌入可能就能解析了
         self.refresh_embeds(cx);
         let hovered = self.link_preview.hovered.clone();
@@ -203,8 +283,10 @@ impl Editor {
                 if this.link_preview.resolver_generation != generation {
                     return;
                 }
+                this.link_preview.resolver_task = None;
                 this.link_preview.resolver = Some(resolver);
                 this.update_local_link_names();
+                this.refresh_fragment_marks(cx);
                 if this.link_preview.hovered.is_some() {
                     this.schedule_link_preview(cx);
                 }
@@ -214,6 +296,7 @@ impl Editor {
     }
 
     pub(super) fn update_local_link_names(&mut self) {
+        self.invalidate_fragment_marks();
         let deleted = self.is_deleted();
         if let Some(resolver) = &mut self.link_preview.resolver {
             if deleted {
@@ -238,41 +321,83 @@ impl Editor {
         self.update_local_link_names();
     }
 
-    /// 画出链接之前，把跨篇片段是否存在读进缓存。同一指纹不重复读盘。
-    pub(super) fn refresh_fragment_marks(&mut self) {
+    fn fragment_request(&self) -> FragmentRequest {
+        FragmentRequest {
+            version: self.doc.version(),
+            resolver_generation: self.link_preview.resolver_generation,
+            generation: self.link_preview.fragment_generation,
+        }
+    }
+
+    fn invalidate_fragment_marks(&mut self) {
+        self.link_preview.fragment_generation += 1;
+        self.link_preview.fragment_request = None;
+        self.link_preview.fragment_cancel = None;
+        self.link_preview.fragment_task = None;
+    }
+
+    fn finish_fragment_marks(
+        &mut self,
+        request: FragmentRequest,
+        marks: HashMap<(VaultPath, String), FragmentMark>,
+    ) -> bool {
+        if self.is_deleted()
+            || self.fragment_request() != request
+            || self.link_preview.fragment_request != Some(request)
+        {
+            return false;
+        }
+        self.link_preview.fragments = marks;
+        self.link_preview.fragment_cancel = None;
+        self.link_preview.fragment_task = None;
+        true
+    }
+
+    /// 每个文档 / 目录版本只排队一次；渲染不扫正文、不读目标文件，也不等待任务。
+    pub(super) fn refresh_fragment_marks(&mut self, cx: &mut Context<Self>) {
+        if self.is_deleted() || self.link_preview.resolver_task.is_some() {
+            return;
+        }
+        let request = self.fragment_request();
+        if self.link_preview.fragment_request == Some(request) {
+            return;
+        }
         let Some(resolver) = self.link_preview.resolver.clone() else { return };
-        let parent = self.path.parent();
-        let mut needed = Vec::new();
-        for span in aero_core::links::scan(&self.doc.to_string()) {
-            let Some(fragment) = span.fragment.as_deref().filter(|fragment| !fragment.is_empty()) else {
-                continue;
-            };
-            if span.target.is_empty() {
-                continue;
-            }
-            if let Resolution::Resolved { path, .. } = resolver.resolve(&span.target, Some(fragment), &parent)
-                && path != self.path
-            {
-                needed.push((path, fragment.to_owned()));
-            }
-        }
-        needed.sort();
-        needed.dedup();
-        for (path, fragment) in needed {
-            let key = (path.clone(), fragment.clone());
-            match self.vault.read(&path) {
-                Ok((doc, stamp)) => {
-                    if self.link_preview.fragments.get(&key).is_some_and(|mark| mark.hash == stamp.hash) {
-                        continue;
+        self.link_preview.fragment_request = Some(request);
+        let cancel = CancelFragmentScan::default();
+        let cancelled = cancel.0.clone();
+        // 只保留最新的排队任务；旧任务若已经开始，则在下一个检查点退出。
+        self.link_preview.fragment_cancel = Some(cancel);
+        let source = self.doc.snapshot();
+        let path = self.path.clone();
+        let vault = self.vault.clone();
+        #[cfg(test)]
+        let (reads, scans) =
+            (self.link_preview.fragment_reads.clone(), self.link_preview.fragment_scans.clone());
+        self.link_preview.fragment_task = Some(cx.spawn(async move |this, cx| {
+            let Some(marks) = cx
+                .background_spawn(async move {
+                    if cancelled.load(Ordering::Acquire) {
+                        return None;
                     }
-                    let exists = excerpt(&doc, Some(&fragment)).is_ok();
-                    self.link_preview.fragments.insert(key, FragmentMark { hash: stamp.hash, exists });
+                    #[cfg(test)]
+                    scans.fetch_add(1, Ordering::SeqCst);
+                    load_fragment_marks(&String::from(source.text()), &resolver, &path, &cancelled, |path| {
+                        #[cfg(test)]
+                        reads.fetch_add(1, Ordering::SeqCst);
+                        vault.read(path).ok().map(|(doc, _)| doc)
+                    })
+                })
+                .await
+            else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if this.finish_fragment_marks(request, marks) {
+                    cx.notify();
                 }
-                Err(_) => {
-                    self.link_preview.fragments.insert(key, FragmentMark { hash: 0, exists: false });
-                }
-            }
-        }
+            });
+        }));
     }
 
     pub(super) fn preview_link_style(&self, url: &str, cx: &App) -> LinkStyle {
@@ -290,7 +415,8 @@ impl Editor {
             return LinkStyle { color: Some(cx.theme().link), underline: LinkUnderline::Solid };
         };
         let resolution = if target.is_empty() {
-            if fragment.as_deref().is_some_and(|fragment| excerpt(&self.doc, Some(fragment)).is_err()) {
+            if fragment.as_deref().is_some_and(|fragment| fragment_range(&self.doc, Some(fragment)).is_err())
+            {
                 Resolution::Unresolved
             } else {
                 Resolution::Resolved { path: self.path.clone(), fragment }
@@ -305,7 +431,7 @@ impl Editor {
                 let missing =
                     fragment.as_deref().filter(|fragment| !fragment.is_empty()).is_some_and(|fragment| {
                         if path == self.path {
-                            excerpt(&self.doc, Some(fragment)).is_err()
+                            fragment_range(&self.doc, Some(fragment)).is_err()
                         } else {
                             self.link_preview
                                 .fragments
@@ -455,6 +581,9 @@ impl Editor {
         for (path, title) in notes {
             resolver.insert(VaultPath::new(path).unwrap(), *title, &[]);
         }
+        self.invalidate_fragment_marks();
+        self.link_preview.resolver_generation += 1;
+        self.link_preview.resolver_task = None;
         self.link_preview.resolver = Some(resolver);
         self.refresh_embeds(cx);
         cx.notify();
@@ -687,8 +816,445 @@ mod tests {
 
     use super::super::Editor;
     use super::excerpt;
-    use gpui_kit::{Bounds, TestAppContext, point, px};
-    use std::{sync::Arc, time::Duration};
+    use gpui_kit::{AppContext as _, Bounds, Entity, TestAppContext, point, px};
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
+
+    fn fragment_editor(cx: &mut TestAppContext, source: &str) -> (tempfile::TempDir, Entity<Editor>) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), source).unwrap();
+        let vault = Arc::new(aero_core::Vault::open(dir.path()).unwrap());
+        let path = aero_core::VaultPath::new("a.md").unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let editor = cx.new(|cx| Editor::new(vault, path, doc, stamp, cx));
+        editor.update(cx, |e, cx| e.install_test_resolver(&[("a.md", None), ("b.md", None)], cx));
+        (dir, editor)
+    }
+
+    #[gpui_kit::test]
+    fn fragment_cancel_during_read_skips_remaining_targets(cx: &mut TestAppContext) {
+        let source = "[[d#Old]] [[b#Old]] [[c#Old]] [[b#Other]]\n";
+        let (_dir, editor) = fragment_editor(cx, source);
+        let (resolver, path, cancelled) = editor.update(cx, |e, cx| {
+            e.install_test_resolver(&[("a.md", None), ("b.md", None), ("c.md", None), ("d.md", None)], cx);
+            e.refresh_fragment_marks(cx);
+            (
+                e.link_preview.resolver.clone().unwrap(),
+                e.path.clone(),
+                e.link_preview.fragment_cancel.as_ref().unwrap().0.clone(),
+            )
+        });
+        let mut reads = Vec::new();
+        let marks = super::load_fragment_marks(source, &resolver, &path, &cancelled, |path| {
+            reads.push(path.as_str().to_owned());
+            if reads.len() == 1 {
+                editor.update(cx, |e, _| e.invalidate_fragment_marks());
+            }
+            Some(Document::from_text("# Old\n\n# Other\n"))
+        });
+        assert_eq!(reads, ["b.md"], "cancellation must stop the work, not just its publication");
+        assert!(marks.is_none(), "cancelled scans must not publish partial marks");
+    }
+
+    #[gpui_kit::test]
+    fn fragment_new_requests_cancel_running_reads_and_finish_latest(cx: &mut TestAppContext) {
+        for action in ["edit", "source-request", "resolver"] {
+            let source = "[[d#Old]] [[b#Old]] [[c#Old]]\n";
+            let (dir, editor) = fragment_editor(cx, source);
+            std::fs::write(dir.path().join("b.md"), "# New\n").unwrap();
+            let (resolver, path, cancelled) = editor.update(cx, |e, cx| {
+                e.install_test_resolver(
+                    &[("a.md", None), ("b.md", None), ("c.md", None), ("d.md", None)],
+                    cx,
+                );
+                e.refresh_fragment_marks(cx);
+                (
+                    e.link_preview.resolver.clone().unwrap(),
+                    e.path.clone(),
+                    e.link_preview.fragment_cancel.as_ref().unwrap().0.clone(),
+                )
+            });
+            let mut reads = Vec::new();
+            let marks = super::load_fragment_marks(source, &resolver, &path, &cancelled, |path| {
+                reads.push(path.as_str().to_owned());
+                if reads.len() == 1 {
+                    editor.update(cx, |e, cx| {
+                        match action {
+                            "edit" | "source-request" => {
+                                e.doc.edit(aero_core::Edit::replace(0..e.doc.len(), "[[b#New]]\n")).unwrap();
+                                if action == "edit" {
+                                    e.after_doc_change(cx);
+                                    e.save_task = None;
+                                }
+                            }
+                            "resolver" => e.install_test_resolver(&[("a.md", None), ("b.md", None)], cx),
+                            _ => unreachable!(),
+                        }
+                        if action != "source-request" {
+                            assert!(cancelled.load(Ordering::Acquire), "{action} must cancel immediately");
+                        }
+                        e.refresh_fragment_marks(cx);
+                        assert!(cancelled.load(Ordering::Acquire));
+                        assert!(!e.link_preview.fragment_cancel.as_ref().unwrap().0.load(Ordering::Acquire));
+                    });
+                }
+                Some(Document::from_text("# Old\n"))
+            });
+            assert_eq!(reads, ["b.md"], "{action} must stop old target reads");
+            assert!(marks.is_none());
+            cx.run_until_parked();
+            editor.update(cx, |e, _| {
+                let fragment = if action == "resolver" { "Old" } else { "New" };
+                let key = (aero_core::VaultPath::new("b.md").unwrap(), fragment.into());
+                assert_eq!(e.link_preview.fragments.len(), 1, "{action}: only latest marks survive");
+                assert_eq!(e.link_preview.fragments[&key].exists, action != "resolver");
+                assert!(e.link_preview.fragment_task.is_none(), "{action}: latest request must finish");
+                assert_eq!(e.link_preview.fragment_reads.load(Ordering::SeqCst), 1);
+                assert_eq!(e.link_preview.fragment_scans.load(Ordering::SeqCst), 1);
+            });
+        }
+    }
+
+    #[test]
+    fn fragment_cancelled_before_scan_does_not_read() {
+        let cancel = super::CancelFragmentScan::default();
+        let cancelled = cancel.0.clone();
+        drop(cancel);
+        let path = aero_core::VaultPath::new("a.md").unwrap();
+        let resolver = aero_core::links::Resolver::from_notes([
+            path.clone(),
+            aero_core::VaultPath::new("b.md").unwrap(),
+        ]);
+        let marks = super::load_fragment_marks("[[b#Old]]\n", &resolver, &path, &cancelled, |_| {
+            panic!("a cancelled scan must not read any targets")
+        });
+        assert!(marks.is_none());
+    }
+
+    #[gpui_kit::test]
+    fn fragment_owner_drop_cancels_running_read(cx: &mut TestAppContext) {
+        let source = "[[b#Old]] [[c#Old]]\n";
+        let (_dir, editor) = fragment_editor(cx, source);
+        let (resolver, path, cancelled, scans) = editor.update(cx, |e, cx| {
+            e.install_test_resolver(&[("a.md", None), ("b.md", None), ("c.md", None)], cx);
+            e.refresh_fragment_marks(cx);
+            (
+                e.link_preview.resolver.clone().unwrap(),
+                e.path.clone(),
+                e.link_preview.fragment_cancel.as_ref().unwrap().0.clone(),
+                e.link_preview.fragment_scans.clone(),
+            )
+        });
+        let mut editor = Some(editor);
+        let mut reads = Vec::new();
+        let marks = super::load_fragment_marks(source, &resolver, &path, &cancelled, |path| {
+            reads.push(path.as_str().to_owned());
+            drop(editor.take());
+            // Release the dropped entity without starting any queued background work.
+            cx.update(|_| {});
+            Some(Document::from_text("# Old\n"))
+        });
+        assert!(cancelled.load(Ordering::Acquire), "dropping the owner must signal the worker");
+        assert_eq!(reads, ["b.md"]);
+        assert!(marks.is_none());
+        cx.run_until_parked();
+        assert_eq!(scans.load(Ordering::SeqCst), 0, "the queued scan must also be cancelled");
+    }
+
+    #[gpui_kit::test]
+    fn fragment_pending_requests_coalesce_and_latest_completes(cx: &mut TestAppContext) {
+        let (dir, editor) = fragment_editor(cx, "[[b#Old]]\n");
+        std::fs::write(dir.path().join("b.md"), "# Latest19\n").unwrap();
+        editor.update(cx, |e, cx| {
+            e.refresh_fragment_marks(cx);
+            for version in 0..20 {
+                let cancelled = e.link_preview.fragment_cancel.as_ref().unwrap().0.clone();
+                e.doc
+                    .edit(aero_core::Edit::replace(0..e.doc.len(), format!("[[b#Latest{version}]]\n")))
+                    .unwrap();
+                e.after_doc_change(cx);
+                e.save_task = None;
+                e.refresh_fragment_marks(cx);
+                assert!(cancelled.load(Ordering::Acquire));
+            }
+            assert_eq!(e.link_preview.fragment_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(e.link_preview.fragment_scans.load(Ordering::SeqCst), 0);
+        });
+        cx.run_until_parked();
+        editor.update(cx, |e, _| {
+            assert_eq!(e.link_preview.fragment_reads.load(Ordering::SeqCst), 1);
+            assert_eq!(e.link_preview.fragment_scans.load(Ordering::SeqCst), 1);
+            assert_eq!(e.link_preview.fragments.len(), 1);
+            let key = (aero_core::VaultPath::new("b.md").unwrap(), "Latest19".into());
+            assert!(e.link_preview.fragments[&key].exists);
+            assert!(e.link_preview.fragment_task.is_none());
+            assert!(e.link_preview.fragment_cancel.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn fragment_refresh_does_no_io_until_background_runs(cx: &mut TestAppContext) {
+        let (dir, editor) = fragment_editor(cx, "[[b#Present]]\n");
+        std::fs::write(dir.path().join("b.md"), "# Present\n").unwrap();
+        editor.update(cx, |e, cx| {
+            e.refresh_fragment_marks(cx);
+            assert_eq!(
+                e.link_preview.fragment_reads.load(Ordering::SeqCst),
+                0,
+                "render must not read targets"
+            );
+        });
+        cx.run_until_parked();
+        editor.update(cx, |e, _| {
+            assert_eq!(e.link_preview.fragment_reads.load(Ordering::SeqCst), 1);
+            assert!(e.link_preview.fragments.values().all(|mark| mark.exists));
+            assert_eq!(e.link_preview.fragments.len(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn fragment_cache_hits_do_not_rescan_or_read(cx: &mut TestAppContext) {
+        let (dir, editor) = fragment_editor(cx, "[[b#Present]]\n");
+        std::fs::write(dir.path().join("b.md"), "# Present\n").unwrap();
+        editor.update(cx, |e, cx| e.refresh_fragment_marks(cx));
+        cx.run_until_parked();
+        for _ in 0..20 {
+            editor.update(cx, |e, cx| e.refresh_fragment_marks(cx));
+            cx.run_until_parked();
+        }
+        editor.update(cx, |e, _| {
+            assert_eq!(
+                e.link_preview.fragment_reads.load(Ordering::SeqCst),
+                1,
+                "cache hits must not read/parse targets"
+            );
+            assert_eq!(
+                e.link_preview.fragment_scans.load(Ordering::SeqCst),
+                1,
+                "cache hits must not scan the source"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn fragment_refresh_reads_each_target_once(cx: &mut TestAppContext) {
+        let (dir, editor) = fragment_editor(
+            cx,
+            "[[b#Present]] [[b#Missing]] [[b#^block]] [[b#Present]] [[#Local]] [[a#Local]]\n\n# Local\n",
+        );
+        std::fs::write(dir.path().join("b.md"), "# Present\n\nbody ^block\n").unwrap();
+        editor.update(cx, |e, cx| e.refresh_fragment_marks(cx));
+        cx.run_until_parked();
+        editor.update(cx, |e, _| {
+            assert_eq!(
+                e.link_preview.fragment_reads.load(Ordering::SeqCst),
+                1,
+                "one read/parse per target, not per fragment"
+            );
+            assert_eq!(e.link_preview.fragments.len(), 3);
+            let path = aero_core::VaultPath::new("b.md").unwrap();
+            for (fragment, exists) in [("Present", true), ("Missing", false), ("^block", true)] {
+                assert_eq!(e.link_preview.fragments[&(path.clone(), fragment.into())].exists, exists);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn fragment_missing_target_recovers_after_resolver_refresh(cx: &mut TestAppContext) {
+        let (dir, editor) = fragment_editor(cx, "[[b#Present]]\n");
+        let key = (aero_core::VaultPath::new("b.md").unwrap(), "Present".into());
+        editor.update(cx, |e, cx| e.refresh_fragment_marks(cx));
+        cx.run_until_parked();
+        editor.update(cx, |e, _| assert!(!e.link_preview.fragments[&key].exists));
+        std::fs::write(dir.path().join("b.md"), "# Present\n").unwrap();
+        editor.update(cx, |e, cx| {
+            e.install_test_resolver(&[("a.md", None), ("b.md", None)], cx);
+            e.refresh_fragment_marks(cx);
+            assert!(!e.link_preview.fragments[&key].exists, "keep cached marks until refresh completes");
+        });
+        cx.run_until_parked();
+        editor.update(cx, |e, _| {
+            assert!(e.link_preview.fragments[&key].exists);
+            assert_eq!(e.link_preview.fragment_reads.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn fragment_source_edit_replaces_obsolete_marks(cx: &mut TestAppContext) {
+        let (dir, editor) = fragment_editor(cx, "[[b#Old]]\n");
+        std::fs::write(dir.path().join("b.md"), "# Old\n\n# New\n").unwrap();
+        editor.update(cx, |e, cx| e.refresh_fragment_marks(cx));
+        cx.run_until_parked();
+        let old = (aero_core::VaultPath::new("b.md").unwrap(), "Old".into());
+        let new = (aero_core::VaultPath::new("b.md").unwrap(), "New".into());
+        editor.update(cx, |e, cx| {
+            e.doc.edit(aero_core::Edit::replace(0..e.doc.len(), "[[b#New]]\n")).unwrap();
+            e.after_doc_change(cx);
+            e.save_task = None;
+            assert!(e.link_preview.fragments[&old].exists);
+            e.refresh_fragment_marks(cx);
+        });
+        cx.run_until_parked();
+        editor.update(cx, |e, _| {
+            assert!(e.link_preview.fragments[&new].exists);
+            assert!(
+                !e.link_preview.fragments.contains_key(&old),
+                "completed refresh must prune obsolete marks"
+            );
+            assert_eq!(e.link_preview.fragment_reads.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn fragment_late_completion_is_ignored_after_invalidation(cx: &mut TestAppContext) {
+        for action in ["edit", "reload", "rename", "delete", "resolver", "cancel"] {
+            let (_dir, editor) = fragment_editor(cx, "[[b#Present]]\n");
+            let key = (aero_core::VaultPath::new("b.md").unwrap(), "Present".into());
+            let request = editor.update(cx, |e, cx| {
+                e.refresh_fragment_marks(cx);
+                e.link_preview.fragment_request.unwrap()
+            });
+            cx.run_until_parked();
+            editor.update(cx, |e, cx| {
+                assert!(!e.link_preview.fragments[&key].exists);
+                match action {
+                    // No render or after_doc_change: the completion must check the live version too.
+                    "edit" => {
+                        e.doc.edit(aero_core::Edit::insert(0, "changed ")).unwrap();
+                    }
+                    // A replacement Document restarts at version zero.
+                    "reload" => e.reload(b"replacement\n", e.stamp, cx),
+                    "rename" => e.set_path(aero_core::VaultPath::new("renamed.md").unwrap(), cx),
+                    "delete" => e.mark_deleted(cx),
+                    "resolver" => e.install_test_resolver(&[("a.md", None), ("b.md", None)], cx),
+                    "cancel" => e.invalidate_fragment_marks(),
+                    _ => unreachable!(),
+                }
+                let stale =
+                    std::collections::HashMap::from([(key.clone(), super::FragmentMark { exists: true })]);
+                assert!(!e.finish_fragment_marks(request, stale), "{action} must reject late results");
+                assert!(!e.link_preview.fragments[&key].exists, "{action} must not revive stale marks");
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn fragment_old_completion_cannot_overwrite_new_request(cx: &mut TestAppContext) {
+        let (_dir, editor) = fragment_editor(cx, "[[b#Present]]\n");
+        editor.update(cx, |e, cx| {
+            e.refresh_fragment_marks(cx);
+            let old = e.link_preview.fragment_request.unwrap();
+            e.install_test_resolver(&[("a.md", None), ("b.md", None)], cx);
+            e.refresh_fragment_marks(cx);
+            let current = e.link_preview.fragment_request.unwrap();
+            let key = (aero_core::VaultPath::new("b.md").unwrap(), "Present".into());
+            assert_ne!(old, current);
+            let result =
+                |exists| std::collections::HashMap::from([(key.clone(), super::FragmentMark { exists })]);
+            assert!(
+                !e.finish_fragment_marks(old, result(true)),
+                "reject stale work while the new request is pending"
+            );
+            assert!(e.link_preview.fragment_task.is_some(), "stale work must not cancel the new task");
+            assert!(e.finish_fragment_marks(current, result(false)));
+            assert!(
+                !e.finish_fragment_marks(old, result(true)),
+                "reject stale work after the new request completes"
+            );
+            assert!(!e.link_preview.fragments[&key].exists);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn fragment_resolver_notifications_refresh_unchanged_source(cx: &mut TestAppContext) {
+        let (dir, editor) = fragment_editor(cx, "[[b#Present]]\n");
+        std::fs::write(dir.path().join("b.md"), "# Missing\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = editor.update(cx, |e, _| e.vault.clone());
+        let service = cx.new(|cx| super::SearchService::new(vault, data.path().into(), cx));
+        // Join the OS startup thread; exercise the real observer/resolver with its disk fallback.
+        cx.update(|cx| service.read(cx).close_blocking());
+        editor.update(cx, |e, cx| e.connect_link_preview(service.clone(), cx));
+        cx.run_until_parked();
+        let key = (aero_core::VaultPath::new("b.md").unwrap(), "Present".into());
+        editor.update(cx, |e, _| assert!(!e.link_preview.fragments[&key].exists));
+        for (text, exists) in [
+            (Some("# Present\n"), true),
+            (Some("# Missing\n"), false),
+            (None, false),
+            (Some("# Present\n"), true),
+        ] {
+            match text {
+                Some(text) => std::fs::write(dir.path().join("b.md"), text).unwrap(),
+                None => std::fs::remove_file(dir.path().join("b.md")).unwrap(),
+            }
+            // SearchService's save/watch/index completion calls notify, not a source edit.
+            service.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            editor.update(cx, |e, cx| {
+                assert_eq!(e.doc.version(), 0, "the source was not edited");
+                let url = aero_core::links::encode_note_url("b", Some("Present"));
+                assert_eq!(
+                    e.preview_link_style(&url, cx).underline,
+                    if exists {
+                        gpui_kit::base::text::LinkUnderline::Solid
+                    } else {
+                        gpui_kit::base::text::LinkUnderline::Dashed
+                    }
+                );
+                if text.is_some() {
+                    assert_eq!(e.link_preview.fragments[&key].exists, exists);
+                } else {
+                    assert!(
+                        e.link_preview.fragments.is_empty(),
+                        "deleted targets are pruned from the catalog"
+                    );
+                }
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn fragment_resolver_refresh_tracks_target_rename(cx: &mut TestAppContext) {
+        let (dir, editor) = fragment_editor(cx, "[[b#Present]]\n");
+        std::fs::write(dir.path().join("b.md"), "# Present\n").unwrap();
+        editor.update(cx, |e, cx| e.refresh_fragment_marks(cx));
+        cx.run_until_parked();
+        std::fs::rename(dir.path().join("b.md"), dir.path().join("c.md")).unwrap();
+        editor.update(cx, |e, cx| {
+            e.install_test_resolver(&[("a.md", None), ("c.md", Some("b"))], cx);
+            e.refresh_fragment_marks(cx);
+        });
+        cx.run_until_parked();
+        editor.update(cx, |e, _| {
+            assert_eq!(e.doc.version(), 0);
+            assert_eq!(e.link_preview.fragments.len(), 1);
+            let key = (aero_core::VaultPath::new("c.md").unwrap(), "Present".into());
+            assert!(e.link_preview.fragments[&key].exists);
+            assert_eq!(e.link_preview.fragment_reads.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn fragment_existence_matches_excerpt_validation() {
+        for source in [
+            "# **Heading**\n\nbody ^block\n",
+            "> ## Heading\n> nested\n\nbody ^block\n",
+            "# Heading\n",
+            "first ^block\n\nsecond ^block\n",
+            "---\ntitle: Heading\n---\n",
+        ] {
+            let doc = Document::from_text(source);
+            for fragment in
+                [None, Some(""), Some("Heading"), Some("missing"), Some("^block"), Some("^missing")]
+            {
+                assert_eq!(super::fragment_range(&doc, fragment).is_ok(), excerpt(&doc, fragment).is_ok());
+            }
+        }
+    }
 
     #[gpui_kit::test]
     fn hover_waits_500ms_and_cancels_before_opening(cx: &mut TestAppContext) {
@@ -751,6 +1317,8 @@ mod tests {
                     cx.notify();
                 })
             });
+            // The first render queues fragment checks; settle them without hovering.
+            visual.update(|window, cx| window.draw(cx).clear(cx));
             visual.run_until_parked();
             visual.update(|window, cx| {
                 use gpui_kit::component::ActiveTheme as _;
@@ -967,9 +1535,10 @@ mod tests {
             })
         });
         std::fs::rename(&original, &parked).unwrap();
+        visual.update(|_, cx| editor.update(cx, |e, cx| e.check_external(cx)));
+        visual.run_until_parked();
         visual.update(|_, cx| {
-            editor.update(cx, |e, cx| {
-                e.check_external(cx);
+            editor.update(cx, |e, _| {
                 assert!(e.is_deleted());
                 assert!(matches!(
                     e.link_preview.resolver.as_ref().unwrap().resolve("local-name", None, ""),
@@ -978,23 +1547,27 @@ mod tests {
             })
         });
         std::fs::rename(&parked, &original).unwrap();
-        visual.update(|_, cx| editor.update(cx, |e, cx| {
-            e.check_external(cx);
+        visual.update(|_, cx| editor.update(cx, |e, cx| e.check_external(cx)));
+        visual.run_until_parked();
+        visual.update(|_, cx| editor.update(cx, |e, _| {
             assert!(!e.is_deleted());
             assert!(matches!(e.link_preview.resolver.as_ref().unwrap().resolve("local-name", None, ""), Resolution::Resolved { path, .. } if path.as_str() == "a.md"));
         }));
         std::fs::rename(&original, &parked).unwrap();
+        visual.update(|_, cx| editor.update(cx, |e, cx| e.check_external(cx)));
+        visual.run_until_parked();
         visual.update(|_, cx| editor.update(cx, |e, cx| {
-            e.check_external(cx);
+            assert!(e.is_deleted());
             e.save_as(aero_core::VaultPath::new("recovered.md").unwrap(), cx).unwrap();
             let resolver = e.link_preview.resolver.as_ref().unwrap();
             assert!(matches!(resolver.resolve("a", None, ""), Resolution::Unresolved));
             assert!(matches!(resolver.resolve("local-name", None, ""), Resolution::Resolved { path, .. } if path.as_str() == "recovered.md"));
         }));
         std::fs::rename(dir.path().join("recovered.md"), dir.path().join("parked-recovered")).unwrap();
+        visual.update(|_, cx| editor.update(cx, |e, cx| e.check_external(cx)));
+        visual.run_until_parked();
         visual.update(|_, cx| {
             editor.update(cx, |e, cx| {
-                e.check_external(cx);
                 assert!(e.is_deleted());
                 e.restore_deleted(cx);
             })

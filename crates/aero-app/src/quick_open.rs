@@ -1,9 +1,12 @@
 //! 快速打开（`ui_design.md` 3.2）：居中弹出的模糊搜索框，范围是笔记标题与路径。
 //!
 //! 空输入显示最近打开的笔记；`⏎` 打开，`⌘⏎` 或无匹配时新建同名笔记；`Esc` 关闭。
-//! 候选先用文件名（同步、立刻可用），后台补齐 front matter 标题与别名；显示标题不变。
+//! 复用当前目录缓存，后台读取标题与别名；大目录的模糊匹配也在后台完成。
 
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aero_core::{Vault, VaultPath};
 use gpui_kit::assets::IconName;
@@ -19,6 +22,8 @@ use crate::search::SearchService;
 
 const MAX_SHOWN: usize = 12;
 const RECENT_SHOWN: usize = 10;
+const SYNC_CATALOG_LIMIT: usize = 256;
+const FILTER_DEBOUNCE: Duration = Duration::from_millis(100);
 
 pub enum QuickOpenEvent {
     Open(VaultPath),
@@ -35,12 +40,27 @@ impl EventEmitter<QuickOpenEvent> for QuickOpen {}
 
 use aero_core::links::NoteSummary;
 
+struct PendingConfirmation {
+    query: String,
+    filter_generation: u64,
+    catalog_generation: u64,
+    create: bool,
+    selection: Option<VaultPath>,
+}
+
 pub struct QuickOpen {
     input: Entity<InputState>,
-    candidates: Vec<NoteSummary>,
+    candidates: Arc<Vec<NoteSummary>>,
+    catalog_vault: Option<String>,
     /// 丢弃上一次 set_notes 尚未完成的目录结果。
     catalog_generation: u64,
     catalog_status: Option<Result<(), String>>,
+    filter_generation: u64,
+    filter_task: Option<Task<()>>,
+    filter_query: String,
+    filtering: bool,
+    pending_selection: Option<VaultPath>,
+    pending_confirmation: Option<PendingConfirmation>,
     has_vault: bool,
     /// 最近打开的在前
     recent: Vec<VaultPath>,
@@ -68,9 +88,16 @@ impl QuickOpen {
         let sub = cx.subscribe_in(&input, window, Self::on_input_event);
         let mut this = QuickOpen {
             input,
-            candidates: Vec::new(),
+            candidates: Arc::default(),
+            catalog_vault: None,
             catalog_generation: 0,
             catalog_status: None,
+            filter_generation: 0,
+            filter_task: None,
+            filter_query: String::new(),
+            filtering: false,
+            pending_selection: None,
+            pending_confirmation: None,
             has_vault: false,
             recent: Vec::new(),
             commands,
@@ -94,32 +121,52 @@ impl QuickOpen {
         recent: Vec<VaultPath>,
         cx: &mut Context<Self>,
     ) {
-        self.candidates = vault
-            .notes()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| NoteSummary { title: p.stem().to_owned(), path: p, aliases: Vec::new() })
-            .collect();
+        if self.catalog_vault.as_deref() != Some(vault.id()) {
+            self.candidates = Arc::default();
+            self.shown.clear();
+            self.pending_selection = None;
+        }
+        self.catalog_vault = Some(vault.id().to_owned());
         self.recent = recent;
         self.has_vault = true;
         self.catalog_status = None;
-        self.refilter(cx);
         self.catalog_generation += 1;
+        self.refilter(cx);
         let generation = self.catalog_generation;
         let notes = service.read(cx).completion_notes(vault, cx);
         cx.spawn(async move |this, cx| {
             let notes = notes.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.catalog_generation != generation {
-                    return;
-                }
-                this.catalog_status = Some(notes.map(|notes| this.candidates = notes));
-                if !this.command_mode {
-                    this.refilter(cx);
-                }
-            });
+            let _ = this.update(cx, |this, cx| this.receive_catalog(generation, notes, cx));
         })
         .detach();
+    }
+
+    fn receive_catalog(
+        &mut self,
+        generation: u64,
+        notes: Result<Vec<NoteSummary>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.catalog_generation != generation {
+            return;
+        }
+        let selection = self.selected_path();
+        self.catalog_status = Some(notes.map(|notes| self.candidates = Arc::new(notes)));
+        if !self.command_mode {
+            self.refilter_with_selection(selection, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn selected_path(&self) -> Option<VaultPath> {
+        if self.command_mode {
+            return None;
+        }
+        if self.filtering {
+            return self.pending_selection.clone();
+        }
+        self.shown.get(self.selected).and_then(|&i| self.candidates.get(i)).map(|note| note.path.clone())
     }
 
     pub fn show_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -157,18 +204,40 @@ impl QuickOpen {
             InputEvent::PressEnter { secondary, .. } => self.confirm(*secondary, cx),
             InputEvent::Focus => {}
             // 点到别处：关闭
-            InputEvent::Blur => cx.emit(QuickOpenEvent::Dismiss),
+            InputEvent::Blur => {
+                self.pending_confirmation = None;
+                cx.emit(QuickOpenEvent::Dismiss);
+            }
         }
     }
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
+        self.refilter_with_selection(self.selected_path(), cx);
+    }
+
+    fn refilter_with_selection(&mut self, selection: Option<VaultPath>, cx: &mut Context<Self>) {
         let q = self.query(cx);
+        let selection = selection.filter(|_| self.filter_query == q);
+        self.filter_query = q.clone();
+        self.filter_generation += 1;
+        let generation = self.filter_generation;
+        self.pending_confirmation = self
+            .pending_confirmation
+            .take()
+            .filter(|pending| pending.query == q && pending.catalog_generation == self.catalog_generation);
+        if let Some(pending) = self.pending_confirmation.as_mut() {
+            // 同一查询的目录完成会重新筛选；确认跟随这次筛选，不能接受旧结果。
+            pending.filter_generation = generation;
+        }
+        self.filter_task = None;
+        self.filtering = false;
+        self.pending_selection = selection.clone();
         self.command_mode = q.starts_with('>');
-        self.has_query = self.has_vault
-            && !self.command_mode
-            && !q.is_empty()
-            && matches!(self.catalog_status, Some(Ok(())));
-        self.shown = if let Some(query) = q.strip_prefix('>') {
+        self.has_query = false;
+        self.shown.clear();
+        self.selected = 0;
+        self.scroll.scroll_to_item(0);
+        if let Some(query) = q.strip_prefix('>') {
             let query = query.trim();
             let mut scored: Vec<_> = self
                 .commands
@@ -183,47 +252,71 @@ impl QuickOpen {
                 })
                 .collect();
             scored.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.cmp(&a.1)).then_with(|| a.0.cmp(&b.0)));
-            scored.into_iter().map(|(i, _, _)| i).collect()
-        } else if q.is_empty() {
-            // 最近打开优先，不足的按路径补
-            let mut out: Vec<usize> = self
-                .recent
-                .iter()
-                .filter_map(|r| self.candidates.iter().position(|c| &c.path == r))
-                .take(RECENT_SHOWN)
-                .collect();
-            for i in 0..self.candidates.len() {
-                if out.len() >= RECENT_SHOWN {
-                    break;
-                }
-                if !out.contains(&i) {
-                    out.push(i);
-                }
-            }
-            out
+            self.shown = scored.into_iter().map(|(i, _, _)| i).collect();
+        } else if self.candidates.len() <= SYNC_CATALOG_LIMIT {
+            let shown = filter_notes(&self.candidates, &self.recent, &q);
+            self.receive_filter(generation, shown, selection, cx);
+            return;
         } else {
-            let mut scored: Vec<(i32, usize)> = self
-                .candidates
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| {
-                    let s = fuzzy_score(&q, &c.title)
-                        .max(fuzzy_score(&q, c.path.as_str()))
-                        .max(c.aliases.iter().filter_map(|alias| fuzzy_score(&q, alias)).max())?;
-                    // 最近打开的加一点分
-                    let bonus =
-                        self.recent.iter().position(|r| r == &c.path).map_or(0, |p| 20 - (p as i32).min(10));
-                    Some((s + bonus, i))
-                })
-                .collect();
-            scored.sort_by(|a, b| {
-                b.0.cmp(&a.0).then_with(|| self.candidates[a.1].path.cmp(&self.candidates[b.1].path))
-            });
-            scored.into_iter().take(MAX_SHOWN).map(|(_, i)| i).collect()
-        };
-        self.selected = 0;
-        self.scroll.scroll_to_item(0);
+            self.filtering = true;
+            let candidates = self.candidates.clone();
+            let recent = self.recent.clone();
+            self.filter_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(FILTER_DEBOUNCE).await;
+                let shown = cx.background_spawn(async move { filter_notes(&candidates, &recent, &q) }).await;
+                let _ = this.update(cx, |this, cx| this.receive_filter(generation, shown, selection, cx));
+            }));
+        }
         cx.notify();
+    }
+
+    fn receive_filter(
+        &mut self,
+        generation: u64,
+        shown: Vec<usize>,
+        selection: Option<VaultPath>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.filter_generation {
+            return;
+        }
+        self.filter_task = None;
+        self.filtering = false;
+        self.pending_selection = None;
+        self.shown = shown;
+        self.has_query = self.has_vault
+            && !self.command_mode
+            && !self.filter_query.is_empty()
+            && matches!(self.catalog_status, Some(Ok(())));
+        self.selected = selection
+            .and_then(|path| self.shown.iter().position(|&i| self.candidates[i].path == path))
+            .unwrap_or(0);
+        self.scroll.scroll_to_item(self.selected);
+        self.replay_pending_confirmation(cx);
+        cx.notify();
+    }
+
+    fn replay_pending_confirmation(&mut self, cx: &mut Context<Self>) {
+        if self.catalog_status.is_none() {
+            return;
+        }
+        let Some(pending) = self.pending_confirmation.take().filter(|pending| {
+            pending.filter_generation == self.filter_generation
+                && pending.catalog_generation == self.catalog_generation
+                && pending.query == self.query(cx)
+                && matches!(self.catalog_status, Some(Ok(())))
+        }) else {
+            return;
+        };
+        if !pending.create
+            && let Some(path) = pending.selection
+        {
+            let Some(selected) = self.shown.iter().position(|&i| self.candidates[i].path == path) else {
+                return;
+            };
+            self.selected = selected;
+        }
+        self.confirm(pending.create, cx);
     }
 
     fn on_select_prev(&mut self, _: &SelectPrev, _window: &mut Window, cx: &mut Context<Self>) {
@@ -245,6 +338,7 @@ impl QuickOpen {
     }
 
     fn on_dismiss(&mut self, _: &Dismiss, _window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_confirmation = None;
         cx.emit(QuickOpenEvent::Dismiss);
     }
 
@@ -254,6 +348,10 @@ impl QuickOpen {
     }
 
     fn confirm(&mut self, create: bool, cx: &mut Context<Self>) {
+        let q = self.query(cx);
+        if q != self.filter_query {
+            self.refilter(cx);
+        }
         if self.command_mode {
             if let Some(&i) = self.shown.get(self.selected) {
                 let command = &self.commands[i];
@@ -264,7 +362,17 @@ impl QuickOpen {
         if !self.has_vault {
             return;
         }
-        let q = self.query(cx);
+        if self.filtering || self.catalog_status.is_none() {
+            self.pending_confirmation = Some(PendingConfirmation {
+                query: q,
+                filter_generation: self.filter_generation,
+                catalog_generation: self.catalog_generation,
+                create,
+                selection: self.selected_path(),
+            });
+            return;
+        }
+        self.pending_confirmation = None;
         if create || self.shown.is_empty() || self.selected >= self.shown.len() {
             if self.has_query {
                 cx.emit(QuickOpenEvent::Create(q));
@@ -276,17 +384,63 @@ impl QuickOpen {
     }
 }
 
+/// 只保留最好的 12 项，不为整个目录分配排序数组。大目录在后台调用。
+fn filter_notes(candidates: &[NoteSummary], recent: &[VaultPath], query: &str) -> Vec<usize> {
+    let mut recent_positions = HashMap::new();
+    for (i, path) in recent.iter().enumerate() {
+        recent_positions.entry(path).or_insert(i);
+    }
+    if query.is_empty() {
+        let mut recent_matches = vec![None; recent.len()];
+        for (i, note) in candidates.iter().enumerate() {
+            if let Some(&position) = recent_positions.get(&note.path) {
+                recent_matches[position] = Some(i);
+            }
+        }
+        let mut shown: Vec<_> = recent_matches.into_iter().flatten().take(RECENT_SHOWN).collect();
+        for i in 0..candidates.len() {
+            if shown.len() >= RECENT_SHOWN {
+                break;
+            }
+            if !shown.contains(&i) {
+                shown.push(i);
+            }
+        }
+        return shown;
+    }
+    let query: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    let mut best = BinaryHeap::with_capacity(MAX_SHOWN);
+    for (i, note) in candidates.iter().enumerate() {
+        let score = fuzzy_score_prepared(&query, &note.title)
+            .max(fuzzy_score_prepared(&query, note.path.as_str()))
+            .max(note.aliases.iter().filter_map(|alias| fuzzy_score_prepared(&query, alias)).max());
+        let Some(score) = score else { continue };
+        let bonus = recent_positions.get(&note.path).map_or(0, |&p| 20 - p.min(10) as i32);
+        let ranked = (score + bonus, Reverse(&note.path), Reverse(i));
+        if best.len() < MAX_SHOWN {
+            best.push(Reverse(ranked));
+        } else if best.peek().is_some_and(|worst| ranked > worst.0) {
+            *best.peek_mut().unwrap() = Reverse(ranked);
+        }
+    }
+    best.into_sorted_vec().into_iter().map(|Reverse((_, _, Reverse(i)))| i).collect()
+}
+
 /// 子序列模糊匹配得分：不匹配返回 `None`。前缀 / 连续 / 词首命中加分，越长的候选略减分。
 pub fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
     let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    let t: Vec<char> = target.chars().flat_map(char::to_lowercase).collect();
+    fuzzy_score_prepared(&q, target)
+}
+
+fn fuzzy_score_prepared(q: &[char], target: &str) -> Option<i32> {
     if q.is_empty() {
         return Some(0);
     }
+    let t: Vec<char> = target.chars().flat_map(char::to_lowercase).collect();
     let mut score = 0i32;
     let mut ti = 0usize;
     let mut prev_hit: Option<usize> = None;
-    for &qc in &q {
+    for &qc in q {
         let pos = t[ti..].iter().position(|&c| c == qc)? + ti;
         score += 10;
         if pos == 0 {
@@ -399,17 +553,21 @@ impl Render for QuickOpen {
                     .track_scroll(&self.scroll)
                     .children(rows)
                     .when(
-                        self.has_vault && !self.command_mode && !matches!(self.catalog_status, Some(Ok(()))),
+                        self.has_vault
+                            && !self.command_mode
+                            && (self.filtering || !matches!(self.catalog_status, Some(Ok(())))),
                         |el| {
                             let message = match &self.catalog_status {
                                 Some(Err(error)) => format!("无法读取笔记目录：{error}"),
-                                _ => "正在读取标题与别名…".to_owned(),
+                                Some(Ok(())) => "正在筛选笔记…".to_owned(),
+                                None => "正在读取标题与别名…".to_owned(),
                             };
                             el.child(div().px_3().py_2().text_sm().text_color(muted).child(message))
                         },
                     )
                     .when(
                         empty
+                            && !self.filtering
                             && (!self.has_vault
                                 || self.command_mode
                                 || matches!(self.catalog_status, Some(Ok(())))),
@@ -443,6 +601,483 @@ mod tests {
     // 不能 `use super::*`：它会把 GPUI 的 `test` 属性宏带进作用域，遮住标准 `#[test]`
     use super::{QuickOpen, QuickOpenEvent, fuzzy_score};
     use crate::search::SearchService;
+
+    fn large_picker(window: &mut gpui_kit::Window, cx: &mut gpui_kit::Context<QuickOpen>) -> QuickOpen {
+        let mut picker = QuickOpen::new(vec![], vec![], window, cx);
+        picker.has_vault = true;
+        picker.catalog_status = Some(Ok(()));
+        picker.candidates = (0..512)
+            .map(|i| aero_core::links::NoteSummary {
+                title: format!("note {i}"),
+                path: VaultPath::new(&format!("{i:04}.md")).unwrap(),
+                aliases: vec![],
+            })
+            .collect::<Vec<_>>()
+            .into();
+        picker.refilter(cx);
+        picker
+    }
+
+    fn record_note_events(
+        picker: &gpui_kit::Entity<QuickOpen>,
+        visual: &mut gpui_kit::VisualTestContext,
+    ) -> Rc<RefCell<Vec<String>>> {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        visual.update(|_, cx| {
+            cx.subscribe(picker, move |_, event, _| match event {
+                QuickOpenEvent::Open(path) => sink.borrow_mut().push(format!("open {path}")),
+                QuickOpenEvent::Create(name) => sink.borrow_mut().push(format!("create {name}")),
+                _ => {}
+            })
+            .detach();
+        });
+        events
+    }
+
+    fn finish_filter(visual: &mut gpui_kit::VisualTestContext) {
+        visual.run_until_parked();
+        visual.executor().advance_clock(super::FILTER_DEBOUNCE);
+        visual.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn enter_during_debounce_opens_intended_query_once(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let (picker, visual) = cx.add_window_view(large_picker);
+        let events = record_note_events(&picker, visual);
+        finish_filter(visual);
+        visual.simulate_input("0511");
+        assert!(picker.read_with(visual, |p, _| p.filtering));
+        visual.simulate_keystrokes("enter");
+        assert!(events.borrow().is_empty());
+        finish_filter(visual);
+        assert_eq!(*events.borrow(), ["open 0511.md"]);
+        picker.update(visual, |p, cx| {
+            p.receive_filter(p.filter_generation, p.shown.clone(), None, cx);
+            p.refilter(cx);
+        });
+        finish_filter(visual);
+        assert_eq!(*events.borrow(), ["open 0511.md"], "confirmation is consumed exactly once");
+    }
+
+    #[gpui_kit::test]
+    fn cmd_enter_during_debounce_creates_once(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let (picker, visual) = cx.add_window_view(large_picker);
+        let events = record_note_events(&picker, visual);
+        visual.simulate_input("note");
+        visual.simulate_keystrokes("cmd-enter");
+        assert!(events.borrow().is_empty());
+        finish_filter(visual);
+        assert_eq!(*events.borrow(), ["create note"], "Cmd-Enter must create even with matches");
+        picker.update(visual, |p, cx| p.receive_filter(p.filter_generation, p.shown.clone(), None, cx));
+        finish_filter(visual);
+        assert_eq!(*events.borrow(), ["create note"]);
+    }
+
+    #[gpui_kit::test]
+    fn changed_query_cancels_pending_confirmation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (picker, visual) = cx.add_window_view(large_picker);
+        let events = record_note_events(&picker, visual);
+        picker.update_in(visual, |p, window, cx| {
+            p.input.update(cx, |s, cx| s.set_value("0511", window, cx));
+            p.refilter(cx);
+            p.confirm(false, cx);
+            p.input.update(cx, |s, cx| s.set_value("0510", window, cx));
+            p.refilter(cx);
+        });
+        finish_filter(visual);
+        assert!(events.borrow().is_empty());
+        picker.update_in(visual, |p, window, cx| {
+            p.input.update(cx, |s, cx| s.set_value("0511", window, cx));
+            p.refilter(cx);
+        });
+        finish_filter(visual);
+        assert!(events.borrow().is_empty(), "returning to the old query must not resurrect Enter");
+    }
+
+    #[gpui_kit::test]
+    fn stale_filter_cannot_replay_pending_confirmation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (picker, visual) = cx.add_window_view(large_picker);
+        let events = record_note_events(&picker, visual);
+        picker.update_in(visual, |p, window, cx| {
+            p.input.update(cx, |s, cx| s.set_value("0511", window, cx));
+            p.refilter(cx);
+            let obsolete = p.filter_generation;
+            p.input.update(cx, |s, cx| s.set_value("0510", window, cx));
+            p.refilter(cx);
+            p.confirm(false, cx);
+            p.receive_filter(obsolete, vec![usize::MAX], None, cx);
+            assert!(p.filtering);
+        });
+        assert!(events.borrow().is_empty(), "stale results must not confirm the current query");
+        finish_filter(visual);
+        assert_eq!(*events.borrow(), ["open 0510.md"]);
+    }
+
+    #[gpui_kit::test]
+    fn pending_confirmation_preserves_selected_path_across_same_query_refresh(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (picker, visual) = cx.add_window_view(large_picker);
+        let events = record_note_events(&picker, visual);
+        visual.simulate_input("note");
+        finish_filter(visual);
+        picker.update_in(visual, |p, window, cx| {
+            p.on_select_next(&crate::actions::SelectNext, window, cx);
+            assert_eq!(p.selected_path().unwrap().as_str(), "0001.md");
+            p.refilter(cx);
+            p.confirm(false, cx);
+            let notes = p.candidates.iter().cloned().rev().collect();
+            p.receive_catalog(p.catalog_generation, Ok(notes), cx);
+        });
+        finish_filter(visual);
+        assert_eq!(*events.borrow(), ["open 0001.md"], "preserve the path, not its old row index");
+    }
+
+    #[gpui_kit::test]
+    fn dismissal_cancels_pending_confirmation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (picker, visual) = cx.add_window_view(large_picker);
+        let events = record_note_events(&picker, visual);
+        for blur in [false, true] {
+            picker.update_in(visual, |p, window, cx| {
+                p.input.update(cx, |s, cx| s.set_value("0511", window, cx));
+                p.refilter(cx);
+                p.confirm(false, cx);
+                if blur {
+                    p.on_input_event(&p.input.clone(), &gpui_kit::base::input::InputEvent::Blur, window, cx);
+                } else {
+                    p.on_dismiss(&crate::actions::Dismiss, window, cx);
+                }
+            });
+            finish_filter(visual);
+            assert!(events.borrow().is_empty(), "dismissal must cancel Enter (blur={blur})");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn vault_switch_cancels_pending_confirmation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("0511.md"), "other vault").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        cx.update(|cx| service.read(cx).close_blocking());
+        let (picker, visual) = cx.add_window_view(large_picker);
+        let events = record_note_events(&picker, visual);
+        picker.update_in(visual, |p, window, cx| {
+            p.input.update(cx, |s, cx| s.set_value("0511", window, cx));
+            p.refilter(cx);
+            p.confirm(false, cx);
+            let obsolete = p.filter_generation;
+            p.set_notes(vault, service, vec![], cx);
+            p.receive_filter(obsolete, vec![usize::MAX], None, cx);
+        });
+        finish_filter(visual);
+        assert_eq!(picker.read_with(visual, |p, _| p.shown_paths().len()), 1);
+        assert!(events.borrow().is_empty(), "Enter must not carry over to the new vault");
+    }
+
+    #[gpui_kit::test]
+    fn pending_confirmation_waits_for_catalog_before_creating(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (picker, visual) = cx.add_window_view(large_picker);
+        let events = record_note_events(&picker, visual);
+        picker.update_in(visual, |p, window, cx| {
+            p.catalog_status = None;
+            p.input.update(cx, |s, cx| s.set_value("missing", window, cx));
+            p.refilter(cx);
+            p.confirm(true, cx);
+        });
+        finish_filter(visual);
+        assert!(events.borrow().is_empty(), "a partial catalog must never allow creation");
+        picker.update(visual, |p, cx| p.receive_catalog(p.catalog_generation, Ok(p.candidates.to_vec()), cx));
+        finish_filter(visual);
+        assert_eq!(*events.borrow(), ["create missing"]);
+    }
+
+    #[gpui_kit::test]
+    fn startup_catalog_loads_in_background_and_applies_pending_query(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("n.md"), "---\naliases: silver\n---\n").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        cx.update(|cx| service.read(cx).close_blocking());
+        let (picker, visual) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(vec![], vec![], window, cx);
+            picker.set_notes(vault, service, vec![], cx);
+            assert!(picker.candidates.is_empty(), "set_notes must not enumerate the vault synchronously");
+            assert!(picker.catalog_status.is_none());
+            picker.input.update(cx, |s, cx| s.set_value("silver", window, cx));
+            picker.refilter(cx);
+            assert_eq!(picker.rows(), 0, "loading must not imply a missing note");
+            picker
+        });
+        visual.run_until_parked();
+        picker.read_with(visual, |picker, _| {
+            assert_eq!(picker.catalog_status, Some(Ok(())));
+            assert_eq!(picker.shown_paths(), ["n.md"]);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn large_catalog_waits_for_latest_query(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (picker, visual) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(vec![], vec![], window, cx);
+            picker.has_vault = true;
+            picker.catalog_status = Some(Ok(()));
+            picker.candidates = (0..2048)
+                .map(|i| aero_core::links::NoteSummary {
+                    title: format!("note {i}"),
+                    path: VaultPath::new(&format!("{i:04}.md")).unwrap(),
+                    aliases: vec![],
+                })
+                .collect::<Vec<_>>()
+                .into();
+            picker.input.update(cx, |s, cx| s.set_value("note", window, cx));
+            picker.refilter(cx);
+            assert_eq!(picker.rows(), 0, "large catalogs must defer scoring and creation");
+            picker
+        });
+        let events = Rc::new(RefCell::new(0));
+        visual.update(|_, cx| {
+            let events = events.clone();
+            cx.subscribe(&picker, move |_, event, _| {
+                if matches!(event, QuickOpenEvent::Open(_) | QuickOpenEvent::Create(_)) {
+                    *events.borrow_mut() += 1;
+                }
+            })
+            .detach();
+        });
+        visual.run_until_parked();
+        let obsolete = picker.read_with(visual, |p, _| p.filter_generation);
+        picker.update_in(visual, |p, window, cx| {
+            p.input.update(cx, |s, cx| s.set_value("2047", window, cx));
+            p.refilter(cx);
+            p.receive_filter(obsolete, vec![usize::MAX], None, cx);
+            assert!(p.filtering, "obsolete results must not end the pending query");
+            assert_eq!(p.rows(), 0);
+            p.confirm(false, cx);
+        });
+        assert_eq!(*events.borrow(), 0, "Enter must wait for matching results");
+        visual.run_until_parked();
+        visual.executor().advance_clock(super::FILTER_DEBOUNCE - std::time::Duration::from_millis(1));
+        visual.run_until_parked();
+        picker.read_with(visual, |p, _| assert!(p.filtering, "scoring is debounced"));
+        visual.executor().advance_clock(std::time::Duration::from_millis(1));
+        visual.run_until_parked();
+        picker.update_in(visual, |p, window, cx| {
+            assert!(!p.filtering);
+            assert_eq!(p.shown_paths(), ["2047.md"]);
+            assert_eq!(p.selected(), 0);
+            assert_eq!(p.rows(), 2);
+            p.on_select_next(&crate::actions::SelectNext, window, cx);
+            assert_eq!(p.selected(), 1);
+            p.on_select_next(&crate::actions::SelectNext, window, cx);
+            assert_eq!(p.selected(), 0);
+            p.receive_filter(obsolete, vec![usize::MAX], None, cx);
+            assert_eq!(p.shown_paths(), ["2047.md"]);
+        });
+        assert_eq!(*events.borrow(), 1, "the queued Enter must run without a second keypress");
+    }
+
+    #[test]
+    fn bounded_top_matches_full_ranking_with_aliases_recent_bonus_and_ties() {
+        let candidates: Vec<_> = (0..384)
+            .rev()
+            .map(|i| aero_core::links::NoteSummary {
+                title: format!("Note {}", i % 5),
+                path: VaultPath::new(&format!("dir/{i:04}.md")).unwrap(),
+                aliases: vec![format!("雪 山 {}", i % 7)],
+            })
+            .collect();
+        let recent = vec![candidates[94].path.clone(), candidates[53].path.clone()];
+        for query in ["Note", "n1", "雪山", "23", "unmatched"] {
+            let mut expected: Vec<_> = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(i, note)| {
+                    let score =
+                        fuzzy_score(query, &note.title)
+                            .max(fuzzy_score(query, note.path.as_str()))
+                            .max(note.aliases.iter().filter_map(|alias| fuzzy_score(query, alias)).max())?;
+                    let bonus =
+                        recent.iter().position(|p| p == &note.path).map_or(0, |p| 20 - p.min(10) as i32);
+                    Some((score + bonus, i))
+                })
+                .collect();
+            expected
+                .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| candidates[a.1].path.cmp(&candidates[b.1].path)));
+            let expected: Vec<_> = expected.into_iter().take(super::MAX_SHOWN).map(|(_, i)| i).collect();
+            assert_eq!(super::filter_notes(&candidates, &recent, query), expected, "query: {query}");
+        }
+        let shown = super::filter_notes(&candidates, &recent, "");
+        assert_eq!(&shown[..2], &[94, 53]);
+        assert_eq!(shown.len(), super::RECENT_SHOWN);
+        assert_eq!(shown.iter().collect::<std::collections::HashSet<_>>().len(), shown.len());
+    }
+
+    #[gpui_kit::test]
+    fn cached_catalog_refresh_preserves_keyboard_selection_by_path(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        for name in ["b.md", "c.md"] {
+            std::fs::write(dir.path().join(name), "body").unwrap();
+        }
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        cx.update(|cx| service.read(cx).close_blocking());
+        let (picker, visual) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(vec![], vec![], window, cx);
+            picker.set_notes(vault.clone(), service.clone(), vec![], cx);
+            picker
+        });
+        visual.run_until_parked();
+        std::fs::write(dir.path().join("a.md"), "new").unwrap();
+        picker.update_in(visual, |p, window, cx| {
+            assert_eq!(p.shown_paths(), ["b.md", "c.md"]);
+            p.on_select_next(&crate::actions::SelectNext, window, cx);
+            let cached = p.candidates.clone();
+            p.set_notes(vault, service, vec![], cx);
+            assert!(Arc::ptr_eq(&cached, &p.candidates), "reuse the current view's catalog until refreshed");
+            assert_eq!(p.shown_paths(), ["b.md", "c.md"]);
+            assert_eq!(p.selected_path().unwrap().as_str(), "c.md");
+        });
+        visual.run_until_parked();
+        picker.read_with(visual, |p, _| {
+            assert_eq!(p.catalog_status, Some(Ok(())));
+            assert_eq!(p.shown_paths(), ["a.md", "b.md", "c.md"]);
+            assert_eq!(p.selected(), 2);
+            assert_eq!(p.selected_path().unwrap().as_str(), "c.md");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn catalog_completion_preserves_selection_during_a_debounced_refresh(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (picker, visual) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(vec![], vec![], window, cx);
+            picker.has_vault = true;
+            let notes = (0..512)
+                .map(|i| aero_core::links::NoteSummary {
+                    title: format!("note {i}"),
+                    path: VaultPath::new(&format!("{i:04}.md")).unwrap(),
+                    aliases: vec![],
+                })
+                .collect();
+            picker.receive_catalog(picker.catalog_generation, Ok(notes), cx);
+            picker
+        });
+        visual.run_until_parked();
+        visual.executor().advance_clock(super::FILTER_DEBOUNCE);
+        visual.run_until_parked();
+        picker.update_in(visual, |p, window, cx| {
+            assert_eq!(p.shown.len(), super::RECENT_SHOWN);
+            p.on_select_next(&crate::actions::SelectNext, window, cx);
+            assert_eq!(p.selected_path().unwrap().as_str(), "0001.md");
+            p.catalog_status = None;
+            p.refilter(cx);
+            assert!(p.filtering);
+            p.receive_catalog(p.catalog_generation, Ok(p.candidates.to_vec()), cx);
+        });
+        visual.run_until_parked();
+        visual.executor().advance_clock(super::FILTER_DEBOUNCE);
+        visual.run_until_parked();
+        picker.read_with(visual, |p, _| {
+            assert_eq!(p.selected_path().unwrap().as_str(), "0001.md");
+            assert_eq!(p.selected(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn stale_catalog_is_ignored_after_switching_vaults(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let old_dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(old_dir.path().join("old.md"), "old").unwrap();
+        std::fs::write(dir.path().join("new.md"), "---\naliases: silver\n---\n").unwrap();
+        let old_vault = Arc::new(Vault::open(old_dir.path()).unwrap());
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(old_vault.clone(), data.path().into(), cx));
+        cx.update(|cx| service.read(cx).close_blocking());
+        let (picker, visual) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(vec![], vec![], window, cx);
+            picker.set_notes(old_vault, service.clone(), vec![], cx);
+            let obsolete = picker.catalog_generation;
+            picker.set_notes(vault, service, vec![], cx);
+            picker.receive_catalog(obsolete, Err("obsolete error".into()), cx);
+            assert_eq!(picker.catalog_status, None);
+            picker.receive_catalog(
+                obsolete,
+                Ok(vec![aero_core::links::NoteSummary {
+                    title: "old".into(),
+                    path: VaultPath::new("old.md").unwrap(),
+                    aliases: vec![],
+                }]),
+                cx,
+            );
+            assert!(picker.candidates.is_empty());
+            picker.input.update(cx, |s, cx| s.set_value("silver", window, cx));
+            picker.refilter(cx);
+            picker
+        });
+        visual.run_until_parked();
+        picker.read_with(visual, |p, _| {
+            assert_eq!(p.catalog_status, Some(Ok(())));
+            assert_eq!(p.shown_paths(), ["new.md"]);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn switching_to_commands_invalidates_pending_note_filter(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (picker, visual) = cx.add_window_view(|window, cx| {
+            let mut picker = QuickOpen::new(crate::actions::commands(), vec![], window, cx);
+            picker.has_vault = true;
+            picker.catalog_status = Some(Ok(()));
+            picker.candidates = Arc::new(
+                (0..512)
+                    .map(|i| aero_core::links::NoteSummary {
+                        title: format!("note {i}"),
+                        path: VaultPath::new(&format!("{i}.md")).unwrap(),
+                        aliases: vec![],
+                    })
+                    .collect(),
+            );
+            picker.input.update(cx, |s, cx| s.set_value("note", window, cx));
+            picker.refilter(cx);
+            let obsolete = picker.filter_generation;
+            picker.show_commands(window, cx);
+            picker.receive_filter(obsolete, vec![usize::MAX], None, cx);
+            assert!(picker.command_mode);
+            assert!(!picker.filtering);
+            assert!(!picker.has_query);
+            assert_eq!(picker.shown.len(), picker.commands.len());
+            picker
+        });
+        visual.run_until_parked();
+        visual.executor().advance_clock(super::FILTER_DEBOUNCE);
+        visual.run_until_parked();
+        picker.read_with(visual, |p, _| {
+            assert!(p.command_mode);
+            assert_eq!(p.shown.len(), p.commands.len());
+        });
+    }
 
     #[test]
     fn fuzzy_prefers_prefix_and_word_starts() {

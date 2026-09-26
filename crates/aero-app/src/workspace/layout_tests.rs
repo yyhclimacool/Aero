@@ -36,11 +36,95 @@ fn draw(cx: &mut VisualTestContext) {
 }
 
 fn close_index(cx: &mut VisualTestContext, workspace: &Entity<Workspace>) {
+    with_root(cx, workspace);
+    cx.run_until_parked();
     cx.update(|_, cx| {
         if let Some(open) = workspace.read(cx).open.as_ref() {
             open.search.read(cx).close_blocking();
         }
     });
+}
+
+#[gpui_kit::test]
+fn opening_tabs_defers_io_and_discards_replaced_loads(cx: &mut TestAppContext) {
+    let (dir, _data, workspace) = open(cx, Some("# A\n"));
+    std::fs::write(dir.path().join("b.md"), "# B\n\nsecond\n").unwrap();
+    std::fs::write(dir.path().join("c.md"), "# C\n\nthird\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    workspace.update_in(cx, |w, window, cx| {
+        w.open_hit(note("b.md"), 1, true, window, cx);
+        assert!(w.open.as_ref().unwrap().editor().is_none(), "opening must not read/parse on UI");
+        w.open_hit(note("c.md"), 1, true, window, cx);
+        assert_eq!(tab_paths(w, cx), ["a.md", "c.md"]);
+        w.activate_tab(0, window, cx);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let w = workspace.read(cx);
+        assert_eq!(active(w), 0, "background completion must not steal the active tab");
+        let loaded = w.open.as_ref().unwrap().tabs[1].editor.as_ref().unwrap().read(cx);
+        assert_eq!(loaded.path(), &note("c.md"));
+        assert!(loaded.highlighted_block().is_some(), "search jump survives asynchronous loading");
+    });
+    close_index(cx, &workspace);
+}
+
+#[gpui_kit::test]
+fn closing_a_dirty_tab_waits_for_the_latest_save(cx: &mut TestAppContext) {
+    let (dir, _data, workspace) = open(cx, Some("body\n"));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    with_root(cx, &workspace);
+    draw(cx);
+    let editor = cx.update(|window, cx| {
+        let editor = workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone();
+        editor.update(cx, |e, cx| e.start_writing(window, cx));
+        editor
+    });
+    cx.simulate_input("first");
+    workspace.update_in(cx, |w, window, cx| {
+        w.close_tab(0, window, cx);
+        assert_eq!(w.open.as_ref().unwrap().editor(), Some(&editor), "retain editor until save completes");
+    });
+    cx.simulate_input("latest");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(tab_paths(workspace.read(cx), cx), [""]));
+    assert!(std::fs::read_to_string(dir.path().join("a.md")).unwrap().contains("latest"));
+    close_index(cx, &workspace);
+}
+
+#[gpui_kit::test]
+fn vault_close_keeps_the_session_until_saves_and_indexes_finish(cx: &mut TestAppContext) {
+    let (dir, _data, workspace) = open(cx, Some("body\n"));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    with_root(cx, &workspace);
+    draw(cx);
+    cx.update(|window, cx| {
+        let editor = workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone();
+        editor.update(cx, |e, cx| e.start_writing(window, cx));
+    });
+    cx.simulate_input("saved before leaving");
+    workspace.update_in(cx, |w, window, cx| {
+        w.on_close_vault(&crate::actions::CloseVault, window, cx);
+        assert!(w.open.is_some(), "the session must own all outstanding saves and native cleanup");
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(workspace.read(cx).open.is_none()));
+    assert!(std::fs::read_to_string(dir.path().join("a.md")).unwrap().contains("saved before leaving"));
+}
+
+#[gpui_kit::test]
+fn load_completion_cannot_resurrect_a_closed_tab(cx: &mut TestAppContext) {
+    let (dir, _data, workspace) = open(cx, Some("body\n"));
+    std::fs::write(dir.path().join("b.md"), "# B\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    workspace.update_in(cx, |w, window, cx| {
+        w.open_note(note("b.md"), window, cx);
+        w.close_tab(1, window, cx);
+        assert_eq!(tab_paths(w, cx), ["a.md"]);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(tab_paths(workspace.read(cx), cx), ["a.md"]));
+    close_index(cx, &workspace);
 }
 
 #[gpui_kit::test]
@@ -173,6 +257,9 @@ fn search_preview_reuses_one_tab_until_it_is_confirmed_or_edited(cx: &mut TestAp
         assert!(!w.open.as_ref().unwrap().tabs[1].preview, "⏎ 之后预览页变成普通页");
         w.open_hit(note("d.md"), 0, true, window, cx);
         assert_eq!(tab_paths(w, cx), ["a.md", "c.md", "d.md"]);
+    });
+    cx.run_until_parked();
+    workspace.update_in(cx, |w, window, cx| {
         let editor = w.open.as_ref().unwrap().editor().cloned().unwrap();
         editor.update(cx, |e, cx| e.start_writing(window, cx));
     });
@@ -183,7 +270,8 @@ fn search_preview_reuses_one_tab_until_it_is_confirmed_or_edited(cx: &mut TestAp
         w.open_hit(note("b.md"), 0, true, window, cx);
         assert_eq!(tab_paths(w, cx), ["a.md", "c.md", "d.md", "b.md"]);
     });
-    assert!(std::fs::read_to_string(dir.path().join("d.md")).unwrap().contains('!'), "离开的那页已落盘");
+    cx.run_until_parked();
+    assert!(std::fs::read_to_string(dir.path().join("d.md")).unwrap().contains('!'), "离开的那页已异步落盘");
     close_index(cx, &workspace);
 }
 
@@ -229,7 +317,8 @@ fn switching_tabs_saves_the_one_left_and_keeps_its_editor(cx: &mut TestAppContex
     });
     cx.simulate_input("!");
     workspace.update_in(cx, |w, window, cx| w.open_note(note("b.md"), window, cx));
-    assert!(std::fs::read_to_string(dir.path().join("a.md")).unwrap().contains('!'), "切走时立刻落盘");
+    cx.run_until_parked();
+    assert!(std::fs::read_to_string(dir.path().join("a.md")).unwrap().contains('!'), "切走后异步落盘");
     workspace.update_in(cx, |w, window, cx| {
         assert_eq!(w.open.as_ref().unwrap().tabs[0].editor.as_ref(), Some(&first), "没显示的页保留编辑器");
         w.activate_tab(0, window, cx);

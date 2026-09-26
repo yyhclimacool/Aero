@@ -29,11 +29,33 @@ pub(super) struct Tab {
     pub(super) editor: Option<Entity<Editor>>,
     _subscription: Option<Subscription>,
     pub(super) preview: bool,
+    loading: bool,
+    load_generation: u64,
+    closing: bool,
+    navigation: Option<Navigation>,
+}
+
+/// Stored on the stable tab, not the active editor: loads may finish out of order.
+pub(super) enum Navigation {
+    Block(u32),
+    Fragment(String),
+    Backlink(aero_index::Backlink),
+    Write,
 }
 
 impl Tab {
     fn empty(id: u64) -> Self {
-        Tab { id, path: None, editor: None, _subscription: None, preview: false }
+        Tab {
+            id,
+            path: None,
+            editor: None,
+            _subscription: None,
+            preview: false,
+            loading: false,
+            load_generation: 0,
+            closing: false,
+            navigation: None,
+        }
     }
 
     pub(super) fn path<'a>(&'a self, cx: &'a App) -> Option<&'a VaultPath> {
@@ -48,6 +70,9 @@ impl Tab {
         if let Some(path) = &self.path {
             self.path = Some(map(path));
         }
+        // A same-path title/link rewrite invalidates old bytes too.
+        self.load_generation += 1;
+        self.loading = false;
     }
 
     fn title(&self, cx: &App) -> String {
@@ -63,7 +88,7 @@ impl Tab {
 impl Tab {
     /// 测试直接拼会话时用：一页已经加载好的编辑器。
     pub(super) fn loaded(id: u64, editor: Entity<Editor>) -> Self {
-        Tab { id, path: None, editor: Some(editor), _subscription: None, preview: false }
+        Tab { editor: Some(editor), ..Self::empty(id) }
     }
 
     pub(super) fn subscribe(&mut self, subscription: Subscription) {
@@ -147,6 +172,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.session_busy() {
+            return;
+        }
         let Some(open) = self.open.as_ref() else { return };
         if let Some(ix) = open.tab_of(&path, cx) {
             if mode != OpenIn::Preview
@@ -160,27 +188,19 @@ impl Workspace {
         let current = &open.tabs[open.active];
         let empty = current.path.is_none() && current.editor.is_none();
         let mut replace = empty || (current.preview && mode != OpenIn::NewTab);
-        let shown = current.editor.clone();
-        // 换掉预览页前先落盘；落不了盘就另开一页，不丢它的内容
-        if replace && let Some(editor) = shown {
-            let result = editor.update(cx, |e, _| e.flush_sync());
-            if result.is_ok() {
-                self.index_editor(&editor, cx);
-            } else {
-                replace = false;
-            }
-            self.report_flush(result, window, cx);
+        // A preview with work in flight remains owned until its last save succeeds.
+        let close_after_save = replace
+            && current.editor.as_ref().is_some_and(|e| {
+                let e = e.read(cx);
+                e.has_pending_export() || !matches!(e.save_state(), SaveState::Clean | SaveState::Saved(_))
+            });
+        let old_id = current.id;
+        if close_after_save {
+            replace = false;
         }
-        let Some((editor, subscription)) = self.load_editor(&path, window, cx) else { return };
         let id = self.next_tab_id();
         let Some(open) = self.open.as_mut() else { return };
-        let tab = Tab {
-            id,
-            path: Some(path),
-            editor: Some(editor),
-            _subscription: Some(subscription),
-            preview: mode == OpenIn::Preview,
-        };
+        let tab = Tab { path: Some(path), preview: mode == OpenIn::Preview, ..Tab::empty(id) };
         let ix = if replace {
             open.tabs[open.active] = tab;
             open.active
@@ -189,79 +209,139 @@ impl Workspace {
             open.active + 1
         };
         self.activate_tab(ix, window, cx);
+        if close_after_save {
+            if let Some(ix) = self.open.as_ref().and_then(|o| o.tabs.iter().position(|t| t.id == old_id)) {
+                self.close_tab(ix, window, cx);
+            }
+        }
     }
 
-    /// 读盘并建编辑器，连上索引、图片、反链服务与事件订阅。失败时弹通知。
-    fn load_editor(
-        &mut self,
-        path: &VaultPath,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<(Entity<Editor>, Subscription)> {
-        let open = self.open.as_ref()?;
-        match Editor::load(open.vault.clone(), path.clone()) {
-            Ok((doc, stamp)) => {
-                let (vault, search, images) = (open.vault.clone(), open.search.clone(), open.images.clone());
-                let editor = cx.new(|cx| Editor::new(vault, path.clone(), doc, stamp, cx));
+    /// Reading and parsing happen off-thread. Entity construction/subscriptions stay on GPUI.
+    pub(super) fn load_editor(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_mut() else { return };
+        let tab = &mut open.tabs[ix];
+        if tab.loading || tab.editor.is_some() {
+            return;
+        }
+        let Some(path) = tab.path.clone() else { return };
+        tab.loading = true;
+        tab.load_generation += 1;
+        let generation = tab.load_generation;
+        let id = tab.id;
+        let vault = open.vault.clone();
+        let source = vault.clone();
+        let load_path = path.clone();
+        let load = cx.background_spawn(async move { Editor::load(source, load_path) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = load.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(open) = this.open.as_ref().filter(|o| Arc::ptr_eq(&o.vault, &vault)) else { return };
+                let Some(ix) = open
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == id && t.load_generation == generation && t.path(cx) == Some(&path))
+                else {
+                    return;
+                };
+                if this.session_busy() {
+                    return;
+                }
+                let (doc, stamp) = match result {
+                    Ok(loaded) => loaded,
+                    Err(err) => {
+                        window.push_notification(Notification::error(format!("无法打开 {path}：{err}")), cx);
+                        this.remove_tab(ix, window, cx);
+                        return;
+                    }
+                };
+                let (search, images) = (open.search.clone(), open.images.clone());
+                let editor = cx.new(|cx| Editor::new(vault, path, doc, stamp, cx));
                 editor.update(cx, |e, cx| {
                     e.connect_link_preview(search, cx);
                     e.connect_images(images, cx);
                 });
-                let subscription = self.subscribe_editor(&editor, window, cx);
-                Some((editor, subscription))
-            }
-            Err(err) => {
-                window
-                    .push_notification(Notification::error(format!("无法打开 {}：{err}", path.as_str())), cx);
+                let subscription = this.subscribe_editor(&editor, window, cx);
+                let open = this.open.as_mut().unwrap();
+                open.tabs[ix].loading = false;
+                open.tabs[ix].editor = Some(editor);
+                open.tabs[ix]._subscription = Some(subscription);
+                if open.active == ix {
+                    let focus = window.focused(cx).as_ref() == Some(&this.focus_handle);
+                    this.refresh_active_tab(focus, window, cx);
+                }
+                this.apply_navigation(ix, window, cx);
+                this.tabs_changed(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn navigate_note(
+        &mut self,
+        path: &VaultPath,
+        navigation: Navigation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.open.as_mut() else { return };
+        let Some(ix) = open.tab_of(path, cx) else { return };
+        open.tabs[ix].navigation = Some(navigation);
+        self.apply_navigation(ix, window, cx);
+    }
+
+    fn apply_navigation(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_mut() else { return };
+        let tab = &mut open.tabs[ix];
+        let Some(editor) = tab.editor.clone() else { return };
+        if matches!(tab.navigation, Some(Navigation::Write)) && ix != open.active {
+            return;
+        }
+        let Some(navigation) = tab.navigation.take() else { return };
+        let error = editor.update(cx, |e, cx| match navigation {
+            Navigation::Block(ord) => {
+                e.reveal_indexed_block(ord, cx);
                 None
             }
+            Navigation::Fragment(fragment) => e.reveal_fragment(&fragment, cx).err(),
+            Navigation::Backlink(hit) => (!e.reveal_backlink(&hit, cx))
+                .then(|| "来源笔记已变化，已打开笔记；反链将在索引更新后刷新。".into()),
+            Navigation::Write => {
+                e.start_writing(window, cx);
+                None
+            }
+        });
+        if let Some(error) = error {
+            window.push_notification(Notification::info(error).title("Aero"), cx);
         }
     }
 
     /// 切到第 `ix` 个标签页：按需加载编辑器，文件树、反链、菜单跟上，焦点给编辑器。
     pub(super) fn activate_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_busy() {
+            return;
+        }
         let Some(open) = self.open.as_mut() else { return };
         let ix = ix.min(open.tabs.len() - 1);
         let leaving = open.editor().cloned().filter(|_| open.active != ix);
         open.active = ix;
-        // 离开的那页立刻落盘并进索引：反链、链接解析马上看得到刚写的内容。
-        // 落不了盘也照样切走，内容还在那页的编辑器里（标签上是红点）。
-        if let Some(editor) = leaving
-            && editor.read(cx).save_state() != &SaveState::Saving
-        {
-            let result = editor.update(cx, |e, _| e.flush_sync());
-            if result.is_ok() {
-                self.index_editor(&editor, cx);
-            }
-            self.report_flush(result, window, cx);
+        // Save events index the exact completed write. Switching never waits on disk.
+        if let Some(editor) = leaving {
+            editor.update(cx, |e, cx| e.save_now(cx));
         }
-        let Some(open) = self.open.as_mut() else { return };
-        let tab = &open.tabs[ix];
-        // 已加载的页切回来先看一眼磁盘：文件监听可能还没送到（或退回了轮询）
-        if let Some(editor) = tab.editor.clone() {
+        if let Some(editor) = self.open.as_ref().and_then(|o| o.editor().cloned()) {
             editor.update(cx, |e, cx| e.check_external(cx));
         }
+        self.load_editor(ix, window, cx);
+        self.refresh_active_tab(true, window, cx);
+        self.apply_navigation(ix, window, cx);
+    }
+
+    pub(super) fn refresh_active_tab(&mut self, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_mut() else { return };
-        let tab = &open.tabs[ix];
-        if tab.editor.is_none()
-            && let Some(path) = tab.path.clone()
-        {
-            match self.load_editor(&path, window, cx) {
-                Some((editor, subscription)) => {
-                    let Some(open) = self.open.as_mut() else { return };
-                    open.tabs[ix].editor = Some(editor);
-                    open.tabs[ix]._subscription = Some(subscription);
-                }
-                None => {
-                    // 笔记已经不在了：这一页没有意义，关掉
-                    self.remove_tab(ix, window, cx);
-                    return;
-                }
-            }
-        }
-        let Some(open) = self.open.as_mut() else { return };
+        let ix = open.active;
         let editor = open.editor().cloned();
-        let path = editor.as_ref().map(|e| e.read(cx).path().clone());
+        let path = open.tabs[ix].path(cx).cloned();
         if let Some(path) = &path {
             open.recent.retain(|p| p != path);
             open.recent.insert(0, path.clone());
@@ -273,9 +353,12 @@ impl Workspace {
         match &editor {
             Some(editor) => editor.update(cx, |e, cx| {
                 e.connect_backlinks(backlinks, cx);
-                e.focus_browse(window, cx);
+                if focus {
+                    e.focus_browse(window, cx);
+                }
             }),
-            None => self.focus_handle.focus(window, cx),
+            None if focus => self.focus_handle.focus(window, cx),
+            None => {}
         }
         self.tab_scroll.scroll_to_item(ix);
         self.tabs_changed(cx);
@@ -339,22 +422,49 @@ impl Workspace {
 
     /// 关闭一页前先落盘；落不了盘就不关，免得丢掉内容。
     pub(super) fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(open) = self.open.as_ref() else { return false };
-        let Some(tab) = open.tabs.get(ix) else { return false };
-        if let Some(editor) = tab.editor.clone() {
-            if editor.read(cx).save_state() == &SaveState::Saving {
-                window.push_notification(Notification::warning("正在保存，请稍后再试。").title("Aero"), cx);
+        if self.session_busy() {
+            return false;
+        }
+        let Some(open) = self.open.as_mut() else { return false };
+        let Some(tab) = open.tabs.get_mut(ix) else { return false };
+        tab.closing = true;
+        self.finish_close_tab(ix, window, cx)
+    }
+
+    pub(super) fn continue_tab_closes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_busy() {
+            return;
+        }
+        let ids: Vec<_> =
+            self.open.iter().flat_map(|o| o.tabs.iter()).filter(|t| t.closing).map(|t| t.id).collect();
+        for id in ids {
+            if let Some(ix) = self.open.as_ref().and_then(|o| o.tabs.iter().position(|t| t.id == id)) {
+                self.finish_close_tab(ix, window, cx);
+            }
+        }
+    }
+
+    fn finish_close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(open) = self.open.as_mut() else { return false };
+        if let Some(editor) = open.tabs[ix].editor.clone() {
+            let e = editor.read(cx);
+            if e.has_pending_export() || e.is_deleted() || matches!(e.save_state(), SaveState::Failed(_)) {
+                open.tabs[ix].closing = false;
+                window.push_notification(
+                    Notification::warning("笔记尚未安全保存，请处理保存错误或导出后重试。").title("Aero"),
+                    cx,
+                );
                 return false;
             }
-            let result = editor.update(cx, |e, _| e.flush_sync());
-            let saved = result.is_ok();
-            if saved {
-                self.index_editor(&editor, cx);
+            match e.save_state() {
+                SaveState::Dirty => {
+                    editor.update(cx, |e, cx| e.save_now(cx));
+                    return false;
+                }
+                SaveState::Saving => return false,
+                _ => {}
             }
-            self.report_flush(result, window, cx);
-            if !saved {
-                return false;
-            }
+            self.index_editor(&editor, cx);
         }
         let Some(open) = self.open.as_mut() else { return false };
         if let Some(path) = open.tabs[ix].path(cx).cloned() {
@@ -375,6 +485,7 @@ impl Workspace {
         if ix >= open.tabs.len() {
             return;
         }
+        let keep_focus = (ix != open.active).then(|| window.focused(cx)).flatten();
         open.tabs.remove(ix);
         if open.tabs.is_empty() {
             open.tabs.push(Tab::empty(id));
@@ -387,6 +498,9 @@ impl Workspace {
         };
         let active = active.min(open.tabs.len() - 1);
         self.activate_tab(active, window, cx);
+        if let Some(focus) = keep_focus {
+            window.focus(&focus, cx);
+        }
     }
 
     /// 某篇笔记不能再显示了（移进废纸篓、撤销新建）：拿掉显示它的标签页。返回拿掉的是第几页。
@@ -452,6 +566,9 @@ impl Workspace {
     // ---- 动作 ----
 
     pub(super) fn on_new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_busy() {
+            return;
+        }
         let id = self.next_tab_id();
         let Some(open) = self.open.as_mut() else { return };
         let ix = open.active + 1;

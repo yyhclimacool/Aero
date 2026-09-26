@@ -175,6 +175,32 @@ impl Measure {
     }
 }
 
+/// Batch GPUI's `LineLayout::x_for_index`: the first glyph in run/glyph order with
+/// `glyph.index >= index`, or the line width if none exists. Glyph indexes need not be
+/// sorted (RTL and font runs can overlap). A glyph at or below an earlier index can
+/// never be the first match, so retain only strictly increasing prefix maxima.
+/// Binary searching those records preserves first-match semantics for arbitrary query
+/// order in O(glyphs + queries * log(glyphs)) time, without sorting the glyphs.
+fn batch_x_for_indices<'a>(
+    glyphs: impl Iterator<Item = &'a gpui::ShapedGlyph>,
+    width: Pixels,
+    indices: impl IntoIterator<Item = usize>,
+) -> Vec<Pixels> {
+    let mut first_matches: Vec<(usize, Pixels)> = Vec::new();
+    for glyph in glyphs {
+        if first_matches.last().is_none_or(|&(index, _)| glyph.index > index) {
+            first_matches.push((glyph.index, glyph.position.x));
+        }
+    }
+    indices
+        .into_iter()
+        .map(|index| {
+            let at = first_matches.partition_point(|&(glyph_index, _)| glyph_index < index);
+            first_matches.get(at).map_or(width, |&(_, x)| x)
+        })
+        .collect()
+}
+
 /// Same break rules as GPUI's `LineWrapper::wrap_line`, over pre-measured characters, plus
 /// East Asian line-breaking (kinsoku): a line never starts with closing punctuation such as
 /// `。`, `，` or `」`, and never ends with opening punctuation such as `「` or `（`. The
@@ -513,9 +539,15 @@ impl TextWrapper {
             return Vec::new();
         }
         let layout = measure.text.layout_line(&display, measure.font_size, &runs, None);
+        let positions = batch_x_for_indices(
+            layout.runs.iter().flat_map(|run| run.glyphs.iter()),
+            layout.width,
+            drawn.iter().map(|&(_, _, at)| at).chain(std::iter::once(display.len())),
+        );
         let chars: Vec<(usize, char, Pixels)> = drawn
             .iter()
-            .map(|&(i, ch, at)| (i, ch, layout.x_for_index(at + ch.len_utf8()) - layout.x_for_index(at)))
+            .zip(positions.windows(2))
+            .map(|(&(i, ch, _), xs)| (i, ch, xs[1] - xs[0]))
             .collect();
         wrap_chars(&chars, measure.space(), wrap_width)
     }
@@ -1193,6 +1225,146 @@ mod tests {
     use std::rc::Rc;
 
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};
+
+    fn glyph_layout(runs: &[&[(usize, f32)]], len: usize, width: f32) -> gpui::LineLayout {
+        gpui::LineLayout {
+            len,
+            width: px(width),
+            runs: runs.iter().enumerate().map(|(font, glyphs)| gpui::ShapedRun {
+                font_id: gpui::FontId(font),
+                glyphs: glyphs.iter().map(|&(index, x)| gpui::ShapedGlyph {
+                    id: gpui::GlyphId(0),
+                    index,
+                    position: point(px(x), px(0.)),
+                    is_emoji: false,
+                }).collect(),
+            }).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn batch_x_positions_match_gpui_for_missing_and_unordered_glyphs() {
+        let layouts = [
+            glyph_layout(&[], 0, 0.),
+            glyph_layout(&[&[], &[]], 12, 47.),
+            // No glyph at zero, ligature interiors, duplicate cluster indexes, and a missing tail.
+            glyph_layout(&[&[(2, -3.), (5, 12.), (5, 99.)], &[], &[(9, 7.)]], 12, 47.),
+            // Descending (RTL) indexes and overlapping indexes across different font runs.
+            glyph_layout(&[&[(6, 30.), (4, 20.), (2, 10.)], &[(1, 90.), (8, 15.), (7, 80.)]], 12, 47.),
+            // Even at/past len, GPUI still prefers a qualifying glyph over the line width.
+            glyph_layout(&[&[(0, 4.), (12, 55.)], &[(15, -8.)]], 12, 47.),
+        ];
+        let indices = [12, 0, 1, 2, 3, 4, 5, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, usize::MAX, 0];
+        for layout in layouts {
+            let expected: Vec<_> = indices.iter().map(|&index| layout.x_for_index(index)).collect();
+            let actual = batch_x_for_indices(
+                layout.runs.iter().flat_map(|run| run.glyphs.iter()),
+                layout.width,
+                indices,
+            );
+            assert_eq!(actual, expected, "layout: {layout:?}");
+        }
+    }
+
+    #[test]
+    fn batch_x_positions_match_gpui_for_every_small_glyph_order() {
+        // Exhaustively cover repeats and arbitrary run/glyph order, not just sorted layouts.
+        for glyph_count in 0..=6 {
+            for mut encoding in 0..4usize.pow(glyph_count) {
+                let glyphs: Vec<_> = (0..glyph_count).map(|ordinal| {
+                    let index = encoding % 4;
+                    encoding /= 4;
+                    (index, 20. - ordinal as f32 * 3.)
+                }).collect();
+                let split = glyphs.len() / 2;
+                let layout = glyph_layout(&[&glyphs[..split], &[], &glyphs[split..]], 4, 31.);
+                let indices = [0, 1, 2, 3, 4, 5, 2, 0];
+                let actual = batch_x_for_indices(
+                    layout.runs.iter().flat_map(|run| run.glyphs.iter()),
+                    layout.width,
+                    indices,
+                );
+                let expected: Vec<_> = indices.iter().map(|&index| layout.x_for_index(index)).collect();
+                assert_eq!(actual, expected, "layout: {layout:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn batch_x_positions_visit_each_glyph_at_most_once() {
+        for count in [256, 1024, 4096] {
+            for unordered in [false, true] {
+                let glyphs: Vec<_> = (0..count).map(|ordinal| {
+                    let index = if unordered { ordinal ^ 1 } else { ordinal };
+                    (index, ordinal as f32)
+                }).collect();
+                let layout = glyph_layout(&[&glyphs[..count / 2], &[], &glyphs[count / 2..]], count, count as f32);
+                let visits = std::cell::Cell::new(0);
+                let actual = batch_x_for_indices(
+                    layout.runs.iter().flat_map(|run| run.glyphs.iter()).inspect(|_| visits.set(visits.get() + 1)),
+                    layout.width,
+                    (0..=count).rev(),
+                );
+                let expected: Vec<_> = (0..=count).rev().map(|index| layout.x_for_index(index)).collect();
+                assert_eq!(actual, expected);
+                assert!(visits.get() <= count, "{count} glyphs required {} visits", visits.get());
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn presented_wrap_matches_gpui_with_conceal_and_mixed_fonts(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let measure = Measure {
+                text: WindowTextSystem::new(cx.text_system().clone()),
+                base: test_font(),
+                font_size: px(14.),
+            };
+            let source = "**  of~~fi~~ce e\u{301}，中文 אבג 🙂 tail**";
+            let display = "  office e\u{301}，中文 אבג 🙂 tail";
+            let line_start = 37;
+            let bold = FontOverride { weight: Some(FontWeight::BOLD), ..Default::default() };
+            let italic = FontOverride {
+                style: Some(FontStyle::Italic),
+                family: Some("Courier New".into()),
+                ..Default::default()
+            };
+            let split = display.find('中').unwrap();
+            let fonts = vec![
+                (line_start + 2..line_start + source.len() - 2, bold.clone()),
+                (line_start + source.find('中').unwrap()..line_start + source.len() - 2, italic.clone()),
+            ];
+            let runs: Vec<_> = [
+                (split, measure.font([&bold].into_iter())),
+                (display.len() - split, measure.font([&bold, &italic].into_iter())),
+            ].into_iter().map(|(len, font)| TextRun {
+                len,
+                font,
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }).collect();
+            let layout = measure.text.layout_line(display, measure.font_size, &runs, None);
+            let visible_source = source.char_indices().filter(|&(_, ch)| ch != '*' && ch != '~');
+            let chars: Vec<_> = display.char_indices().zip(visible_source).map(|((at, ch), (source_at, source_ch))| {
+                assert_eq!(ch, source_ch);
+                (source_at, ch, layout.x_for_index(at + ch.len_utf8()) - layout.x_for_index(at))
+            }).collect();
+            let conceal: Vec<_> = source.match_indices("**").chain(source.match_indices("~~"))
+                .map(|(at, marker)| line_start + at..line_start + at + marker.len()).collect();
+            for width in [px(1.), px(35.), px(75.), px(1000.)] {
+                let expected = wrap_chars(&chars, measure.space(), width);
+                let actual = TextWrapper::wrap_presented_line(&measure, source, line_start, &conceal, &fonts, width);
+                let boundaries = |items: Vec<Boundary>| items.into_iter().map(|b| (b.ix, b.next_indent)).collect::<Vec<_>>();
+                assert_eq!(boundaries(actual), boundaries(expected));
+            }
+            assert!(TextWrapper::wrap_presented_line(
+                &measure, source, line_start, &[line_start..line_start + source.len()], &fonts, px(1.),
+            ).is_empty());
+        });
+    }
 
     #[test]
     fn test_update() {

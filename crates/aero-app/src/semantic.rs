@@ -119,8 +119,27 @@ impl Shared {
 pub struct SemanticService {
     preferences: SearchPreferences,
     shared: Arc<Shared>,
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    close_lock: Arc<Mutex<()>>,
     poll: Option<Task<()>>,
+}
+
+pub(crate) struct SemanticShutdown {
+    shared: Arc<Shared>,
+    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    lock: Arc<Mutex<()>>,
+}
+
+impl Drop for SemanticShutdown {
+    fn drop(&mut self) {
+        self.shared.stopped.store(true, Ordering::Release);
+        self.shared.download_cancelled.store(true, Ordering::Release);
+        self.shared.wake.notify_all();
+        let _closing = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(thread) = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl SemanticService {
@@ -155,7 +174,13 @@ impl SemanticService {
                 None
             }
         };
-        let mut this = Self { preferences, shared, thread: Mutex::new(thread), poll: None };
+        let mut this = Self {
+            preferences,
+            shared,
+            thread: Arc::new(Mutex::new(thread)),
+            close_lock: Arc::default(),
+            poll: None,
+        };
         this.start_poll(cx);
         this
     }
@@ -295,13 +320,30 @@ impl SemanticService {
         })
     }
 
-    pub fn close_blocking(&self) {
+    /// Completion includes the worker, downloader and native index/model destruction.
+    /// The owner must await this before dropping the service or quitting/reopening.
+    pub fn close_async(&self, cx: &App) -> Task<()> {
+        self.request_stop();
+        let guard = self.shutdown_guard();
+        cx.background_spawn(async move { drop(guard) })
+    }
+
+    fn request_stop(&self) {
         self.shared.stopped.store(true, Ordering::Release);
         self.shared.download_cancelled.store(true, Ordering::Release);
         self.shared.wake.notify_all();
-        if let Some(thread) = self.thread.lock().unwrap().take() {
-            let _ = thread.join();
+    }
+
+    pub(crate) fn shutdown_guard(&self) -> SemanticShutdown {
+        SemanticShutdown {
+            shared: self.shared.clone(),
+            thread: self.thread.clone(),
+            lock: self.close_lock.clone(),
         }
+    }
+
+    pub fn close_blocking(&self) {
+        drop(self.shutdown_guard());
     }
 }
 
@@ -729,6 +771,25 @@ fn worker_loop(vault: Arc<Vault>, data_dir: PathBuf, shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn async_close_joins_worker_and_persists_pending_preferences(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SemanticService::new(vault, data.path().into(), cx));
+        service.update(cx, |s, _| {
+            let mut control = s.shared.control.lock().unwrap();
+            control.preferences = SearchPreferences::default();
+            control.save_preferences = true;
+        });
+        let close = cx.update(|cx| service.read(cx).close_async(cx));
+        cx.foreground_executor().block_on(close);
+        cx.update(|cx| assert!(service.read(cx).thread.lock().unwrap().is_none()));
+        let stored: SearchPreferences =
+            toml::from_str(&std::fs::read_to_string(data.path().join("search.toml")).unwrap()).unwrap();
+        assert!(!stored.allow_model_downloads);
+    }
 
     #[test]
     fn search_privacy_defaults_disable_models_and_network() {

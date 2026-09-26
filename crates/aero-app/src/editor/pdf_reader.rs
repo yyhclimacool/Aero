@@ -694,6 +694,36 @@ impl Render for PdfReader {
             .child(self.toolbar(cx))
             .child(viewport)
             .child(self.resize_handle(false, cx))
+            .child({
+                let reader = cx.weak_entity();
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        let moving = reader.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                            if phase.capture() {
+                                let _ = moving.update(cx, |this, cx| {
+                                    if this.drag.is_some() {
+                                        this.drag_resize(event, window, cx);
+                                    }
+                                });
+                            }
+                        });
+                        let finishing = reader.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                            if phase.capture() && event.button == MouseButton::Left {
+                                let _ = finishing.update(cx, |this, cx| {
+                                    if this.drag.is_some() {
+                                        this.finish_resize(event, window, cx);
+                                    }
+                                });
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full()
+            })
             .children(self.resize_overlay(window, cx))
     }
 }

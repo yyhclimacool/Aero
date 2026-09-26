@@ -79,6 +79,10 @@ pub struct Workspace {
     recent_commands: Vec<&'static str>,
     sidebar_tab: SidebarTab,
     rename_pending: bool,
+    rename_changes: Batch,
+    pending_operation: Option<PendingOperation>,
+    session_closing: bool,
+    io_task: Option<Task<()>>,
     sidebar_visible: bool,
     panel_visible: bool,
     /// 两侧拖出来的宽度；实际画多宽还看窗口宽度（`chrome::column_widths`）
@@ -102,6 +106,14 @@ pub struct Workspace {
     _activation_subscription: Subscription,
 }
 
+enum PendingOperation {
+    OpenVault(PathBuf),
+    CloseVault,
+    CloseWindow,
+    Quit,
+    Rename { old: VaultPath, target: VaultPath, title: Option<String> },
+}
+
 /// 预览里点 wikilink 后的动作：打开已存在的笔记，或提示同名候选，或失败原因。不创建笔记。
 enum LinkAction {
     Open { path: VaultPath, fragment: Option<String> },
@@ -119,15 +131,21 @@ impl Workspace {
         let state = PersistedState::load(&data_dir);
         let workspace = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
-            workspace.update(cx, |this, cx| this.flush_before_leaving(window, cx)).unwrap_or(true)
+            workspace
+                .update(cx, |this, cx| {
+                    if this.open.is_none() && !this.session_busy() {
+                        return true;
+                    }
+                    this.request_operation(PendingOperation::CloseWindow, window, cx);
+                    false
+                })
+                .unwrap_or(true)
         });
-        let quit = cx.on_app_quit(|this, cx| {
-            this.flush_all(cx);
-            async {}
-        });
+        let quit = cx.on_app_quit(|this, cx| this.shutdown_on_quit(cx));
         // 从别的程序切回来时立刻看一眼磁盘（方案 12）；平时靠编辑器自己的轮询
         let activation = cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active()
+            if !this.session_busy()
+                && window.is_window_active()
                 && let Some(open) = this.open.as_ref()
             {
                 for editor in open.editors().cloned().collect::<Vec<_>>() {
@@ -153,6 +171,10 @@ impl Workspace {
             recent_commands: Vec::new(),
             sidebar_tab: SidebarTab::Files,
             rename_pending: false,
+            rename_changes: Batch::default(),
+            pending_operation: None,
+            session_closing: false,
+            io_task: None,
             sidebar_visible: state.sidebar_visible.unwrap_or(true),
             panel_visible: state.panel_visible.unwrap_or(true),
             sidebar_width: px(state.sidebar_width.unwrap_or(SIDEBAR_DEFAULT)),
@@ -188,7 +210,16 @@ impl Workspace {
     // ---- vault ----
 
     fn open_vault(&mut self, root: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.flush_before_leaving(window, cx) {
+        if self.open.is_some() {
+            // Validate first: an unusable destination must not destroy the current session.
+            if let Err(error) = Vault::open(root) {
+                window.push_notification(
+                    Notification::error(format!("无法打开 {}：{error}", display_path(root))),
+                    cx,
+                );
+                return;
+            }
+            self.request_operation(PendingOperation::OpenVault(root.to_owned()), window, cx);
             return;
         }
         match Vault::open(root) {
@@ -196,10 +227,7 @@ impl Workspace {
                 let vault = Arc::new(vault);
                 let tree = cx.new(|cx| FileTree::new(vault.clone(), cx));
                 let sub = self.subscribe_tree(&tree, window, cx);
-                // 新 vault 打得开才离开旧的：落盘并同步关掉旧索引句柄（再打开同一个 vault 时锁才能拿到），
-                // 然后丢掉上一个会话
-                self.flush_all(cx);
-                self.open = None;
+                // Any previous session has already completed asynchronous shutdown.
                 let index_dir = self.data_dir.join("index");
                 let search = cx.new(|cx| SearchService::new(vault.clone(), index_dir, cx));
                 let search_sub = cx.observe(&search, |_, _, cx| cx.notify());
@@ -366,13 +394,7 @@ impl Workspace {
     }
 
     fn on_close_vault(&mut self, _: &CloseVault, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.flush_before_leaving(window, cx) {
-            return;
-        }
-        self.flush_all(cx);
-        self.open = None;
-        self.focus_handle.focus(window, cx);
-        cx.notify();
+        self.request_operation(PendingOperation::CloseVault, window, cx);
     }
 
     fn open_recent(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -430,15 +452,7 @@ impl Workspace {
         cx.subscribe_in(view, window, |this, _, event: &ReferenceOpened, window, cx| match event {
             ReferenceOpened::Backlink(hit) => {
                 this.open_note(hit.path.clone(), window, cx);
-                if let Some(editor) = this.open.as_ref().and_then(|o| o.editor().cloned())
-                    && editor.read(cx).path() == &hit.path
-                    && !editor.update(cx, |e, cx| e.reveal_backlink(hit, cx))
-                {
-                    window.push_notification(
-                        Notification::info("来源笔记已变化，已打开笔记；反链将在索引更新后刷新。"),
-                        cx,
-                    );
-                }
+                this.navigate_note(&hit.path, tabs::Navigation::Backlink(hit.clone()), window, cx);
             }
             ReferenceOpened::Outgoing(url) => {
                 let path = url.split('#').next().unwrap_or(url);
@@ -500,6 +514,8 @@ impl Workspace {
                     open.semantic.read(cx).touch_activity();
                 }
                 this.keep_preview_if_edited(editor, cx);
+                this.continue_tab_closes(window, cx);
+                this.continue_operation(window, cx);
                 cx.notify()
             }
             EditorEvent::Saved | EditorEvent::Reloaded => {
@@ -570,15 +586,8 @@ impl Workspace {
         }
         if path.as_str().to_ascii_lowercase().ends_with(".md") {
             self.open_note(path.clone(), window, cx);
-            if let Some(fragment) = fragment
-                && let Some(editor) = self.open.as_ref().and_then(|open| open.editor().cloned())
-                && editor.read(cx).path() == &path
-                && let Err(error) = editor.update(cx, |editor, cx| editor.reveal_fragment(&fragment, cx))
-            {
-                window.push_notification(
-                    Notification::info(format!("{}：{error}", path.as_str())).title("Aero"),
-                    cx,
-                );
+            if let Some(fragment) = fragment {
+                self.navigate_note(&path, tabs::Navigation::Fragment(fragment), window, cx);
             }
         } else {
             cx.reveal_path(&fs_path);
@@ -608,7 +617,8 @@ impl Workspace {
         }
         // 相对路径按链接所在笔记的目录解析；撤销时回到来源笔记
         let source_dir = editor.as_ref().map(|e| e.read(cx).path().parent().to_owned()).unwrap_or_default();
-        let resolver = open.search.read(cx).link_resolver(open.vault.clone(), cx);
+        let vault = open.vault.clone();
+        let resolver = open.search.read(cx).link_resolver(vault.clone(), cx);
         cx.spawn_in(window, async move |this, cx| {
             let action = cx
                 .background_spawn(async move {
@@ -629,34 +639,31 @@ impl Workspace {
                     }
                 })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| match action {
-                LinkAction::Open { path, fragment } => {
-                    this.open_note(path.clone(), window, cx);
-                    // 打开可能被否决（上一篇保存失败）或失败：只在真的切到目标后才定位标题
-                    let editor = this.open.as_ref().and_then(|o| o.editor().cloned());
-                    if let (Some(fragment), Some(editor)) = (fragment, editor)
-                        && editor.read(cx).path() == &path
-                        && let Err(error) = editor.update(cx, |e, cx| e.reveal_fragment(&fragment, cx))
-                    {
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.session_busy() || !this.open.as_ref().is_some_and(|o| Arc::ptr_eq(&o.vault, &vault)) {
+                    return;
+                }
+                match action {
+                    LinkAction::Open { path, fragment } => {
+                        this.open_note(path.clone(), window, cx);
+                        if let Some(fragment) = fragment {
+                            this.navigate_note(&path, tabs::Navigation::Fragment(fragment), window, cx);
+                        }
+                    }
+                    LinkAction::Ambiguous { target, candidates } => {
+                        let list = candidates.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("、");
                         window.push_notification(
-                            Notification::info(format!("{}：{error}", path.as_str())).title("Aero"),
+                            Notification::warning(format!(
+                                "「{target}」有 {} 篇同名笔记：{list}。请在链接里写明路径。",
+                                candidates.len()
+                            ))
+                            .title("Aero"),
                             cx,
                         );
                     }
-                }
-                LinkAction::Ambiguous { target, candidates } => {
-                    let list = candidates.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("、");
-                    window.push_notification(
-                        Notification::warning(format!(
-                            "「{target}」有 {} 篇同名笔记：{list}。请在链接里写明路径。",
-                            candidates.len()
-                        ))
-                        .title("Aero"),
-                        cx,
-                    );
-                }
-                LinkAction::Failed(msg) => {
-                    window.push_notification(Notification::error(msg).title("Aero"), cx)
+                    LinkAction::Failed(msg) => {
+                        window.push_notification(Notification::error(msg).title("Aero"), cx)
+                    }
                 }
             });
         })
@@ -676,16 +683,14 @@ impl Workspace {
         let already = self.open.as_ref().and_then(|o| o.editor()).is_some_and(|e| e.read(cx).path() == &path);
         if !already {
             let focused = window.focused(cx);
-            self.open_note_in(path, if preview { OpenIn::Preview } else { OpenIn::Auto }, window, cx);
+            self.open_note_in(path.clone(), if preview { OpenIn::Preview } else { OpenIn::Auto }, window, cx);
             if let Some(f) = focused {
                 window.focus(&f, cx);
             }
         } else if !preview {
             self.keep_active_preview();
         }
-        if let Some(editor) = self.open.as_ref().and_then(|o| o.editor().cloned()) {
-            editor.update(cx, |e, cx| e.reveal_indexed_block(block_ord, cx));
-        }
+        self.navigate_note(&path, tabs::Navigation::Block(block_ord), window, cx);
     }
 
     fn on_quick_open(&mut self, _: &QuickOpen_, window: &mut Window, cx: &mut Context<Self>) {
@@ -801,6 +806,9 @@ impl Workspace {
 
     /// 快速打开里"新建 X"：在 vault 根（3.5 的默认位置）新建并进入编辑。
     fn create_note_named(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_busy() {
+            return;
+        }
         let Some(open) = self.open.as_ref() else { return };
         let path = match note_path_in("", name) {
             Ok(p) => p,
@@ -820,10 +828,8 @@ impl Workspace {
                 cx.notify();
             });
         }
-        self.open_note(path, window, cx);
-        if let Some(editor) = self.open.as_ref().and_then(|o| o.editor().cloned()) {
-            editor.update(cx, |e, cx| e.start_writing(window, cx));
-        }
+        self.open_note(path.clone(), window, cx);
+        self.navigate_note(&path, tabs::Navigation::Write, window, cx);
     }
 
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -980,6 +986,9 @@ impl Workspace {
     }
 
     fn on_new_note(&mut self, _: &NewNote, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_busy() {
+            return;
+        }
         let Some(open) = self.open.as_ref() else { return };
         let vault = open.vault.clone();
         let existing = vault.notes().unwrap_or_default();
@@ -994,10 +1003,8 @@ impl Workspace {
                     t.rescan();
                     cx.notify();
                 });
-                self.open_note(path, window, cx);
-                if let Some(editor) = self.open.as_ref().and_then(|o| o.editor().cloned()) {
-                    editor.update(cx, |e, cx| e.start_writing(window, cx));
-                }
+                self.open_note(path.clone(), window, cx);
+                self.navigate_note(&path, tabs::Navigation::Write, window, cx);
             }
             Err(err) => window.push_notification(Notification::error(format!("无法新建笔记：{err}")), cx),
         }
@@ -1005,6 +1012,9 @@ impl Workspace {
 
     /// ⌘⇧D：今日日记 `daily/YYYY-MM-DD.md`，不存在则按模板创建（3.4）。
     fn on_open_daily(&mut self, _: &OpenDaily, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_busy() {
+            return;
+        }
         let Some(open) = self.open.as_ref() else { return };
         let vault = open.vault.clone();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -1023,13 +1033,16 @@ impl Workspace {
             });
             true
         };
-        self.open_note(path, window, cx);
-        if created && let Some(editor) = self.open.as_ref().and_then(|o| o.editor().cloned()) {
-            editor.update(cx, |e, cx| e.start_writing(window, cx));
+        self.open_note(path.clone(), window, cx);
+        if created {
+            self.navigate_note(&path, tabs::Navigation::Write, window, cx);
         }
     }
 
     fn on_save_now(&mut self, _: &SaveNow, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_busy() {
+            return;
+        }
         if let Some(editor) = self.open.as_ref().and_then(|o| o.editor().cloned()) {
             editor.update(cx, |e, cx| e.save_now(cx));
         }
@@ -1062,6 +1075,9 @@ impl Workspace {
 
     /// 移到系统废纸篓。显示这篇的标签页先拿掉、不落盘——它排队中的自动保存会把文件写回来。
     fn trash_note(&mut self, path: &VaultPath, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_busy() {
+            return;
+        }
         let Some(open) = self.open.as_ref() else { return };
         let fs_path = open.vault.fs_path(path);
         let tab = self.drop_tab_showing(path, window, cx);
@@ -1144,9 +1160,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.flush_before_leaving(window, cx) {
-            return;
-        }
+        self.request_operation(PendingOperation::Rename { old, target, title }, window, cx);
+    }
+
+    fn prepare_change_name(
+        &mut self,
+        old: VaultPath,
+        target: VaultPath,
+        title: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(open) = self.open.as_ref() else { return };
         // 各标签页都已落盘；提交前核对它们在准备期间没被改过
         let snapshots: Vec<_> = open
@@ -1231,24 +1255,84 @@ impl Workspace {
                     );
                     return;
                 }
-                let editors: Vec<_> = open.editors().cloned().collect();
+                this.execute_change_name(plan, old, target, directory, description, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn execute_change_name(
+        &mut self,
+        plan: aero_core::rename::RenamePlan,
+        old: VaultPath,
+        target: VaultPath,
+        directory: bool,
+        description: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.open.as_ref() else {
+            self.rename_pending = false;
+            return;
+        };
+        let editors: Vec<_> = open.editors().cloned().collect();
+        // Include tabs opened after preparation. Either all editors are frozen, or none are.
+        for editor in &editors {
+            if !editor.update(cx, |e, cx| e.suspend_io(cx)) {
+                for editor in &editors {
+                    editor.update(cx, |e, cx| e.resume_io(cx));
+                }
+                self.rename_pending = false;
+                window.push_notification(
+                    Notification::warning("笔记在准备期间已变化，重命名已取消，请保存后重试。"),
+                    cx,
+                );
+                cx.notify();
+                return;
+            }
+        }
+        let paths = editors.iter().map(|e| e.read(cx).path().clone()).collect::<Vec<_>>();
+        let vault = open.vault.clone();
+        self.rename_pending = true;
+        self.session_closing = true;
+        self.quick_open = None;
+        self.picker_focus = None;
+        self.focus_handle.focus(window, cx);
+        self.io_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let (from, to) = (old.clone(), target.clone());
+            let (result, loaded) = cx
+                .background_spawn(async move {
+                    let result = plan.execute();
+                    // Read and parse the resulting documents before re-enabling input.
+                    // On a failed rollback, follow whichever path actually survived.
+                    let loaded = paths
+                        .into_iter()
+                        .map(|path| {
+                            let mapped = moved_path(&path, &from, &to, directory);
+                            let path = if result.is_ok() || (!vault.exists(&path) && vault.exists(&mapped)) {
+                                mapped
+                            } else {
+                                path
+                            };
+                            let document = vault.read(&path);
+                            (path, document)
+                        })
+                        .collect::<Vec<_>>();
+                    (result, loaded)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.rename_pending = false;
+                this.session_closing = false;
+                this.io_task = None;
+                let Some(open) = this.open.as_mut() else { return };
                 let mut renamed = false;
-                // 提交与编辑器换路径在同一次 UI 回调内完成，文件监听/自动保存不会在两者之间插入。
-                match plan.execute() {
+                match result {
                     Ok(report) => {
                         renamed = true;
                         let message = format!("已完成 {description}，更新 {} 处链接。", report.links_changed);
                         open.search.update(cx, |s, cx| s.notes_renamed(report, cx));
                         open.semantic.update(cx, |s, cx| s.rescan(cx));
-                        for editor in &editors {
-                            editor.update(cx, |e, cx| {
-                                let mapped = moved_path(e.path(), &old, &target, directory);
-                                if e.path() != &mapped {
-                                    e.set_path(mapped, cx);
-                                }
-                                e.check_external(cx);
-                            });
-                        }
                         let map = |p: &VaultPath| moved_path(p, &old, &target, directory);
                         for tab in &mut open.tabs {
                             tab.retarget(&map);
@@ -1259,19 +1343,12 @@ impl Workspace {
                         window.push_notification(Notification::info(message).title("重命名"), cx);
                     }
                     Err(error) => {
-                        // 回滚被外部改动阻止时仍跟随存活的文件，错误中带有恢复副本路径。
-                        for editor in &editors {
-                            editor.update(cx, |e, cx| {
-                                let mapped = moved_path(e.path(), &old, &target, directory);
-                                if !open.vault.exists(e.path()) && open.vault.exists(&mapped) {
-                                    e.set_path(mapped, cx);
-                                }
-                                e.check_external(cx);
-                            });
-                        }
                         open.search.update(cx, |s, cx| s.resync(cx));
                         window.push_notification(Notification::error(error.to_string()).title("重命名"), cx);
                     }
+                }
+                for (editor, (path, document)) in editors.iter().zip(loaded) {
+                    editor.update(cx, |e, cx| e.finish_file_operation(path, document, cx));
                 }
                 let current = open.editor().map(|e| e.read(cx).path().clone());
                 open.backlinks.update(cx, |v, cx| v.set_note(current.clone(), cx));
@@ -1279,7 +1356,7 @@ impl Workspace {
                     editor.update(cx, |e, cx| e.connect_backlinks(open.backlinks.clone(), cx));
                 }
                 open.tree.update(cx, |t, cx| {
-                    t.rescan();
+                    t.rescan_in_background(cx);
                     t.select(current, cx);
                 });
                 if renamed {
@@ -1288,14 +1365,60 @@ impl Workspace {
                     this.set_favorites(favorites, cx);
                 }
                 this.tabs_changed(cx);
+                if let Some(active) = this.open.as_ref().map(|o| o.active) {
+                    this.load_editor(active, window, cx);
+                }
+                this.refresh_active_tab(true, window, cx);
+                let changes = std::mem::take(&mut this.rename_changes);
+                if !changes.is_empty() {
+                    this.on_vault_changed(&changes, window, cx);
+                }
                 cx.notify();
             });
-        })
-        .detach();
+        }));
+        cx.notify();
     }
 
-    /// 离开当前 vault（退出 / 关闭 / 切换）前把每个标签页都落盘。这里没有窗口可以提示，冲突副本只进日志。
-    /// 索引同步 flush 并**关掉**：引擎句柄不能留给后台任务在退出途中释放（见 `SearchService::close_blocking`）。
+    /// GPUI's irrevocable native quit hook has a timeout and removes all windows before
+    /// polling its futures. User actions use `request_operation` BEFORE reaching here.
+    /// Keep raw shutdown guards: if GPUI times out, their Drop still joins/destroys C++.
+    fn shutdown_on_quit(&mut self, cx: &mut Context<Self>) -> impl std::future::Future<Output = ()> + use<> {
+        self.session_closing = true;
+        // OS-initiated termination cannot be vetoed in GPUI 0.3.5. This is the final
+        // safety fallback; asynchronous user saves must finish before calling quit.
+        let saves = self
+            .open
+            .iter()
+            .flat_map(|o| o.editors().cloned())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|editor| editor.update(cx, |e, cx| e.native_save_barrier(cx)))
+            .collect::<Vec<_>>();
+        let open = self.open.take();
+        let shutdown = open.as_ref().map(|open| {
+            (
+                open.search.read(cx).shutdown_guard(),
+                open.semantic.read(cx).shutdown_guard(),
+                open.search.read(cx).close_async(cx),
+                open.semantic.read(cx).close_async(cx),
+            )
+        });
+        async move {
+            for (guard, wait) in saves {
+                wait.await;
+                drop(guard);
+            }
+            if let Some((search_guard, semantic_guard, search, semantic)) = shutdown {
+                search.await;
+                semantic.await;
+                drop((search_guard, semantic_guard));
+            }
+            drop(open);
+        }
+    }
+
+    /// Synchronous test/Drop fallback, never used for ordinary user actions.
+    #[cfg(test)]
     fn flush_all(&mut self, cx: &mut Context<Self>) {
         for editor in self.open.iter().flat_map(|o| o.editors().cloned()).collect::<Vec<_>>() {
             match editor.update(cx, |e, _| e.flush_sync()) {
@@ -1310,34 +1433,108 @@ impl Workspace {
         }
     }
 
-    /// 离开 vault、退出、重命名前：所有标签页都要落盘成功，有一篇失败就否决（它的内容还在编辑器里）。
-    fn flush_before_leaving(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.rename_pending {
-            window.push_notification(Notification::warning("正在准备重命名，请稍后再试。").title("Aero"), cx);
-            return false;
+    fn session_busy(&self) -> bool {
+        self.session_closing
+    }
+
+    fn request_operation(
+        &mut self,
+        operation: PendingOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rename_pending || self.pending_operation.is_some() || self.session_busy() {
+            window
+                .push_notification(Notification::warning("正在完成文件操作，请稍后再试。").title("Aero"), cx);
+            return;
+        }
+        self.pending_operation = Some(operation);
+        self.continue_operation(window, cx);
+    }
+
+    /// Save completion drives this continuation; newer edits cause another save, never a discard.
+    fn continue_operation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_operation.is_none() || self.session_busy() {
+            return;
         }
         let editors: Vec<_> = self.open.iter().flat_map(|o| o.editors().cloned()).collect();
-        if editors.iter().any(|e| e.read(cx).save_state() == &SaveState::Saving) {
-            window.push_notification(Notification::warning("正在保存，请稍后再试。").title("Aero"), cx);
-            return false;
+        if editors.iter().any(|e| {
+            let e = e.read(cx);
+            e.has_pending_export() || e.is_deleted() || matches!(e.save_state(), SaveState::Failed(_))
+        }) {
+            self.pending_operation = None;
+            window.push_notification(
+                Notification::warning("笔记尚未安全保存，请处理保存错误或导出后重试。").title("Aero"),
+                cx,
+            );
+            return;
         }
-        let mut saved = true;
+        let mut waiting = false;
         for editor in editors {
-            let result = editor.update(cx, |e, _| e.flush_sync());
-            if result.is_ok() {
-                self.index_editor(&editor, cx);
-            } else {
-                saved = false;
+            match editor.read(cx).save_state() {
+                SaveState::Dirty => {
+                    waiting = true;
+                    editor.update(cx, |e, cx| e.save_now(cx));
+                }
+                SaveState::Saving => waiting = true,
+                _ => {}
             }
-            self.report_flush(result, window, cx);
         }
-        saved
+        if waiting {
+            return;
+        }
+        let operation = self.pending_operation.take().unwrap();
+        if let PendingOperation::Rename { old, target, title } = operation {
+            self.prepare_change_name(old, target, title, window, cx);
+            return;
+        }
+        for editor in self.open.iter().flat_map(|open| open.editors()) {
+            editor.update(cx, |e, cx| {
+                e.suspend_io(cx);
+            });
+        }
+        self.session_closing = true;
+        self.quick_open = None;
+        self.picker_focus = None;
+        self.focus_handle.focus(window, cx);
+        let tasks = self
+            .open
+            .as_ref()
+            .map(|open| (open.search.read(cx).close_async(cx), open.semantic.read(cx).close_async(cx)));
+        // The session stays owned by Workspace, including its editors and service Drop guards.
+        // Native close is vetoed until this continuation removes the window.
+        self.io_task = Some(cx.spawn_in(window, async move |this, cx| {
+            if let Some((search, semantic)) = tasks {
+                search.await;
+                semantic.await;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.open = None;
+                this.session_closing = false;
+                this.io_task = None;
+                this.references_task = None;
+                this.references_again = false;
+                this.sync_editor_menus(cx);
+                match operation {
+                    PendingOperation::OpenVault(root) => {
+                        this.open_vault(&root, window, cx);
+                        if this.is_demo_vault(&root) {
+                            this.open_note(VaultPath::new(crate::demo_vault::WELCOME).unwrap(), window, cx);
+                        }
+                    }
+                    PendingOperation::CloseVault => {}
+                    PendingOperation::CloseWindow => window.remove_window(),
+                    PendingOperation::Quit => cx.quit(),
+                    PendingOperation::Rename { .. } => unreachable!(),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     fn on_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
-        if self.flush_before_leaving(window, cx) {
-            cx.quit();
-        }
+        self.request_operation(PendingOperation::Quit, window, cx);
     }
 
     /// 编辑器刚落盘（或重载）：把它的内容送进索引。
@@ -1346,41 +1543,6 @@ impl Workspace {
         let (path, text, stamp) = editor.read(cx).index_snapshot();
         open.semantic.update(cx, |s, cx| s.note_changed(vec![path.clone()], cx));
         open.search.update(cx, |s, cx| s.note_saved(path, text, stamp, cx));
-    }
-
-    fn report_flush(
-        &mut self,
-        result: Result<Option<VaultPath>, aero_core::VaultError>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match result {
-            Ok(Some(copy)) => self.notify_conflict(&copy, window, cx),
-            Ok(None) => {}
-            Err(err) => {
-                window.push_notification(Notification::error(format!("保存失败：{err}")).title("Aero"), cx)
-            }
-        }
-    }
-
-    /// 切换笔记时上一篇落盘留下了冲突副本：那个编辑器已经不在了，横幅没处显示，用通知代替。
-    fn notify_conflict(&mut self, copy: &VaultPath, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(open) = self.open.as_ref() {
-            open.tree.update(cx, |t, cx| {
-                t.rescan();
-                cx.notify();
-            });
-            let copy = copy.clone();
-            open.search.update(cx, |s, cx| s.note_changed(copy, cx));
-        }
-        window.push_notification(
-            Notification::warning(format!(
-                "这篇笔记在磁盘上被别的程序改过。磁盘版本已另存为 {}，当前内容照常保存。",
-                copy.as_str()
-            ))
-            .title("外部修改"),
-            cx,
-        );
     }
 
     /// 编辑器改动了其他路径：笔记副本 / 另存为对齐索引与标签页；附件导出只刷新树、引用与渲染缓存。
@@ -1439,6 +1601,24 @@ impl Workspace {
 
     /// vault 目录有动静（文件监听）：文件树重扫；标签页里打开着的笔记立刻检查外部修改；其余按指纹对齐索引。
     fn on_vault_changed(&mut self, batch: &Batch, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_busy() {
+            if self.rename_pending {
+                // Do not lose events delivered while the transaction owns the files.
+                self.rename_changes.changed.extend(batch.changed.iter().cloned());
+                self.rename_changes.removed.extend(batch.removed.iter().cloned());
+                self.rename_changes.attachments.extend(batch.attachments.iter().cloned());
+                for paths in [
+                    &mut self.rename_changes.changed,
+                    &mut self.rename_changes.removed,
+                    &mut self.rename_changes.attachments,
+                ] {
+                    paths.sort();
+                    paths.dedup();
+                }
+                self.rename_changes.rescan |= batch.rescan;
+            }
+            return;
+        }
         let Some(open) = self.open.as_ref() else { return };
         let editors: Vec<Entity<Editor>> = open.editors().cloned().collect();
         let shown: Vec<VaultPath> = editors.iter().map(|e| e.read(cx).path().clone()).collect();
@@ -1614,6 +1794,12 @@ impl Workspace {
         let background = cx.theme().background;
         let body = match open.editor() {
             Some(editor) => editor.clone().into_any_element(),
+            None if open.tabs[open.active].path(cx).is_some() => div()
+                .debug_selector(|| "note-loading".into())
+                .p_6()
+                .text_color(cx.theme().muted_foreground)
+                .child("正在读取笔记…")
+                .into_any_element(),
             None => self.render_empty_tab(open, cx).into_any_element(),
         };
         v_flex()
@@ -1719,6 +1905,7 @@ impl Render for Workspace {
         }
 
         let body: AnyElement = match &self.open {
+            _ if self.session_busy() => div().flex_1().p_6().child("正在完成文件操作…").into_any_element(),
             None => self.render_first_run(cx).into_any_element(),
             Some(open) => v_flex()
                 .flex_1()
@@ -1776,7 +1963,7 @@ impl Render for Workspace {
             .size_full()
             .bg(background)
             .text_color(foreground)
-            .child(self.render_title_bar(window, cx))
+            .when(!self.session_busy(), |el| el.child(self.render_title_bar(window, cx)))
             .child(body)
             .children(gpui_kit::component::Root::render_dialog_layer(window, cx))
             .children(gpui_kit::component::Root::render_notification_layer(window, cx))
@@ -1882,14 +2069,15 @@ mod tests {
     use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 
     use super::{SidebarTab, Tab, VaultSession, Workspace};
+    use crate::actions::NewTab;
     use crate::backlinks::BacklinksView;
-    use crate::editor::Editor;
+    use crate::editor::{Editor, SaveState};
     use crate::file_tree::FileTree;
     use crate::paths::PersistedState;
     use crate::search::SearchService;
     use crate::search_view::SearchView;
     use crate::tags_view::TagsView;
-    use crate::watch::VaultWatcher;
+    use crate::watch::{Batch, VaultWatcher};
     use gpui_kit::px;
 
     #[gpui_kit::test]
@@ -2019,6 +2207,10 @@ mod tests {
                 recent_commands: vec![],
                 sidebar_tab: SidebarTab::Files,
                 rename_pending: false,
+                rename_changes: Batch::default(),
+                pending_operation: None,
+                session_closing: false,
+                io_task: None,
                 sidebar_visible: true,
                 panel_visible: true,
                 sidebar_width: px(super::SIDEBAR_DEFAULT),
@@ -2303,9 +2495,10 @@ mod tests {
         std::fs::write(vault.fs_path(&long_path), "theirs from disk\n").unwrap();
         std::fs::write(dir.path().join("b.md"), "other\n").unwrap();
         let other_vault = tempfile::tempdir().unwrap();
+        workspace.update_in(cx, |w, window, cx| w.open_note(VaultPath::new("b.md").unwrap(), window, cx));
+        cx.run_until_parked();
         cx.update(|window, cx| {
             workspace.update(cx, |w, cx| {
-                w.open_note(VaultPath::new("b.md").unwrap(), window, cx);
                 let open = w.open.as_ref().unwrap();
                 assert_eq!(open.tabs.len(), 2);
                 assert_eq!(open.tabs[0].editor.as_ref(), Some(&editor), "保存失败的那页还在");
@@ -2318,7 +2511,8 @@ mod tests {
                 assert!(w.open.is_some());
                 w.open_vault(other_vault.path(), window, cx);
                 assert_eq!(w.open.as_ref().unwrap().vault.root(), vault.root());
-                assert!(!w.flush_before_leaving(window, cx), "close/quit must be vetoed");
+                w.on_quit(&crate::actions::Quit, window, cx);
+                assert!(!w.session_closing && w.pending_operation.is_none(), "close/quit must be vetoed");
             })
         });
         assert_eq!(std::fs::read_to_string(vault.fs_path(&long_path)).unwrap(), "theirs from disk\n");
@@ -2614,9 +2808,11 @@ mod tests {
             let commands = workspace.read(cx).available_commands(window, cx);
             assert_eq!(
                 commands.iter().map(|command| command.id).collect::<Vec<_>>(),
-                ["open-vault", "new-vault", "quit"]
+                ["settings", "about", "check-updates", "open-vault", "new-vault", "quit"]
             );
-            assert!(commands[0].shortcut.contains('O'));
+            assert!(
+                commands.iter().find(|command| command.id == "open-vault").unwrap().shortcut.contains('O')
+            );
         });
         cx.simulate_keystrokes("cmd-shift-p");
         cx.run_until_parked();
@@ -3165,6 +3361,75 @@ mod tests {
         assert!(!dir.path().join("a.md").exists());
         assert!(std::fs::read_to_string(dir.path().join("新名字.md")).unwrap().contains("追加正文"));
         cx.update(|_, cx| search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn rename_submission_returns_before_disk_change_and_blocks_hidden_input(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("# base\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let editor = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        editor.update_in(cx, |e, window, cx| e.focus_block(e.headings()[0].2, window, cx));
+        workspace.update_in(cx, |w, window, cx| {
+            let open = w.open.as_ref().unwrap();
+            let old = VaultPath::new("a.md").unwrap();
+            let target = VaultPath::new("new.md").unwrap();
+            let plan =
+                aero_core::rename::RenamePlan::prepare(&open.vault, old.clone(), target.clone()).unwrap();
+            w.execute_change_name(plan, old, target, false, "test rename".into(), window, cx);
+            assert!(w.session_busy());
+            assert!(w.open.is_some(), "session ownership remains until completion");
+            assert!(w.focus_handle.is_focused(window));
+            assert!(dir.path().join("a.md").exists(), "submission must not execute disk changes inline");
+            assert!(!dir.path().join("new.md").exists());
+            w.on_new_tab(&NewTab, window, cx);
+            w.close_editor(&editor, window, cx);
+            assert_eq!(w.open.as_ref().unwrap().tabs.len(), 1);
+        });
+        cx.simulate_input("must not edit hidden text");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).session_busy()));
+        assert!(!dir.path().join("a.md").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("new.md")).unwrap(), "# base\n");
+        cx.update(|_, cx| assert_eq!(editor.read(cx).index_snapshot().1, "# base\n"));
+    }
+
+    #[gpui_kit::test]
+    fn rename_failure_resumes_editors_without_resurrecting_old_paths(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("base\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let editor = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        workspace.update_in(cx, |w, window, cx| {
+            let vault = w.open.as_ref().unwrap().vault.clone();
+            let old = VaultPath::new("a.md").unwrap();
+            let target = VaultPath::new("new.md").unwrap();
+            let plan = aero_core::rename::RenamePlan::prepare(&vault, old.clone(), target.clone()).unwrap();
+            w.execute_change_name(plan, old.clone(), target.clone(), false, "test rename".into(), window, cx);
+            // An external move makes execute fail; watcher/restore/save must not recreate the source.
+            vault.rename(&old, &target).unwrap();
+            editor.update(cx, |e, cx| {
+                e.check_external(cx);
+                e.restore_deleted(cx);
+                e.save_now(cx);
+            });
+            assert!(!dir.path().join("a.md").exists());
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).session_busy()));
+        editor.update_in(cx, |e, window, cx| {
+            assert_eq!(e.path().as_str(), "new.md");
+            e.start_writing(window, cx);
+        });
+        cx.simulate_input("after failure");
+        editor.update(cx, |e, cx| e.save_now(cx));
+        wait_until(cx, |cx| cx.update(|_, cx| matches!(editor.read(cx).save_state(), SaveState::Saved(_))));
+        assert!(!dir.path().join("a.md").exists());
+        assert!(std::fs::read_to_string(dir.path().join("new.md")).unwrap().contains("after failure"));
     }
 
     #[gpui_kit::test]

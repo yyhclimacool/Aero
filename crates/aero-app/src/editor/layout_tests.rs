@@ -226,6 +226,363 @@ fn draw(cx: &mut VisualTestContext) {
     }
 }
 
+#[gpui_kit::test]
+fn long_document_only_mounts_visible_presenters(cx: &mut TestAppContext) {
+    let source = (0..1000).map(|i| format!("Paragraph {i}: responsive editing.\n\n")).collect::<String>();
+    let (_dir, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(
+            e.presenters.len() < 100,
+            "offscreen paragraphs must not allocate input controls: {}",
+            e.presenters.len()
+        );
+        assert_eq!(e.units.len(), 1000);
+    });
+    let last = cx.update(|_, cx| editor.read(cx).units.last().unwrap().id);
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_block(last, cx)));
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.presenters.contains_key(&Key::unit(last)), "jumping must mount the target");
+        assert!(e.presenters.len() < 100, "jumping must not mount intervening paragraphs");
+        assert!(e.scroll.offset().y < px(-1000.));
+    });
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_block(last, window, cx)));
+    draw(cx);
+    cx.simulate_input("末");
+    draw(cx);
+    assert!(cx.update(|_, cx| editor.read(cx).doc.to_string()).contains("末"));
+    cx.simulate_keystrokes("cmd-z");
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source);
+}
+
+#[gpui_kit::test]
+fn thousand_item_list_mounts_only_visible_items_and_edits_in_place(cx: &mut TestAppContext) {
+    let mut source = (0..1000)
+        .map(|i| {
+            let task = match i % 3 {
+                1 => "[ ] ",
+                2 => "[x] ",
+                _ => "",
+            };
+            format!("7. {task}Item {i}: **bold**.\n")
+        })
+        .collect::<String>();
+    source.push_str("\n^large-list\n\nAfter list.\n");
+    let (_dir, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.units.len(), 1001);
+        assert!(e.presenters.len() < 100, "one list mounted {} presenters", e.presenters.len());
+        assert_eq!(e.units[999].list.as_ref().unwrap().ordered, Some(7));
+        assert_eq!(e.units[999].list.as_ref().unwrap().item_index, 999);
+    });
+    let initial = rows(&editor, cx);
+    assert_eq!(initial[0].1.top(), px(40.));
+    assert_eq!(initial[1].1.top() - initial[0].1.bottom(), px(4.));
+    let (first, last, after, task) = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        (e.units[0].id, e.units[999].id, e.units[1000].id, e.doc.blocks().roots[0].children[997].id)
+    });
+    let area = text_area(&editor, Key::unit(first), cx);
+    click(cx, area.center());
+    let focused = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_block(last, cx)));
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.presenters.len() < 100, "a far jump must not mount intervening items");
+        assert_eq!(e.focused.as_ref().unwrap().textarea, focused);
+        assert!(e.presenters.contains_key(&Key::unit(first)));
+        assert!(e.presenters.contains_key(&Key::unit(last)));
+        assert!(!e.presenters.contains_key(&Key::unit(e.units[500].id)));
+        assert!(e.scroll.offset().y < px(-1000.));
+    });
+    let last_bounds = text_area(&editor, Key::unit(last), cx);
+    let after_bounds = text_area(&editor, Key::unit(after), cx);
+    assert_eq!(after_bounds.top() - last_bounds.bottom(), px(8.), "final item keeps the root gap");
+    assert_eq!(cx.debug_bounds("editor-tail").unwrap().top(), after_bounds.bottom());
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_block(last, window, cx)));
+    draw(cx);
+    let before = rows(&editor, cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let ta = e.presenters[&Key::unit(last)].textarea.read(cx);
+        let marker = ta.value().find("**").unwrap();
+        assert_eq!(ta.range_to_bounds(&(marker..marker + 2)).unwrap().size.width, px(0.));
+    });
+    cx.simulate_input("末");
+    draw(cx);
+    assert!(cx.update(|_, cx| editor.read(cx).doc.to_string()).contains("末"));
+    assert_eq!(rows(&editor, cx), before, "single-line editing must not shift neighboring items");
+    cx.simulate_keystrokes("cmd-z");
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source);
+    assert_eq!(rows(&editor, cx), before, "undo must keep measured item geometry");
+    cx.simulate_keystrokes("escape escape");
+    draw(cx);
+    let before = rows(&editor, cx);
+    let checkbox = cx.debug_bounds(Box::leak(format!("task-{}", task.0).into_boxed_str())).unwrap();
+    click(cx, checkbox.center());
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.doc.to_string().contains("7. [x] Item 997"));
+        assert_eq!(e.units[997].list.as_ref().unwrap().checked, Some(true));
+        assert!(e.focused.is_none());
+        assert!(e.presenters.len() < 100);
+    });
+    assert_eq!(rows(&editor, cx), before, "checking a task must not shift visible items");
+}
+
+#[gpui_kit::test]
+fn virtualized_list_matches_small_direct_root_geometry(cx: &mut TestAppContext) {
+    let source = "Before.\n\n7. Outer **bold**.\n   - [ ] Nested.\n   - Child.\n7. [x] Done.\n7. Last.\n\n^list\n\nAfter.\n";
+    let (_small_dir, small) = open(cx, source);
+    let small_cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    small_cx.simulate_resize(size(px(900.), px(700.)));
+    draw(small_cx);
+    let original = rows(&small, small_cx);
+    assert_eq!(original.len(), 7);
+    assert_eq!(original[1].1.top() - original[0].1.bottom(), px(8.));
+    assert_eq!(original[4].1.top() - original[3].1.bottom(), px(4.));
+    assert_eq!(original[6].1.top() - original[5].1.bottom(), px(8.));
+    let large_source = format!("{source}\n{}", "Padding paragraph.\n\n".repeat(100));
+    let (_large_dir, large) = open(cx, &large_source);
+    let large_cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+    large_cx.simulate_resize(size(px(900.), px(700.)));
+    draw(large_cx);
+    let virtualized = rows(&large, large_cx);
+    for ((_, expected), (_, actual)) in original.iter().zip(&virtualized) {
+        assert_eq!(actual, expected, "splitting a list must preserve its direct-root geometry");
+    }
+    let nested = large_cx.update(|_, cx| large.read(cx).units[2].id);
+    let before = rows(&large, large_cx);
+    let area = text_area(&large, Key::unit(nested), large_cx);
+    click(large_cx, area.center());
+    assert_eq!(rows(&large, large_cx), before, "nested item focus must stay in its parent row");
+}
+
+#[gpui_kit::test]
+fn virtualized_list_keeps_anchor_through_insert_delete_and_reorder(cx: &mut TestAppContext) {
+    let source = (0..300)
+        .map(|i| format!("7. Item {i}: {}\n", "wrapping words and 中文内容。".repeat(5)))
+        .collect::<String>();
+    let (_dir, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    let target = cx.update(|_, cx| editor.read(cx).units[150].id);
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_block(target, cx)));
+    draw(cx);
+    let (anchor, before) = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.presenters.len() < 100);
+        e.unit_bounds.iter().find(|(_, b)| b.top() <= px(0.) && b.bottom() > px(0.)).copied().unwrap()
+    });
+    let inserted = "7. Inserted item.\n";
+    for edit in [aero_core::Edit::insert(0, inserted), aero_core::Edit::delete(0..inserted.len())] {
+        cx.update(|_, cx| {
+            editor.update(cx, |e, cx| {
+                e.doc.edit(edit).unwrap();
+                e.after_doc_change(cx);
+            })
+        });
+        draw(cx);
+        cx.update(|_, cx| {
+            let e = editor.read(cx);
+            let after = e.unit_bounds.iter().find(|(id, _)| *id == anchor).unwrap().1;
+            assert!((after.top() - before.top()).abs() <= px(1.), "structural edit moved the anchor");
+            assert!(e.presenters.len() < 100);
+        });
+    }
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            let range = e.units[250].list.as_ref().unwrap().item_range.clone();
+            let text = e.doc.slice(range.clone()).to_string();
+            e.doc.edit_group(vec![aero_core::Edit::delete(range), aero_core::Edit::insert(0, text)]).unwrap();
+            e.after_doc_change(cx);
+        })
+    });
+    draw(cx);
+    cx.simulate_resize(size(px(540.), px(700.)));
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let after = e.unit_bounds.iter().find(|(id, _)| *id == anchor).unwrap().1;
+        assert!((after.top() - before.top()).abs() <= px(1.), "reordering/resizing moved the anchor");
+        assert!(e.presenters.len() < 100);
+    });
+    let settled = rows(&editor, cx);
+    draw(cx);
+    assert_eq!(rows(&editor, cx), settled, "item measurements must converge");
+}
+
+#[gpui_kit::test]
+fn virtualized_document_preserves_visible_geometry_on_focus(cx: &mut TestAppContext) {
+    let source = (0..500).map(|i| format!("Paragraph {i}: **bold** and 中文内容。\n\n")).collect::<String>();
+    let (_dir, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    let before = rows(&editor, cx);
+    let id = cx.update(|_, cx| editor.read(cx).units[1].id);
+    let bounds = text_area(&editor, Key::unit(id), cx);
+    click(cx, bounds.center());
+    assert_eq!(rows(&editor, cx), before);
+    assert!(cx.update(|_, cx| editor.read(cx).presenters.len()) < 100);
+}
+
+#[gpui_kit::test]
+fn virtualized_scroll_resize_keeps_anchor_and_evicts_stale_bounds(cx: &mut TestAppContext) {
+    let source = (0..1200)
+        .map(|i| format!("Paragraph {i}: {}\n\n", "wrapping words and 中文内容。".repeat(8)))
+        .collect::<String>();
+    let (_dir, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    let first = cx.update(|_, cx| editor.read(cx).units[0].id);
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            e.scroll.set_offset(point(px(0.), px(-15000.)));
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let (anchor, before) = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.presenters.len() < 100);
+        assert!(!e.unit_bounds.iter().any(|(id, _)| *id == first), "old hit targets must be evicted");
+        e.unit_bounds
+            .iter()
+            .filter(|(_, b)| b.top() <= px(0.) && b.bottom() > px(0.))
+            .copied()
+            .next()
+            .expect("viewport has an anchor")
+    });
+    cx.simulate_resize(size(px(540.), px(700.)));
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let after = e.unit_bounds.iter().find(|(id, _)| *id == anchor).unwrap().1;
+        assert!((after.top() - before.top()).abs() <= px(1.), "resize moved anchor: {before:?} -> {after:?}");
+        assert!(e.presenters.len() < 100);
+    });
+    let settled = rows(&editor, cx);
+    draw(cx);
+    assert_eq!(rows(&editor, cx), settled, "height corrections must converge");
+}
+
+#[gpui_kit::test]
+fn virtualized_far_focus_retains_control_without_mounting_between_ranges(cx: &mut TestAppContext) {
+    let source = (0..1200).map(|i| format!("Paragraph {i}.\n\n")).collect::<String>();
+    let (_dir, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    let first = cx.update(|_, cx| editor.read(cx).units[0].id);
+    let area = text_area(&editor, Key::unit(first), cx);
+    click(cx, area.center());
+    let ta = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    let last = cx.update(|_, cx| editor.read(cx).units.last().unwrap().id);
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.reveal_block(last, cx)));
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.focused.as_ref().unwrap().textarea, ta);
+        assert!(e.presenters.contains_key(&Key::unit(first)));
+        assert!(e.presenters.contains_key(&Key::unit(last)));
+        assert!(e.presenters.len() < 100, "only viewport and focused root stay mounted");
+        assert!(!e.presenters.contains_key(&Key::unit(e.units[600].id)));
+    });
+}
+
+#[gpui_kit::test]
+fn virtualized_small_document_keeps_gaps_markers_and_pending_slot(cx: &mut TestAppContext) {
+    let source = "First.\n\n^first\n\nSecond.\n";
+    let (_dir, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    draw(cx);
+    let before = rows(&editor, cx);
+    assert_eq!(before.len(), 2, "marker roots do not occupy a row");
+    assert_eq!(before[0].1.top(), px(40.));
+    assert_eq!(before[1].1.top() - before[0].1.bottom(), px(8.));
+    assert_eq!(cx.debug_bounds("editor-tail").unwrap().top(), before[1].1.bottom());
+    let offset = cx.update(|_, cx| editor.read(cx).units[1].range.start - 1);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.focus_range(offset..offset, None, false, 0, window, cx);
+        })
+    });
+    draw(cx);
+    let after = rows(&editor, cx);
+    let pending = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.focused.as_ref().unwrap().id.is_none());
+        e.focused.as_ref().unwrap().textarea.read(cx).input_bounds()
+    });
+    assert_eq!(after[0].1, before[0].1);
+    assert_eq!(pending.top() - after[0].1.bottom(), px(8.));
+    assert_eq!(after[1].1.top() - pending.bottom(), px(8.));
+    assert_eq!(cx.debug_bounds("editor-tail").unwrap().top(), after[1].1.bottom());
+    cx.simulate_input("Inserted");
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        for (ix, unit) in e.units.iter().enumerate() {
+            assert_eq!(e.unit_index(unit.id), Some(ix));
+        }
+    });
+    cx.simulate_keystrokes("cmd-z");
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source);
+}
+
+#[gpui_kit::test]
+fn virtualized_source_covered_roots_leave_no_phantom_gaps(cx: &mut TestAppContext) {
+    let (_dir, editor) = open(cx, "First.\n\nSecond.\n\nThird.\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    draw(cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.note_source = true;
+            let id = e.units[0].id;
+            e.focus_range(0..e.doc.len(), Some(id), true, 0, window, cx);
+        })
+    });
+    draw(cx);
+    let visible = rows(&editor, cx);
+    assert_eq!(visible.len(), 1, "covered roots are rendered by the focused textarea");
+    assert_eq!(cx.debug_bounds("editor-tail").unwrap().top(), visible[0].1.bottom());
+}
+
+#[gpui_kit::test]
+fn virtualized_height_resize_mounts_newly_visible_rows(cx: &mut TestAppContext) {
+    let source = (0..1200).map(|i| format!("Paragraph {i}.\n\n")).collect::<String>();
+    let (_dir, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(400.)));
+    draw(cx);
+    cx.simulate_resize(size(px(900.), px(1700.)));
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(
+            e.unit_bounds.iter().any(|(_, b)| b.top() < px(1700.) && b.bottom() >= px(1700.)),
+            "the expanded viewport must not show an unmounted spacer"
+        );
+        assert!(e.presenters.len() < 100);
+    });
+}
+
 /// 每一块的外框（含 gutter 的那一行）。
 fn rows(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> Vec<(String, Bounds<Pixels>)> {
     let ids: Vec<u64> = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id.0).collect());

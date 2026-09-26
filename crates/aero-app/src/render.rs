@@ -14,7 +14,7 @@
 //! 图片与数学使用 [`Renderer`]；图表（merman）与 PDF（hayro）封装在 `rich` 中，
 //! 共用请求、缓存、占位、失败回退与取消流程。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -334,6 +334,10 @@ pub enum Attachment {
 }
 
 const PDF_PAGE_CACHE_LIMIT: usize = 12;
+const NON_PDF_CACHE_LIMIT: usize = 64;
+const RENDER_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+const RENDER_CONCURRENCY: usize = 2;
+const RENDER_QUEUE_LIMIT: usize = 32;
 
 pub struct RenderService {
     vault: Arc<Vault>,
@@ -341,9 +345,14 @@ pub struct RenderService {
     entries: HashMap<Request, Entry>,
     /// 元数据只按 vault 相对路径缓存，不随页面位图 LRU 淘汰。
     pdf_infos: HashMap<VaultPath, PdfInfoEntry>,
-    pdf_access: HashMap<Request, u64>,
-    pdf_tick: u64,
-    pdf_eviction_scheduled: bool,
+    access: HashMap<Request, u64>,
+    tick: u64,
+    eviction_scheduled: bool,
+    active_since: u64,
+    /// 队列只保留最近请求；溢出的可见项保留轻量 Waiting 占位，不创建 future。
+    queue: VecDeque<Request>,
+    /// 同步解码开始后无法中断：即使 entry 被淘汰，仍持有任务直到完成才释放并发名额。
+    running: HashMap<u64, Task<()>>,
     next_token: u64,
     /// 上次渲染出的像素尺寸，占位用；同一源换尺寸时也不用从零等
     pixels: HashMap<Source, Size<u32>>,
@@ -359,16 +368,9 @@ enum PdfInfoEntry {
 }
 
 enum Entry {
-    /// 持有任务句柄：服务被丢掉（关闭 / 切换 vault）时后台渲染随之取消
-    Pending {
-        token: u64,
-        _task: Task<()>,
-    },
-    Ready {
-        image: Arc<RenderImage>,
-        pixels: Size<u32>,
-        pages: Option<u32>,
-    },
+    Waiting,
+    Pending { token: u64 },
+    Ready { image: Arc<RenderImage>, pixels: Size<u32>, pages: Option<u32> },
     Failed(SharedString),
 }
 
@@ -379,9 +381,12 @@ impl RenderService {
             cache,
             entries: HashMap::new(),
             pdf_infos: HashMap::new(),
-            pdf_access: HashMap::new(),
-            pdf_tick: 0,
-            pdf_eviction_scheduled: false,
+            access: HashMap::new(),
+            tick: 0,
+            eviction_scheduled: false,
+            active_since: 0,
+            queue: VecDeque::new(),
+            running: HashMap::new(),
             next_token: 0,
             pixels: HashMap::new(),
             catalog: None,
@@ -423,7 +428,9 @@ impl RenderService {
     /// 取一张图。没有就排队渲染并先返回占位，渲染完成后 `notify` 触发重绘。
     pub fn image(&mut self, source: VaultPath, width: u32, scale: f32, cx: &mut Context<Self>) -> State {
         let scale = (scale.max(0.5) * 100.).round() as u32;
-        let request = Request { kind: Kind::Image, source: Source::File(source), size: width.max(1), scale };
+        // 向上取 64 逻辑像素一档；窗口逐像素缩放复用位图，HiDPI 下也不会低于请求分辨率。
+        let width = width.max(1).div_ceil(64).saturating_mul(64);
+        let request = Request { kind: Kind::Image, source: Source::File(source), size: width, scale };
         self.state(request, cx)
     }
 
@@ -484,37 +491,7 @@ impl RenderService {
             size: width.max(1),
             scale: (scale.max(0.5) * 100.).round() as u32,
         };
-        let state = self.state(request.clone(), cx);
-        self.pdf_tick += 1;
-        self.pdf_access.insert(request.clone(), self.pdf_tick);
-        if !self.pdf_eviction_scheduled {
-            self.pdf_eviction_scheduled = true;
-            let active_since = self.pdf_tick;
-            let service = cx.weak_entity();
-            // 同一轮绘制的可见页不能互相淘汰，否则超过缓存容量时会一直重新排队。
-            cx.defer(move |cx| {
-                let _ = service.update(cx, |this, _| {
-                    this.pdf_eviction_scheduled = false;
-                    while this.pdf_access.len() > PDF_PAGE_CACHE_LIMIT {
-                        let Some(oldest) = this
-                            .pdf_access
-                            .iter()
-                            .filter(|(_, tick)| **tick < active_since)
-                            .min_by_key(|(_, tick)| **tick)
-                            .map(|(key, _)| key.clone())
-                        else {
-                            break;
-                        };
-                        this.pdf_access.remove(&oldest);
-                        this.entries.remove(&oldest);
-                        if !this.entries.keys().any(|key| key.source == oldest.source) {
-                            this.pixels.remove(&oldest.source);
-                        }
-                    }
-                });
-            });
-        }
-        state
+        self.state(request, cx)
     }
 
     /// 首次仅排队；读取、指纹与全页尺寸解析都在后台完成，不触发页面光栅化。
@@ -564,20 +541,119 @@ impl RenderService {
     }
 
     fn state(&mut self, request: Request, cx: &mut Context<Self>) -> State {
+        self.tick = self.tick.checked_add(1).expect("渲染访问序号耗尽");
+        self.access.insert(request.clone(), self.tick);
+        if !self.eviction_scheduled {
+            self.eviction_scheduled = true;
+            let active_since = self.tick;
+            self.active_since = active_since;
+            let service = cx.weak_entity();
+            // 收齐同一轮绘制再淘汰 / 派发，不能让可见项互相淘汰而永久重排。
+            cx.defer(move |cx| {
+                let _ = service.update(cx, |this, cx| {
+                    this.eviction_scheduled = false;
+                    this.evict(active_since);
+                    this.dispatch(cx);
+                });
+            });
+        }
         let placeholder = || State::Pending { pixels: self.pixels.get(&request.source).copied() };
         match self.entries.get(&request) {
             Some(Entry::Ready { image, pixels, pages }) => {
                 State::Ready { image: image.clone(), pixels: *pixels, pages: *pages }
             }
             Some(Entry::Failed(error)) => State::Failed(error.clone()),
-            Some(Entry::Pending { .. }) => placeholder(),
+            Some(Entry::Pending { .. } | Entry::Waiting) => placeholder(),
             None => {
                 let state = placeholder();
-                let token = self.token();
-                let task = self.render(request.clone(), token, cx);
-                self.entries.insert(request, Entry::Pending { token, _task: task });
+                self.entries.insert(request, Entry::Waiting);
                 state
             }
+        }
+    }
+
+    fn evict(&mut self, active_since: u64) {
+        let active_images = self
+            .access
+            .iter()
+            .filter(|(key, tick)| key.kind == Kind::Image && **tick >= active_since)
+            .map(|(key, _)| &key.source)
+            .collect::<HashSet<_>>();
+        // 连续缩放时只取消不再显示的旧尺寸；同帧不同位置显示的多个尺寸仍受保护。
+        let superseded = self
+            .entries
+            .iter()
+            .filter(|(key, entry)| {
+                key.kind == Kind::Image
+                    && self.access[*key] < active_since
+                    && active_images.contains(&key.source)
+                    && matches!(entry, Entry::Waiting | Entry::Pending { .. })
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in superseded {
+            self.remove_entry(&key);
+        }
+        for (pdf, limit) in [(true, PDF_PAGE_CACHE_LIMIT), (false, NON_PDF_CACHE_LIMIT)] {
+            let count = self.access.keys().filter(|key| (key.kind == Kind::Pdf) == pdf).count();
+            let mut inactive = self
+                .access
+                .iter()
+                .filter(|(key, tick)| (key.kind == Kind::Pdf) == pdf && **tick < active_since)
+                .map(|(key, tick)| (key.clone(), *tick))
+                .collect::<Vec<_>>();
+            inactive.sort_unstable_by_key(|(_, tick)| *tick);
+            for (key, _) in inactive.into_iter().take(count.saturating_sub(limit)) {
+                self.remove_entry(&key);
+            }
+        }
+        // All bitmap kinds share the byte budget. Current-frame resources stay alive:
+        // evicting those would create a render/evict loop when many images are visible.
+        let bytes = |entry: &Entry| match entry {
+            Entry::Ready { pixels, .. } => u64::from(pixels.width) * u64::from(pixels.height) * 4,
+            _ => 0,
+        };
+        let mut total: u64 = self.entries.values().map(bytes).sum();
+        let mut inactive = self
+            .access
+            .iter()
+            .filter(|(_, tick)| **tick < active_since)
+            .map(|(key, tick)| (key.clone(), *tick))
+            .collect::<Vec<_>>();
+        inactive.sort_unstable_by_key(|(_, tick)| *tick);
+        for (key, _) in inactive {
+            if total <= RENDER_CACHE_BYTES {
+                break;
+            }
+            total -= self.entries.get(&key).map_or(0, bytes);
+            self.remove_entry(&key);
+        }
+    }
+
+    fn remove_entry(&mut self, key: &Request) {
+        self.entries.remove(key);
+        self.access.remove(key);
+        if !self.entries.keys().any(|other| other.source == key.source) {
+            self.pixels.remove(&key.source);
+        }
+    }
+
+    fn dispatch(&mut self, cx: &mut Context<Self>) {
+        // 未派发的旧队列可直接重建：最新 / 再次请求的内容优先，不积累后台 future。
+        let mut waiting = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry, Entry::Waiting))
+            .map(|(key, _)| (key.clone(), self.access[key]))
+            .collect::<Vec<_>>();
+        waiting.sort_unstable_by_key(|(_, tick)| std::cmp::Reverse(*tick));
+        self.queue = waiting.into_iter().take(RENDER_QUEUE_LIMIT).map(|(key, _)| key).collect();
+        while self.running.len() < RENDER_CONCURRENCY {
+            let Some(request) = self.queue.pop_front() else { break };
+            let token = self.token();
+            self.entries.insert(request.clone(), Entry::Pending { token });
+            let task = self.render(request, token, cx);
+            self.running.insert(token, task);
         }
     }
 
@@ -589,8 +665,10 @@ impl RenderService {
                 .background_spawn(async move { produce_with_text(&vault, &cache, &key, Some(text_system)) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.running.remove(&token);
                 // 淘汰 / 失效后的回调不能复活 entry，也不能覆盖同 key 的新任务。
-                if !matches!(this.entries.get(&request), Some(Entry::Pending { token: current, .. }) if *current == token) {
+                if !matches!(this.entries.get(&request), Some(Entry::Pending { token: current }) if *current == token) {
+                    this.dispatch(cx);
                     return;
                 }
                 this.entries.insert(
@@ -612,6 +690,8 @@ impl RenderService {
                         }
                     },
                 );
+                this.evict(this.active_since);
+                this.dispatch(cx);
                 cx.notify();
             });
         })
@@ -629,7 +709,8 @@ impl RenderService {
         });
         self.pdf_infos
             .retain(|path, entry| !paths.contains(path) && !matches!(entry, PdfInfoEntry::Failed(_)));
-        self.pdf_access.retain(|request, _| self.entries.contains_key(request));
+        self.access.retain(|request, _| self.entries.contains_key(request));
+        self.queue.retain(|request| self.entries.contains_key(request));
         self.pixels.retain(|source, _| !source.file().is_some_and(|file| paths.contains(file)));
         for path in paths {
             if let Some(catalog) = &mut self.catalog {
@@ -644,7 +725,8 @@ impl RenderService {
     pub fn retry(&mut self, cx: &mut Context<Self>) {
         self.entries.retain(|_, entry| !matches!(entry, Entry::Failed(_)));
         self.pdf_infos.clear();
-        self.pdf_access.retain(|request, _| self.entries.contains_key(request));
+        self.access.retain(|request, _| self.entries.contains_key(request));
+        self.queue.retain(|request| self.entries.contains_key(request));
         self.catalog = None;
         cx.notify();
     }
@@ -680,7 +762,7 @@ fn produce_with_text(
     request: &Request,
     text: Option<Arc<TextSystem>>,
 ) -> Result<Produced, String> {
-    let (bytes, hash) = match &request.source {
+    let (mut bytes, hash) = match &request.source {
         Source::File(path) => {
             let (bytes, stamp) = vault.read_bytes(path).map_err(|e| e.to_string())?;
             (bytes, stamp.hash)
@@ -706,7 +788,8 @@ fn produce_with_text(
     let device =
         u32::try_from(u64::from(request.size) * u64::from(request.scale) / 100).unwrap_or(u32::MAX).max(1);
     let pdf = if let Source::Pdf { page, .. } = &request.source {
-        Some(rich::PdfPage::new(bytes.clone(), *page, device)?)
+        // PDF 解析器拥有源字节；其它渲染器不会再用到它，避免整份文档再复制一次。
+        Some(rich::PdfPage::new(std::mem::take(&mut bytes), *page, device)?)
     } else {
         None
     };
@@ -954,11 +1037,11 @@ mod tests {
         cx.run_until_parked();
         let ready = service.update(cx, |s, cx| s.image(path.clone(), 200, 2., cx));
         let State::Ready { pixels, .. } = ready else { panic!("渲染后应有位图: {ready:?}") };
-        assert_eq!(pixels, size(400, 200));
+        assert_eq!(pixels, size(512, 256));
 
-        // 换宽度：新请求要重新渲染，但占位能用已知尺寸，列表不会从零跳
+        // 换宽度档位：新请求要重新渲染，但占位能用已知尺寸，列表不会从零跳
         let other = service.update(cx, |s, cx| s.image(path.clone(), 100, 2., cx));
-        assert!(matches!(other, State::Pending { pixels: Some(p) } if p == size(400, 200)));
+        assert!(matches!(other, State::Pending { pixels: Some(p) } if p == size(512, 256)));
         cx.run_until_parked();
 
         // 文件改了：缓存项丢弃，重新渲染出新尺寸
@@ -971,7 +1054,294 @@ mod tests {
         cx.run_until_parked();
         let ready = service.update(cx, |s, cx| s.image(path.clone(), 200, 2., cx));
         let State::Ready { pixels, .. } = ready else { panic!("改动后应重新渲染: {ready:?}") };
-        assert_eq!(pixels, size(400, 400));
+        assert_eq!(pixels, size(512, 512));
+    }
+
+    #[gpui_kit::test]
+    fn service_render_image_widths_reuse_an_upward_bucket(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) = vault_with(&png(1000, 500, [1, 2, 3, 255]), "photo.png");
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        service.update(cx, |s, cx| s.image(path.clone(), 257, 2., cx));
+        cx.run_until_parked();
+        let State::Ready { image, pixels, .. } =
+            service.update(cx, |s, cx| s.image(path.clone(), 257, 2., cx))
+        else {
+            panic!("first image must finish");
+        };
+        for width in 258..=319 {
+            let state = service.update(cx, |s, cx| s.image(path.clone(), width, 2., cx));
+            let State::Ready { image: cached, .. } = state else {
+                panic!("nearby widths should not enqueue another decode: {width}");
+            };
+            assert!(Arc::ptr_eq(&image, &cached));
+            assert!(pixels.width >= width * 2, "bucket must not undersample the display");
+        }
+        service.update(cx, |s, _| assert_eq!(s.entries.len(), 1));
+        assert_eq!(std::fs::read_dir(cache.path().join("images")).unwrap().count(), 1);
+    }
+
+    fn image_paths(vault: &Vault, count: usize) -> Vec<VaultPath> {
+        let bytes = png(8, 4, [1, 2, 3, 255]);
+        (0..count)
+            .map(|i| {
+                let path = VaultPath::new(&format!("image-{i}.png")).unwrap();
+                vault.create_bytes(&path, &bytes).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    #[gpui_kit::test]
+    fn service_render_non_pdf_lru_bounds_entries_and_pixels(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, _) = vault_with(b"unused", "a.txt");
+        let paths = image_paths(&vault, 80);
+        let cache = tempfile::tempdir().unwrap();
+        let vault = Arc::new(vault);
+        for drain in [false, true] {
+            let service = cx.new(|_| RenderService::new(vault.clone(), cache.path().to_path_buf()));
+            for path in &paths[..64] {
+                service.update(cx, |s, cx| s.image(path.clone(), 128, 1., cx));
+                if drain {
+                    cx.run_until_parked();
+                }
+            }
+            // A hit (including a pending hit) must refresh recency.
+            service.update(cx, |s, cx| s.image(paths[0].clone(), 128, 1., cx));
+            for path in &paths[64..] {
+                service.update(cx, |s, cx| s.image(path.clone(), 128, 1., cx));
+                service.update(cx, |s, _| {
+                    assert!(s.entries.len() <= 64, "non-PDF cache must have a finite budget");
+                    assert!(s.entries.contains_key(&req(&paths[0], 128, 100)));
+                    assert!(s.entries.contains_key(&req(path, 128, 100)));
+                    assert!(!s.entries.contains_key(&req(&paths[1], 128, 100)));
+                    assert!(!s.pixels.contains_key(&Source::File(paths[1].clone())));
+                });
+                if drain {
+                    cx.run_until_parked();
+                }
+            }
+            cx.run_until_parked();
+            service.update(cx, |s, _| {
+                assert_eq!(s.entries.len(), 64);
+                assert_eq!(s.pixels.len(), 64);
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn service_render_byte_budget_is_shared_and_preserves_visible_images(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) = vault_with(&png(1, 1, [1, 2, 3, 255]), "photo.png");
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        service.update(cx, |s, _| {
+            let keys = [req(&path, 64, 100), req(&path, 128, 100), pdf_request(&path, 1, 100)];
+            for (i, key) in keys.iter().enumerate() {
+                s.entries.insert(
+                    key.clone(),
+                    super::Entry::Ready {
+                        // Synthetic dimensions exercise accounting without allocating 192 MiB in the test.
+                        image: Arc::new(gpui_kit::RenderImage::new(vec![])),
+                        pixels: size(4096, 4096),
+                        pages: None,
+                    },
+                );
+                s.access.insert(key.clone(), i as u64 + 1);
+            }
+            s.evict(1);
+            assert_eq!(s.entries.len(), 3, "visible resources cannot evict one another");
+            s.evict(3);
+            assert!(!s.entries.contains_key(&keys[0]), "evict the oldest inactive bitmap by bytes");
+            assert!(s.entries.contains_key(&keys[1]));
+            assert!(s.entries.contains_key(&keys[2]));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn service_render_protects_all_current_frame_images(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, _) = vault_with(b"unused", "a.txt");
+        let paths = image_paths(&vault, 80);
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        service.update(cx, |s, cx| {
+            for path in &paths {
+                s.image(path.clone(), 128, 1., cx);
+            }
+        });
+        cx.run_until_parked();
+        for _ in 0..3 {
+            service.update(cx, |s, cx| {
+                for path in &paths {
+                    assert!(
+                        matches!(s.image(path.clone(), 128, 1., cx), State::Ready { .. }),
+                        "visible images must not evict one another"
+                    );
+                }
+            });
+            cx.run_until_parked();
+        }
+        service.update(cx, |s, cx| s.image(paths[79].clone(), 128, 1., cx));
+        service.update(cx, |s, _| {
+            assert_eq!(s.entries.len(), 64);
+            assert_eq!(s.pixels.len(), 64);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn service_render_bounds_expensive_jobs_during_a_request_storm(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, _) = vault_with(b"unused", "a.txt");
+        let paths = image_paths(&vault, 100);
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        for path in &paths {
+            service.update(cx, |s, cx| s.image(path.clone(), 128, 1., cx));
+            service.update(cx, |s, _| {
+                let jobs =
+                    s.entries.values().filter(|entry| matches!(entry, super::Entry::Pending { .. })).count();
+                assert!(jobs <= 2, "request storms must not spawn one task per image: {jobs}");
+                assert!(s.running.len() <= 2);
+                assert!(s.queue.len() <= 32);
+            });
+        }
+        cx.run_until_parked();
+        assert!(matches!(
+            service.update(cx, |s, cx| s.image(paths[99].clone(), 128, 1., cx)),
+            State::Ready { .. }
+        ));
+    }
+
+    #[gpui_kit::test]
+    fn service_render_prioritizes_latest_width_before_decoding_backlog(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) = vault_with(&png(8, 4, [1, 2, 3, 255]), "photo.png");
+        let hash = vault.read_bytes(&path).unwrap().1.hash;
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        service.update(cx, |s, cx| {
+            for width in (128..=12800).step_by(128) {
+                s.image(path.clone(), width, 1., cx);
+            }
+        });
+        park_background_reply(cx);
+        let files = std::fs::read_dir(cache.path().join("images")).unwrap().count();
+        assert!(files <= 2, "only the admitted jobs may perform I/O: {files}");
+        assert!(
+            cache_file(cache.path(), &req(&path, 12800, 100), hash).is_file(),
+            "the latest width must be admitted before the old backlog"
+        );
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn service_render_skips_superseded_widths_without_releasing_busy_slots(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let (_dir, vault, path) = vault_with(&png(8, 4, [1, 2, 3, 255]), "photo.png");
+        let hash = vault.read_bytes(&path).unwrap().1.hash;
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        for width in (128..=12800).step_by(128) {
+            service.update(cx, |s, cx| s.image(path.clone(), width, 1., cx));
+            service.update(cx, |s, _| {
+                assert!(s.running.len() <= 2, "obsolete synchronous jobs still occupy their slots");
+                assert!(s.queue.len() <= 32);
+            });
+        }
+        cx.run_until_parked();
+        assert!(cache_file(cache.path(), &req(&path, 12800, 100), hash).is_file());
+        assert!(
+            std::fs::read_dir(cache.path().join("images")).unwrap().count() <= 3,
+            "only the two started jobs and the latest width should decode"
+        );
+        service.update(cx, |s, _| {
+            assert_eq!(s.entries.len(), 1);
+            assert!(s.running.is_empty() && s.queue.is_empty());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn service_render_invalidation_keeps_running_jobs_accounted_for(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, path) = vault_with(&png(8, 4, [1, 2, 3, 255]), "photo.png");
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        for _ in 0..100 {
+            service.update(cx, |s, cx| {
+                s.invalidate(&[path.clone()], cx);
+                s.image(path.clone(), 128, 1., cx);
+            });
+            service.update(cx, |s, _| {
+                assert!(s.running.len() <= 2);
+                assert!(s.next_token <= 2, "invalidation must not admit replacement work early");
+                assert!(s.queue.len() <= 1);
+            });
+        }
+        cx.run_until_parked();
+        assert!(matches!(service.update(cx, |s, cx| s.image(path, 128, 1., cx)), State::Ready { .. }));
+        service.update(cx, |s, _| assert!(s.running.is_empty() && s.queue.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn service_render_budget_includes_math_diagrams_and_failures(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, _) = vault_with(b"unused", "a.txt");
+        let paths = image_paths(&vault, 80);
+        let cache = tempfile::tempdir().unwrap();
+        let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
+        for (i, path) in paths.iter().enumerate() {
+            let request = match i % 3 {
+                0 => req(path, 128, 100),
+                1 => formula(&format!("\\frac{{{i}"), false, 16),
+                _ => diagram_request(&format!("invalid mermaid {i}"), false, "Arial", 100),
+            };
+            service.update(cx, |s, cx| s.state(request, cx));
+            cx.run_until_parked();
+            service.update(cx, |s, _| assert!(s.entries.len() <= 64));
+        }
+        service.update(cx, |s, _| {
+            assert_eq!(s.entries.len(), 64);
+            for kind in [Kind::Image, Kind::Math, Kind::Diagram] {
+                assert!(s.entries.keys().any(|key| key.kind == kind));
+            }
+            assert!(s.entries.values().any(|entry| matches!(entry, super::Entry::Failed(_))));
+            assert!(s.pixels.keys().all(|source| s.entries.keys().any(|key| &key.source == source)));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn service_render_evicted_reply_cannot_revive_or_replace_an_image(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, vault, _) = vault_with(b"unused", "a.txt");
+        let paths = image_paths(&vault, 65);
+        let cache = tempfile::tempdir().unwrap();
+        let vault = Arc::new(vault);
+        for rerequest in [false, true] {
+            let service = cx.new(|_| RenderService::new(vault.clone(), cache.path().to_path_buf()));
+            let request = req(&paths[0], 128, 100);
+            service.update(cx, |s, cx| s.image(paths[0].clone(), 128, 1., cx));
+            park_background_reply(cx);
+            let obsolete = service.update(cx, |s, _| {
+                let super::Entry::Pending { token } = s.entries.get(&request).unwrap() else { panic!() };
+                std::mem::replace(s.running.get_mut(token).unwrap(), gpui_kit::Task::ready(()))
+            });
+            service.update(cx, |s, cx| {
+                for path in &paths[1..] {
+                    s.image(path.clone(), 128, 1., cx);
+                }
+            });
+            service.update(cx, |s, _| assert!(!s.entries.contains_key(&request)));
+            if rerequest {
+                std::fs::write(vault.fs_path(&paths[0]), png(8, 8, [9, 9, 9, 255])).unwrap();
+                service.update(cx, |s, cx| s.image(paths[0].clone(), 128, 1., cx));
+            }
+            finish_obsolete(&obsolete, cx);
+            service.update(cx, |s, _| {
+                if rerequest {
+                    assert!(matches!(s.entries.get(&request), Some(super::Entry::Pending { .. } | super::Entry::Waiting))
+                        || matches!(s.entries.get(&request), Some(super::Entry::Ready { pixels, .. }) if *pixels == size(8, 8)));
+                } else {
+                    assert!(!s.entries.contains_key(&request));
+                    assert!(!s.pixels.contains_key(&request.source));
+                }
+            });
+            cx.run_until_parked();
+        }
     }
 
     /// 解析走的是补全同一套规则；导入 / 删除只增量维护目录，不重扫整库。
@@ -1274,10 +1644,8 @@ mod tests {
             service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx));
             park_background_reply(cx);
             let obsolete = service.update(cx, |s, _| {
-                let super::Entry::Pending { _task, .. } = s.entries.get_mut(&request).unwrap() else {
-                    panic!()
-                };
-                std::mem::replace(_task, gpui_kit::Task::ready(()))
+                let super::Entry::Pending { token } = s.entries.get(&request).unwrap() else { panic!() };
+                std::mem::replace(s.running.get_mut(token).unwrap(), gpui_kit::Task::ready(()))
             });
             service.update(cx, |s, cx| {
                 for page in 2..=13 {
@@ -1296,7 +1664,7 @@ mod tests {
             finish_obsolete(&obsolete, cx);
             service.update(cx, |s, _| {
                 if rerequest {
-                    assert!(matches!(s.entries.get(&request), Some(super::Entry::Pending { .. }))
+                    assert!(matches!(s.entries.get(&request), Some(super::Entry::Pending { .. } | super::Entry::Waiting))
                         || matches!(s.entries.get(&request), Some(super::Entry::Ready { pixels, .. }) if *pixels == size(200, 300)), "旧回调覆盖重新请求的页面");
                 } else {
                     assert!(!s.entries.contains_key(&request), "旧回调不能复活已淘汰 entry");
@@ -1341,7 +1709,7 @@ mod tests {
             s.pdf(b.clone(), 7, 200, 1., cx);
         });
         cx.run_until_parked();
-        service.update(cx, |s, _| assert_eq!(s.pdf_access.len(), 12));
+        service.update(cx, |s, _| assert_eq!(s.access.len(), 12));
     }
 
     #[gpui_kit::test]

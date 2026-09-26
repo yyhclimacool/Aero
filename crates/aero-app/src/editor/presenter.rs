@@ -95,7 +95,7 @@ impl Editor {
         let mut specs = Vec::new();
         let spec =
             |key, range, enter_newline, extra| Spec { key, range, enter_newline, extra, measure: None };
-        for unit in &self.units {
+        for unit in self.viewport.unit_ranges.iter().flat_map(|range| &self.units[range.clone()]) {
             if self.block_shows_source(unit.id) {
                 continue;
             }

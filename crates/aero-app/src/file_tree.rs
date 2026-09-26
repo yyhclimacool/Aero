@@ -154,15 +154,27 @@ impl Folder {
 
 /// 一次磁盘枚举的结果：目录树与每篇笔记的附件。只读磁盘，可以在后台线程做。
 struct Scan {
-    tree: Result<Folder, String>,
+    tree: Result<(Folder, HashSet<VaultPath>), String>,
     attachments: BTreeMap<VaultPath, Vec<VaultPath>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Scan {
     fn read(vault: &Vault) -> Scan {
+        #[cfg(test)]
+        SCAN_READS.with(|count| count.set(count.get() + 1));
         let tree = vault
             .notes()
-            .and_then(|notes| vault.folders().map(|folders| Folder::build(&notes, &folders)))
+            .and_then(|notes| {
+                vault.folders().map(|folders| {
+                    let root = Folder::build(&notes, &folders);
+                    (root, notes.into_iter().collect())
+                })
+            })
             .map_err(|e| e.to_string());
         // 附件只按后缀枚举、不读内容；枚举失败不影响笔记树
         let mut attachments: BTreeMap<VaultPath, Vec<VaultPath>> = BTreeMap::new();
@@ -192,6 +204,8 @@ enum Row {
     VaultHeader {
         expanded: bool,
     },
+    /// 初次扫描尚未完成，不能把空快照当作空 vault。
+    VaultLoading,
     /// vault 里一篇笔记、一个文件夹都没有
     VaultEmpty,
     Folder {
@@ -214,6 +228,12 @@ enum Row {
 pub struct FileTree {
     vault: Arc<Vault>,
     root: Folder,
+    /// 与 root 同一快照的路径索引，监听批次只查询成员关系，不遍历或重建目录树。
+    notes: HashSet<VaultPath>,
+    loading: bool,
+    expand_initial_folders: bool,
+    reveal_after_scan: bool,
+    scan_generation: u64,
     /// 展开的文件夹路径，以及展开了附件的笔记路径（笔记路径带 `.md`，不会与文件夹撞）
     expanded: HashSet<String>,
     /// 笔记 → 它 `<note>.assets/` 下的附件
@@ -245,6 +265,11 @@ impl FileTree {
         let mut this = FileTree {
             vault,
             root: Folder::default(),
+            notes: HashSet::new(),
+            loading: true,
+            expand_initial_folders: true,
+            reveal_after_scan: true,
+            scan_generation: 0,
             expanded: HashSet::new(),
             attachments: BTreeMap::new(),
             references: None,
@@ -263,12 +288,8 @@ impl FileTree {
             focus_handle: cx.focus_handle(),
             error: None,
         };
-        this.rescan();
-        // 默认展开第一层，让新用户一眼看到内容
-        for f in &this.root.folders {
-            this.expanded.insert(f.path.clone());
-        }
         this.rebuild_rows();
+        this.rescan_in_background(cx);
         this
     }
 
@@ -318,42 +339,69 @@ impl FileTree {
 
     /// 重新枚举磁盘上的笔记和目录（包括空目录）与每篇笔记的附件。用户操作之后调用，调用方紧接着要用新树。
     pub fn rescan(&mut self) {
+        self.scan_generation += 1;
+        self.scan_again = false;
         let scan = Scan::read(&self.vault);
-        self.apply(scan);
+        self.apply(self.scan_generation, scan);
     }
 
     /// 文件监听触发的重扫放到后台：目录遍历在有安全软件逐个审计文件访问的机器上可能要几秒，
     /// 不能卡住界面。扫描中又来请求就在这次结束后再扫一次，同时最多一个在跑。
     pub fn rescan_in_background(&mut self, cx: &mut Context<Self>) {
+        self.scan_generation += 1;
         if self.scanning.is_some() {
             self.scan_again = true;
             return;
         }
+        let generation = self.scan_generation;
         let vault = self.vault.clone();
         let scan = cx.background_spawn(async move { Scan::read(&vault) });
         self.scanning = Some(cx.spawn(async move |this, cx| {
             let scan = scan.await;
             let _ = this.update(cx, |this, cx| {
                 this.scanning = None;
-                this.apply(scan);
-                cx.notify();
+                this.apply(generation, scan);
                 if std::mem::take(&mut this.scan_again) {
                     this.rescan_in_background(cx);
                 }
+                cx.notify();
             });
         }));
     }
 
-    fn apply(&mut self, scan: Scan) {
+    fn apply(&mut self, generation: u64, scan: Scan) {
+        if generation != self.scan_generation {
+            return;
+        }
+        self.loading = false;
         match scan.tree {
-            Ok(root) => {
+            Ok((root, notes)) => {
+                // 默认只在首次成功加载时展开第一层；加载期间的显式收起优先。
+                if std::mem::take(&mut self.expand_initial_folders) {
+                    self.expanded.extend(root.folders.iter().map(|folder| folder.path.clone()));
+                }
                 self.root = root;
+                self.notes = notes;
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
         }
         self.attachments = scan.attachments;
         self.rebuild_rows();
+        // 普通刷新保留手动滚动位置；只补做初次加载或扫描期间请求的定位。
+        if std::mem::take(&mut self.reveal_after_scan) {
+            self.scroll_to_selection();
+        }
+    }
+
+    fn scroll_to_selection(&self) {
+        if let Some(ix) = self.rows.iter().position(|row| match row {
+            Row::Note { path, .. } => self.selected.as_ref() == Some(path),
+            Row::Folder { path, .. } => self.selected_folder.as_ref().is_some_and(|p| p.as_str() == path),
+            _ => false,
+        }) {
+            self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        }
     }
 
     /// 后台扫出来的引用计数（工作区送进来）：用来标出没人引用的附件。
@@ -389,6 +437,7 @@ impl FileTree {
 
     /// 收起所有文件夹（收藏与 vault 分区保持原样）。
     pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.expand_initial_folders = false;
         self.expanded.clear();
         self.rebuild_rows();
         cx.notify();
@@ -407,11 +456,9 @@ impl FileTree {
         }
         self.selected = None;
         self.selected_folder = VaultPath::new(dir).ok();
+        self.reveal_after_scan = self.loading || self.scanning.is_some();
         self.rebuild_rows();
-        if let Some(ix) = self.rows.iter().position(|r| matches!(r, Row::Folder { path, .. } if path == dir))
-        {
-            self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
-        }
+        self.scroll_to_selection();
         cx.notify();
     }
 
@@ -422,14 +469,7 @@ impl FileTree {
 
     /// 树里是否有这篇笔记（上次 `rescan` 时磁盘上的、且没被忽略规则过滤掉）。
     pub fn contains(&self, path: &VaultPath) -> bool {
-        let mut cur = &self.root;
-        for seg in path.parent().split('/').filter(|s| !s.is_empty()) {
-            match cur.folders.iter().find(|f| f.name == seg) {
-                Some(f) => cur = f,
-                None => return false,
-            }
-        }
-        cur.notes.contains(path)
+        self.notes.contains(path)
     }
 
     /// 当前选中的文件夹（选中的是笔记时取其所在目录），用于新建笔记的位置规则（3.5）。
@@ -467,13 +507,9 @@ impl FileTree {
             }
         }
         self.selected = path;
+        self.reveal_after_scan = self.selected.is_some() && (self.loading || self.scanning.is_some());
         self.rebuild_rows();
-        if let Some(sel) = &self.selected
-            && let Some(ix) =
-                self.rows.iter().position(|r| matches!(r, Row::Note { path, .. } if path == sel))
-        {
-            self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
-        }
+        self.scroll_to_selection();
         cx.notify();
     }
 
@@ -518,7 +554,7 @@ impl FileTree {
             let before = rows.len();
             walk(&self.root, 0, &self.expanded, &self.attachments, &mut rows);
             if rows.len() == before {
-                rows.push(Row::VaultEmpty);
+                rows.push(if self.loading { Row::VaultLoading } else { Row::VaultEmpty });
             }
         }
         self.row_sizes = Rc::new(vec![size(px(200.), px(ROW_HEIGHT)); rows.len()]);
@@ -706,7 +742,7 @@ impl FileTree {
                 .child("还没有收藏。在笔记上点 ☆ 收藏")
                 .into_any_element(),
             Row::Favorite { path } => {
-                let exists = self.contains(&path);
+                let exists = self.loading || self.contains(&path);
                 let selected = self.selected.as_ref() == Some(&path);
                 let (open_path, star_path) = (path.clone(), path.clone());
                 let dir = path.parent().to_owned();
@@ -806,7 +842,7 @@ impl FileTree {
                     }))
                     .into_any_element()
             }
-            Row::VaultEmpty => div()
+            Row::VaultEmpty | Row::VaultLoading => div()
                 .w_full()
                 .h(px(ROW_HEIGHT))
                 .pl(indent(0))
@@ -816,7 +852,11 @@ impl FileTree {
                 .text_xs()
                 .text_color(muted)
                 .truncate()
-                .child("这个 vault 还没有笔记。按 ⌘N 新建一篇。")
+                .child(if self.loading {
+                    "正在读取笔记目录…"
+                } else {
+                    "这个 vault 还没有笔记。按 ⌘N 新建一篇。"
+                })
                 .into_any_element(),
             Row::Folder { path, name, depth, expanded } => h_flex()
                 .id(("folder", ix))
@@ -1172,7 +1212,225 @@ mod tests {
         std::fs::write(dir.path().join("root.md"), "# Root\n").unwrap();
         let vault = Arc::new(Vault::open(dir.path()).unwrap());
         let (tree, _) = cx.add_window_view(|_, cx| FileTree::new(vault.clone(), cx));
+        cx.run_until_parked();
+        tree.read_with(cx, |tree, _| {
+            assert!(!tree.is_scanning(), "setup must wait for the initial scan");
+            assert!(tree.contains(&aero_core::VaultPath::new("source/a.md").unwrap()));
+        });
         (dir, vault, tree)
+    }
+
+    fn large_vault() -> (tempfile::TempDir, Arc<Vault>) {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..100 {
+            std::fs::write(dir.path().join(format!("{i:04}.md")), "note").unwrap();
+        }
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        (dir, vault)
+    }
+
+    #[gpui_kit::test]
+    fn background_rescan_preserves_manual_scroll_away_from_selection(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (dir, vault) = large_vault();
+        let (tree, visual) = cx.add_window_view(|_, cx| FileTree::new(vault, cx));
+        draw(visual);
+        let selected = aero_core::VaultPath::new("0000.md").unwrap();
+        tree.update(visual, |tree, cx| tree.select(Some(selected.clone()), cx));
+        draw(visual);
+        tree.update(visual, |tree, cx| {
+            tree.scroll.set_offset(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(-1400.)));
+            cx.notify();
+        });
+        draw(visual);
+        let offset = tree.read_with(visual, |tree, _| tree.scroll.offset());
+        assert_eq!(offset.y, gpui_kit::px(-1400.));
+        assert!(visual.debug_bounds("file-tree-note:0000.md").is_none());
+        std::fs::write(dir.path().join("new.md"), "external addition").unwrap();
+        tree.update(visual, |tree, cx| tree.rescan_in_background(cx));
+        draw(visual);
+        tree.read_with(visual, |tree, _| {
+            assert!(tree.contains(&aero_core::VaultPath::new("new.md").unwrap()));
+            assert_eq!(tree.selected(), Some(&selected));
+            assert_eq!(tree.scroll.offset(), offset, "background refresh must not recenter selection");
+        });
+        tree.update(visual, |tree, cx| {
+            tree.rescan();
+            cx.notify();
+        });
+        draw(visual);
+        assert_eq!(tree.read_with(visual, |tree, _| tree.scroll.offset()), offset);
+    }
+
+    #[gpui_kit::test]
+    fn initial_async_selection_reveals_note_after_scan(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_dir, vault) = large_vault();
+        let (tree, visual) = cx.add_window_view(|_, cx| {
+            let mut tree = FileTree::new(vault, cx);
+            tree.select(Some(aero_core::VaultPath::new("0099.md").unwrap()), cx);
+            assert!(tree.is_scanning());
+            tree
+        });
+        draw(visual);
+        assert!(visual.debug_bounds("file-tree-note:0099.md").is_some(), "initial selection must reveal");
+        assert!(tree.read_with(visual, |tree, _| tree.scroll.offset().y < gpui_kit::px(0.)));
+    }
+
+    #[gpui_kit::test]
+    fn explicit_selection_during_pending_rescan_reveals_new_rows(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (dir, vault) = large_vault();
+        let (tree, visual) = cx.add_window_view(|_, cx| FileTree::new(vault, cx));
+        draw(visual);
+        std::fs::write(dir.path().join("new.md"), "new note").unwrap();
+        tree.update(visual, |tree, cx| {
+            tree.rescan_in_background(cx);
+            tree.select(Some(aero_core::VaultPath::new("new.md").unwrap()), cx);
+        });
+        draw(visual);
+        assert!(visual.debug_bounds("file-tree-note:new.md").is_some());
+        std::fs::create_dir_all(dir.path().join("new-folder/deep")).unwrap();
+        tree.update(visual, |tree, cx| {
+            tree.rescan_in_background(cx);
+            tree.reveal_folder("new-folder/deep", cx);
+        });
+        draw(visual);
+        assert!(visual.debug_bounds("file-tree-folder:new-folder/deep").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn startup_tree_loads_in_background_and_preserves_selection(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested/deep")).unwrap();
+        std::fs::write(dir.path().join("nested/deep/n.md"), "note").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let note = aero_core::VaultPath::new("nested/deep/n.md").unwrap();
+        let (tree, visual) = cx.add_window_view(|_, cx| {
+            let reads = super::SCAN_READS.with(|count| count.get());
+            let mut tree = FileTree::new(vault, cx);
+            assert_eq!(super::SCAN_READS.with(|count| count.get()), reads, "no foreground Scan::read");
+            assert!(tree.root.folders.is_empty(), "construction must not enumerate the vault");
+            assert!(tree.is_scanning(), "initial population must use the background scanner");
+            tree.select(Some(note.clone()), cx);
+            tree.set_favorites(vec![note.clone()], cx);
+            tree
+        });
+        visual.run_until_parked();
+        tree.read_with(visual, |tree, _| {
+            assert!(!tree.is_scanning());
+            assert!(tree.contains(&note));
+            assert_eq!(tree.selected(), Some(&note));
+            assert!(tree.expanded.contains("nested"));
+            assert!(tree.expanded.contains("nested/deep"));
+            assert!(tree.rows.iter().any(|row| matches!(row, Row::Note { path, .. } if path == &note)));
+            assert!(tree.rows.iter().any(|row| matches!(row, Row::Favorite { path } if path == &note)));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn initial_scan_honors_collapsed_sections_and_revealed_folder(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested/deep")).unwrap();
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let (tree, visual) = cx.add_window_view(|_, cx| {
+            let mut tree = FileTree::new(vault, cx);
+            tree.collapse_all(cx);
+            tree.toggle_section(true, cx);
+            tree.reveal_folder("nested/deep", cx);
+            assert!(tree.rows.iter().any(|row| matches!(row, Row::VaultLoading)));
+            tree
+        });
+        visual.run_until_parked();
+        tree.read_with(visual, |tree, _| {
+            assert!(!tree.loading);
+            assert_eq!(tree.selected_folder().map(|p| p.as_str()), Some("nested/deep"));
+            assert!(tree.expanded.contains("nested/deep"));
+            assert!(!tree.expanded.contains("other"), "initial expansion must not undo collapse_all");
+            assert!(tree.rows.iter().any(|row| matches!(row, Row::FavoritesHeader { expanded: false })));
+            assert!(
+                tree.rows.iter().any(|row| matches!(row, Row::Folder { path, .. } if path == "nested/deep"))
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn background_refresh_updates_membership_without_rebuilding_for_queries(cx: &mut TestAppContext) {
+        let (dir, _vault, tree) = setup(cx);
+        let removed = aero_core::VaultPath::new("root.md").unwrap();
+        let added = aero_core::VaultPath::new("source/new.md").unwrap();
+        std::fs::remove_file(dir.path().join(removed.as_str())).unwrap();
+        std::fs::write(dir.path().join(added.as_str()), "new").unwrap();
+        tree.update(cx, |tree, cx| {
+            tree.rescan_in_background(cx);
+            assert!(tree.is_scanning());
+            assert!(tree.contains(&removed));
+            assert!(!tree.contains(&added));
+        });
+        cx.run_until_parked();
+        tree.read_with(cx, |tree, _| {
+            assert!(!tree.is_scanning());
+            assert!(!tree.contains(&removed));
+            let row_sizes = tree.row_sizes.clone();
+            for _ in 0..2048 {
+                assert!(tree.contains(&added));
+            }
+            assert!(std::rc::Rc::ptr_eq(&row_sizes, &tree.row_sizes));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn stale_scan_cannot_overwrite_a_synchronous_refresh(cx: &mut TestAppContext) {
+        let (dir, vault, tree) = setup(cx);
+        let stale = super::Scan::read(&vault);
+        let removed = aero_core::VaultPath::new("root.md").unwrap();
+        let added = aero_core::VaultPath::new("new.md").unwrap();
+        std::fs::remove_file(dir.path().join(removed.as_str())).unwrap();
+        std::fs::write(dir.path().join(added.as_str()), "new").unwrap();
+        tree.update(cx, |tree, cx| {
+            tree.rescan_in_background(cx);
+            let generation = tree.scan_generation;
+            tree.rescan();
+            tree.apply(generation, stale);
+            assert!(tree.contains(&added));
+            assert!(!tree.contains(&removed));
+        });
+        cx.run_until_parked();
+        tree.read_with(cx, |tree, _| {
+            assert!(tree.contains(&added));
+            assert!(!tree.contains(&removed));
+            assert!(!tree.is_scanning());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn queued_rescan_ignores_obsolete_snapshot_and_refreshes_once_ready(cx: &mut TestAppContext) {
+        let (dir, vault, tree) = setup(cx);
+        let intermediate = aero_core::VaultPath::new("intermediate.md").unwrap();
+        let latest = aero_core::VaultPath::new("latest.md").unwrap();
+        std::fs::write(dir.path().join(intermediate.as_str()), "intermediate").unwrap();
+        let stale = super::Scan::read(&vault);
+        tree.update(cx, |tree, cx| {
+            tree.rescan_in_background(cx);
+            let generation = tree.scan_generation;
+            std::fs::remove_file(dir.path().join(intermediate.as_str())).unwrap();
+            std::fs::write(dir.path().join(latest.as_str()), "latest").unwrap();
+            tree.rescan_in_background(cx);
+            tree.rescan_in_background(cx);
+            assert!(tree.scan_again);
+            tree.apply(generation, stale);
+            assert!(!tree.contains(&intermediate), "a queued refresh invalidates the active scan");
+        });
+        cx.run_until_parked();
+        tree.read_with(cx, |tree, _| {
+            assert!(!tree.is_scanning());
+            assert!(!tree.scan_again);
+            assert!(tree.contains(&latest));
+            assert!(!tree.contains(&intermediate));
+        });
     }
 
     fn draw(cx: &mut VisualTestContext) {

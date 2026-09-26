@@ -2,7 +2,7 @@
 //!
 //! - 打开 vault 时在后台线程打开索引并与磁盘对齐（每篇一把锁，期间搜索与保存不用等整个同步）；
 //! - 编辑器保存 / 重命名 / 删除后增量更新；文件监听报告的路径按指纹对齐（`note_touched`）；
-//! - 空闲 30 s `flush()`，退出时同步 flush（ADR 0003：保存路径上不 flush）；
+//! - 空闲 30 s `flush()`，退出前异步 drain / flush 并等待原生句柄关闭；
 //! - `optimize()`：全量同步写入超过阈值后立刻做一次；平时累计增量写入达到阈值、且距上次超过 10 分钟，
 //!   在空闲 flush 之后顺带做（合并段文件，搜索不会越用越慢）；
 //! - 进度用原子量暴露，前台定时器轮询刷新状态栏（`ui_design.md` 2.1）。
@@ -47,6 +47,7 @@ struct Shared {
     done: AtomicUsize,
     total: AtomicUsize,
     cancelled: AtomicBool,
+    closing: AtomicBool,
     error: Mutex<Option<String>>,
     report: Mutex<Option<SyncReport>>,
     writes: Mutex<WriteProgress>,
@@ -89,8 +90,9 @@ impl Shared {
     }
 
     fn set_phase(&self, phase: u8) {
+        // Startup runs on a native thread. Only the GPUI progress task may wake
+        // executor futures (the deterministic test scheduler is thread-confined).
         self.phase.store(phase, Ordering::Release);
-        self.wake_waiters();
     }
 
     fn wake_waiters(&self) {
@@ -107,12 +109,44 @@ pub struct SearchService {
     shared: Arc<Shared>,
     submitted_writes: usize,
     /// 打开 + 全量对齐的专用线程；[`Self::close_blocking`] 会等它停下
-    sync_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    sync_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Covers join AND handle destruction, including a concurrent Drop/forced shutdown.
+    close_lock: Arc<Mutex<()>>,
     _poll: Option<Task<()>>,
     flush_task: Option<Task<()>>,
     /// 上次 optimize 之后的增量写入次数
     writes_since_optimize: usize,
     last_optimize: Instant,
+}
+
+/// Kept by app shutdown futures as well as services. A GPUI shutdown timeout drops
+/// this guard synchronously, so native destruction can never escape into process exit.
+pub(crate) struct SearchShutdown {
+    indexer: Arc<Mutex<Option<Indexer>>>,
+    shared: Arc<Shared>,
+    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    lock: Arc<Mutex<()>>,
+}
+
+impl Drop for SearchShutdown {
+    fn drop(&mut self) {
+        self.shared.closing.store(true, Ordering::Release);
+        self.shared.cancelled.store(true, Ordering::Release);
+        self.shared.wake_waiters();
+        let _closing = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(thread) = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            if let Err(error) = thread.join() {
+                log::error!("index sync thread panicked: {error:?}");
+            }
+        }
+        let mut guard = self.indexer.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ix) = guard.as_mut() {
+            if let Err(error) = ix.flush() {
+                log::warn!("index flush: {error}");
+            }
+        }
+        *guard = None;
+    }
 }
 
 impl SearchService {
@@ -127,6 +161,7 @@ impl SearchService {
             loop {
                 cx.background_executor().timer(PROGRESS_POLL).await;
                 let Ok(done) = this.update(cx, |this, cx| {
+                    this.shared.wake_waiters();
                     cx.notify();
                     matches!(this.phase(), Phase::Idle | Phase::Failed(_))
                 }) else {
@@ -141,7 +176,8 @@ impl SearchService {
             indexer,
             shared,
             submitted_writes: 0,
-            sync_thread: Mutex::new(sync_thread),
+            sync_thread: Arc::new(Mutex::new(sync_thread)),
+            close_lock: Arc::default(),
             _poll: Some(poll),
             flush_task: None,
             writes_since_optimize: 0,
@@ -423,32 +459,31 @@ impl SearchService {
         });
     }
 
-    /// 退出 / 切换 vault 前：停掉同步线程，flush，并在**当前线程**上释放引擎句柄。
-    /// 之后还在飞的后台任务拿到锁只会看到 `None`，什么都不做。
-    ///
-    /// 必须同步做：引擎句柄若留给最后一个持有 `Arc` 的后台任务顺手释放，可能正好撞上 `exit()`
-    /// 在跑 C++ 静态析构（销毁引擎的全局线程池），2026-09-16 的三份崩溃报告都是这一条
-    /// （`zvec_collection_close` 在 GCD 线程上 vs 主线程 `__cxa_finalize_ranges`）。
-    /// 同理，切换到同一个 vault 时新句柄必须在旧句柄关掉之后再开，否则锁不上。
+    /// Drain accepted writes, join startup, flush and destroy the native handle off-thread.
+    /// Await completion BEFORE quitting or reopening the same index. The service must
+    /// remain owned until then; forced termination additionally keeps a shutdown guard.
+    pub fn close_async(&self, cx: &App) -> Task<()> {
+        self.shared.closing.store(true, Ordering::Release);
+        let guard = self.shutdown_guard();
+        let through = self.submitted_writes;
+        cx.background_spawn(async move {
+            guard.shared.wait_for_writes(through, false).await;
+            drop(guard);
+        })
+    }
+
+    pub(crate) fn shutdown_guard(&self) -> SearchShutdown {
+        SearchShutdown {
+            shared: self.shared.clone(),
+            indexer: self.indexer.clone(),
+            thread: self.sync_thread.clone(),
+            lock: self.close_lock.clone(),
+        }
+    }
+
+    /// Drop/forced-exit fallback. Ordinary actions await `close_async` first.
     pub fn close_blocking(&self) {
-        self.shared.cancelled.store(true, Ordering::Release);
-        // Only an operation already holding the indexer lock can delay close, never queued work.
-        self.shared.wake_waiters();
-        // 等同步线程停下（它每篇检查一次 cancelled；还在打开索引时会在存进锁之前看到 cancelled）
-        if let Some(handle) = self.sync_thread.lock().unwrap_or_else(|p| p.into_inner()).take()
-            && let Err(e) = handle.join()
-        {
-            log::error!("index sync thread panicked: {e:?}");
-        }
-        let mut guard = self.indexer.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(ix) = guard.as_mut() {
-            if let Err(e) = ix.flush() {
-                log::warn!("index flush: {e}");
-            }
-            log::debug!("index closed on {:?}", std::thread::current().name());
-        }
-        // 引擎句柄在这里关掉
-        *guard = None;
+        drop(self.shutdown_guard());
     }
 
     /// 上次 optimize 后累计的增量写入数（测试观察 optimize 策略用）。
@@ -472,6 +507,9 @@ impl SearchService {
         wait_for_sync: bool,
         op: impl FnOnce(&mut Indexer) -> Result<bool, String> + Send + 'static,
     ) {
+        if self.shared.closing.load(Ordering::Acquire) {
+            return;
+        }
         let previous = self.submitted_writes;
         self.submitted_writes += 1;
         let indexer = self.indexer.clone();
@@ -727,7 +765,10 @@ mod tests {
 
     /// Freeze startup without depending on the OS sync thread or wall-clock delays.
     fn set_phase(service: &Entity<SearchService>, phase: u8, cx: &mut TestAppContext) {
-        service.update(cx, |s, _| s.shared.set_phase(phase));
+        service.update(cx, |s, _| {
+            s.shared.set_phase(phase);
+            s.shared.wake_waiters();
+        });
     }
 
     #[gpui_kit::test]
@@ -1014,6 +1055,57 @@ mod tests {
         let reopened = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
         idle(cx, &reopened);
         cx.update(|cx| reopened.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn async_close_drains_writes_and_releases_index_before_reopen(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "body\n").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        let wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        service.update(cx, |s, cx| {
+            let wrote = wrote.clone();
+            s.run(cx, false, move |_| {
+                wrote.store(true, std::sync::atomic::Ordering::Release);
+                Ok(true)
+            });
+        });
+        let close = cx.update(|cx| service.read(cx).close_async(cx));
+        assert!(!wrote.load(std::sync::atomic::Ordering::Acquire), "close must yield to the executor");
+        cx.foreground_executor().block_on(close);
+        assert!(wrote.load(std::sync::atomic::Ordering::Acquire), "accepted writes must drain");
+        cx.update(|cx| {
+            let s = service.read(cx);
+            assert!(s.indexer.lock().unwrap().is_none());
+            assert!(s.sync_thread.lock().unwrap().is_none());
+        });
+        let reopened = cx.new(|cx| SearchService::new(vault, data.path().into(), cx));
+        idle(cx, &reopened);
+        cx.update(|cx| reopened.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn shutdown_timeout_guard_destroys_native_handle_even_with_unpolled_cleanup(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault, data.path().into(), cx));
+        idle(cx, &service);
+        let (guard, cleanup) = cx.update(|cx| {
+            let s = service.read(cx);
+            (s.shutdown_guard(), s.close_async(cx))
+        });
+        // Models GPUI dropping an on_app_quit future at its 200 ms timeout.
+        drop(guard);
+        cx.update(|cx| {
+            let s = service.read(cx);
+            assert!(s.indexer.lock().unwrap().is_none());
+            assert!(s.sync_thread.lock().unwrap().is_none());
+        });
+        cx.foreground_executor().block_on(cleanup);
     }
 
     #[gpui_kit::test]

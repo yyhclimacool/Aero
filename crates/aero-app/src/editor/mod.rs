@@ -19,6 +19,7 @@ mod highlight_ui;
 mod images_ui;
 mod inline_format_ui;
 mod inline_links_ui;
+mod io;
 #[cfg(test)]
 mod layout_tests;
 mod link_preview;
@@ -40,6 +41,7 @@ mod tests;
 mod text_ops;
 mod toolbar;
 mod units;
+mod viewport;
 mod wiki;
 mod wiki_ui;
 
@@ -157,7 +159,7 @@ type BannerAction = (&'static str, &'static str, Box<dyn Fn(&mut Editor, &mut Wi
 /// 磁盘上这篇文件相对编辑器所知指纹的状态。
 enum Disk {
     Unchanged,
-    Changed(Vec<u8>, FileStamp),
+    Changed(Vec<u8>),
     Missing,
 }
 
@@ -235,6 +237,8 @@ pub struct Editor {
     /// 上次读 / 写磁盘时文件的指纹，用来发现外部修改（5.5）
     stamp: FileStamp,
     units: Vec<Unit>,
+    unit_indices: std::collections::HashMap<BlockId, usize>,
+    viewport: viewport::Viewport,
     preview: Entity<preview::PreviewState>,
     _preview_subscription: Subscription,
     link_preview: link_preview::LinkPreview,
@@ -246,6 +250,7 @@ pub struct Editor {
     /// 重内容渲染服务（9.9）；没连上时图片按源码显示
     images: Option<Entity<crate::render::RenderService>>,
     images_subscription: Option<Subscription>,
+    imports: images_ui::Imports,
     rich: rich_ui::RichUi,
     /// 全屏看图：双击图片打开，`Space` / `Esc` / 点击关闭
     viewer: Option<ImageViewer>,
@@ -310,6 +315,7 @@ pub struct Editor {
     dirty: bool,
     save_state: SaveState,
     save_task: Option<Task<()>>,
+    io: io::IoState,
     last_edit_at: Option<Instant>,
     /// 正在把点击重放给刚出现的控件（见 `focus_block_at`），此时再收到的点击不要再重放
     replaying_click: bool,
@@ -345,6 +351,8 @@ impl Editor {
             path,
             doc,
             stamp,
+            unit_indices: units.iter().enumerate().map(|(ix, unit)| (unit.id, ix)).collect(),
+            viewport: viewport::Viewport::default(),
             units,
             preview,
             _preview_subscription: preview_subscription,
@@ -355,6 +363,7 @@ impl Editor {
             embeds: embeds_ui::Embeds::default(),
             images: None,
             images_subscription: None,
+            imports: Default::default(),
             rich: Default::default(),
             viewer: None,
             scale: 1.,
@@ -399,6 +408,7 @@ impl Editor {
             dirty: false,
             save_state: SaveState::Clean,
             save_task: None,
+            io: io::IoState::default(),
             last_edit_at: None,
             replaying_click: false,
             _poll_task: poll,
@@ -459,6 +469,8 @@ impl Editor {
         self.wiki = None;
         self.tag_menu = None;
         self.rich.cancel_export();
+        self.io.epoch += 1;
+        self.io.checking = None;
         let old_path = std::mem::replace(&mut self.path, path);
         self.repath_link_preview(&old_path, cx);
         cx.emit(EditorEvent::Changed);
@@ -1451,7 +1463,7 @@ impl Editor {
     // ---- 块 gutter（`ui_design.md` 5.3） ----
 
     fn unit_index(&self, id: BlockId) -> Option<usize> {
-        self.units.iter().position(|u| u.id == id)
+        self.unit_indices.get(&id).copied()
     }
 
     /// 点图片：只记住这张图，方便画选中框和 ⌫ 删除，不给整块上选中底色。
@@ -1727,7 +1739,7 @@ impl Editor {
         self.cancel_link_preview(cx);
         self.doc.reparse();
         self.update_local_link_names();
-        self.units = units::units(&self.doc);
+        self.refresh_units();
         self.refresh_embeds(cx);
         if let Some(f) = self.focused.as_mut() {
             // 单元格、callout 标题与正文从块中间开始：仍属于原来那一块，否则控件会在别处再画一份
@@ -1746,7 +1758,7 @@ impl Editor {
         self.rich.export_menu = None;
         self.sync_diagram_preview(false, cx);
         self.dirty = true;
-        self.save_state = SaveState::Dirty;
+        self.save_state = if self.io.writing { SaveState::Saving } else { SaveState::Dirty };
         self.schedule_save(cx);
         cx.emit(EditorEvent::Changed);
         cx.notify();
@@ -2231,65 +2243,84 @@ impl Editor {
         }));
     }
 
-    /// 立即（异步）写盘。写前先看磁盘有没有被别人改过（5.5 写前校验）。
-    /// 文件已在外部被删时不写：自动保存不该把用户刚删掉的文件变回来（横幅上有"恢复"）。
     pub fn save_now(&mut self, cx: &mut Context<Self>) {
-        if !self.dirty || self.save_state == SaveState::Saving || self.is_deleted() {
+        self.save_task = None;
+        if !self.dirty || self.io.writing || self.io.suspended || self.is_deleted() {
             return;
         }
-        self.save_task = None;
-        match self.disk_state() {
-            Ok(Disk::Changed(disk, stamp)) => {
-                if !self.write_conflict_copy(&disk, stamp, cx) {
-                    return;
-                }
-            }
-            Ok(Disk::Missing) => {
-                self.mark_deleted(cx);
-                return;
-            }
-            Ok(Disk::Unchanged) => {}
-            Err(err) => {
-                self.save_failed(format!("无法校验磁盘版本，已停止保存：{err}"), cx);
-                return;
-            }
-        }
-        self.start_write(cx);
+        self.start_checked_write(false, cx);
     }
 
-    /// 真正的异步写盘，不看磁盘状态（校验在 [`Self::save_now`]；"恢复"要越过"文件不存在"直接写）。
     fn start_write(&mut self, cx: &mut Context<Self>) {
-        let bytes = self.doc.to_bytes();
-        let version = self.doc.version();
-        let (vault, path) = (self.vault.clone(), self.path.clone());
+        self.start_checked_write(true, cx);
+    }
+
+    fn start_checked_write(&mut self, allow_missing: bool, cx: &mut Context<Self>) {
+        if self.io.writing || self.io.suspended {
+            return;
+        }
+        let snapshot = self.doc.snapshot();
+        let version = snapshot.version();
+        let (bom, ending) = (self.doc.bom, self.doc.line_ending);
+        let (vault, path, stamp) = (self.vault.clone(), self.path.clone(), self.stamp);
+        let expected_path = path.clone();
+        let conflict_base = self.conflict_path();
+        let epoch = self.io.epoch;
+        self.io.checking = None;
+        self.io.check_generation += 1;
+        self.io.writing = true;
         self.save_state = SaveState::Saving;
         cx.emit(EditorEvent::Changed);
-        let write = cx.background_spawn(async move { vault.write_bytes(&path, &bytes) });
+        let job = io::WriteJob::spawn(path.clone(), epoch, version, move || {
+            io::save(&vault, &path, stamp, conflict_base, snapshot, bom, ending, allow_missing)
+        });
+        self.io.pending = Some(job.clone());
+        let write = cx.background_spawn(async move { job.wait() });
         cx.spawn(async move |this, cx| {
-            let result = write.await;
+            let outcome = write.await;
             let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(stamp) => {
+                this.io.writing = false;
+                this.io.pending = None;
+                if this.io.epoch != epoch || this.path != expected_path {
+                    if this.save_state == SaveState::Saving {
+                        this.save_state = if this.dirty { SaveState::Dirty } else { SaveState::Clean };
+                    }
+                    cx.emit(EditorEvent::Changed);
+                    cx.notify();
+                    return;
+                }
+                if let Some(copy) = outcome.conflict {
+                    this.set_banner(Some(Banner::Conflict { copy: copy.clone() }), cx);
+                    cx.emit(EditorEvent::PathsTouched(vec![copy]));
+                }
+                match outcome.result {
+                    Ok(Some(stamp)) => {
                         this.stamp = stamp;
                         this.update_local_link_names();
                         if this.doc.version() == version {
                             this.dirty = false;
                             this.save_state = SaveState::Saved(Instant::now());
+                            if let Some(copy) = this.io.remove_after_save.take() {
+                                let file = this.vault.fs_path(&copy);
+                                cx.background_spawn(async move {
+                                    if let Err(error) = std::fs::remove_file(file) {
+                                        log::warn!("remove conflict copy: {error}");
+                                    }
+                                })
+                                .detach();
+                                cx.emit(EditorEvent::PathsTouched(vec![copy]));
+                            }
                             cx.emit(EditorEvent::Saved);
                         } else {
-                            // 写盘期间又有编辑，交给它自己的定时器
                             this.save_state = SaveState::Dirty;
-                            if this.save_task.is_none() {
-                                this.schedule_save(cx);
-                            }
+                            this.schedule_save(cx);
                         }
                     }
-                    Err(err) => {
-                        let msg = err.to_string();
-                        log::error!("save {}: {msg}", this.path.as_str());
-                        this.save_state = SaveState::Failed(msg.clone());
-                        cx.emit(EditorEvent::SaveFailed(msg));
+                    Ok(None) => {
+                        this.save_state = SaveState::Dirty;
+                        this.mark_deleted(cx);
                     }
+                    Err(message) => this.save_failed(message, cx),
                 }
                 cx.emit(EditorEvent::Changed);
                 cx.notify();
@@ -2298,13 +2329,89 @@ impl Editor {
         .detach();
     }
 
+    /// Freeze disk activity while a rename transaction moves and rewrites files.
+    pub(crate) fn suspend_io(&mut self, _cx: &mut Context<Self>) -> bool {
+        if self.io.writing || self.dirty || self.has_pending_export() {
+            return false;
+        }
+        self.save_task = None;
+        self.io.checking = None;
+        self.io.check_generation += 1;
+        self.io.suspended = true;
+        true
+    }
+
+    pub(crate) fn resume_io(&mut self, cx: &mut Context<Self>) {
+        self.io.suspended = false;
+        self.check_external(cx);
+        if self.dirty {
+            self.schedule_save(cx);
+        }
+    }
+
+    pub(crate) fn finish_file_operation(
+        &mut self,
+        path: VaultPath,
+        document: Result<(Document, FileStamp), VaultError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.path != path {
+            self.set_path(path, cx);
+        }
+        match document {
+            Ok((doc, stamp)) if stamp.hash != self.stamp.hash => self.install_document(doc, stamp, cx),
+            Ok((_, stamp)) => self.stamp = stamp,
+            Err(VaultError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                self.mark_deleted(cx)
+            }
+            Err(error) => self.save_failed(format!("无法重载文件操作后的笔记：{error}"), cx),
+        }
+        self.resume_io(cx);
+    }
+
+    /// GPUI may drop its native-quit future without polling it. Both the latest
+    /// snapshot and the accepted write are owned by an immediately started job.
+    pub(crate) fn native_save_barrier(&mut self, cx: &mut Context<Self>) -> (io::SaveGuard, Task<()>) {
+        self.save_task = None;
+        self.io.checking = None;
+        self.io.check_generation += 1;
+        let request = io::SaveRequest {
+            vault: self.vault.clone(),
+            path: self.path.clone(),
+            known: self.stamp,
+            conflict_base: self.conflict_path(),
+            snapshot: self.doc.snapshot(),
+            bom: self.doc.bom,
+            ending: self.doc.line_ending,
+            epoch: self.io.epoch,
+            allow_missing: false,
+        };
+        let guard = request.finish(
+            self.io.pending.clone(),
+            self.dirty && !self.io.suspended && !self.is_deleted(),
+            self.io.remove_after_save.take(),
+        );
+        let job = guard.job();
+        let wait = cx.background_spawn(async move {
+            let _ = job.wait();
+        });
+        (guard, wait)
+    }
+
     pub fn has_pending_export(&self) -> bool {
-        self.rich.export_in_progress()
+        self.rich.export_in_progress() || self.imports.is_pending()
     }
 
     /// 同步落盘（切换笔记、退出前）。有外部修改时同样先留冲突副本，返回其路径。
     /// 文件已在外部被删时不写回（与 [`Self::save_now`] 一致），未保存内容随编辑器丢弃。
+    #[cfg(test)]
     pub fn flush_sync(&mut self) -> Result<Option<VaultPath>, VaultError> {
+        if self.io.writing || self.io.suspended {
+            return Err(VaultError::Io {
+                path: self.vault.fs_path(&self.path),
+                source: std::io::Error::other("正在保存，请稍后再试"),
+            });
+        }
         if self.has_pending_export() {
             return Err(VaultError::Io {
                 path: self.vault.fs_path(&self.path),
@@ -2316,7 +2423,7 @@ impl Editor {
         }
         self.save_task = None;
         let conflict = match self.disk_state()? {
-            Disk::Changed(disk, _) => Some(self.backup_disk(&disk)?),
+            Disk::Changed(disk) => Some(self.backup_disk(&disk)?),
             Disk::Missing => {
                 log::warn!("{}: deleted on disk; unsaved changes dropped", self.path.as_str());
                 return Ok(None);
@@ -2333,68 +2440,106 @@ impl Editor {
     // ---- 外部修改（方案 12：vault 监听 + 2 s 轮询兜底 + 写前校验；不做三方合并） ----
 
     /// 磁盘文件相对编辑器所知指纹的状态：先比 mtime/size（不读内容），变了再比内容 hash。
+    #[cfg(test)]
     fn disk_state(&mut self) -> Result<Disk, VaultError> {
-        let (mtime, size) = match self.vault.stat(&self.path) {
-            Ok(stamp) => stamp,
-            Err(VaultError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Disk::Missing);
-            }
-            Err(err) => return Err(err),
-        };
-        if mtime == self.stamp.mtime && size == self.stamp.size {
-            return Ok(Disk::Unchanged);
-        }
-        let (bytes, stamp) = self.vault.read_bytes(&self.path)?;
-        if stamp.hash == self.stamp.hash {
-            // 只是被 touch 了一下（或同步工具写回同样的内容）
+        let (state, stamp) = io::disk_state(&self.vault, &self.path, self.stamp)?;
+        if matches!(state, Disk::Unchanged) {
             self.stamp = stamp;
-            return Ok(Disk::Unchanged);
         }
-        Ok(Disk::Changed(bytes, stamp))
+        Ok(state)
     }
 
     /// 监听 / 轮询 / 窗口激活时调用：无未保存修改则重载，有则留冲突副本并立即落盘本地版本；
     /// 文件不见了进入"已删除"态，又出现了（比如从废纸篓放回）则解除。
     pub fn check_external(&mut self, cx: &mut Context<Self>) {
-        if self.save_state == SaveState::Saving {
+        if self.io.writing || self.io.suspended || self.io.checking.is_some() {
             return;
         }
-        match self.disk_state() {
-            Ok(Disk::Missing) => self.mark_deleted(cx),
-            Ok(Disk::Unchanged) => {
-                if self.is_deleted() {
-                    self.set_banner(None, cx);
-                    self.update_local_link_names();
-                    if self.dirty {
-                        self.schedule_save(cx);
+        let (vault, path, stamp) = (self.vault.clone(), self.path.clone(), self.stamp);
+        let epoch = self.io.epoch;
+        let version = self.doc.version();
+        self.io.check_generation += 1;
+        let generation = self.io.check_generation;
+        self.io.checking = Some(cx.spawn(async move |this, cx| {
+            let read_path = path.clone();
+            let result = cx
+                .background_spawn(async move {
+                    let (state, stamp) = io::disk_state(&vault, &read_path, stamp)?;
+                    let document = match &state {
+                        Disk::Changed(bytes) => Some(
+                            Document::from_bytes(bytes)
+                                .map_err(|_| VaultError::Utf8 { path: vault.fs_path(&read_path) }),
+                        ),
+                        _ => None,
+                    };
+                    Ok::<_, VaultError>((state, stamp, document))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.io.epoch != epoch || this.path != path || this.io.check_generation != generation {
+                    return;
+                }
+                this.io.checking = None;
+                if this.io.writing || this.io.suspended {
+                    return;
+                }
+                match result {
+                    Ok((Disk::Missing, _, _)) => this.mark_deleted(cx),
+                    Ok((Disk::Unchanged, stamp, _)) => {
+                        this.stamp = stamp;
+                        if this.is_deleted() {
+                            this.set_banner(None, cx);
+                            this.update_local_link_names();
+                            if this.dirty {
+                                this.schedule_save(cx);
+                            }
+                        }
+                        if !this.dirty && matches!(this.save_state, SaveState::Failed(_)) {
+                            this.save_state = SaveState::Clean;
+                            cx.emit(EditorEvent::Changed);
+                            cx.notify();
+                        }
                     }
+                    Ok((Disk::Changed(_), stamp, Some(document))) => {
+                        if this.is_deleted() {
+                            this.set_banner(None, cx);
+                        }
+                        if this.dirty || this.doc.version() != version {
+                            this.save_now(cx);
+                        } else {
+                            match document {
+                                Ok(document) => {
+                                    this.install_document(document, stamp, cx);
+                                    this.set_banner(Some(Banner::Reloaded), cx);
+                                }
+                                Err(error) => this.save_failed(error.to_string(), cx),
+                            }
+                        }
+                    }
+                    Ok(_) => unreachable!(),
+                    Err(error) => this.save_failed(format!("无法读取磁盘版本，已停止保存：{error}"), cx),
                 }
-            }
-            Ok(Disk::Changed(disk, stamp)) => {
-                if self.is_deleted() {
-                    self.set_banner(None, cx);
-                }
-                if self.dirty {
-                    // 统一经过写前校验与备份；失败时不能继续保存。
-                    self.save_now(cx);
-                } else {
-                    self.reload(&disk, stamp, cx);
-                    self.set_banner(Some(Banner::Reloaded), cx);
-                }
-            }
-            Err(err) => self.save_failed(format!("无法读取磁盘版本，已停止保存：{err}"), cx),
-        }
+            });
+        }));
     }
 
     /// 用磁盘内容替换文档（undo 栈随之丢弃）。编辑态退回浏览态：旧的控件区间对新文本已无意义，
     /// 而这里拿不到 `Window` 去重新聚焦——无未保存修改时通常也没人正在打字。
+    #[cfg(test)]
     fn reload(&mut self, disk: &[u8], stamp: FileStamp, cx: &mut Context<Self>) {
-        self.wiki = None;
-        self.tag_menu = None;
         let Ok(doc) = Document::from_bytes(disk) else {
             log::warn!("reload {}: not valid UTF-8, keeping in-memory version", self.path.as_str());
             return;
         };
+        self.install_document(doc, stamp, cx);
+    }
+
+    fn install_document(&mut self, doc: Document, stamp: FileStamp, cx: &mut Context<Self>) {
+        self.wiki = None;
+        self.tag_menu = None;
+        self.io.epoch += 1;
+        self.io.check_generation += 1;
+        self.io.checking = None;
         log::info!("reload {} (changed on disk)", self.path.as_str());
         self.cancel_link_preview(cx);
         self.focused = None;
@@ -2404,7 +2549,7 @@ impl Editor {
         self.doc = doc;
         self.update_local_link_names();
         self.stamp = stamp;
-        self.units = units::units(&self.doc);
+        self.refresh_units();
         self.refresh_embeds(cx);
         self.clamp_selection();
         self.preview.update(cx, |state, _| *state = preview::PreviewState::default());
@@ -2468,27 +2613,49 @@ impl Editor {
     /// 横幅"使用磁盘版本"：把冲突副本的内容换进来并落盘到本笔记，副本删掉（内容已在这里，不会丢）。
     pub fn take_disk_version(&mut self, cx: &mut Context<Self>) {
         let Some(Banner::Conflict { copy }) = self.banner.clone() else { return };
-        let (bytes, _) = match self.vault.read_bytes(&copy) {
-            Ok(v) => v,
-            Err(err) => {
-                cx.emit(EditorEvent::SaveFailed(format!("无法读取冲突副本 {}：{err}", copy.as_str())));
-                return;
-            }
-        };
-        self.reload(&bytes, self.stamp, cx);
-        self.dirty = true;
-        self.save_state = SaveState::Dirty;
-        self.set_banner(None, cx);
-        self.save_now(cx);
-        if let Err(err) = std::fs::remove_file(self.vault.fs_path(&copy)) {
-            log::warn!("remove conflict copy {}: {err}", copy.as_str());
+        if self.io.writing || self.io.suspended {
+            return;
         }
-        cx.emit(EditorEvent::PathsTouched(vec![copy]));
+        let (vault, path) = (self.vault.clone(), self.path.clone());
+        let (epoch, version) = (self.io.epoch, self.doc.version());
+        self.io.checking = None;
+        self.io.check_generation += 1;
+        let source = copy.clone();
+        let read = cx.background_spawn(async move { vault.read(&source) });
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.io.epoch != epoch
+                    || this.path != path
+                    || this.io.writing
+                    || this.io.suspended
+                    || this.doc.version() != version
+                    || this.banner != Some(Banner::Conflict { copy: copy.clone() })
+                {
+                    return;
+                }
+                match result {
+                    Ok((doc, _)) => {
+                        this.install_document(doc, this.stamp, cx);
+                        this.io.remove_after_save = Some(copy);
+                        this.dirty = true;
+                        this.save_state = SaveState::Dirty;
+                        this.set_banner(None, cx);
+                        this.save_now(cx);
+                    }
+                    Err(error) => cx.emit(EditorEvent::SaveFailed(format!(
+                        "无法读取冲突副本 {}：{error}",
+                        copy.as_str()
+                    ))),
+                }
+            });
+        })
+        .detach();
     }
 
     /// 横幅"恢复"：把编辑器里的内容写回原路径。
     pub fn restore_deleted(&mut self, cx: &mut Context<Self>) {
-        if !self.is_deleted() || self.save_state == SaveState::Saving {
+        if self.io.suspended || !self.is_deleted() || self.save_state == SaveState::Saving {
             return;
         }
         self.set_banner(None, cx);
@@ -2548,22 +2715,9 @@ impl Editor {
     }
 
     /// 把磁盘版本另存为冲突副本，然后本地版本继续走正常保存（绝不静默覆盖外部修改）。
+    #[cfg(test)]
     fn backup_disk(&self, disk: &[u8]) -> Result<VaultPath, VaultError> {
-        let base = self.conflict_path();
-        // 一秒内可能收到多次外部保存；同名时换名字，不能覆盖上一份副本。
-        for attempt in 0..1000 {
-            let path = if attempt == 0 {
-                base.clone()
-            } else {
-                VaultPath::new(&format!("{}-{attempt}.md", base.as_str().trim_end_matches(".md")))?
-            };
-            match self.vault.create_bytes(&path, disk) {
-                Ok(_) => return Ok(path),
-                Err(VaultError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(err) => return Err(err),
-            }
-        }
-        Err(VaultError::AlreadyExists(base.to_string()))
+        io::backup(&self.vault, self.conflict_path(), disk)
     }
 
     fn save_failed(&mut self, msg: String, cx: &mut Context<Self>) {
@@ -2574,27 +2728,6 @@ impl Editor {
             cx.emit(EditorEvent::SaveFailed(msg));
             cx.emit(EditorEvent::Changed);
             cx.notify();
-        }
-    }
-
-    fn write_conflict_copy(&mut self, disk: &[u8], stamp: FileStamp, cx: &mut Context<Self>) -> bool {
-        match self.backup_disk(disk) {
-            Ok(conflict) => {
-                log::warn!(
-                    "{}: changed on disk while dirty; disk version saved as {}",
-                    self.path.as_str(),
-                    conflict.as_str()
-                );
-                // 记下磁盘当前指纹：接下来的写盘不该再把同一份外部修改当成新冲突
-                self.stamp = stamp;
-                self.set_banner(Some(Banner::Conflict { copy: conflict.clone() }), cx);
-                cx.emit(EditorEvent::PathsTouched(vec![conflict]));
-                true
-            }
-            Err(err) => {
-                self.save_failed(format!("无法保存冲突副本，已停止保存：{err}"), cx);
-                false
-            }
         }
     }
 
@@ -2723,7 +2856,7 @@ impl Editor {
     /// 这个块（作为编辑单位）在块选区里。
     pub(super) fn is_selected_block(&self, id: BlockId) -> bool {
         let Some(sel) = self.selection else { return false };
-        self.units.iter().position(|u| u.id == id).is_some_and(|ix| sel.contains(ix))
+        self.unit_index(id).is_some_and(|ix| sel.contains(ix))
     }
 
     /// 块选中态的高亮：整块淡底色，与搜索定位的 `accent` 高亮区分。
@@ -2871,25 +3004,8 @@ impl Editor {
         .into_any_element()
     }
 
-    fn render_blocks(&self, blocks: &[Block], cx: &mut Context<Self>) -> Vec<AnyElement> {
-        // 聚焦区间没有落在任何块上（空段落）时，控件画在它所在位置
-        let mut pending = self.focused.as_ref().filter(|f| f.id.is_none()).map(|f| f.range.start);
-        let mut out = Vec::with_capacity(blocks.len() + 1);
-        for b in blocks {
-            if let Some(off) = pending
-                && off <= self.doc.range_of(b).start
-            {
-                out.push(self.render_textarea(None, cx));
-                pending = None;
-            }
-            if let Some(el) = self.render_block(b, 0, None, cx) {
-                out.push(el);
-            }
-        }
-        if pending.is_some() {
-            out.push(self.render_textarea(None, cx));
-        }
-        out
+    fn render_blocks(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.render_viewport(cx)
     }
 
     /// 块颜色作用于整块及其子块（6.3.10）：背景在最外层那个块上铺一次，文字色往下传，
@@ -3617,6 +3733,7 @@ impl Render for Editor {
         crate::colors::apply_text_selection(cx);
         self.sync_navigation();
         self.inline_math_hits.clear();
+        self.unit_bounds.clear();
         if self.dragging_block && !cx.has_active_drag() {
             self.dragging_block = false;
             self.block_drop = None;
@@ -3629,7 +3746,8 @@ impl Render for Editor {
             self.finish_image_resize(window, cx);
         }
         self.validate_link_preview_scroll(cx);
-        self.refresh_fragment_marks();
+        self.refresh_fragment_marks(cx);
+        self.prepare_viewport(window);
         self.sync_presenters(window, cx);
         self.sync_diagram_preview(false, cx);
         self.rich.pdf_readers.borrow_mut().retain(|id, _| {
@@ -3644,8 +3762,7 @@ impl Render for Editor {
         });
         self.scale = window.scale_factor();
         let (foreground, muted) = (cx.theme().foreground, cx.theme().muted_foreground);
-        let roots = self.doc.blocks().roots.clone();
-        let blocks = self.render_blocks(&roots, cx);
+        let blocks = self.render_blocks(cx);
         let empty = self.doc.blocks().is_empty() && self.focused.is_none();
 
         let body = div()
@@ -3753,7 +3870,7 @@ impl Render for Editor {
                     .line_height(relative(BODY_LINE_HEIGHT))
                     .text_color(foreground)
                     .children(self.render_banner(cx))
-                    .child(v_flex().w_full().gap(px(8.)).children(blocks))
+                    .child(blocks)
                     .when(empty, |el| el.child(div().text_color(muted).child("点击这里开始写，或按 ⏎")))
                     .child(
                         div()

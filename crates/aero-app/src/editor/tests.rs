@@ -4055,6 +4055,52 @@ fn external_reload_resets_callout_fold_choices(cx: &mut TestAppContext) {
     assert_eq!(std::fs::read_to_string(file).unwrap(), replacement);
 }
 
+#[gpui_kit::test]
+fn external_check_defers_disk_read_and_parse(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "old\n");
+    std::fs::write(dir.path().join("a.md"), "new from disk\n").unwrap();
+    editor.update(cx, |e, cx| {
+        e.check_external(cx);
+        assert_eq!(e.doc.to_string(), "old\n", "disk read and parse must not run in the UI callback");
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| editor.read(cx).doc.to_string()), "new from disk\n");
+}
+
+#[gpui_kit::test]
+fn save_defers_conflict_backup_until_background_work(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "base\n");
+    std::fs::write(dir.path().join("a.md"), "theirs\n").unwrap();
+    editor.update(cx, |e, cx| {
+        e.doc.edit(aero_core::Edit::insert(0, "mine ")).unwrap();
+        e.after_doc_change(cx);
+        e.save_now(cx);
+        assert!(conflict_copies(dir.path()).is_empty(), "conflict backup must not block the UI callback");
+    });
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "mine base\n");
+    assert_eq!(conflict_copies(dir.path()).len(), 1);
+}
+
+#[gpui_kit::test]
+fn editing_during_external_check_preserves_local_changes(cx: &mut TestAppContext) {
+    let (dir, _vault, _path, editor) = open(cx, "base\n");
+    std::fs::write(dir.path().join("a.md"), "theirs\n").unwrap();
+    editor.update(cx, |e, cx| {
+        e.check_external(cx);
+        e.doc.edit(aero_core::Edit::insert(0, "mine ")).unwrap();
+        e.after_doc_change(cx);
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| editor.read(cx).doc.to_string()), "mine base\n");
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "mine base\n");
+    let copies = conflict_copies(dir.path());
+    assert_eq!(copies.len(), 1);
+    assert_eq!(std::fs::read_to_string(dir.path().join(&copies[0])).unwrap(), "theirs\n");
+}
+
 /// 外部改了文件、这里没有未保存修改：下一次轮询静默重载（方案 12）。
 #[gpui_kit::test]
 fn external_change_reloads_when_clean(cx: &mut TestAppContext) {
@@ -4277,6 +4323,38 @@ fn failed_conflict_backup_preserves_both_versions_and_can_retry(cx: &mut TestApp
     let copies = conflict_copies(dir.path());
     assert_eq!(copies.len(), 1);
     assert_eq!(std::fs::read_to_string(dir.path().join(&copies[0])).unwrap(), "theirs from disk\n");
+}
+
+#[gpui_kit::test]
+fn conflict_choice_keeps_backup_when_save_fails(cx: &mut TestAppContext) {
+    let (dir, vault, _path, editor) = open(cx, "base\n");
+    let copy = VaultPath::new("a.conflict-backup.md").unwrap();
+    vault.create_bytes(&copy, b"disk version\n").unwrap();
+    std::fs::rename(dir.path().join("a.md"), dir.path().join("original.md")).unwrap();
+    std::fs::create_dir(dir.path().join("a.md")).unwrap();
+    editor.update(cx, |e, cx| {
+        e.set_banner(Some(super::Banner::Conflict { copy: copy.clone() }), cx);
+        e.take_disk_version(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(vault.fs_path(&copy)).unwrap(), b"disk version\n");
+    assert_eq!(std::fs::read(dir.path().join("original.md")).unwrap(), b"base\n");
+}
+
+#[gpui_kit::test]
+fn conflict_choice_does_not_replace_newer_input(cx: &mut TestAppContext) {
+    let (_dir, vault, _path, editor) = open(cx, "base\n");
+    let copy = VaultPath::new("a.conflict-backup.md").unwrap();
+    vault.create_bytes(&copy, b"disk version\n").unwrap();
+    editor.update(cx, |e, cx| {
+        e.set_banner(Some(super::Banner::Conflict { copy: copy.clone() }), cx);
+        e.take_disk_version(cx);
+        e.doc.edit(aero_core::Edit::insert(0, "new ")).unwrap();
+        e.after_doc_change(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| editor.read(cx).doc.to_string()), "new base\n");
+    assert!(vault.fs_path(&copy).is_file());
 }
 
 /// 10.2 的横幅：重载 → 蓝色并 10 s 自动消失；冲突 → 黄色，"使用磁盘版本"把副本换进来并删掉副本。
@@ -4946,6 +5024,27 @@ fn markdown_links_open_in_the_browser(cx: &mut TestAppContext) {
         editor.update(cx, |e, cx| e.open_external_link("rustup.rs", window, cx));
     });
     assert_eq!(cx.opened_url().as_deref(), Some("http://rustup.rs"));
+}
+
+#[gpui_kit::test]
+fn attachment_import_defers_file_copy(cx: &mut TestAppContext) {
+    let (dir, _cache, _vault, editor) = open_with_images(cx, "正文\n");
+    let outside = tempfile::tempdir().unwrap();
+    let source = outside.path().join("shot.png");
+    std::fs::write(&source, image_bytes(8, 8)).unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.drop_external_files(&gpui_kit::ExternalPaths(vec![source].into()), window, cx);
+            assert!(
+                !dir.path().join("a.assets/shot.png").exists(),
+                "copy must happen outside the UI callback"
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(dir.path().join("a.assets/shot.png").is_file());
+    assert!(text(&editor, cx).contains("![[shot.png]]"));
 }
 
 /// 拖到编辑区的文件和 `⌘V` 同一套规则：图片变嵌入，其他文件变库内指针。

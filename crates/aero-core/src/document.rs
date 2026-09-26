@@ -34,8 +34,14 @@ impl Snapshot {
 
     /// 物化 + 解析。10 MB 文档物化 ≈ 0.7 ms，解析按 ~18 ms/MB 估（ADR 0002 / 0004）。
     pub fn parse(&self) -> ParseOutput {
-        parse::parse(&String::from(&self.text))
+        parse_text(&String::from(&self.text))
     }
+}
+
+fn parse_text(text: &str) -> ParseOutput {
+    #[cfg(test)]
+    tests::PARSED_BYTES.with(|bytes| bytes.borrow_mut().push(text.len()));
+    parse::parse(text)
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +53,10 @@ pub struct Document {
     version: u64,
     /// 当前块树对应的文本版本
     parsed_version: u64,
+    /// Candidate root; invalidation is sticky until a full parse.
+    pending_paragraph: Option<usize>,
+    /// Number of '[' bytes in the current text.
+    reference_brackets: usize,
     next_id: u64,
     /// 逆编辑组；每组按顺序应用即可撤销一次操作
     undo: Vec<Vec<Edit>>,
@@ -80,6 +90,8 @@ impl Document {
             blocks: BlockTree::default(),
             version: 0,
             parsed_version: u64::MAX,
+            pending_paragraph: None,
+            reference_brackets: 0,
             next_id: 1,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -296,10 +308,60 @@ impl Document {
 
     /// 改 Rope + 平移 anchor + 版本号。调用方保证编辑合法。
     fn apply_raw(&mut self, edit: &Edit) -> Edit {
+        self.pending_paragraph = self.paragraph_edit_candidate(edit);
         let inverse = text::apply_edit(&mut self.text, edit);
+        self.reference_brackets -= inverse.text.bytes().filter(|&b| b == b'[').count();
+        self.reference_brackets += edit.text.bytes().filter(|&b| b == b'[').count();
         self.anchors.apply(edit);
         self.version += 1;
         inverse
+    }
+
+    fn paragraph_edit_candidate(&self, edit: &Edit) -> Option<usize> {
+        let after_len = self.len() - edit.range.len() + edit.text.len();
+        // Comrak's global reference budget depends on document byte length.
+        if self.reference_brackets != 0 && self.len().min(100_000) != after_len.min(100_000) {
+            return None;
+        }
+        if self.report != ParseReport::default() || !edit.text.chars().all(plain_paragraph_char) {
+            return None;
+        }
+        let index = if self.is_parse_stale() {
+            self.pending_paragraph?
+        } else {
+            // Roots are source-ordered and non-overlapping after a clean parse.
+            self.blocks
+                .roots
+                .partition_point(|b| self.range_of(b).start <= edit.range.start)
+                .checked_sub(1)?
+        };
+        let block = &self.blocks.roots[index];
+        let content = self.content_range(block);
+        // Leave both ends (and all suffix bytes) untouched, including on undo/rollback.
+        if edit.range.start <= content.start || edit.range.end >= content.end {
+            return None;
+        }
+        if !self.is_parse_stale() {
+            if block.kind != BlockKind::Paragraph
+                || !block.children.is_empty()
+                || self.blocks.roots.get(index + 1).is_some_and(|b| b.kind == BlockKind::Marker)
+            {
+                return None;
+            }
+            let source = self.block_text(block);
+            let (body, suffix) = source.split_at(content.len());
+            // Inline references can change remote blocks; exclude their syntax.
+            if !body.starts_with(char::is_alphanumeric)
+                || !body.chars().all(plain_paragraph_char)
+                // Keep untouched suffixes reference-free too.
+                || !suffix.chars().all(|c| plain_paragraph_char(c)
+                    || matches!(c, '^' | '{' | '}' | '#' | '-' | '=' | '"'))
+            {
+                return None;
+            }
+        }
+        // Batched edits preserve the checked alphabet and boundaries.
+        Some(index)
     }
 
     // ---- 解析 ----
@@ -308,11 +370,45 @@ impl Document {
         Snapshot { text: self.text.clone(), version: self.version }
     }
 
-    /// 同步重解析。
+    /// 同步重解析。确定只改了普通段落正文时，只解析该段并保留 anchor 表。
     pub fn reparse(&mut self) {
+        if !self.is_parse_stale() || self.reparse_paragraph() {
+            return;
+        }
         let snap = self.snapshot();
         let out = snap.parse();
         self.apply_parse(snap.version(), out);
+    }
+
+    fn reparse_paragraph(&mut self) -> bool {
+        let Some(index) = self.pending_paragraph.take() else { return false };
+        if self.report != ParseReport::default() {
+            return false;
+        }
+        let block = &self.blocks.roots[index];
+        let range = self.range_of(block);
+        let mut out = parse_text(&self.text.slice(range.clone()).to_string());
+        if out.report != ParseReport::default() || out.blocks.len() != 1 {
+            return false;
+        }
+        let parsed = out.blocks.pop().unwrap();
+        if parsed.kind != BlockKind::Paragraph
+            || !parsed.children.is_empty()
+            || parsed.range != (0..range.len())
+            || parsed.suffix_len != block.suffix_len
+            || parsed.persisted_id != block.persisted_id
+            || parsed.attrs != block.attrs
+        {
+            return false;
+        }
+        // Anchors already shifted; retain this root's identity and handles.
+        let block = &mut self.blocks.roots[index];
+        block.hash = parsed.hash;
+        block.suffix_len = parsed.suffix_len;
+        block.persisted_id = parsed.persisted_id;
+        block.attrs = parsed.attrs;
+        self.parsed_version = self.version;
+        true
     }
 
     /// 装回一次解析结果。`version` 是解析所用快照的版本；与当前不符则丢弃并返回 `false`。
@@ -323,6 +419,9 @@ impl Document {
         self.report = out.report;
         self.rebuild(out.blocks);
         self.parsed_version = version;
+        self.pending_paragraph = None;
+        self.reference_brackets =
+            self.text.chunks().map(|chunk| chunk.bytes().filter(|&b| b == b'[').count()).sum();
         true
     }
 
@@ -409,6 +508,12 @@ impl Document {
             })
             .collect()
     }
+}
+
+fn plain_paragraph_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(c, ' ' | '.' | ',' | ':' | ';' | '!' | '?' | '*' | '_')
+        || matches!(c, '，' | '。' | '：' | '；' | '！' | '？' | '、' | '…')
 }
 
 /// Lossless cache encoding shared by metadata and full-text storage.
@@ -585,6 +690,517 @@ pub fn front_matter_title(src: &str) -> Option<(Range<usize>, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        pub(super) static PARSED_BYTES: std::cell::RefCell<Vec<usize>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    fn take_parse_work() -> Vec<usize> {
+        PARSED_BYTES.with(|bytes| std::mem::take(&mut *bytes.borrow_mut()))
+    }
+
+    fn assert_same_parse(doc: &Document, full: &Document) {
+        fn blocks(doc: &Document, source: &[Block]) -> Vec<ParsedBlock> {
+            source
+                .iter()
+                .map(|b| ParsedBlock {
+                    kind: b.kind.clone(),
+                    range: doc.range_of(b),
+                    suffix_len: b.suffix_len,
+                    persisted_id: b.persisted_id.clone(),
+                    attrs: b.attrs.clone(),
+                    hash: b.hash,
+                    children: blocks(doc, &b.children),
+                })
+                .collect()
+        }
+        assert!(!doc.is_parse_stale());
+        assert!(!full.is_parse_stale());
+        assert_eq!(doc.to_string(), full.to_string());
+        assert_eq!(blocks(doc, &doc.blocks.roots), blocks(full, &full.blocks.roots));
+        assert_eq!(doc.report, full.report);
+    }
+
+    fn assert_matches_full(doc: &Document) {
+        assert_same_parse(doc, &Document::from_text(&doc.to_string()));
+    }
+
+    fn assert_matches_forced_full(doc: &Document, full: &mut Document) {
+        let snapshot = full.snapshot();
+        assert!(full.apply_parse(snapshot.version(), snapshot.parse()));
+        assert_same_parse(doc, full);
+        assert_eq!(doc.version(), full.version());
+        assert_eq!(
+            doc.blocks.iter().map(|(depth, b)| (depth, b.id)).collect::<Vec<_>>(),
+            full.blocks.iter().map(|(depth, b)| (depth, b.id)).collect::<Vec<_>>()
+        );
+    }
+
+    fn reference_budget_source() -> String {
+        format!(
+            "a{}z\n\n> [r]: /{}\n> [ ^n]: /{}\n\n[r] [r] [r] [^n]\n\n[^n]: footnote\n",
+            "a".repeat(145),
+            "x".repeat(100),
+            "y".repeat(100)
+        )
+    }
+
+    #[test]
+    fn incremental_reparse_reference_budget_edit_undo_redo_matches_full() {
+        let source = reference_budget_source();
+        let mut doc = Document::from_text(&source);
+        let mut full = doc.clone();
+        assert_eq!(doc.len(), 403);
+        assert_eq!(doc.report, ParseReport::default());
+        assert!(matches!(doc.blocks.roots.last().unwrap().kind, BlockKind::FootnoteDefinition { .. }));
+        doc.edit(Edit::insert(3, "X")).unwrap();
+        full.edit(Edit::insert(3, "X")).unwrap();
+        take_parse_work();
+        doc.reparse();
+        let work = take_parse_work();
+        assert_matches_forced_full(&doc, &mut full);
+        assert_eq!(work, [404]);
+        assert_eq!(doc.blocks.roots.last().unwrap().kind, BlockKind::Raw);
+        for undo in [true, false] {
+            if undo {
+                assert_eq!(doc.undo(), full.undo());
+            } else {
+                assert_eq!(doc.redo(), full.redo());
+            }
+            take_parse_work();
+            doc.reparse();
+            let work = take_parse_work();
+            assert_matches_forced_full(&doc, &mut full);
+            assert_eq!(work, [doc.len()]);
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_reference_budget_coalescing_matches_full() {
+        for parse_between in [false, true] {
+            let mut doc = Document::from_text(&reference_budget_source());
+            let mut full = doc.clone();
+            doc.edit(Edit::insert(3, "X")).unwrap();
+            full.edit(Edit::insert(3, "X")).unwrap();
+            if parse_between {
+                doc.reparse();
+                assert_matches_forced_full(&doc, &mut full);
+            }
+            doc.edit_coalescing(Edit::insert(4, "Y")).unwrap();
+            full.edit_coalescing(Edit::insert(4, "Y")).unwrap();
+            doc.reparse();
+            assert_matches_forced_full(&doc, &mut full);
+            for undo in [true, false] {
+                if undo {
+                    assert_eq!(doc.undo(), full.undo());
+                    assert_eq!(doc.to_string(), reference_budget_source());
+                } else {
+                    assert_eq!(doc.redo(), full.redo());
+                }
+                take_parse_work();
+                doc.reparse();
+                let work = take_parse_work();
+                assert_matches_forced_full(&doc, &mut full);
+                assert_eq!(work, [doc.len()]);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_reference_budget_uses_bytes_and_cap() {
+        let prefix = "alphabet soup end\n\n";
+        let suffix = "\n\nother [^n]\n\n[^n]: footnote\n";
+        for before_len in [403, 99_999, 100_000, 100_001] {
+            let source = format!("{prefix}{}{suffix}", "x".repeat(before_len - prefix.len() - suffix.len()));
+            for edit in [
+                Edit::replace(2..4, "XY"),
+                Edit::replace(2..4, "雪"),
+                Edit::insert(3, "X"),
+                Edit::delete(3..4),
+            ] {
+                let mut doc = Document::from_text(&source);
+                let mut full = doc.clone();
+                assert_eq!(doc.len(), before_len);
+                assert_eq!(doc.report, ParseReport::default());
+                doc.edit(edit.clone()).unwrap();
+                full.edit(edit.clone()).unwrap();
+                let after_len = doc.len();
+                for step in 0..3 {
+                    if step == 1 {
+                        assert_eq!(doc.undo(), full.undo());
+                    } else if step == 2 {
+                        assert_eq!(doc.redo(), full.redo());
+                    }
+                    let expected = if before_len.min(100_000) == after_len.min(100_000) {
+                        doc.range_of(&doc.blocks.roots[0]).len()
+                    } else {
+                        doc.len()
+                    };
+                    take_parse_work();
+                    doc.reparse();
+                    assert_eq!(take_parse_work(), [expected], "{before_len}, {edit:?}, {step}");
+                    assert_matches_forced_full(&doc, &mut full);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_reference_cache_tracks_edits_and_parse_installs() {
+        for use_snapshot in [false, true] {
+            let mut doc = Document::from_text("alphabet soup end\n\nother paragraph\n");
+            let mut full = doc.clone();
+            assert_eq!(doc.reference_brackets, 0);
+            for brackets in ["[[", "[", ""] {
+                let previous_count = doc.reference_brackets;
+                let stale = doc.snapshot();
+                let range = doc.range_of(&doc.blocks.roots[1]);
+                let edit = Edit::replace(range, format!("other {brackets} end"));
+                doc.edit(edit.clone()).unwrap();
+                full.edit(edit).unwrap();
+                assert_eq!(doc.reference_brackets, brackets.len());
+                assert!(!doc.apply_parse(stale.version(), stale.parse()));
+                assert_eq!(doc.reference_brackets, brackets.len());
+                if use_snapshot {
+                    let current = doc.snapshot();
+                    assert!(doc.apply_parse(current.version(), current.parse()));
+                } else {
+                    doc.reparse();
+                }
+                assert_eq!(doc.reference_brackets, brackets.len());
+                assert_matches_forced_full(&doc, &mut full);
+                for undo in [true, false] {
+                    let expected = if undo {
+                        assert_eq!(doc.undo(), full.undo());
+                        previous_count
+                    } else {
+                        assert_eq!(doc.redo(), full.redo());
+                        brackets.len()
+                    };
+                    assert_eq!(doc.reference_brackets, expected);
+                    doc.reparse();
+                    assert_eq!(doc.reference_brackets, expected);
+                    assert_matches_forced_full(&doc, &mut full);
+                }
+                doc.edit(Edit::insert(3, "X")).unwrap();
+                full.edit(Edit::insert(3, "X")).unwrap();
+                let expected =
+                    if brackets.is_empty() { doc.range_of(&doc.blocks.roots[0]).len() } else { doc.len() };
+                take_parse_work();
+                doc.reparse();
+                assert_eq!(take_parse_work(), [expected]);
+                assert_matches_forced_full(&doc, &mut full);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_reference_cache_survives_rollback() {
+        for (source, first, count) in [
+            ("alphabet soup end\n\nother paragraph\n", Edit::insert(3, "["), 0),
+            ("alp[habet soup end\n\nother paragraph\n", Edit::delete(3..4), 1),
+        ] {
+            let mut doc = Document::from_text(source);
+            let mut full = doc.clone();
+            let edits = vec![first, Edit::delete(0..999)];
+            assert!(doc.edit_group(edits.clone()).is_err());
+            assert!(full.edit_group(edits).is_err());
+            assert_eq!(doc.reference_brackets, count);
+            assert_eq!(doc.to_string(), source);
+            doc.reparse();
+            assert_eq!(doc.reference_brackets, count);
+            assert_matches_forced_full(&doc, &mut full);
+            doc.edit(Edit::insert(3, "X")).unwrap();
+            full.edit(Edit::insert(3, "X")).unwrap();
+            let expected = if count == 0 { doc.range_of(&doc.blocks.roots[0]).len() } else { doc.len() };
+            take_parse_work();
+            doc.reparse();
+            assert_eq!(take_parse_work(), [expected]);
+            assert_matches_forced_full(&doc, &mut full);
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_work_is_one_paragraph_not_document_size() {
+        for root_count in [8, 4096] {
+            let mut source = "ordinary paragraph end\n\n".repeat(root_count / 2);
+            source.push_str("alphabet, **bold** _text_ end. {.red #named key=val} ^stable-id\n\n");
+            source.push_str(&"ordinary paragraph end\n\n".repeat(root_count / 2));
+            let mut doc = Document::from_text(&source);
+            let mut full = doc.clone();
+            let index = root_count / 2;
+            let old = doc.blocks.roots.clone();
+            let start = doc.range_of(&old[index]).start;
+            doc.edit(Edit::insert(start + 3, "雪é9")).unwrap();
+            full.edit(Edit::insert(start + 3, "雪é9")).unwrap();
+            let local_len = doc.range_of(&doc.blocks.roots[index]).len();
+            take_parse_work();
+            doc.reparse();
+            assert_eq!(take_parse_work(), [local_len], "{root_count} roots");
+            for (i, (before, after)) in old.iter().zip(&doc.blocks.roots).enumerate() {
+                assert_eq!(before.id, after.id);
+                assert_eq!(before.range, after.range, "anchors must not be rebuilt");
+                if i != index {
+                    assert_eq!(before.hash, after.hash);
+                } else {
+                    assert_ne!(before.hash, after.hash);
+                    assert_eq!(after.persisted_id.as_deref(), Some("stable-id"));
+                    assert_eq!(before.attrs, after.attrs);
+                    assert_eq!(before.suffix_len, after.suffix_len);
+                }
+            }
+            assert_matches_forced_full(&doc, &mut full);
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_matches_full_for_unicode_suffixes_and_batches() {
+        for suffix in ["", " ^para-id", " {.red #named key=\"a b\"}", " {.red} ^para-id", "   "] {
+            let source = format!(
+                "# Before\n\nalphabet, **bold** _text_ end.{suffix}\n\n- item\n- another\n\n# After\n"
+            );
+            let mut doc = Document::from_text(&source);
+            let mut full = doc.clone();
+            let start = source.find("alphabet").unwrap();
+            let edits = vec![
+                Edit::replace(start + 2..start + 5, "雪é，**"),
+                Edit::insert(start + 2, "中 _"),
+                Edit::delete(start + 1..start + 2),
+            ];
+            doc.edit_group(edits.clone()).unwrap();
+            full.edit_group(edits).unwrap();
+            let len = doc.range_of(&doc.blocks.roots[1]).len();
+            take_parse_work();
+            doc.reparse();
+            assert_eq!(take_parse_work(), [len], "{suffix:?}");
+            assert_matches_forced_full(&doc, &mut full);
+            for undo in [true, false] {
+                if undo {
+                    assert_eq!(doc.undo(), full.undo());
+                } else {
+                    assert_eq!(doc.redo(), full.redo());
+                }
+                let len = doc.range_of(&doc.blocks.roots[1]).len();
+                take_parse_work();
+                doc.reparse();
+                assert_eq!(take_parse_work(), [len]);
+                assert_matches_forced_full(&doc, &mut full);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_coalescing_and_snapshot_version_gates() {
+        let source = "alphabet, **bold** _text_ end.\n\nother paragraph\n";
+        let mut doc = Document::from_text(source);
+        let mut full = doc.clone();
+        let stale = doc.snapshot();
+        doc.edit(Edit::insert(3, "雪!")).unwrap();
+        full.edit(Edit::insert(3, "雪!")).unwrap();
+        let intermediate = doc.snapshot();
+        doc.edit_coalescing(Edit::insert(6, "é_*")).unwrap();
+        full.edit_coalescing(Edit::insert(6, "é_*")).unwrap();
+        assert!(!doc.apply_parse(stale.version(), stale.parse()));
+        assert!(!doc.apply_parse(intermediate.version(), intermediate.parse()));
+        let version = doc.version();
+        take_parse_work();
+        doc.reparse();
+        assert_eq!(take_parse_work(), ["alp雪é_*!habet, **bold** _text_ end.".len()]);
+        assert_eq!(doc.version(), version);
+        assert_matches_forced_full(&doc, &mut full);
+        take_parse_work();
+        doc.reparse();
+        assert!(take_parse_work().is_empty(), "a current tree needs no parse");
+        for undo in [true, false] {
+            if undo {
+                assert_eq!(doc.undo(), full.undo());
+                assert_eq!(doc.to_string(), source);
+            } else {
+                assert_eq!(doc.redo(), full.redo());
+            }
+            let len = doc.range_of(&doc.blocks.roots[0]).len();
+            take_parse_work();
+            doc.reparse();
+            assert_eq!(take_parse_work(), [len]);
+            assert_matches_forced_full(&doc, &mut full);
+        }
+        let current = doc.snapshot();
+        assert!(doc.apply_parse(current.version(), current.parse()));
+        assert_matches_forced_full(&doc, &mut full);
+        // A successful full apply must clear any old candidate.
+        let at = doc.to_string().find("other").unwrap() + 2;
+        doc.edit(Edit::insert(at, "X")).unwrap();
+        full.edit(Edit::insert(at, "X")).unwrap();
+        take_parse_work();
+        doc.reparse();
+        assert_eq!(take_parse_work(), ["otXher paragraph".len()]);
+        assert_matches_forced_full(&doc, &mut full);
+    }
+
+    #[test]
+    fn incremental_reparse_punctuation_emphasis_edits_match_full() {
+        for suffix in ["", " {.red #named key=val} ^stable-id"] {
+            let source = format!(
+                "alphabet, **bold** _text_ end.{suffix}\n\nalphabet, **bold** _text_ end.{suffix}\n\n# Tail\n"
+            );
+            for text in
+                [".", ",", ":", ";", "!", "?", "，", "。", "：", "；", "！", "？", "、", "…", "*", "_"]
+            {
+                for edit in [Edit::insert(3, text), Edit::replace(10..12, text), Edit::delete(10..12)] {
+                    let mut doc = Document::from_text(&source);
+                    let mut full = doc.clone();
+                    doc.edit(edit.clone()).unwrap();
+                    full.edit(edit.clone()).unwrap();
+                    let len = doc.range_of(&doc.blocks.roots[0]).len();
+                    take_parse_work();
+                    doc.reparse();
+                    assert_eq!(take_parse_work(), [len], "{edit:?}, {suffix:?}");
+                    assert_matches_forced_full(&doc, &mut full);
+                    for undo in [true, false] {
+                        if undo {
+                            assert_eq!(doc.undo(), full.undo());
+                        } else {
+                            assert_eq!(doc.redo(), full.redo());
+                        }
+                        let len = doc.range_of(&doc.blocks.roots[0]).len();
+                        take_parse_work();
+                        doc.reparse();
+                        assert_eq!(take_parse_work(), [len]);
+                        assert_matches_forced_full(&doc, &mut full);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_rejects_boundaries_prefixes_and_delimiters() {
+        for edit in [
+            Edit::insert(0, "# "),
+            Edit::insert(0, "- "),
+            Edit::insert(0, "> "),
+            Edit::delete(0..1),
+            Edit::insert(17, "x"),
+            Edit::delete(16..17),
+            Edit::insert(3, "\n"),
+            Edit::insert(3, "\r"),
+            Edit::insert(3, "\t"),
+            Edit::insert(3, "\0"),
+            Edit::insert(3, "]"),
+            Edit::insert(3, "`"),
+            Edit::insert(3, "$"),
+            Edit::insert(3, "[ref]"),
+            Edit::insert(3, "[^note]"),
+            Edit::insert(3, "[[wiki]]"),
+            Edit::insert(3, "<em>"),
+            Edit::insert(3, "\\"),
+            Edit::insert(3, "&amp;"),
+            Edit::insert(3, "^id"),
+            Edit::insert(3, "{.red}"),
+            Edit::insert(3, "|"),
+        ] {
+            let mut doc = Document::from_text("alphabet soup end\n\nother paragraph\n");
+            doc.edit(edit.clone()).unwrap();
+            take_parse_work();
+            doc.reparse();
+            assert_eq!(take_parse_work(), [doc.len()], "{edit:?}");
+            assert_matches_full(&doc);
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_rejects_context_sensitive_paragraphs() {
+        for source in [
+            "*alphabet* end\n",
+            "_alphabet_ end\n",
+            "!alphabet end\n",
+            "alp[ref] end\n\n[ref]: /url\n",
+            "alp[^note] end\n\n[^note]: footnote\n",
+            "alp[^unused] end\n",
+            "alphabet\nsecond line\n",
+            "  alphabet end\ncontinued\n",
+            "alphabet end\n\n^attached-id\n",
+            "alphabet end\n\n{.attached}\n",
+            "alphabet end {key=\"[^note]\"}\n\n[^note]: footnote\n",
+            "alphabet end {key=\"`code`\"}\n",
+            "[ref]: /alphabet\n\n[ref]\n",
+            "- alphabet end\n",
+            "> alphabet end\n",
+            "# alphabet end\n",
+            "```\nalphabet end\n```\n",
+            "$$alphabet$$\n",
+        ] {
+            let mut doc = Document::from_text(source);
+            let at = source.find("alp").unwrap() + 2;
+            doc.edit(Edit::insert(at, "X")).unwrap();
+            take_parse_work();
+            doc.reparse();
+            assert_eq!(take_parse_work(), [doc.len()], "{source:?}");
+            assert_matches_full(&doc);
+        }
+        for needle in ["para-id", "red"] {
+            let source = "alphabet end {.red} ^para-id\n\nother paragraph\n";
+            let mut doc = Document::from_text(source);
+            doc.edit(Edit::insert(source.find(needle).unwrap() + 1, "X")).unwrap();
+            take_parse_work();
+            doc.reparse();
+            assert_eq!(take_parse_work(), [doc.len()]);
+            assert_matches_full(&doc);
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_invalidation_is_sticky_until_full_parse() {
+        let source = "alphabet soup end\n\nother paragraph\n";
+        for edits in [
+            vec![Edit::insert(3, "X"), Edit::insert(23, "Y")],
+            vec![Edit::insert(3, "X"), Edit::insert(0, "# ")],
+            vec![Edit::insert(3, "["), Edit::delete(3..4), Edit::insert(3, "X")],
+            vec![Edit::insert(3, "\n"), Edit::delete(3..4), Edit::insert(3, "X")],
+            vec![Edit::insert(3, "X"), Edit::delete(16..21)],
+        ] {
+            let mut doc = Document::from_text(source);
+            doc.edit_group(edits).unwrap();
+            take_parse_work();
+            doc.reparse();
+            assert_eq!(take_parse_work(), [doc.len()]);
+            assert_matches_full(&doc);
+            doc.undo().unwrap();
+            doc.reparse();
+            assert_eq!(doc.to_string(), source);
+            assert_matches_full(&doc);
+            doc.redo().unwrap();
+            doc.reparse();
+            assert_matches_full(&doc);
+        }
+    }
+
+    #[test]
+    fn incremental_reparse_rollback_and_invalid_edits_preserve_correctness() {
+        for first in [Edit::insert(3, "雪"), Edit::insert(3, "\n")] {
+            let source = "alphabet soup end\n\nother paragraph\n";
+            let mut doc = Document::from_text(source);
+            assert!(doc.edit_group(vec![first.clone(), Edit::delete(0..999)]).is_err());
+            assert_eq!(doc.to_string(), source);
+            assert!(!doc.can_undo());
+            assert!(!doc.can_redo());
+            doc.edit(Edit::insert(3, "X")).unwrap();
+            take_parse_work();
+            doc.reparse();
+            let expected = if first.text == "雪" { "alpXhabet soup end".len() } else { doc.len() };
+            assert_eq!(take_parse_work(), [expected]);
+            assert_matches_full(&doc);
+        }
+        let mut doc = Document::from_text("al雪phabet end\n");
+        doc.edit(Edit::insert(2, "é")).unwrap();
+        assert!(doc.edit_coalescing(Edit::insert(3, "X")).is_err());
+        take_parse_work();
+        doc.reparse();
+        assert_eq!(take_parse_work(), ["alé雪phabet end".len()]);
+        assert_matches_full(&doc);
+    }
 
     #[test]
     fn aliases_parse_only_actual_front_matter_without_rewriting() {
