@@ -1,6 +1,6 @@
 # 性能优化续作验收（2026-09-26）
 
-在独立 worktree `/Users/aero/code/Aero-performance`、分支 `perf/interaction` 继续已有改动。基线为 `023eff8`，本次没有提交，也未修改主工作区。
+本记录形成于独立 worktree `/Users/aero/code/Aero-performance`、分支 `perf/interaction`，基线为 `023eff8`；当时尚未提交。相关改动现已进入项目提交 `ee1f7cd`（2026-09-26）。以下保留原验收环境与结果，不代表本次文档更新重新运行了这些检查。
 
 ## 五项问题的处理
 
@@ -27,6 +27,6 @@
 
 本地构建使用主工作区已有的 `vendor/zvec/lib`，通过 `ZVEC_LIB_DIR` 指向，不重新下载索引依赖。
 
-持久验收材料位于 `target/performance-validation/`（构建产物，不纳入版本控制）：`wrapper-tests.log`、`ui-list-probe.log`、`ui-paragraph-probe.log`、`ui/shots/view/` 和隔离样例库。前一阶段完整工作区测试的临时日志已被环境清理，通过结果已在本次任务输出中确认。
+原验收工作区的材料位于 `target/performance-validation/`（构建产物，不纳入版本控制）：`wrapper-tests.log`、`ui-list-probe.log`、`ui-paragraph-probe.log`、`ui/shots/view/` 和隔离样例库。前一阶段完整工作区测试的临时日志已被环境清理，通过结果已在当时的任务输出中确认。
 
 本次证明功能回归、后台执行边界和实际点击／保存行为；未测量 GUI 输入到呈现 p99、持续滚动帧率或参考机器上的常驻内存，不据此宣称这些性能指标达标。

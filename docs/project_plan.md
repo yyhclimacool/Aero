@@ -1,11 +1,11 @@
 # Aero · Local-First AI Knowledge Workspace 技术方案
 
-> 状态：草案 v0.10（2026-09-22）
+> 状态：方案 v0.11（2026-09-26，按当前源码同步）
 > 投入假设：单人、业余时间（约每周 10 小时）。排期见第 18 节。
-> 本文是后续所有架构决策的依据。产品与范围层面的决定已全部拍板，见第 22 节；剩余待定项均为由 M0 spike 数据决定的技术选型。
+> 本文同时保留设计目标与实施记录；标为「规划」的能力尚未交付，带日期的进展与测试数字只代表当时范围。M0 技术选型已完成，见 `decisions/`；当前使用入口见 [README](../README.md)。
 > 2026-09-22：默认编辑观感定为「所见即所得，源码按需打开」，见 2.2、9.1 与第 22 节第 20 条。后续编辑器开发以 9.1 为准。
 > UI 与交互设计见 `docs/ui_design.md`。
-> 当前验收状态（2026-09-16）：M1 编辑/搜索主流程已实现，完整验收尚未关闭。保存保护修复、自动化测试、性能实测及待验项目见 [M1 验收记录](qa/m1.md)。
+> 当前状态（2026-09-26）：编辑、全文搜索、知识互联、CLI、Mermaid / PDF 与本地语义混合搜索已接入；MCP 与链接卡片未实现。最近验证见 [性能续作记录](qa/performance-followup-2026-09-26.md)，原生 IME、性能预算与正式分发仍以 [M1 验收记录](qa/m1.md) 的待验项为准。
 
 ---
 
@@ -130,20 +130,20 @@ Rust (edition 2024)
 ├── 全文 + 向量索引                         zvec-rust（一套引擎，ADR 0003）
 │                                           jieba 分词，dylib 随应用分发（第 10、16 节）
 │
-├── Embedding（Phase 3）                    fastembed（本地 ONNX，多语言模型）
+├── Embedding（已接入）                     ort + tokenizers，本地 multilingual-e5-small int8
 │
 ├── 重内容渲染（第 9.9 节）
 │   ├── RaTeX                               LaTeX 数学（纯 Rust KaTeX 移植）
 │   ├── merman                              mermaid（headless 纯 Rust）
 │   ├── hayro                               PDF 页面光栅化（纯 Rust）
 │   ├── resvg                               SVG → 位图
-│   └── reqwest + scraper                   链接卡片元数据抓取
+│   └── 链接卡片元数据抓取（规划）
 │
 ├── notify + ignore                         文件监听、vault 扫描
 │
 ├── GPUI Executor（主）/ Tokio（受限）      异步模型见第 15 节
 │
-├── MCP Server (rmcp)                       AI 接入
+├── MCP Server (rmcp，规划)                 AI 接入
 │
 └── CLI (clap)                              脚本与 AI 的通用接口
 ```
@@ -169,19 +169,21 @@ GPUI 处于 pre-1.0，版本间有 breaking change。上游已把 GPUI + gpui-ba
 
 ### 3.2 Crate 分层
 
+当前四个正式 crate：
+
 ```text
 aero/
 ├── crates/
-│   ├── aero-core        vault、Knowledge Markdown 解析/序列化、Block 模型、
-│   │                    链接解析、索引管线。无 UI 依赖，可 headless 测试。
-│   ├── aero-index       全文 / 向量索引实现（zvec、Tantivy、SQLite；core 只依赖 trait）
-│   ├── aero-app         GPUI 桌面应用
-│   ├── aero-cli         `aero search / read / append / index ...`
-│   └── aero-mcp         MCP Server，本质是 aero-core 的薄包装
+│   ├── aero-core        文本、块模型、Markdown、vault、链接、附件、编辑与索引抽取；无 UI
+│   ├── aero-index       zvec 全文 / 向量索引、SQLite 元数据、增量同步与 RRF 融合
+│   ├── aero-embedding   ort + tokenizers，本地 CPU 推理与固定版本模型的显式下载
+│   └── aero-app         GPUI 桌面应用、后台服务与 CLI（src/cli.rs）
+├── forks/gpui-base/     应用使用的文本控件补丁
+├── spikes/             保留的 M0 实验，仍是 workspace 成员
 └── docs/
 ```
 
-"AI = Another Client"落到代码上，就是 GUI、CLI、MCP 三者都是 `aero-core` 的客户端，没有任何一方拥有特权路径。
+GUI 与 CLI 共用核心层和索引层；CLI 目前与 GUI 编入同一个 `aero` 二进制，没有独立 `aero-cli` crate。`aero-mcp` 仍是规划。Tantivy 未采用。
 
 ---
 
@@ -253,19 +255,24 @@ AI = Another Client
 
 ### 5.3 索引与缓存放在应用数据目录
 
+macOS 根目录为 `~/Library/Application Support/Aero/`；Linux 使用 `$XDG_DATA_HOME/aero`（默认 `~/.local/share/aero/`），Windows 使用 `%APPDATA%\Aero\`。当前布局：
+
 ```text
-~/Library/Application Support/Aero/           (macOS)
-~/.local/share/aero/                          (Linux)
-%APPDATA%\Aero\                               (Windows)
-└── vaults/<vault_id>/
-    ├── meta.sqlite       元数据、链接、标签、索引状态
-    ├── index/            全文 + 向量索引（zvec Collection，或 Tantivy 目录）
-    └── cache/            缩略图、公式/图表/PDF 页面位图、链接卡片元数据（9.9 节）
+Aero/
+├── index/<vault-id>/
+│   ├── meta.sqlite          全文索引元数据、链接、标签
+│   ├── fts/                 zvec 全文 Collection
+│   └── semantic/            独立向量 Collection 与 metadata.sqlite
+├── cache/<vault-id>/        图片、公式、图表和 PDF 位图
+├── models/<固定模型版本>/   下载并校验的 ONNX 模型与 tokenizer
+├── state.toml              最近库、标签页、收藏、面板与编辑器偏好
+├── search.toml             模型下载许可、语义搜索与暂停状态
+└── demo-vault/             可编辑示例库
 ```
 
-理由：local-first 用户几乎必然用 iCloud / Dropbox / Syncthing / git 同步 vault。高频写、体积大的索引若放在 vault 内，会被反复上传并产生冲突副本。上述目录都可以删除并从 `*.md` 重建。
+索引与渲染缓存可在退出应用后删除重建，不进入 vault。模型可重新下载，但删除后离线语义搜索需等模型重新就绪。`state.toml`、`search.toml` 是用户偏好，`demo-vault/` 是真实笔记，都不属于可丢弃的索引缓存；不要为清索引而删除整个应用数据目录。示例库更新规则见 [README](../README.md)。
 
-同一目录下还有两个不是缓存的条目，删除它们会丢东西：`state.toml`（最近打开的 vault、面板折叠状态）和 `demo-vault/`（示例库，由库选择页的入口交付，见 UI 设计 11 节）。示例库是用户可编辑的真实笔记：新版本只更新其中没被改动过的示例，改过的内容不会被覆盖。
+Debug 构建支持用 `AERO_DATA_DIR` 指向隔离目录，供测试使用；release 构建不使用该覆盖。
 
 ### 5.4 附件
 
@@ -682,26 +689,28 @@ Inline 树节点同样带 `attrs`，承载 6.3.10 的行内属性列表。
 
 ### 7.4 编辑管线
 
+当前 GUI 按键路径：
+
 ```text
 键入 / 块操作
-  → [同步段，按键路径] Rope 编辑（记录到 undo 栈）→ marker 表平移 → 聚焦块从 Rope 切片重绘
-  → [异步段] Rope.clone() 快照 → 后台线程物化 + 重解析（第 8 节）
-       → 主线程 Block 树 diff → 重建 marker 表、BlockId 映射（7.3）→ 视图增量刷新（只重建受影响的块元素）
-  → 500 ms debounce → 原子写盘（第 5.5 节）
-  → 文件事件被自身写入过滤 → 索引增量更新（第 10 节）
+  → Rope 编辑、undo 记录、marker 平移
+  → Document::reparse()：安全的普通段落局部解析，否则整篇解析
+  → 更新块与可见控件，保持焦点和滚动锚点
+  → 500 ms debounce → 后台校验与原子保存
+  → 保存成功后排队更新全文 / 语义索引
 ```
 
-同步段在 10 MB 文档上 < 0.2 ms。异步段的解析成本随文档线性（真实笔记约 18 ms/MB，见 ADR 0002）：文档 < 256 KB 时允许直接在同步段里解析（≤ 5 ms），超过则一律走后台；期间视图靠漂移后的 anchor 保持一致，解析结果回来后再 diff。
+核心层仍提供 `Snapshot::parse` / `apply_parse` 供后台解析使用，旧版本结果会被丢弃；但当前 `Editor::after_doc_change` 直接同步调用 `reparse`，尚未按文档大小自动转后台。ADR 中的 Rope / 解析微基准不能直接当作 GUI 输入延迟结论。
 
 ---
 
 ## 8. 解析与无损往返
 
-### 8.1 解析策略：整篇重解析 + 树 diff
+### 8.1 解析策略：段落快速路径 + 整篇解析回退
 
-不做增量解析。笔记文件通常在数 KB 到数百 KB，成熟解析器整篇解析耗时在 1 ms 量级；超过 2 MB 的文件将解析移到后台并在完成前冻结块结构（仍可编辑当前块）。解析结果与旧 Block 树做 diff（7.3），保证 UI 状态和索引增量都基于稳定的 BlockId。
+2026-09-26 起，`Document` 对普通顶层段落内部、不会改变结构的编辑局部重解析；仅在块类型、区间、属性与持久 ID 校验一致时安装结果。边界、换行、结构标记、上下文敏感引用或解析警告等情况回退整篇解析，仍按 7.3 匹配 BlockId。引用语法及 comrak 的全局引用预算也会使快速路径失效。
 
-这一策略比 tree-sitter 增量解析实现简单得多，且不需要为每个扩展语法修改 grammar。
+这不是通用增量 Markdown 解析器。随机编辑、撤销 / 重做与引用预算回归对比局部路径和整篇结果；大文档的后台解析能力与 GUI 接线状态见 7.4。
 
 ### 8.2 解析器选型
 
@@ -807,19 +816,16 @@ Inline 树节点同样带 `attrs`，承载 6.3.10 的行内属性列表。
 
 ### 9.2 渲染结构
 
-- 文档是一个 GPUI 虚拟列表（gpui-component `VirtualList` 或 GPUI `list`），每个顶层 Block 一个元素，高度按需测量并缓存。
-- 容器块递归渲染子块；列表缩进、引用竖线、callout 外框由容器元素绘制。
-- 图片、嵌入、公式、图表、PDF 页面、链接卡片均经 9.9 的渲染服务异步产出，占位高度避免抖动。
+- 当前用 `editor/viewport.rs` 按视口管理块行，缓存高度并保留滚动锚点；大列表可按顶层列表项拆分，带属性的容器和嵌套子树保持整体渲染。可见区前后保留预渲染余量。
+- 文字类块浏览与编辑共用文本控件，容器绘制缩进、引用竖线与 callout 外框；控件按可见性维护，聚焦块受保护。
+- 图片、公式、Mermaid、PDF 经 9.9 的后台渲染服务；笔记嵌入由单独的来源读取缓存交给编辑器预览。链接卡片仍未实现。
+- 长文滚动、点击和关闭保存的验证见 [2026-09-26 性能记录](qa/performance-followup-2026-09-26.md)，不据此宣称帧率或输入 p99 已达标。
 
 ### 9.3 聚焦块编辑器
 
-Phase 1 直接使用 gpui-base 的文本引擎（`InputBaseState` 系列，含 IME、选区、软换行、`InputHighlighter` 高亮钩子）作为聚焦块的编辑控件：
+当前文字类块使用 gpui-base 文本控件，浏览与编辑复用同一套控件和标记隐藏规则（9.1）。段落、标题、列表项、表格单元格与简单 callout 按各自编辑单元呈现；源码入口按需显示标记。
 
-- 聚焦块的编辑控件是 `Document.text` 中该块区间的一个视图；每次输入即时写回 Rope，再触发 7.4 的管线。gpui-base 的 `InputBaseState.text` 与 `Document.text` 是同一个 `ropey 2.0` 类型，光标 / 选区都是字节偏移，块文本以 `RopeSlice` 传递，不做 `String` 往返（ADR 0004）。
-- 块切换时销毁/重建控件，光标位置按字节偏移直接换算，无需 char 索引转换。
-- 通过 `InputHighlighter` 实现 Knowledge Markdown 的语法高亮与样式叠加。
-
-以 trait 隔离该控件。9.1 的标记隐藏若需要更细的控制（光标靠近才显现、行内图片 / 复选框），可替换为自研元素而不影响模型层。
+控件的输入写回 `Document`，文档持有统一撤销历史，再由 7.4 的管线更新结构和保存。核心与控件使用相同版本的 ropey，但不是直接共享一个可变 Rope 实例；控件文本、文档范围与光标由应用层同步。当前视口负责保留可见控件和聚焦状态，不再在每次浏览 / 编辑切换时换成另一套渲染布局。
 
 ### 9.4 选区与键盘模型
 
@@ -856,23 +862,22 @@ Phase 1 直接使用 gpui-base 的文本引擎（`InputBaseState` 系列，含 I
 
 ### 9.9 重内容渲染服务
 
-数学、mermaid、PDF 页面、链接卡片、大图缩略图都不在 UI 线程直接渲染，而是走同一条服务：
+当前图片、数学、Mermaid 与 PDF 共用 `crates/aero-app/src/render.rs`；链接卡片尚未接入。
 
 ```text
-RenderRequest { kind, source_hash, scale, theme, size_hint }
-  → 内存缓存命中？→ 直接返回
-  → 磁盘缓存 cache/<kind>/<hash>-<scale>-<theme>.png 命中？→ 解码返回
-  → 后台线程渲染（RaTeX / merman / hayro / 链接卡片抓取）
-  → 写入两级缓存 → 通知块元素重绘
+请求（源、宽度 / 字号、HiDPI 倍率，公式 / 图表含主题信息）
+  → 内存缓存命中：返回位图
+  → 后台检查内容指纹与磁盘缓存 cache/<vault-id>/<kind>/
+  → 未命中：后台解码 / 渲染 → 原子写缓存 → 通知界面
 ```
 
-- 块元素首帧按"上次已知尺寸"占位（尺寸也进缓存），渲染完成后替换，列表不抖动。
-- SVG 结果分两类处理：单色内容（数学公式）用 GPUI `svg()` 元素以 alpha 蒙版着色，自动跟随主题色；彩色内容（mermaid、图片）经 resvg 光栅化为 RGBA 后用 `img()` 元素显示。
-  数学按 6.5 的调研结论改为在 RaTeX 排版阶段直接给定主题色再光栅化，省掉 SVG 与蒙版这一跳；缓存键因此包含主题色。
-- 缓存键包含主题（浅/深）与缩放倍率（HiDPI），主题切换只触发重渲染而不阻塞 UI。
-- 渲染任务归第 15 节的"结构性"优先级，滚动到视口附近才排队，滚出视口即取消（hayro 的协作式取消落地后接入）。
-- 渲染失败统一表现：显示源码 + 一行错误提示，可点击重试。内容永不丢失，也不写回文件。
-- 所有渲染器藏在各自的 trait 后面（`MathRenderer` / `DiagramRenderer` / `PdfRenderer` / `LinkPreviewFetcher`），依赖都是 0.x 版本，随时可换。
+- 图片等比缩小；数学由 RaTeX 按主题色直接光栅化；Mermaid 经 merman 生成 SVG，再由 resvg 光栅化；PDF 经 hayro 渲染。
+- 首帧显示占位，失败保留源码和错误提示。坏磁盘缓存按未命中重建，不修改笔记内容。
+- 渲染并发 2，待派发队列最多 32；非 PDF 内存缓存 64 项、PDF 12 页，共享约 128 MiB 位图软预算。当前帧可见资源受保护，可能暂时超预算；该预算不是应用总内存上限。
+- 图片宽度按 64 逻辑像素分档；任务代次丢弃过期尺寸和回调。已启动渲染的全面协作式取消仍不是已交付保证。
+- 磁盘缓存尚无容量淘汰。笔记嵌入另走来源读取缓存，再由同一套预览显示；它不是位图缓存。
+
+后台文件操作、缓存与真实窗口回归见 [性能续作记录](qa/performance-followup-2026-09-26.md)。
 
 ---
 
@@ -909,27 +914,28 @@ index_state (name, version, last_built)
 
 无论引擎为何，索引文档 = Block，字段：`note_id`、`block_ord`、`title`、`body`、`tags`、`path`。`aero-core` 只依赖 `FullTextIndex` trait，引擎实现在 `aero-index` 内可替换。
 
-**引擎：zvec FTS（已定，ADR 0003）**。随 zvec-rust 一并获得（见 10.4）：原生 BM25、短语、布尔 `+term -term "phrase"`，tokenizer 用 `jieba`（`cut_mode=search`）+ `lowercase` filter。全文与向量是一个引擎，混合检索由引擎层完成。无 snippet API，高亮在客户端基于 block 源文本自行完成。
+**引擎：zvec FTS（已定，ADR 0003）**。随 zvec-rust 一并获得（见 10.4）：原生 BM25、短语、布尔 `+term -term "phrase"`，tokenizer 用 `jieba`（`cut_mode=search`）+ `lowercase` filter。全文与向量共用 zvec 引擎但使用独立 Collection；当前混合结果由 `aero-index::semantic::fuse_results` 做 RRF 融合（10.4）。无 snippet API，高亮在客户端基于 block 源文本自行完成。
 
 M0 实测（`bench-10k`，120k block，Apple M5 Pro）：查询 p95 ≤ 3 ms；保存一篇（≈12 block）后 2 ms 内可搜到，不需要 `flush()`；冷打开 100 ms。Tantivy 与 SQLite FTS5 不再评估，`FullTextIndex` trait 只作为架构隔离保留。
 
 引擎使用约束（全部来自 spike 实测）：
 
 - **保存路径 = `upsert(新 block)` + `delete(旧有而新无的 pk)`**。旧 pk 列表来自 SQLite 的 block 表。**禁用 `delete_by_filter`**：它会留下僵尸主键——doc 查不到了，但同一 pk `insert` 报 `AlreadyExists`、`delete` 报 `NotFound`，`flush` / `optimize` 都救不回，只有 `upsert` 能覆盖。
-- **正在编辑的文档**：写入即可见，所以不做内存 overlay；编辑中的 block 以 300 ms 节流 `upsert` 进引擎即可（原方案的"简单倒排 overlay"取消）。
+- **正在编辑的文档**：当前在保存成功 / 外部重载后排队更新全文索引，没有未保存正文的内存 overlay，也没有按键后 300 ms 直接 upsert 的通道。500 ms 自动保存与有序写队列保证保存后进入索引。
 - 刷盘与整理：保存后不 flush；空闲 30 s 无编辑时 `flush()`；后台全量重建**每 1 万 block `flush()` 一次**（否则峰值内存冲到 900 MB，分批后 ≈ 280 MB）；碎片段会让 p95 从 3 ms 涨到 9 ms，每日或段数超阈值时 `optimize()`（10k 上 0.5 s）。
 - **jieba 词典裁剪（已实现）**：全词典（349k 词）常驻 ≈150 MB，是索引侧最大的内存项。`scripts/trim-jieba-dict.sh` 按词频截到 ~100k 词（磁盘 1.4 MB），长尾交给 HMM 与 search 模式的子词切分。实测常驻并非线性下降——cppjieba 的 `DictTrie` 节点开销高，100k 词裁剪后仍 ≈110 MB（省 ≈60 MB；裁到 50k 省 ≈85 MB），原先"裁后 45 MB / 省 150 MB"的估计过于乐观。领域词：zvec 的 `JiebaTokenizer` 只加载 `jieba.dict.utf8` + `hmm_model.utf8`，**不读**单独的 `user.dict.utf8`，故 `assets/jieba/user.dict.utf8` 里的领域词由脚本直接并进主词典。裁剪词典由 `fetch-zvec.sh` 产出到 `vendor/zvec/lib/data/jieba_dict_trimmed`（不入库，随 fetch 重生）；运行时 `aero-index` 显式 `set_default_jieba_dict_dir` 覆盖 zvec 自动发现的全词典，打包时装进 `Resources/jieba_dict`。
 - `ngram` tokenizer 不作备选：构建慢 2 倍、磁盘 2.5 倍，英文按字母二元组匹配 precision 太差。
 
-### 10.4 语义索引（Phase 3）
+### 10.4 本地语义索引（已接入）
 
-- 分块单位就是 Block（短块与相邻块合并到 ~200 token）。
-- **向量存储 = [zvec-rust](https://github.com/zvec-ai/zvec-rust)**（Alibaba zvec 嵌入式向量库的 Rust 绑定，Apache-2.0；ADR 0003）：HNSW / HNSW+量化 / IVF / RaBitQ，支持 fp16、int8、binary 向量；标量字段 + 倒排 + `filter("note_id = ... AND tag = ...")`；`MultiQuery` 在引擎层完成向量路 + FTS 路的 RRF / 加权重排。每个 vault 一个 Collection，存放在 5.3 的应用数据目录。M0 实测 20k × 384 维 HNSW：写入 2.5 s，查询 p95 1.7 ms，混合 RRF p95 1.7 ms，单 doc upsert 后 2 ms 可查。
-- ~~备选 `usearch` + `sqlite-vec`~~ 不再评估（zvec 四项验收全部通过）。
-- Embedding 不在 zvec 范围内，仍由应用负责。默认本地 `fastembed-rs`（ONNX Runtime）：质量档选多语言模型（bge-m3 或 multilingual-e5-small）；快速档评估 model2vec 静态向量模型（如 potion 系列的 multilingual 版本，CPU 上比 transformer 快一到两个数量级，中文效果需单独验证）。首次使用时下载并提示体积。
-- 可选远程 Embedding API，必须在设置中显式开启，并显示"内容将发送至 X"。
-- 全量索引在后台以最低优先级运行，可暂停。混合检索直接用 `MultiQuery` RRF。
-- zvec 是进程级全局状态（`initialize()` / `shutdown()` 一次，自带线程池），API 同步，全部调用放在后台线程。注意 `memory_limit` / `enable_mmap` / `max_buffer_size` 对 FTS 的常驻内存都没有作用（M0 实测），内存靠 10.3 的词典裁剪与分批 flush 控制。
+- `aero-embedding` 直接使用 `ort` + `tokenizers`，固定 multilingual-e5-small int8 模型，384 维、CPU 单线程、每批最多 4 段、每段最多 256 tokens。当前没有 fastembed、模型档位或远程 Embedding。
+- 模型下载与语义搜索是两个默认关闭的开关；用户先允许下载，再显式点击下载。约 135 MB 的固定文件经过大小与 SHA-256 校验后发布；笔记与查询不上传。
+- `aero-index::semantic` 用独立 zvec HNSW / cosine Collection 与 SQLite 元数据，放在 `index/<vault-id>/semantic/`，不占用全文 Collection 的锁。模型 ID 或缓存格式变化可重建语义缓存。
+- 按可索引正文块提取纯文本，长块切成带有限重叠的片段并保留 `block_ord`；不是把相邻短块合并。每段加限长标题前缀，超过 2 MiB 的笔记等超预算输入不进入语义索引。
+- 全文与语义查询独立返回；先显示全文，再由 `fuse_results` 以 RRF（k=60）按路径和块去重融合，稳定同分时优先全文。当前未使用引擎 `MultiQuery`。模型不可用时全文搜索继续工作。
+- 专用后台线程在输入空闲 800 ms 后分批索引，可手动暂停，查询优先于索引；模型空闲 60 秒后卸载。保存、删除、外部变化与忽略规则变化触发增量同步，版本校验避免发布过期片段。
+
+开启方法、资源边界和真实模型测试见 [本地语义搜索](semantic-search.md)。zvec API 同步，均在后台使用；全文的词典和分批写入约束仍见 10.3。
 
 ### 10.5 一致性
 
@@ -938,7 +944,7 @@ M0 实测（`bench-10k`，120k block，Apple M5 Pro）：查询 p95 ≤ 3 ms；�
 
 ### 10.6 与第三方索引工具的关系
 
-vault 就是 Markdown 文件，用户可以同时用 [zvec-grep](https://github.com/zvec-ai/zvec-grep)（`zg`，Node.js CLI + MCP，同样基于 zvec）等第三方工具对 vault 建索引并接给自己的 agent，这是"AI = Another Client"的自然结果。Aero 不复用 zg 作为组件（Node 运行时、索引落在项目根目录都与本方案冲突），但借鉴其检索管线设计：prose 按 section/chunk 分块并保留源位置、"语义发现 → BM25 锚定 → 精确文本验证"三段式、MCP 工具签名（`query` + `fts[]` + `fuse`）。Aero 自己的 MCP 提供 zg 给不了的能力：Block 级结构、链接/反链/标签、带审阅的写入。
+vault 就是 Markdown 文件，用户可以同时用 [zvec-grep](https://github.com/zvec-ai/zvec-grep)（`zg`，Node.js CLI + MCP，同样基于 zvec）等第三方工具对 vault 建索引并接给自己的 agent，这是"AI = Another Client"的自然结果。Aero 不复用 zg 作为组件（Node 运行时、索引落在项目根目录都与本方案冲突），但借鉴其检索管线设计：prose 按 section/chunk 分块并保留源位置、"语义发现 → BM25 锚定 → 精确文本验证"三段式、MCP 工具签名（`query` + `fts[]` + `fuse`）。规划中的 Aero MCP 将提供：Block 级结构、链接/反链/标签、带审阅的写入。
 
 ---
 
@@ -958,7 +964,7 @@ vault 就是 Markdown 文件，用户可以同时用 [zvec-grep](https://github.
 - 事件 debounce 200 ms；忽略 `.aero/`、附件目录以外的非 `.md` 文件，以及自身刚写入的路径（按 `(path, hash)` 在 2 s 窗口内过滤）。
 - macOS FSEvents 会合并事件、其他编辑器的原子保存会产生 `Remove + Create`，统一按"路径最终状态"处理，不依赖事件类型。
 - 磁盘文件变化且当前文档**无未保存修改**：静默重载，光标按块 hash 匹配复位。
-- 磁盘文件变化且**有未保存修改**：以上次读取的内容为 base 做三方合并；无冲突自动合并，有冲突则保留双方版本，以 `<name>.conflict-<time>.md` 保存磁盘版本并提示。绝不静默覆盖外部修改。
+- 磁盘文件变化且**有未保存修改**：当前保留双方版本，以 `<name>.conflict-<time>.md` 保存磁盘版本并提示选择。基于上次读取内容的三方自动合并仍是后续目标，尚未接入。
 - 文件被外部删除：文档转为"已删除"状态，保留内容，用户可另存。
 
 ---
@@ -977,9 +983,9 @@ aero index rebuild | status
 aero export <note> --format md|html|json
 ```
 
-CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线：MCP 工具与 CLI 子命令一一对应，都调用 `aero-core`。
+上述七个子命令已在 `aero-app/src/cli.rs` 实现，输出支持 `--json`；`search` 当前只查全文。按现存路径读、导出、追加和新建可以绕开被 GUI 占用的索引；搜索、反链、状态在锁冲突时读取临时全文副本，重建仍需独占。参数和新鲜度限制见 [CLI 记录](qa/m2-cli.md)。MCP 尚未实现。
 
-### 13.2 MCP Server
+### 13.2 MCP Server（规划，尚未实现）
 
 - 实现基于 `rmcp`，传输先支持 stdio（Claude Desktop / Cursor 等本地客户端），Streamable HTTP 列入 Phase 3。
 - 工具：`search_notes`、`semantic_search`（Phase 3）、`read_note`、`read_block`、`list_notes`、`get_backlinks`、`get_tags`、`create_note`、`append_to_note`、`replace_block`。
@@ -1000,6 +1006,8 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
 
 ## 15. 并发与异步模型
 
+下列为架构约束与目标；当前 GUI 同步解析的边界见 7.4，文件操作后台化和切库保存屏障见 [2026-09-26 记录](qa/performance-followup-2026-09-26.md)。语义服务使用独立线程，模型下载用同步 `ureq`；MCP 与远程 Embedding 尚未实现。
+
 - 主执行器是 GPUI 的 `ForegroundExecutor` / `BackgroundExecutor`；`aero-core` 的异步接口不绑定运行时（返回 `Future`，内部用 `async-channel` / `futures` 原语）。
 - Tokio 只存在于 `aero-mcp`（`rmcp` 依赖）与远程 HTTP 调用（链接卡片抓取、可选的远程 Embedding）中，运行在独立线程的 runtime 上，与 GPUI 侧通过 channel 通信。GUI 代码不得直接依赖 Tokio。
 - 后台任务分三级优先级：用户可感知（解析、保存、FTS 增量）> 结构性（反链、缩略图）> 可延后（向量索引、全量重建）。低优先级任务在用户输入期间让出。
@@ -1011,7 +1019,7 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
 
 - **macOS 首发，最低 macOS 15**（与 gpui-component 的要求一致，只跟最新两代）；Linux（Wayland/X11）与 Windows 列入 M4，单人投入下视 M1–M3 的实际进度决定是否推进。
 - **无移动端**：GPUI 不支持 iOS/Android。策略是坦白告知：vault 就是 Markdown 文件，配合任意手机 Markdown 编辑器与同步工具即可读写。产品文档中明确写出。
-- 分发：macOS `.dmg` + 自动更新；Linux AppImage/Flatpak；Windows MSIX。签名与公证纳入 M1 的 CI。
+- 当前分发：macOS `.app` / `.dmg` 打包、签名与公证脚本已有；正式签名公证的验收仍未关闭。自动更新、Linux AppImage/Flatpak 与 Windows MSIX 为后续目标；当前「检查更新」没有配置更新源。
 - **零遥测**：不采集任何使用数据。崩溃时只在本地生成报告文件（含 panic 信息、版本、平台，不含 vault 内容），由用户决定是否手动提交。
 - **开源**：仓库已采用 Apache-2.0，M1 可用后公开；此前保持私有以避免在编辑器骨架不稳时消耗精力应对外部反馈。
 - **原生动态库**：zvec-rust 依赖 `libzvec_c_api.dylib / .so / .dll`（macOS 版 23 MB，只依赖系统库，minos 14.0）。链路已在 M0 跑通（ADR 0003，`spikes/zvec-index/bundle.sh`）：
@@ -1034,7 +1042,7 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
 - Notion 式数据库 / 关系型属性视图
 - 插件系统（MCP + CLI 是 v1 的扩展面；WASM 插件列入长期路线）
 - 云账号、托管同步
-- 所见即所得的表格编辑
+- 表格增删行列与合并单元格（单元格编辑、列宽拖动已实现）
 - 应用级「纯 Markdown 模式」，以及写进文档的字体族 / 字号 / 字间距 / 段距（9.1）
 - 网页能力只做链接卡片：不做网页剪藏、不做内联或侧栏的实时网页视图（WebView）
 - PDF 编辑、批注、正文全文索引（只做页面预览）
@@ -1047,10 +1055,12 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
 
 每个里程碑交付可运行的软件，按垂直切片而非按模块推进。
 
+**2026-09-26 状态摘要**：M2 的互联、颜色、源码入口、表格单元格编辑、标签页与 CLI 已接入；M3 中 Mermaid、PDF 和本地语义混合搜索已提前接入，MCP 与审阅写入仍待做。以下带日期的进展保留当时范围，不能把旧条目里的「尚未做」直接视为当前状态。
+
 ### 18.1 排期假设
 
 - 单人、业余，按每周约 10 小时、每月约 40 小时估算；估算误差按 ±30% 看待。
-- 2026 年 10 月启动。下面的时长是"投入小时数 ÷ 40"得出的月数，不含假期。
+- 原计划假设 2026 年 10 月启动；实际 M0 已于 2026-09-15 完成，M2 与部分 M3 能力已提前落地。下方月份保留为最初估算，不作为当前交付承诺；以带日期的进展和验收记录判断完成度。
 - 每个里程碑带一份**砍单清单**：进度落后时先砍清单里的项，而不是延期。
 
 ### 18.2 节奏纪律（单人项目最重要的部分）
@@ -1058,7 +1068,7 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
 - Spike 一律限时（一周内），到期就按现有数据决策，不追求完美对比。
 - 能复用就不自研：gpui-base 文本引擎、zvec、comrak、`ignore`、`notify`。
 - 先做窄而深的垂直切片（打开 → 编辑 → 保存 → 搜索），再横向铺功能。
-- 不做任何 M 级别之外的"顺手"功能；想法记入 `docs/backlog.md`。
+- 不做里程碑范围之外的「顺手」功能；新增想法先记在对应里程碑的后续范围中。
 - 每个里程碑结束发一个可安装的 build 给自己日常使用，用自己的 vault 吃自己的狗粮。
 
 ### M0 · Spike（约 60 小时，2026-10 → 2026-11 中）
@@ -1190,7 +1200,7 @@ CLI 输出支持 `--json`。它既是脚本接口，也是 MCP 的功能基线�
 ### M3 · AI 与富内容（约 135 小时，2027-09 初 → 2027-12 初）
 
 - MCP Server（stdio）、审阅模式写入。
-- 语义索引（zvec-rust）与混合检索（`MultiQuery` RRF）、本地 Embedding（质量档；快速档仅评估）。
+- 语义索引（zvec-rust）与混合检索（应用侧 RRF）、本地 Embedding；当前实现见 10.4，其他模型档位仍待评估。
 - mermaid 渲染（merman，接入 GPUI 文本测量回调，约 15 小时）。
 - PDF 嵌入（hayro，首页/指定页位图 + 翻页，约 20 小时）。
 - 砍单清单：PDF 嵌入 → mermaid → 快速档评估 → 混合检索（先只做纯语义）→ 审阅模式（先只开只读工具）。

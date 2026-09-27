@@ -1,5 +1,7 @@
 # M2 渲染服务与图片验收
 
+> 2026-09-26 现状补充：下文是 2026-09-22 首次交付的记录。数学、Mermaid、PDF、笔记嵌入、附件树与引用计数现已接入；拖放导入和图片宽度预设已实现。渲染任务与内存缓存已有预算，见 [性能续作验收](performance-followup-2026-09-26.md)；磁盘缓存仍无容量淘汰。当前使用说明见 [README](../../README.md)。原测试数字不改写为新结果。
+
 更新日期：2026-09-22。对应 [方案 9.9](../project_plan.md)（重内容渲染服务）、[UI 设计 5.6](../ui_design.md)（富内容块）与 7.5（粘贴规则）。
 
 ## 范围
@@ -29,7 +31,9 @@
 ```sh
 cargo fmt -p aero-core -p aero-index -p aero-app -- --check
 cargo test --locked -p aero-app render::
-cargo test --locked -p aero-app image_ pasting_ clicking_an_image
+cargo test --locked -p aero-app image_
+cargo test --locked -p aero-app pasting_
+cargo test --locked -p aero-app clicking_an_image
 cargo test --locked -p aero-core attachment
 cargo test --locked -p aero-core -p aero-index -p aero-app
 ```
