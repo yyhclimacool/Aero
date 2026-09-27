@@ -441,6 +441,48 @@ fn virtualized_document_preserves_visible_geometry_on_focus(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
+fn scrollbar_stays_interactive_after_scrolling_a_long_document(cx: &mut TestAppContext) {
+    let source = (0..300).map(|i| format!("Paragraph {i}.\n\n")).collect::<String>();
+    let (_dir, editor) = open(cx, &source);
+    cx.update(|cx| {
+        gpui_kit::component::Theme::set_scrollbar_mode(gpui_kit::base::ScrollbarMode::Always, cx);
+    });
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    draw(cx);
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            e.scroll.set_offset(point(px(0.), px(-1400.)));
+            cx.notify();
+        });
+    });
+    draw(cx);
+    let (track, before) = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        (e.scroll.bounds(), e.scroll.offset().y)
+    });
+    // The track must still cover the viewport after the content moved by two pages.
+    let end = point(track.right() - px(8.), track.bottom() - px(8.));
+    click(cx, end);
+    draw(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.scroll.offset().y < before, "scrollbar scrolled away with the document");
+        assert!((e.scroll.offset().y + e.scroll.max_offset().y).abs() <= px(1.));
+        let last = e.units.last().unwrap().id;
+        assert!(
+            e.unit_bounds.iter().any(|(id, b)| *id == last && b.intersects(&track)),
+            "last {last:?}, track {track:?}, offset {:?}, max {:?}, tail {:?}, rows {:?}",
+            e.scroll.offset(), e.scroll.max_offset(), e.unit_bounds.last(), e.viewport.unit_ranges
+        );
+        assert!(e.presenters.len() < 100, "scrollbar jumps must preserve virtualization");
+    });
+    click(cx, point(track.right() - px(8.), track.top() + px(8.)));
+    draw(cx);
+    assert_eq!(cx.update(|_, cx| editor.read(cx).scroll.offset().y), px(0.));
+}
+
+#[gpui_kit::test]
 fn virtualized_scroll_resize_keeps_anchor_and_evicts_stale_bounds(cx: &mut TestAppContext) {
     let source = (0..1200)
         .map(|i| format!("Paragraph {i}: {}\n\n", "wrapping words and 中文内容。".repeat(8)))

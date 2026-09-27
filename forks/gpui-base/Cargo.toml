@@ -33,7 +33,6 @@ keywords = [
 ]
 license = "Apache-2.0"
 repository = "https://github.com/longbridge/gpui-kit"
-resolver = "2"
 
 [features]
 inspector = [
@@ -138,10 +137,6 @@ package = "gpui-pre"
 
 [dev-dependencies.indoc]
 version = "2"
-
-[dev-dependencies.reqwest_client]
-version = "0.3.1"
-package = "gpui-pre-reqwest-client"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies.smol]
 version = "2"

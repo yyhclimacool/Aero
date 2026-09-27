@@ -172,6 +172,18 @@ impl Vault {
     /// 枚举全部笔记（`*.md`），按路径排序。跳过隐藏目录（含 `.aero/`、`.git/`）、`*.assets/`，
     /// 尊重 `.gitignore` 与 `.aero/ignore`。
     pub fn notes(&self) -> Result<Vec<VaultPath>, VaultError> {
+        Ok(self.notes_cancellable(|| false)?.expect("uncancellable enumeration"))
+    }
+
+    /// Enumerate notes with cooperative cancellation between directory entries.
+    /// `None` means cancelled, never an empty/partial snapshot of the vault.
+    pub fn notes_cancellable(
+        &self,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<Vec<VaultPath>>, VaultError> {
+        if cancelled() {
+            return Ok(None);
+        }
         let mut wb = ignore::WalkBuilder::new(&self.root);
         wb.hidden(true).git_ignore(true).require_git(false).follow_links(false);
         let custom = self.root.join(".aero").join("ignore");
@@ -186,6 +198,9 @@ impl Vault {
         });
         let mut out = Vec::new();
         for entry in wb.build() {
+            if cancelled() {
+                return Ok(None);
+            }
             let entry = entry.map_err(|e| VaultError::Walk(e.to_string()))?;
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
@@ -195,7 +210,7 @@ impl Vault {
             }
         }
         out.sort();
-        Ok(out)
+        Ok(Some(out))
     }
 
     pub fn folders(&self) -> Result<Vec<VaultPath>, VaultError> {
@@ -506,6 +521,26 @@ mod tests {
                 .unwrap()
                 .any(|entry| { entry.unwrap().file_name().to_string_lossy().contains("aero-tmp") })
         );
+    }
+
+    #[test]
+    fn cancelled_note_enumeration_never_returns_a_partial_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..20 {
+            fs::write(dir.path().join(format!("{index}.md")), "body\n").unwrap();
+        }
+        let vault = Vault::open(dir.path()).unwrap();
+        let mut visited = 0;
+        let cancelled = vault
+            .notes_cancellable(|| {
+                visited += 1;
+                visited == 5
+            })
+            .unwrap();
+        assert!(cancelled.is_none());
+        assert_eq!(visited, 5, "stop during the walk instead of after enumerating everything");
+        assert_eq!(vault.notes_cancellable(|| false).unwrap().unwrap(), vault.notes().unwrap());
+        assert_eq!(vault.notes().unwrap().len(), 20);
     }
 
     #[test]

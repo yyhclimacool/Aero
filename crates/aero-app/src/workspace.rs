@@ -231,6 +231,9 @@ impl Workspace {
                 let index_dir = self.data_dir.join("index");
                 let search = cx.new(|cx| SearchService::new(vault.clone(), index_dir, cx));
                 let search_sub = cx.observe(&search, |_, _, cx| cx.notify());
+                let progress_sub = cx.subscribe(&search, |_, _, _: &crate::search::SearchEvent, cx| {
+                    cx.notify();
+                });
                 let semantic = cx.new(|cx| {
                     crate::semantic::SemanticService::new(vault.clone(), self.data_dir.clone(), cx)
                 });
@@ -293,6 +296,7 @@ impl Workspace {
                     _subscriptions: vec![
                         sub,
                         search_sub,
+                        progress_sub,
                         view_sub,
                         tags_sub,
                         watch_sub,
@@ -337,14 +341,21 @@ impl Workspace {
         self.references_task = Some(cx.spawn(async move |this, cx| {
             let report = cx
                 .background_spawn(async move {
-                    let from_index = indexer.lock().ok().and_then(|guard| {
-                        guard.as_ref().and_then(|index| index.attachment_references().ok())
-                    });
-                    from_index.or_else(|| {
-                        aero_core::attachments::References::read(&vault)
+                    let targets = indexer
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.as_ref().and_then(|index| index.attachment_targets().ok()));
+                    if let Some(targets) = targets {
+                        return aero_core::attachments::Catalog::read(&vault)
+                            .map(|catalog| {
+                                aero_core::attachments::References::from_targets(&catalog, targets)
+                            })
                             .map_err(|error| log::warn!("attachment references: {error}"))
-                            .ok()
-                    })
+                            .ok();
+                    }
+                    aero_core::attachments::References::read(&vault)
+                        .map_err(|error| log::warn!("attachment references: {error}"))
+                        .ok()
                 })
                 .await;
             if let Some(report) = report {
@@ -1504,12 +1515,15 @@ impl Workspace {
         // The session stays owned by Workspace, including its editors and service Drop guards.
         // Native close is vetoed until this continuation removes the window.
         self.io_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let started = Instant::now();
             if let Some((search, semantic)) = tasks {
                 search.await;
                 semantic.await;
             }
+            log::debug!("workspace close: services stopped after {:?}", started.elapsed());
             let _ = this.update_in(cx, |this, window, cx| {
                 this.open = None;
+                log::debug!("workspace close: session released after {:?}", started.elapsed());
                 this.session_closing = false;
                 this.io_task = None;
                 this.references_task = None;
@@ -1905,7 +1919,6 @@ impl Render for Workspace {
         }
 
         let body: AnyElement = match &self.open {
-            _ if self.session_busy() => div().flex_1().p_6().child("正在完成文件操作…").into_any_element(),
             None => self.render_first_run(cx).into_any_element(),
             Some(open) => v_flex()
                 .flex_1()
@@ -1920,50 +1933,52 @@ impl Render for Workspace {
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_quit))
-            .on_action(cx.listener(Self::on_open_vault))
-            .on_action(cx.listener(Self::on_new_vault))
-            .on_action(cx.listener(Self::on_close_vault))
-            .on_action(cx.listener(Self::on_new_note))
-            .on_action(cx.listener(Self::on_open_daily))
-            .on_action(cx.listener(Self::on_delete_note))
-            .on_action(cx.listener(Self::on_trash_note))
-            .on_action(cx.listener(Self::on_reveal_in_finder))
-            .on_action(cx.listener(Self::on_copy_note_path))
-            .on_action(cx.listener(Self::on_save_now))
-            .on_action(cx.listener(Self::on_open_search))
-            .on_action(cx.listener(Self::on_open_settings))
-            .on_action(cx.listener(Self::on_about))
-            .on_action(cx.listener(Self::on_check_updates))
-            .on_action(cx.listener(Self::on_search_settings))
-            .on_action(cx.listener(Self::on_open_files))
-            .on_action(cx.listener(Self::on_open_tags))
-            .on_action(cx.listener(Self::on_show_backlinks))
-            .on_action(cx.listener(Self::on_show_outline))
-            .on_action(cx.listener(Self::on_toggle_note_source))
-            .on_action(cx.listener(Self::on_toggle_focus_source))
-            .on_action(cx.listener(Self::on_link_preview_hover))
-            .on_action(cx.listener(Self::on_link_preview_command))
-            .on_action(cx.listener(Self::on_link_preview_off))
-            .on_action(cx.listener(Self::on_quick_open))
-            .on_action(cx.listener(Self::on_command_palette))
-            .on_action(cx.listener(Self::on_toggle_sidebar))
-            .on_action(cx.listener(Self::on_toggle_panel))
-            .on_action(cx.listener(Self::on_new_tab))
-            .on_action(cx.listener(Self::on_close_tab))
-            .on_action(cx.listener(Self::on_close_other_tabs))
-            .on_action(cx.listener(Self::on_rename_active_tab))
-            .on_action(cx.listener(Self::on_retitle_active_tab))
-            .on_action(cx.listener(Self::on_reopen_closed_tab))
-            .on_action(cx.listener(Self::on_next_tab))
-            .on_action(cx.listener(Self::on_prev_tab))
-            .on_action(cx.listener(Self::on_activate_tab))
-            .on_action(cx.listener(Self::on_toggle_favorite))
-            .on_action(cx.listener(Self::on_toggle_favorite_note))
-            .on_action(cx.listener(Self::on_open_in_new_tab))
+            .when(!self.session_busy(), |el| {
+                el.on_action(cx.listener(Self::on_open_vault))
+                    .on_action(cx.listener(Self::on_new_vault))
+                    .on_action(cx.listener(Self::on_close_vault))
+                    .on_action(cx.listener(Self::on_new_note))
+                    .on_action(cx.listener(Self::on_open_daily))
+                    .on_action(cx.listener(Self::on_delete_note))
+                    .on_action(cx.listener(Self::on_trash_note))
+                    .on_action(cx.listener(Self::on_reveal_in_finder))
+                    .on_action(cx.listener(Self::on_copy_note_path))
+                    .on_action(cx.listener(Self::on_save_now))
+                    .on_action(cx.listener(Self::on_open_search))
+                    .on_action(cx.listener(Self::on_open_settings))
+                    .on_action(cx.listener(Self::on_about))
+                    .on_action(cx.listener(Self::on_check_updates))
+                    .on_action(cx.listener(Self::on_search_settings))
+                    .on_action(cx.listener(Self::on_open_files))
+                    .on_action(cx.listener(Self::on_open_tags))
+                    .on_action(cx.listener(Self::on_show_backlinks))
+                    .on_action(cx.listener(Self::on_show_outline))
+                    .on_action(cx.listener(Self::on_toggle_note_source))
+                    .on_action(cx.listener(Self::on_toggle_focus_source))
+                    .on_action(cx.listener(Self::on_link_preview_hover))
+                    .on_action(cx.listener(Self::on_link_preview_command))
+                    .on_action(cx.listener(Self::on_link_preview_off))
+                    .on_action(cx.listener(Self::on_quick_open))
+                    .on_action(cx.listener(Self::on_command_palette))
+                    .on_action(cx.listener(Self::on_toggle_sidebar))
+                    .on_action(cx.listener(Self::on_toggle_panel))
+                    .on_action(cx.listener(Self::on_new_tab))
+                    .on_action(cx.listener(Self::on_close_tab))
+                    .on_action(cx.listener(Self::on_close_other_tabs))
+                    .on_action(cx.listener(Self::on_rename_active_tab))
+                    .on_action(cx.listener(Self::on_retitle_active_tab))
+                    .on_action(cx.listener(Self::on_reopen_closed_tab))
+                    .on_action(cx.listener(Self::on_next_tab))
+                    .on_action(cx.listener(Self::on_prev_tab))
+                    .on_action(cx.listener(Self::on_activate_tab))
+                    .on_action(cx.listener(Self::on_toggle_favorite))
+                    .on_action(cx.listener(Self::on_toggle_favorite_note))
+                    .on_action(cx.listener(Self::on_open_in_new_tab))
+            })
             .size_full()
             .bg(background)
             .text_color(foreground)
-            .when(!self.session_busy(), |el| el.child(self.render_title_bar(window, cx)))
+            .child(self.render_title_bar(window, cx))
             .child(body)
             .children(gpui_kit::component::Root::render_dialog_layer(window, cx))
             .children(gpui_kit::component::Root::render_notification_layer(window, cx))
@@ -1986,6 +2001,38 @@ impl Render for Workspace {
                             div()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(picker),
+                        ),
+                ))
+            })
+            .when(self.session_busy(), |el| {
+                // Keep the note and window chrome in place while cleanup runs.
+                // Editors are suspended and focus is on Workspace; block pointer
+                // and keyboard input so visible controls cannot start more work.
+                el.capture_key_down(|_, _, cx| cx.stop_propagation()).child(deferred(
+                    div()
+                        .id("workspace-busy")
+                        .debug_selector(|| "workspace-busy".into())
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_4()
+                                .py_2()
+                                .rounded_md()
+                                .bg(background)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .shadow_md()
+                                .text_sm()
+                                .child(if self.rename_pending {
+                                    "正在完成文件操作…"
+                                } else {
+                                    "正在关闭笔记库…"
+                                }),
                         ),
                 ))
             })
@@ -2415,6 +2462,33 @@ mod tests {
     }
 
     /// 命令行给了路径就不碰示例库，也不去恢复最近打开的库。
+    #[gpui_kit::test]
+    fn startup_finds_recent_note_in_background_without_replacing_user_choice(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::actions::init(cx);
+        });
+        let data = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "recent\n").unwrap();
+        std::fs::write(dir.path().join("b.md"), "chosen\n").unwrap();
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            let mut w = Workspace::new(Some(dir.path().to_path_buf()), data.path().into(), window, cx);
+            let open = w.open.as_ref().unwrap();
+            assert!(open.editor().is_none());
+            assert!(open.tabs[0].path(cx).is_none(), "constructing the window must not walk the vault");
+            w.open_note(VaultPath::new("b.md").unwrap(), window, cx);
+            w
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            assert_eq!(open.tabs.len(), 1);
+            assert_eq!(open.editor().unwrap().read(cx).path().as_str(), "b.md");
+            open.search.read(cx).close_blocking();
+        });
+    }
+
     #[gpui_kit::test]
     fn startup_with_an_explicit_path_skips_the_demo_vault(cx: &mut TestAppContext) {
         cx.update(|cx| {

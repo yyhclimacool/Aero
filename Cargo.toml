@@ -3,7 +3,8 @@ resolver = "3"
 # crates/  正式代码，按 docs/project_plan.md 第 4 节分层
 # spikes/  M0 的限时实验，结论写入 docs/decisions/ 后整个目录删除。
 #          注意 cargo 不允许 glob 匹配不到任何包，spikes/ 清空时要把这一项去掉。
-members = ["crates/*", "spikes/*"]
+# forks/   本地修复的 UI 底座也纳入 workspace，保证交互回归测试可以运行。
+members = ["crates/*", "spikes/*", "forks/gpui-base"]
 default-members = ["crates/aero-app"]
 
 [workspace.package]
@@ -37,6 +38,10 @@ ropey = { version = "=2.0.0-beta.1", features = ["metric_chars", "metric_lines_l
 opt-level = 0
 
 [profile.dev.package."*"]
+opt-level = 2
+
+# gpui-base 作为 workspace 成员参与测试，但保留 UI 依赖的优化级别。
+[profile.dev.package.gpui-base]
 opt-level = 2
 
 [profile.release]

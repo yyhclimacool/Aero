@@ -1181,6 +1181,14 @@ mod tests {
         cx.run_until_parked();
         let key = (aero_core::VaultPath::new("b.md").unwrap(), "Present".into());
         editor.update(cx, |e, _| assert!(!e.link_preview.fragments[&key].exists));
+        let generation = editor.update(cx, |e, _| e.link_preview.resolver_generation);
+        for _ in 0..20 {
+            service.update(cx, |_, cx| cx.emit(crate::search::SearchEvent::Progress));
+        }
+        cx.run_until_parked();
+        editor.update(cx, |e, _| {
+            assert_eq!(e.link_preview.resolver_generation, generation, "progress must not rebuild catalogs");
+        });
         for (text, exists) in [
             (Some("# Present\n"), true),
             (Some("# Missing\n"), false),

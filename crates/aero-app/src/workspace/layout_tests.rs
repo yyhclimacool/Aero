@@ -113,6 +113,61 @@ fn vault_close_keeps_the_session_until_saves_and_indexes_finish(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn closing_keeps_the_document_visible_until_cleanup_finishes(cx: &mut TestAppContext) {
+    let (_dir, _data, workspace) = open(cx, Some("# Still visible\n\nbody\n"));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    with_root(cx, &workspace);
+    draw(cx);
+    let before = cx.debug_bounds("editor").unwrap();
+    workspace.update_in(cx, |w, window, cx| {
+        w.request_operation(super::PendingOperation::CloseVault, window, cx);
+        assert!(w.session_closing);
+    });
+    // Draw before the asynchronous cleanup continuation can dispose of the session.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let during = cx.debug_bounds("editor");
+    cx.run_until_parked();
+    assert_eq!(during, Some(before), "closing must retain the document instead of a blank page");
+    cx.update(|_, cx| assert!(workspace.read(cx).open.is_none()));
+}
+
+#[gpui_kit::test]
+fn busy_workspace_shields_visible_controls_and_shortcuts(cx: &mut TestAppContext) {
+    let (_dir, _data, workspace) = open(cx, Some("# Still visible\n\nbody\n"));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    with_root(cx, &workspace);
+    draw(cx);
+    let editor_bounds = cx.debug_bounds("editor").unwrap();
+    workspace.update_in(cx, |w, window, cx| {
+        w.session_closing = true;
+        w.open.as_ref().unwrap().editor().unwrap().update(cx, |e, cx| {
+            assert!(e.suspend_io(cx));
+        });
+        w.focus_handle.focus(window, cx);
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("workspace-busy").is_some());
+    cx.simulate_click(editor_bounds.center(), Modifiers::default());
+    cx.simulate_input("late input");
+    cx.simulate_keystrokes("cmd-t");
+    cx.update(|window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+    cx.run_until_parked();
+    let (sidebar_visible, paths, text) = workspace.update_in(cx, |w, _, cx| {
+        let paths = tab_paths(w, cx);
+        let editor = w.open.as_ref().unwrap().editor().unwrap();
+        let text = editor.read(cx).index_snapshot().1;
+        editor.update(cx, |e, cx| e.resume_io(cx));
+        w.session_closing = false;
+        (w.sidebar_visible, paths, text)
+    });
+    close_index(cx, &workspace);
+    assert!(sidebar_visible, "busy controls must not react to shortcuts or menu actions");
+    assert_eq!(paths, ["a.md"]);
+    assert_eq!(text, "# Still visible\n\nbody\n");
+}
+
+#[gpui_kit::test]
 fn load_completion_cannot_resurrect_a_closed_tab(cx: &mut TestAppContext) {
     let (dir, _data, workspace) = open(cx, Some("body\n"));
     std::fs::write(dir.path().join("b.md"), "# B\n").unwrap();

@@ -322,7 +322,16 @@ impl Indexer {
     /// 全量同步的计划：磁盘上每篇笔记与其已知元数据，以及元数据里有、磁盘上没有的。
     /// 同时把磁盘上的全部路径登记进链接解析表（新文件预分配 `note_id`），见 [`LinkUniverse`]。
     pub fn plan_sync(&mut self) -> Result<SyncPlan, IndexerError> {
-        let notes = self.vault.notes()?;
+        Ok(self.plan_sync_cancellable(|| false)?.expect("uncancellable sync plan"))
+    }
+
+    /// Cancellation must discard the whole enumeration: a partial file list could
+    /// otherwise turn the unvisited notes into deletions from the index.
+    pub fn plan_sync_cancellable(
+        &mut self,
+        cancelled: impl FnMut() -> bool,
+    ) -> Result<Option<SyncPlan>, IndexerError> {
+        let Some(notes) = self.vault.notes_cancellable(cancelled)? else { return Ok(None) };
         let mut known: HashMap<String, NoteRow> =
             self.meta.all_notes()?.into_iter().map(|r| (r.path.clone(), r)).collect();
         let notes: Vec<(VaultPath, Option<NoteRow>)> = notes
@@ -349,7 +358,7 @@ impl Indexer {
                 }
             }
         }
-        Ok(SyncPlan { notes, removed: known.into_values().collect() })
+        Ok(Some(SyncPlan { notes, removed: known.into_values().collect() }))
     }
 
     /// 同步一篇（`plan_sync` 的一项），结果计入 `report`。每写满 [`FLUSH_EVERY_BLOCKS`] 块 flush 一次。
@@ -746,17 +755,19 @@ impl Indexer {
 
     /// 附件被引用的次数。目标存在索引里，解析只用一次附件目录扫描，不再读每篇笔记。
     pub fn attachment_references(&self) -> Result<aero_core::attachments::References, IndexerError> {
-        use aero_core::links::Resolution;
         let catalog = aero_core::attachments::Catalog::read(self.vault.as_ref())?;
-        let mut refs = aero_core::attachments::References::from_catalog(&catalog);
-        for (note, target) in self.meta.attachment_targets()? {
-            let Ok(note) = aero_core::VaultPath::new(&note) else { continue };
-            let bare = target.split(['#', '?']).next().unwrap_or(&target);
-            if let Resolution::Resolved { path, .. } = catalog.resolve(bare, &note) {
-                refs.increment(&path);
-            }
-        }
-        Ok(refs)
+        Ok(aero_core::attachments::References::from_targets(&catalog, self.attachment_targets()?))
+    }
+
+    /// A cheap owned snapshot; directory traversal and resolution can run after
+    /// the caller releases the index mutex, including while the index is closing.
+    pub fn attachment_targets(&self) -> Result<Vec<(VaultPath, String)>, IndexerError> {
+        Ok(self
+            .meta
+            .attachment_targets()?
+            .into_iter()
+            .filter_map(|(note, target)| VaultPath::new(&note).ok().map(|note| (note, target)))
+            .collect())
     }
 
     /// 外部把笔记改名或搬走：内容指纹唯一对上时，改写入链并让 note_id 跟着新路径走。
@@ -876,6 +887,28 @@ mod tests {
 
     fn paths(hits: &[SearchHit]) -> Vec<(String, u32)> {
         hits.iter().map(|h| (h.path.as_str().to_owned(), h.block_ord)).collect()
+    }
+
+    #[test]
+    fn cancelled_sync_plan_preserves_notes_links_and_later_writes() {
+        let (_dir, mut ix) = setup(&[("a.md", "[[b]]\n"), ("b.md", "body\n"), ("c.md", "third\n")]);
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        let before = ix.meta.links_rows().unwrap();
+        let mut visited = 0;
+        assert!(
+            ix.plan_sync_cancellable(|| {
+                visited += 1;
+                visited == 3
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(visited, 3);
+        assert_eq!(ix.meta.links_rows().unwrap(), before);
+        assert_eq!(ix.note_summaries().unwrap().len(), 3);
+        assert!(!ix.bulk, "cancelled enumeration must not start a bulk update");
+        ix.index_note(&VaultPath::new("b.md").unwrap()).unwrap();
+        assert_eq!(ix.backlinks(&VaultPath::new("b.md").unwrap(), None, 10).unwrap().total, 1);
     }
 
     #[test]

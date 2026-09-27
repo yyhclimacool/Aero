@@ -408,11 +408,30 @@ impl Workspace {
             tabs.push(tab);
         }
         if tabs.is_empty() {
-            if let Some(path) = most_recent_note(&vault) {
-                self.open_note(path, window, cx);
-            } else {
-                self.tabs_changed(cx);
-            }
+            // Finding the newest note walks the whole vault. Let the window paint
+            // first, and never let a late result replace a tab the user chose.
+            let placeholder = self.open.as_ref().unwrap().tabs[0].id;
+            cx.spawn_in(window, async move |this, cx| {
+                let scan = vault.clone();
+                let path = cx.background_spawn(async move { most_recent_note(&scan) }).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    let Some(open) = this.open.as_ref() else { return };
+                    if this.session_busy()
+                        || !Arc::ptr_eq(&open.vault, &vault)
+                        || open.tabs.len() != 1
+                        || open.tabs[0].id != placeholder
+                        || open.tabs[0].path(cx).is_some()
+                    {
+                        return;
+                    }
+                    if let Some(path) = path {
+                        this.open_note(path, window, cx);
+                    } else {
+                        this.tabs_changed(cx);
+                    }
+                });
+            })
+            .detach();
             return;
         }
         let Some(open) = self.open.as_mut() else { return };

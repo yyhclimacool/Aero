@@ -346,13 +346,15 @@ impl FileTree {
     }
 
     /// 文件监听触发的重扫放到后台：目录遍历在有安全软件逐个审计文件访问的机器上可能要几秒，
-    /// 不能卡住界面。扫描中又来请求就在这次结束后再扫一次，同时最多一个在跑。
+    /// 不能卡住界面。扫描中又来请求就先显示本次结果，再补扫一次，同时最多一个在跑。
     pub fn rescan_in_background(&mut self, cx: &mut Context<Self>) {
-        self.scan_generation += 1;
         if self.scanning.is_some() {
+            // A queued refresh must not invalidate the in-flight snapshot. Busy
+            // vaults may change during every scan, otherwise loading never ends.
             self.scan_again = true;
             return;
         }
+        self.scan_generation += 1;
         let generation = self.scan_generation;
         let vault = self.vault.clone();
         let scan = cx.background_spawn(async move { Scan::read(&vault) });
@@ -1407,7 +1409,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn queued_rescan_ignores_obsolete_snapshot_and_refreshes_once_ready(cx: &mut TestAppContext) {
+    fn queued_rescan_publishes_completed_snapshot_then_catches_up(cx: &mut TestAppContext) {
         let (dir, vault, tree) = setup(cx);
         let intermediate = aero_core::VaultPath::new("intermediate.md").unwrap();
         let latest = aero_core::VaultPath::new("latest.md").unwrap();
@@ -1422,7 +1424,7 @@ mod tests {
             tree.rescan_in_background(cx);
             assert!(tree.scan_again);
             tree.apply(generation, stale);
-            assert!(!tree.contains(&intermediate), "a queued refresh invalidates the active scan");
+            assert!(tree.contains(&intermediate), "queued changes must not discard completed work");
         });
         cx.run_until_parked();
         tree.read_with(cx, |tree, _| {
@@ -1430,6 +1432,37 @@ mod tests {
             assert!(!tree.scan_again);
             assert!(tree.contains(&latest));
             assert!(!tree.contains(&intermediate));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn changes_during_initial_scan_do_not_leave_the_tree_loading(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/note.md"), "note").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let snapshot = super::Scan::read(&vault);
+        let note = aero_core::VaultPath::new("nested/note.md").unwrap();
+        let (tree, visual) = cx.add_window_view(|_, cx| {
+            let mut tree = FileTree::new(vault, cx);
+            let generation = tree.scan_generation;
+            // A busy code directory can emit more changes throughout every scan.
+            for _ in 0..20 {
+                tree.rescan_in_background(cx);
+            }
+            assert!(tree.scan_again);
+            tree.apply(generation, snapshot);
+            assert!(!tree.loading, "publish the first completed scan even with a refresh queued");
+            assert!(tree.contains(&note));
+            assert!(!tree.rows.iter().any(|row| matches!(row, Row::VaultLoading)));
+            tree
+        });
+        visual.run_until_parked();
+        tree.read_with(visual, |tree, _| {
+            assert!(!tree.is_scanning());
+            assert!(!tree.scan_again);
+            assert!(tree.contains(&note));
         });
     }
 

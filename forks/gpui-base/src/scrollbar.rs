@@ -10,9 +10,9 @@ use crate::{
 use gpui::{
     Anchor, App, Axis, Background, BorderStyle, Bounds, ContentMask, CursorStyle, Edges, Element,
     ElementId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
-    IsZero, LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels,
-    Point, Position, ScrollHandle, ScrollWheelEvent, Size, Style, UniformListScrollHandle, Window,
-    fill, point, prelude::FluentBuilder, px, relative, size,
+    IsZero, LayoutId, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Point, Position, ScrollHandle, ScrollWheelEvent, Size, Style,
+    UniformListScrollHandle, Window, fill, point, prelude::FluentBuilder, px, relative, size,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,53 @@ fn clamp_thumb_radius(radius: Pixels, bounds: Bounds<Pixels>) -> Pixels {
     radius
         .min(bounds.size.width / 2.)
         .min(bounds.size.height / 2.)
+}
+
+/// One mapping for paint, track clicks, and dragging, including the end insets.
+#[derive(Clone, Copy, Debug)]
+struct ThumbGeometry {
+    inset: Pixels,
+    length: Pixels,
+    travel: Pixels,
+    max_offset: Pixels,
+}
+
+impl ThumbGeometry {
+    fn new(
+        container: Pixels,
+        content: Pixels,
+        track: Pixels,
+        inset: Pixels,
+        min_length: Pixels,
+    ) -> Self {
+        let track = track.max(px(0.));
+        let inset = inset.clamp(px(0.), track / 2.);
+        let outer_length = (container / content * track)
+            .max(min_length)
+            .clamp(inset * 2., track);
+        Self {
+            inset,
+            length: outer_length - inset * 2.,
+            travel: track - outer_length,
+            max_offset: (content - container).max(px(0.)),
+        }
+    }
+
+    fn thumb_start(self, offset: Pixels) -> Pixels {
+        let fraction = if self.max_offset > px(0.) {
+            (-offset / self.max_offset).clamp(0., 1.)
+        } else {
+            0.
+        };
+        self.inset + self.travel * fraction
+    }
+
+    fn offset_for_thumb_start(self, start: Pixels) -> Pixels {
+        if self.travel <= px(0.) {
+            return px(0.);
+        }
+        -self.max_offset * ((start - self.inset) / self.travel).clamp(0., 1.)
+    }
 }
 
 /// Scrollbar show mode.
@@ -753,8 +800,6 @@ impl ScrollbarAxis {
         match self {
             Self::Vertical => vec![Axis::Vertical],
             Self::Horizontal => vec![Axis::Horizontal],
-            // This should keep Horizontal first, Vertical is the primary axis
-            // if Vertical not need display, then Horizontal will not keep right margin.
             Self::Both => vec![Axis::Horizontal, Axis::Vertical],
         }
     }
@@ -1128,10 +1173,7 @@ pub struct AxisPrepaintState {
     // Bounds of thumb to be rendered.
     thumb_fill_bounds: Bounds<Pixels>,
     thumb_bg: Background,
-    scroll_size: Pixels,
-    container_size: Pixels,
-    thumb_size: Pixels,
-    margin_end: Pixels,
+    geometry: ThumbGeometry,
     track_width: Pixels,
     visibility_opacity: f32,
     visibility_position: f32,
@@ -1255,10 +1297,10 @@ impl Element for Scrollbar {
         state.set(inner);
 
         let mut states = vec![];
-        let mut has_both = self.axis.is_both();
         let scroll_size = self
             .scroll_size
             .unwrap_or(self.scroll_handle.content_size());
+        let has_vertical = self.axis.has_vertical() && scroll_size.height > hitbox.size.height;
 
         for axis in self.axis.all().into_iter() {
             let is_vertical = axis.is_vertical();
@@ -1283,7 +1325,7 @@ impl Element for Scrollbar {
             };
 
             // The horizontal scrollbar is set avoid overlapping with the vertical scrollbar, if the vertical scrollbar is visible.
-            let margin_end = if has_both && !is_vertical {
+            let margin_end = if has_vertical && !is_vertical {
                 track_width
             } else {
                 px(0.)
@@ -1291,7 +1333,6 @@ impl Element for Scrollbar {
 
             // Hide scrollbar, if the scroll area is smaller than the container.
             if scroll_area_size <= container_size {
-                has_both = false;
                 continue;
             }
 
@@ -1311,7 +1352,7 @@ impl Element for Scrollbar {
                     width: if is_vertical {
                         track_width
                     } else {
-                        hitbox.size.width
+                        (hitbox.size.width - margin_end).max(px(0.))
                     },
                     height: if is_vertical {
                         hitbox.size.height
@@ -1365,23 +1406,25 @@ impl Element for Scrollbar {
                 window.request_animation_frame();
             }
 
-            let thumb_size = (container_size / scroll_area_size * container_size).max(min_length);
-            let thumb_start = -(scroll_position / (scroll_area_size - container_size)
-                * (container_size - margin_end - thumb_size));
-            let thumb_end = (thumb_start + thumb_size).min(container_size - margin_end);
+            let geometry = ThumbGeometry::new(
+                container_size,
+                scroll_area_size,
+                container_size - margin_end,
+                inset,
+                min_length,
+            );
+            let thumb_start = geometry.thumb_start(scroll_position);
+            let thumb_length = geometry.length;
 
             // The clickable area of the thumb
-            let thumb_length = thumb_end - thumb_start - inset * 2;
             let thumb_bounds = if is_vertical {
-                Bounds::from_anchor_and_size(
-                    Anchor::TopRight,
-                    bounds.top_right() + point(-inset, inset + thumb_start),
+                Bounds::new(
+                    bounds.origin + point(px(0.), thumb_start),
                     size(track_width, thumb_length),
                 )
             } else {
-                Bounds::from_anchor_and_size(
-                    Anchor::BottomLeft,
-                    bounds.bottom_left() + point(inset + thumb_start, -inset),
+                Bounds::new(
+                    bounds.origin + point(thumb_start, px(0.)),
                     size(thumb_length, track_width),
                 )
             };
@@ -1390,13 +1433,13 @@ impl Element for Scrollbar {
             let thumb_fill_bounds = if is_vertical {
                 Bounds::from_anchor_and_size(
                     Anchor::TopRight,
-                    bounds.top_right() + point(-inset, inset + thumb_start),
+                    bounds.top_right() + point(-inset, thumb_start),
                     size(thumb_width, thumb_length),
                 )
             } else {
                 Bounds::from_anchor_and_size(
                     Anchor::BottomLeft,
-                    bounds.bottom_left() + point(inset + thumb_start, -inset),
+                    bounds.bottom_left() + point(thumb_start, -inset),
                     size(thumb_length, thumb_width),
                 )
             };
@@ -1415,10 +1458,7 @@ impl Element for Scrollbar {
                 thumb_bounds,
                 thumb_fill_bounds,
                 thumb_bg,
-                scroll_size: scroll_area_size,
-                container_size,
-                thumb_size: thumb_length,
-                margin_end,
+                geometry,
                 track_width,
                 visibility_opacity: visibility.opacity,
                 visibility_position: visibility.position,
@@ -1464,11 +1504,22 @@ impl Element for Scrollbar {
                     radius = clamp_thumb_radius(radius, state.thumb_fill_bounds);
                     let bounds = state.bounds;
                     let thumb_bounds = state.thumb_bounds;
-                    let scroll_area_size = state.scroll_size;
-                    let container_size = state.container_size;
-                    let thumb_size = state.thumb_size;
-                    let margin_end = state.margin_end;
+                    let geometry = state.geometry;
                     let is_vertical = axis.is_vertical();
+                    let offset_for_position =
+                        move |position: Point<Pixels>,
+                              grab: Point<Pixels>,
+                              current: Point<Pixels>| {
+                            if geometry.travel <= px(0.) {
+                                return current;
+                            }
+                            let start = position - bounds.origin - grab;
+                            if is_vertical {
+                                point(current.x, geometry.offset_for_thumb_start(start.y))
+                            } else {
+                                point(geometry.offset_for_thumb_start(start.x), current.y)
+                            }
+                        };
                     let visibility_opacity = state.visibility_opacity;
                     let is_visible = state.visibility_requested || visibility_opacity > 0.0;
                     let translation =
@@ -1529,15 +1580,16 @@ impl Element for Scrollbar {
                         }
                     });
 
-                    let safe_range = (-scroll_area_size + container_size)..px(0.);
-
                     if is_visible {
                         window.on_mouse_event({
                             let state = scrollbar_state.clone();
                             let scroll_handle = self.scroll_handle.clone();
 
                             move |event: &MouseDownEvent, phase, _, cx| {
-                                if phase.bubble() && bounds.contains(&event.position) {
+                                if phase.bubble()
+                                    && event.button == MouseButton::Left
+                                    && bounds.contains(&event.position)
+                                {
                                     cx.stop_propagation();
 
                                     if thumb_bounds.contains(&event.position) {
@@ -1549,29 +1601,11 @@ impl Element for Scrollbar {
                                     } else {
                                         // click on the scrollbar, jump to the position
                                         // Set the thumb bar center to the click position
-                                        let offset = scroll_handle.offset();
-                                        let percentage = if is_vertical {
-                                            (event.position.y - thumb_size / 2. - bounds.origin.y)
-                                                / (bounds.size.height - thumb_size)
-                                        } else {
-                                            (event.position.x - thumb_size / 2. - bounds.origin.x)
-                                                / (bounds.size.width - thumb_size)
-                                        }
-                                        .min(1.);
-
-                                        if is_vertical {
-                                            scroll_handle.set_offset(point(
-                                                offset.x,
-                                                (-scroll_area_size * percentage)
-                                                    .clamp(safe_range.start, safe_range.end),
-                                            ));
-                                        } else {
-                                            scroll_handle.set_offset(point(
-                                                (-scroll_area_size * percentage)
-                                                    .clamp(safe_range.start, safe_range.end),
-                                                offset.y,
-                                            ));
-                                        }
+                                        scroll_handle.set_offset(offset_for_position(
+                                            event.position,
+                                            point(geometry.length / 2., geometry.length / 2.),
+                                            scroll_handle.offset(),
+                                        ));
                                     }
 
                                     cx.notify(view_id);
@@ -1624,28 +1658,11 @@ impl Element for Scrollbar {
                                 // We need to keep the thumb bar still at the origin down position
                                 let drag_pos = state.get().drag_pos;
 
-                                let percentage = (if is_vertical {
-                                    (event.position.y - drag_pos.y - bounds.origin.y)
-                                        / (bounds.size.height - thumb_size)
-                                } else {
-                                    (event.position.x - drag_pos.x - bounds.origin.x)
-                                        / (bounds.size.width - thumb_size - margin_end)
-                                })
-                                .clamp(0., 1.);
-
-                                let offset = if is_vertical {
-                                    point(
-                                        scroll_handle.offset().x,
-                                        (-(scroll_area_size - container_size) * percentage)
-                                            .clamp(safe_range.start, safe_range.end),
-                                    )
-                                } else {
-                                    point(
-                                        (-(scroll_area_size - container_size) * percentage)
-                                            .clamp(safe_range.start, safe_range.end),
-                                        scroll_handle.offset().y,
-                                    )
-                                };
+                                let offset = offset_for_position(
+                                    event.position,
+                                    drag_pos,
+                                    scroll_handle.offset(),
+                                );
 
                                 if (scroll_handle.offset().y - offset.y).abs() > px(1.)
                                     || (scroll_handle.offset().x - offset.x).abs() > px(1.)
@@ -1669,10 +1686,20 @@ impl Element for Scrollbar {
                         let state = scrollbar_state.clone();
                         let scroll_handle = self.scroll_handle.clone();
 
-                        move |_event: &MouseUpEvent, phase, _, cx| {
-                            if phase.bubble() && state.get().dragged_axis == Some(axis) {
+                        move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase.bubble()
+                                && event.button == MouseButton::Left
+                                && state.get().dragged_axis == Some(axis)
+                            {
+                                // Never discard the final position when the last move was throttled.
+                                scroll_handle.set_offset(offset_for_position(
+                                    event.position,
+                                    state.get().drag_pos,
+                                    scroll_handle.offset(),
+                                ));
                                 scroll_handle.end_drag();
                                 state.set(state.get().with_unset_drag_pos(Instant::now()));
+                                cx.stop_propagation();
                                 cx.notify(view_id);
                             }
                         }
@@ -1693,6 +1720,37 @@ mod tests {
         Context, Modifiers, MouseButton, ParentElement as _, Render, Styled as _, TestAppContext,
         VisualTestContext, div,
     };
+
+    #[test]
+    fn painted_thumb_and_drag_offset_round_trip_with_insets_and_minimum_length() {
+        for (container, content, track) in
+            [(100., 500., 100.), (100., 500., 84.), (800., 1200., 800.)]
+        {
+            let geometry =
+                ThumbGeometry::new(px(container), px(content), px(track), px(4.), px(48.));
+            for fraction in [0., 0.1, 0.5, 0.9, 1.] {
+                let offset = -geometry.max_offset * fraction;
+                let recovered = geometry.offset_for_thumb_start(geometry.thumb_start(offset));
+                assert!((recovered - offset).abs() < px(0.001));
+            }
+            assert_eq!(geometry.offset_for_thumb_start(px(-100.)), px(0.));
+            assert_eq!(
+                geometry.offset_for_thumb_start(px(track + 100.)),
+                -geometry.max_offset
+            );
+        }
+    }
+
+    #[test]
+    fn short_track_never_produces_negative_thumb_or_travel() {
+        for track in [0., 6., 30.] {
+            let geometry = ThumbGeometry::new(px(100.), px(500.), px(track), px(4.), px(48.));
+            assert!(geometry.length >= px(0.));
+            assert_eq!(geometry.travel, px(0.));
+            assert!(geometry.thumb_start(px(-400.)) + geometry.length <= px(track));
+            assert_eq!(geometry.offset_for_thumb_start(px(10.)), px(0.));
+        }
+    }
 
     #[test]
     fn thumb_radius_is_limited_by_its_actual_bounds() {
@@ -2300,6 +2358,94 @@ mod tests {
         cx.simulate_click(point(px(80.), px(95.)), Modifiers::default());
         assert!(horizontal.offset().x < px(0.));
         assert_eq!(horizontal.offset().y, px(0.));
+    }
+
+    #[gpui::test]
+    fn track_click_centers_thumb_at_the_clicked_position(cx: &mut TestAppContext) {
+        let (cx, handle) = harness(
+            cx,
+            ScrollbarAxis::Vertical,
+            ScrollbarMode::Always,
+            size(px(100.), px(500.)),
+        );
+        cx.simulate_click(point(px(95.), px(50.)), Modifiers::default());
+        assert_eq!(handle.offset(), point(px(0.), px(-200.)));
+    }
+
+    #[gpui::test]
+    fn horizontal_track_click_reaches_end_before_shared_corner(cx: &mut TestAppContext) {
+        let (cx, handle) = harness(
+            cx,
+            ScrollbarAxis::Both,
+            ScrollbarMode::Always,
+            size(px(500.), px(500.)),
+        );
+        // The vertical track reserves the last 16 pixels of the horizontal track.
+        cx.simulate_click(point(px(60.), px(95.)), Modifiers::default());
+        assert_eq!(handle.offset(), point(px(-400.), px(0.)));
+    }
+
+    #[gpui::test]
+    fn horizontal_track_uses_full_width_without_vertical_overflow(cx: &mut TestAppContext) {
+        let (cx, handle) = harness(
+            cx,
+            ScrollbarAxis::Both,
+            ScrollbarMode::Always,
+            size(px(500.), px(100.)),
+        );
+        cx.simulate_click(point(px(50.), px(95.)), Modifiers::default());
+        assert_eq!(handle.offset(), point(px(-200.), px(0.)));
+    }
+
+    #[gpui::test]
+    fn right_click_does_not_scroll_or_start_dragging(cx: &mut TestAppContext) {
+        let (cx, handle) = harness(
+            cx,
+            ScrollbarAxis::Vertical,
+            ScrollbarMode::Always,
+            size(px(100.), px(500.)),
+        );
+        for y in [20., 80.] {
+            let position = point(px(95.), px(y));
+            cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+            cx.simulate_mouse_up(position, MouseButton::Right, Modifiers::default());
+        }
+        assert_eq!(handle.offset(), Point::default());
+        assert_eq!(handle.drag_starts.get(), 0);
+    }
+
+    #[gpui::test]
+    fn releasing_thumb_without_moving_keeps_offset(cx: &mut TestAppContext) {
+        let (cx, handle) = harness(
+            cx,
+            ScrollbarAxis::Vertical,
+            ScrollbarMode::Always,
+            size(px(100.), px(500.)),
+        );
+        let position = point(px(95.), px(20.));
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(position, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::default());
+        assert_eq!(handle.offset(), Point::default());
+    }
+
+    #[gpui::test]
+    fn fast_thumb_drag_applies_the_release_position(cx: &mut TestAppContext) {
+        let (cx, handle) = harness(
+            cx,
+            ScrollbarAxis::Vertical,
+            ScrollbarMode::Always,
+            size(px(100.), px(500.)),
+        );
+        cx.simulate_mouse_down(
+            point(px(95.), px(20.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        let end = point(px(95.), px(46.));
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        assert_eq!(handle.offset(), point(px(0.), px(-200.)));
     }
 
     #[gpui::test]

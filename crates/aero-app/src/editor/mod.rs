@@ -57,7 +57,7 @@ use aero_core::{Block, BlockId, BlockKind, Document, Edit, FileStamp, Vault, Vau
 use gpui_kit::base::input::{Backspace, Delete, Escape, InputEvent, Textarea, TextareaState};
 use gpui_kit::base::text::TextViewStyle;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -3887,7 +3887,9 @@ impl Render for Editor {
                     )
                     .children(self.render_references()),
             )
-            .vertical_scrollbar(&self.scroll)
+            // Track the viewport, not the absolute overlay's layout bounds:
+            // children of this scroll container move with the document.
+            .child(div().absolute().inset_0().child(Scrollbar::vertical(&self.scroll)))
             .children(self.render_link_preview(window, cx))
             .children(self.render_toolbar(cx))
             .children(self.render_block_menu(cx))

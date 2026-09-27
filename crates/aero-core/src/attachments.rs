@@ -166,6 +166,18 @@ impl References {
         *self.counts.entry(path.clone()).or_insert(0) += 1;
     }
 
+    /// Resolve a detached index snapshot without holding the search engine lock.
+    pub fn from_targets(catalog: &Catalog, targets: impl IntoIterator<Item = (VaultPath, String)>) -> Self {
+        let mut refs = Self::from_catalog(catalog);
+        for (note, target) in targets {
+            let bare = target.split(['#', '?']).next().unwrap_or(&target);
+            if let Resolution::Resolved { path, .. } = catalog.resolve(bare, &note) {
+                refs.increment(&path);
+            }
+        }
+        refs
+    }
+
     /// 扫描整库：枚举附件 + 读每篇笔记的正文。会读盘，放后台跑。
     /// 个别笔记读不出来（权限、非 UTF-8）只跳过它，不让一篇坏文件毁掉整份报告。
     pub fn read(vault: &Vault) -> Result<References, VaultError> {

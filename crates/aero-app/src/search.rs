@@ -41,6 +41,11 @@ pub enum Phase {
     Failed(String),
 }
 
+/// Progress only redraws the status bar; it does not invalidate note catalogs.
+pub enum SearchEvent {
+    Progress,
+}
+
 #[derive(Default)]
 struct Shared {
     phase: AtomicU8,
@@ -66,6 +71,10 @@ const PHASE_IDLE: u8 = 2;
 const PHASE_FAILED: u8 = 3;
 
 impl Shared {
+    fn stop_sync(&self) -> bool {
+        self.closing.load(Ordering::Acquire) || self.cancelled.load(Ordering::Acquire)
+    }
+
     async fn wait_for_writes(&self, through: usize, wait_for_sync: bool) -> bool {
         poll_fn(|cx| {
             let mut writes = self.writes.lock().unwrap();
@@ -119,6 +128,8 @@ pub struct SearchService {
     last_optimize: Instant,
 }
 
+impl EventEmitter<SearchEvent> for SearchService {}
+
 /// Kept by app shutdown futures as well as services. A GPUI shutdown timeout drops
 /// this guard synchronously, so native destruction can never escape into process exit.
 pub(crate) struct SearchShutdown {
@@ -128,24 +139,34 @@ pub(crate) struct SearchShutdown {
     lock: Arc<Mutex<()>>,
 }
 
-impl Drop for SearchShutdown {
-    fn drop(&mut self) {
-        self.shared.closing.store(true, Ordering::Release);
-        self.shared.cancelled.store(true, Ordering::Release);
-        self.shared.wake_waiters();
-        let _closing = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+impl SearchShutdown {
+    fn join_startup(&self) {
         if let Some(thread) = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take() {
             if let Err(error) = thread.join() {
                 log::error!("index sync thread panicked: {error:?}");
             }
         }
+    }
+}
+
+impl Drop for SearchShutdown {
+    fn drop(&mut self) {
+        let started = Instant::now();
+        self.shared.closing.store(true, Ordering::Release);
+        self.shared.cancelled.store(true, Ordering::Release);
+        self.shared.wake_waiters();
+        let _closing = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.join_startup();
+        log::debug!("index shutdown: joined after {:?}", started.elapsed());
         let mut guard = self.indexer.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(ix) = guard.as_mut() {
             if let Err(error) = ix.flush() {
                 log::warn!("index flush: {error}");
             }
         }
+        log::debug!("index shutdown: flushed after {:?}", started.elapsed());
         *guard = None;
+        log::debug!("index shutdown: released after {:?}", started.elapsed());
     }
 }
 
@@ -162,8 +183,13 @@ impl SearchService {
                 cx.background_executor().timer(PROGRESS_POLL).await;
                 let Ok(done) = this.update(cx, |this, cx| {
                     this.shared.wake_waiters();
-                    cx.notify();
-                    matches!(this.phase(), Phase::Idle | Phase::Failed(_))
+                    let done = matches!(this.phase(), Phase::Idle | Phase::Failed(_));
+                    if done {
+                        cx.notify();
+                    } else {
+                        cx.emit(SearchEvent::Progress);
+                    }
+                    done
                 }) else {
                     return;
                 };
@@ -254,19 +280,28 @@ impl SearchService {
     /// 补全始终以当前文件列表为准；尚未索引的笔记从磁盘补标题与别名，全部在后台完成。
     pub fn completion_notes(&self, vault: Arc<Vault>, cx: &App) -> Task<Result<Vec<NoteSummary>, String>> {
         let summaries = self.note_summaries(cx);
+        let shared = self.shared.clone();
+        // A service already closed by the caller can still provide disk fallback.
+        // Requests made before shutdown must stop instead of extending its work.
+        let disk_fallback = shared.cancelled.load(Ordering::Acquire);
         cx.background_spawn(async move {
             let mut summaries: std::collections::HashMap<_, _> =
                 summaries.await.into_iter().map(|note| (note.path.clone(), note)).collect();
-            let notes = vault.notes().map_err(|e| e.to_string())?;
-            Ok(notes
-                .into_iter()
-                .map(|path| {
-                    summaries.remove(&path).unwrap_or_else(|| match vault.read(&path) {
-                        Ok((doc, _)) => NoteSummary::from_document(path, &doc),
-                        Err(_) => NoteSummary { title: path.stem().to_owned(), path, aliases: Vec::new() },
-                    })
-                })
-                .collect())
+            let cancelled = || !disk_fallback && shared.stop_sync();
+            let Some(notes) = vault.notes_cancellable(cancelled).map_err(|e| e.to_string())? else {
+                return Ok(Vec::new());
+            };
+            let mut catalog = Vec::with_capacity(notes.len());
+            for path in notes {
+                if cancelled() {
+                    return Ok(Vec::new());
+                }
+                catalog.push(summaries.remove(&path).unwrap_or_else(|| match vault.read(&path) {
+                    Ok((doc, _)) => NoteSummary::from_document(path, &doc),
+                    Err(_) => NoteSummary { title: path.stem().to_owned(), path, aliases: Vec::new() },
+                }));
+            }
+            Ok(catalog)
         })
     }
 
@@ -351,25 +386,13 @@ impl SearchService {
     /// 预览点 wikilink 用的解析表：已索引笔记（含 front matter 标题与别名）加尚未索引的文件。
     /// 引擎不可用时在后台读取文档，保留标题与别名匹配。
     pub fn link_resolver(&self, vault: Arc<Vault>, cx: &App) -> Task<Resolver> {
-        let indexer = self.indexer.clone();
-        let shared = self.shared.clone();
-        let through = self.submitted_writes;
+        // Snapshot metadata only under the index lock. Reading unindexed notes
+        // must never block saves or native handle destruction behind a full vault.
+        let notes = self.completion_notes(vault, cx);
         cx.background_spawn(async move {
-            shared.wait_for_writes(through, false).await;
-            let mut guard = indexer.lock().unwrap();
-            if let Some(Ok(resolver)) = guard.as_mut().map(|ix| ix.link_resolver()) {
-                return resolver;
-            }
-            drop(guard);
             let mut resolver = Resolver::new();
-            for path in vault.notes().unwrap_or_default() {
-                match vault.read(&path) {
-                    Ok((doc, _)) => {
-                        let note = NoteSummary::from_document(path, &doc);
-                        resolver.insert(note.path, Some(&note.title), &note.aliases);
-                    }
-                    Err(_) => resolver.insert(path, None, &[]),
-                }
+            for note in notes.await.unwrap_or_default() {
+                resolver.insert(note.path, Some(&note.title), &note.aliases);
             }
             resolver
         })
@@ -432,11 +455,18 @@ impl SearchService {
         if paths.is_empty() {
             return;
         }
+        let shared = self.shared.clone();
         self.run(cx, false, move |ix| {
+            if shared.stop_sync() {
+                return Ok(false);
+            }
             let mut errors = Vec::new();
             let mut written = false;
             let _ = ix.adopt_external_moves(&paths);
             for path in &paths {
+                if shared.stop_sync() {
+                    break;
+                }
                 match ix.refresh_note(path) {
                     Ok(Refresh::Unchanged) => {}
                     Ok(_) => written = true,
@@ -450,8 +480,34 @@ impl SearchService {
     /// 目录级变化（重命名 / 删除文件夹、事件溢出）后与磁盘整体对齐一次：新文件索引、消失的删掉、
     /// 指纹没变的跳过。只 stat 不读内容，万篇量级也在百毫秒内。
     pub fn resync(&mut self, cx: &mut Context<Self>) {
-        self.run(cx, false, |ix| {
-            let report = ix.sync_all(|_, _| {});
+        let shared = self.shared.clone();
+        self.run(cx, false, move |ix| {
+            // Watcher bursts can queue many scans. They are rebuildable on the next
+            // open and must not delay closing behind a full library of documents.
+            if shared.stop_sync() {
+                return Ok(false);
+            }
+            let Some(plan) = ix.plan_sync_cancellable(|| shared.stop_sync()).map_err(|e| e.to_string())?
+            else {
+                return Ok(false);
+            };
+            let mut report = SyncReport::default();
+            for (path, row) in &plan.notes {
+                if shared.stop_sync() {
+                    break;
+                }
+                ix.sync_step(path, row.as_ref(), &mut report);
+            }
+            for row in &plan.removed {
+                if shared.stop_sync() {
+                    break;
+                }
+                ix.remove_step(row, &mut report);
+            }
+            // Also finish partial scans: subsequent accepted saves must not inherit
+            // bulk mode or leave their link updates buffered when the handle closes.
+            ix.finish_sync().map_err(|e| e.to_string())?;
+            ix.flush().map_err(|e| e.to_string())?;
             for e in &report.errors {
                 log::warn!("index resync: {e}");
             }
@@ -459,7 +515,7 @@ impl SearchService {
         });
     }
 
-    /// Drain accepted writes, join startup, flush and destroy the native handle off-thread.
+    /// Stop scans, drain accepted writes, flush and destroy the native handle off-thread.
     /// Await completion BEFORE quitting or reopening the same index. The service must
     /// remain owned until then; forced termination additionally keeps a shutdown guard.
     pub fn close_async(&self, cx: &App) -> Task<()> {
@@ -467,7 +523,20 @@ impl SearchService {
         let guard = self.shutdown_guard();
         let through = self.submitted_writes;
         cx.background_spawn(async move {
+            let started = Instant::now();
+            {
+                let _closing = guard.lock.lock().unwrap_or_else(|p| p.into_inner());
+                guard.join_startup();
+                // Renames wait for startup's old file list to stop being used. A
+                // stopped scan satisfies that barrier just as a completed one does.
+                if guard.shared.phase.load(Ordering::Acquire) != PHASE_FAILED {
+                    guard.shared.set_phase(PHASE_IDLE);
+                }
+            }
+            log::debug!("index close: startup stopped after {:?}", started.elapsed());
+            guard.shared.wake_waiters();
             guard.shared.wait_for_writes(through, false).await;
+            log::debug!("index close: writes drained after {:?}", started.elapsed());
             drop(guard);
         })
     }
@@ -545,7 +614,7 @@ impl SearchService {
                 }
             };
             let _ = this.update(cx, |this, cx| {
-                if this.shared.cancelled.load(Ordering::Acquire) {
+                if this.shared.stop_sync() {
                     return;
                 }
                 if written {
@@ -561,6 +630,7 @@ impl SearchService {
     /// 空闲 flush；累计写入够多且距上次够久时顺带 optimize。
     fn schedule_flush(&mut self, cx: &mut Context<Self>) {
         let indexer = self.indexer.clone();
+        let shared = self.shared.clone();
         self.flush_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(IDLE_FLUSH).await;
             let Ok(optimize) = this.update(cx, |this, _| {
@@ -571,11 +641,14 @@ impl SearchService {
             };
             cx.background_spawn(async move {
                 let Ok(mut g) = indexer.lock() else { return };
+                if shared.stop_sync() {
+                    return;
+                }
                 let Some(ix) = g.as_mut() else { return };
                 if let Err(e) = ix.flush() {
                     log::warn!("index flush: {e}");
                 }
-                if optimize {
+                if optimize && !shared.stop_sync() {
                     let started = Instant::now();
                     match ix.optimize() {
                         Ok(()) => log::info!("index optimize: {:?}", started.elapsed()),
@@ -615,7 +688,11 @@ fn spawn_sync(
         let opened = Indexer::open(vault, &data_dir);
         let plan = match opened {
             Ok(mut ix) => {
-                let plan = ix.plan_sync();
+                if shared.stop_sync() {
+                    *indexer.lock().unwrap() = Some(ix);
+                    return;
+                }
+                let plan = ix.plan_sync_cancellable(|| shared.stop_sync());
                 let mut slot = indexer.lock().unwrap();
                 if shared.cancelled.load(Ordering::Acquire) {
                     // 服务已经关了：句柄就地释放（关闭方正 join 着本线程，不会同时在 exit）
@@ -634,7 +711,8 @@ fn spawn_sync(
             }
         };
         let plan = match plan {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => return,
             Err(e) => {
                 log::error!("index plan: {e}");
                 *shared.error.lock().unwrap() = Some(e.to_string());
@@ -646,19 +724,19 @@ fn spawn_sync(
         shared.set_phase(PHASE_SYNCING);
         let mut report = SyncReport::default();
         for (i, (path, row)) in plan.notes.iter().enumerate() {
-            if shared.cancelled.load(Ordering::Acquire) {
-                return;
+            if shared.stop_sync() {
+                break;
             }
             if let Some(ix) = indexer.lock().unwrap().as_mut() {
                 ix.sync_step(path, row.as_ref(), &mut report);
             }
             shared.done.store(i + 1, Ordering::Relaxed);
         }
-        if shared.cancelled.load(Ordering::Acquire) {
-            return;
-        }
         if let Some(ix) = indexer.lock().unwrap().as_mut() {
             for row in &plan.removed {
+                if shared.stop_sync() {
+                    break;
+                }
                 ix.remove_step(row, &mut report);
             }
             if let Err(e) = ix.finish_sync() {
@@ -668,9 +746,7 @@ fn spawn_sync(
                 report.errors.push(e.to_string());
             }
             // 首次建库 / 大量改动之后合并一次段文件；小改动留给空闲策略。关闭方在等锁时不做（可能要几秒）
-            if report.indexed + report.removed >= OPTIMIZE_AFTER_SYNC_NOTES
-                && !shared.cancelled.load(Ordering::Acquire)
-            {
+            if report.indexed + report.removed >= OPTIMIZE_AFTER_SYNC_NOTES && !shared.stop_sync() {
                 let started = Instant::now();
                 match ix.optimize() {
                     Ok(()) => log::info!("index optimize after sync: {:?}", started.elapsed()),
@@ -705,7 +781,7 @@ fn spawn_sync(
 #[cfg(test)]
 mod tests {
     // 不能 `use super::*`：它会把 GPUI 的 `test` 属性宏带进作用域，遮住标准 `#[test]`
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use aero_core::{Vault, VaultPath};
@@ -1055,6 +1131,74 @@ mod tests {
         let reopened = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
         idle(cx, &reopened);
         cx.update(|cx| reopened.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn async_close_skips_queued_rescans_but_preserves_saved_notes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "before\n").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault.clone(), data.path().into(), cx));
+        idle(cx, &service);
+        std::fs::write(dir.path().join("b.md"), "background scan\n").unwrap();
+        std::fs::write(dir.path().join("a.md"), "savedlatest\n").unwrap();
+        let a = VaultPath::new("a.md").unwrap();
+        let (_, stamp) = vault.read(&a).unwrap();
+        let checked = Arc::new(Mutex::new(None));
+        service.update(cx, |s, cx| {
+            for _ in 0..20 {
+                s.resync(cx);
+                s.notes_touched(vec![VaultPath::new("b.md").unwrap()], cx);
+            }
+            s.note_saved(a, "savedlatest\n".into(), stamp, cx);
+            let checked = checked.clone();
+            s.run(cx, false, move |ix| {
+                *checked.lock().unwrap() = Some((
+                    ix.note_summaries().unwrap().iter().all(|note| note.path.as_str() != "b.md"),
+                    ix.search("savedlatest", 10).unwrap().len(),
+                ));
+                Ok(false)
+            });
+        });
+        let close = cx.update(|cx| service.read(cx).close_async(cx));
+        cx.foreground_executor().block_on(close);
+        assert_eq!(*checked.lock().unwrap(), Some((true, 1)), "skip rescans while draining saved edits");
+        let reopened = cx.new(|cx| SearchService::new(vault, data.path().into(), cx));
+        idle(cx, &reopened);
+        cx.update(|cx| {
+            let s = reopened.read(cx);
+            assert_eq!(s.indexer.lock().unwrap().as_ref().unwrap().note_summaries().unwrap().len(), 2);
+            s.close_blocking();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn async_close_releases_writes_waiting_for_startup(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let service = cx.new(|cx| SearchService::new(vault, data.path().into(), cx));
+        idle(cx, &service);
+        set_phase(&service, super::PHASE_SYNCING, cx);
+        let wrote = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        service.update(cx, |s, cx| {
+            let wrote = wrote.clone();
+            s.run(cx, true, move |_| {
+                wrote.store(true, std::sync::atomic::Ordering::Release);
+                Ok(true)
+            });
+        });
+        let close = cx.update(|cx| service.read(cx).close_async(cx));
+        cx.run_until_parked();
+        let closed = close.is_ready();
+        // Release the old implementation's parked cleanup before reporting the failure.
+        if !closed {
+            set_phase(&service, super::PHASE_IDLE, cx);
+        }
+        cx.foreground_executor().block_on(close);
+        assert!(closed, "close must stop startup and release its queued writes");
+        assert!(wrote.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[gpui_kit::test]

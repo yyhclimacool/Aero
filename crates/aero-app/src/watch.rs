@@ -154,6 +154,9 @@ fn interest(roots: &Roots, path: &Path) -> Interest {
         Ok(p) if aero_core::attachments::Kind::for_path(p.as_str()).is_some() => Interest::Attachment(p),
         // `x.assets/` 里的其他东西不关心；目录本身的出现 / 消失也不影响树（树不显示它）
         Ok(_) if in_assets => Interest::Ignored,
+        // Source files and build outputs do not change the note tree. Keep
+        // unknown/deleted paths conservative because they may be directories.
+        Ok(_) if path.is_file() => Interest::Ignored,
         Ok(_) => Interest::Other,
         Err(_) => Interest::Ignored,
     }
@@ -268,6 +271,21 @@ mod tests {
     use gpui_kit::{AppContext as _, TestAppContext};
 
     use super::{Batch, POLL, Roots, VaultWatcher, WatchEvent, classify};
+
+    #[test]
+    fn unrelated_file_writes_do_not_request_a_full_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("folder")).unwrap();
+        let roots = Roots::of(root);
+        for name in ["build.o", "module.py", "settings.toml", "notes.txt"] {
+            let path = root.join(name);
+            std::fs::write(&path, "unrelated").unwrap();
+            assert!(classify(&roots, [path.as_path()].into_iter(), false).is_empty(), "{name}");
+        }
+        assert!(classify(&roots, [root.join("folder")].iter().map(PathBuf::as_path), false).rescan);
+        assert!(classify(&roots, [root.join("removed-folder")].iter().map(PathBuf::as_path), false).rescan);
+    }
 
     #[test]
     fn ignore_rule_changes_request_a_rescan() {
