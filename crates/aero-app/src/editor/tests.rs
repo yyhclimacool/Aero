@@ -4434,7 +4434,7 @@ fn external_deletion_stops_autosave_until_restored(cx: &mut TestAppContext) {
         cx.subscribe(&editor, move |_, ev: &EditorEvent, _| match ev {
             EditorEvent::Deleted => sink.borrow_mut().push("deleted"),
             EditorEvent::CloseRequested => sink.borrow_mut().push("close"),
-            EditorEvent::Saved => sink.borrow_mut().push("saved"),
+            EditorEvent::Saved(_) => sink.borrow_mut().push("saved"),
             _ => {}
         })
         .detach();

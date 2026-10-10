@@ -14,7 +14,7 @@ scripts/fetch-zvec.sh
 # 打开指定文件夹作为 vault；不带参数则恢复最近打开的库，没有则停在库选择页
 cargo run -p aero-app -- ~/Knowledge
 
-# 日志（默认只输出 warn）
+# 主动开启终端调试输出（本地结构化诊断默认开启）
 AERO_LOG=debug cargo run -p aero-app -- ~/Knowledge
 
 # 正式 crate 的单元、往返、索引与无头 GPUI 交互测试（真实模型测试默认跳过）
@@ -39,6 +39,21 @@ M1 验收状态及复跑说明见 [docs/qa/m1.md](docs/qa/m1.md)，包含保存�
 
 macOS 上 `cargo run` 会自动使用 Aero 的 Dock 图标；欢迎页也使用同一套内嵌品牌资源。
 
+### 日志与诊断
+
+本地诊断默认开启，保存在 `~/Library/Logs/Aero/`。每次运行独立记录操作起止、状态和耗时，用匿名编号关联笔记与后台任务；输入、焦点和滚动按类别汇总，不记录正文、标题、文件路径、查询或剪贴板。历史记录按 7 天 / 50 MiB 清理，活跃会话受保护，每会话日志最多 5 个 1 MiB 文件。记录不会自动上传。
+
+在 `⌘,` →「日志与诊断」可开启 15 分钟详细记录、打开日志目录或导出可检查的 `.aerodiag.json`。GUI 无法启动时，也可直接使用 CLI，无需指定 vault：
+
+```sh
+target/debug/aero diagnostics path
+target/debug/aero diagnostics export ~/Desktop/Aero.aerodiag.json
+```
+
+导出不会覆盖已有文件，只包含受管理的日志、Rust 异常报告和构建信息。macOS 原生崩溃的 `.ips` 报告需另行提供；强制结束或断电可能丢失尚未刷新的尾部记录。「未正常结束」不等于确认崩溃。`AERO_LOG` 仍提供原始终端调试输出，可能含路径等信息，这些文本不进入诊断包。debug 下 `AERO_DATA_DIR` 同时隔离数据和日志。
+
+方案见 [project_plan.md 16.1](docs/project_plan.md#161-本地日志与诊断实施方案2026-10-10)，本机验证范围见 [诊断验收记录](docs/qa/local-diagnostics-2026-10-10.md)。
+
 ### macOS 应用打包
 
 需要 Python 3 与 Xcode 命令行工具。脚本会构建应用、装入图标并进行本地 ad-hoc 签名：
@@ -53,6 +68,8 @@ open target/release/bundle/Aero.app
 ```
 
 自定义 Cargo target 目录或构建 target 时，以脚本输出的 `.app` 路径为准。图标源文件位于 `assets/branding/`，应用包使用 `Aero.icns`；版本号自动取自 Cargo 配置。
+
+Release 打包同时将匹配 UUID 的 dSYM、签名后二进制、原生动态库和构建清单归档到 release 目录下的 `symbols/`，供后续崩溃符号化使用；它们不装入 `.app` 或 DMG。当前 zvec 预编译库没有独立 dSYM，清单明确记录这一限制。
 
 ### 发布（签名、公证、.dmg）
 

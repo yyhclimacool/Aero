@@ -36,14 +36,38 @@ impl WriteJob {
     ) -> Self {
         let result = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
         let output = result.clone();
+        let operation = crate::diagnostics::Operation::new(
+            "save_write",
+            crate::diagnostics::Facts { epoch, version, ..Default::default() },
+        );
+        let queued = std::time::Instant::now();
+        let failed = operation.clone();
         let started = std::thread::Builder::new().name("aero-save".into()).spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| {
-                SaveOutcome { result: Err("保存线程意外终止".into()), conflict: None }
+            operation.stage(
+                "running",
+                crate::diagnostics::Facts {
+                    queue_us: queued.elapsed().as_micros() as u64,
+                    ..Default::default()
+                },
+            );
+            let outcome = operation
+                .scope(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)))
+                .unwrap_or_else(|_| SaveOutcome {
+                    result: Err("保存线程意外终止".into()), conflict: None
+                });
+            if outcome.conflict.is_some() {
+                operation.stage("conflict", Default::default());
+            }
+            operation.finish(if outcome.result.is_ok() {
+                crate::diagnostics::Outcome::Ok
+            } else {
+                crate::diagnostics::Outcome::Failed
             });
             *output.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(outcome);
             output.1.notify_all();
         });
         if let Err(error) = started {
+            failed.finish(crate::diagnostics::Outcome::Failed);
             *result.0.lock().unwrap() = Some(SaveOutcome { result: Err(error.to_string()), conflict: None });
         }
         Self { path, epoch, version, result }
@@ -195,6 +219,7 @@ pub(super) fn save(
 ) -> SaveOutcome {
     let mut conflict = None;
     let result = (|| {
+        crate::diagnostics::stage_current("disk_check", Default::default());
         match disk_state(vault, path, known).map_err(|e| format!("无法校验磁盘版本，已停止保存：{e}"))?.0
         {
             Disk::Missing if !allow_missing => return Ok(None),
@@ -207,7 +232,13 @@ pub(super) fn save(
             Disk::Unchanged | Disk::Missing => {}
         }
         let bytes = aero_core::SourceText::encode(&String::from(snapshot.text()), bom, ending);
-        vault.write_bytes(path, &bytes).map(Some).map_err(|e| e.to_string())
+        crate::diagnostics::stage_current(
+            "write_begin",
+            crate::diagnostics::Facts { bytes: bytes.len() as u64, ..Default::default() },
+        );
+        let result = vault.write_bytes(path, &bytes).map(Some).map_err(|e| e.to_string());
+        crate::diagnostics::stage_current("write_done", Default::default());
+        result
     })();
     SaveOutcome { result, conflict }
 }

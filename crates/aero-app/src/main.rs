@@ -14,6 +14,7 @@ mod catalog;
 mod cli;
 mod colors;
 mod demo_vault;
+mod diagnostics;
 mod editor;
 mod file_tree;
 mod matching;
@@ -41,34 +42,6 @@ use gpui_kit::*;
 
 use crate::workspace::Workspace;
 
-/// 输出到 stderr 的极简 logger。`AERO_LOG=debug|info|warn|error`，默认 warn；只看自己 crate 的日志。
-struct StderrLogger(log::LevelFilter);
-
-impl log::Log for StderrLogger {
-    fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= self.0 && m.target().starts_with("aero")
-    }
-
-    fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            eprintln!("[{} {}] {}", record.level(), record.target(), record.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-fn init_logger() {
-    let level = match std::env::var("AERO_LOG").as_deref() {
-        Ok("debug") => log::LevelFilter::Debug,
-        Ok("info") => log::LevelFilter::Info,
-        Ok("error") => log::LevelFilter::Error,
-        _ => log::LevelFilter::Warn,
-    };
-    let _ = log::set_boxed_logger(Box::new(StderrLogger(level)));
-    log::set_max_level(level);
-}
-
 /// debug 构建里由脚本驱动界面、窗口停在屏幕外（`ui_channel`，`.agents/skills/aero-ui-test/`）。
 fn ui_parked() -> bool {
     #[cfg(debug_assertions)]
@@ -78,12 +51,14 @@ fn ui_parked() -> bool {
 }
 
 fn main() {
-    init_logger();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = cli::wants_cli(&args);
+    let diagnostics = diagnostics::init(if cli { "cli" } else { "gui" });
     // 子命令走 CLI（方案 13.1）。无参数，或第一个参数是库目录，才启动图形界面。
-    if cli::wants_cli(&args) {
-        std::process::exit(cli::run(&args));
+    if cli {
+        let code = cli::run(&args);
+        drop(diagnostics);
+        std::process::exit(code);
     }
     let initial_vault: Option<PathBuf> = args.first().map(PathBuf::from);
 
@@ -92,6 +67,7 @@ fn main() {
         colors::apply_text_selection(cx);
         actions::init(cx);
         branding::set_application_icon();
+        diagnostics::start_heartbeat(cx);
 
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {

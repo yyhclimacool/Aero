@@ -85,8 +85,8 @@ impl std::fmt::Display for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Source::File(path) => write!(f, "{path}"),
-            Source::Formula { latex, .. } => write!(f, "${latex}$"),
-            Source::Diagram { source, .. } => write!(f, "Mermaid {source}"),
+            Source::Formula { .. } => write!(f, "formula"),
+            Source::Diagram { .. } => write!(f, "diagram"),
             Source::Pdf { path, page } => write!(f, "{path} 第 {page} 页"),
         }
     }
@@ -660,14 +660,31 @@ impl RenderService {
     fn render(&self, request: Request, token: u64, cx: &mut Context<Self>) -> Task<()> {
         let (vault, cache, key) = (self.vault.clone(), self.cache.clone(), request.clone());
         let text_system = cx.text_system().clone();
+        let operation = crate::diagnostics::Operation::new(
+            match request.kind {
+                Kind::Image => "render_image",
+                Kind::Math => "render_math",
+                Kind::Diagram => "render_diagram",
+                Kind::Pdf => "render_pdf",
+            },
+            crate::diagnostics::Facts { count: self.running.len() as u64, ..Default::default() },
+        );
+        let queued = std::time::Instant::now();
         cx.spawn(async move |this, cx| {
+            let worker_operation = operation.clone();
             let produced = cx
-                .background_spawn(async move { produce_with_text(&vault, &cache, &key, Some(text_system)) })
+                .background_spawn(async move {
+                    worker_operation.stage("running", crate::diagnostics::Facts { queue_us: queued.elapsed().as_micros() as u64, ..Default::default() });
+                    let result = worker_operation.scope(|| produce_with_text(&vault, &cache, &key, Some(text_system)));
+                    worker_operation.stage("produced", Default::default());
+                    result
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.running.remove(&token);
                 // 淘汰 / 失效后的回调不能复活 entry，也不能覆盖同 key 的新任务。
                 if !matches!(this.entries.get(&request), Some(Entry::Pending { token: current }) if *current == token) {
+                    operation.finish(crate::diagnostics::Outcome::Stale);
                     this.dispatch(cx);
                     return;
                 }
@@ -675,6 +692,8 @@ impl RenderService {
                     request.clone(),
                     match produced {
                         Ok(Produced { frame, pixels, origin, pages }) => {
+                            operation.stage(match origin { Origin::Disk => "disk_hit", Origin::Rendered => "rendered" }, Default::default());
+                            operation.finish(crate::diagnostics::Outcome::Ok);
                             log::debug!(
                                 "render {} {}×{} ({origin:?})",
                                 request.source,
@@ -685,6 +704,7 @@ impl RenderService {
                             Entry::Ready { image: Arc::new(RenderImage::new(vec![frame])), pixels, pages }
                         }
                         Err(error) => {
+                            operation.finish(crate::diagnostics::Outcome::Failed);
                             log::debug!("render {}: {error}", request.source);
                             Entry::Failed(error.into())
                         }

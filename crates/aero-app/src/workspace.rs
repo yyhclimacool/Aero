@@ -81,8 +81,8 @@ pub struct Workspace {
     sidebar_tab: SidebarTab,
     rename_pending: bool,
     rename_changes: Batch,
-    pending_operation: Option<PendingOperation>,
-    operation_queue: std::collections::VecDeque<PendingOperation>,
+    pending_operation: Option<QueuedOperation>,
+    operation_queue: std::collections::VecDeque<QueuedOperation>,
     session_closing: bool,
     io_task: Option<Task<()>>,
     file_guard: Option<files::Guard>,
@@ -116,6 +116,24 @@ enum PendingOperation {
     CloseWindow,
     Quit,
     Rename { old: VaultPath, target: VaultPath, title: Option<String> },
+}
+
+struct QueuedOperation {
+    operation: PendingOperation,
+    diagnostic: crate::diagnostics::Operation,
+}
+
+impl PendingOperation {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::File(operation) => operation.name(),
+            Self::OpenVault(_) => "vault_switch",
+            Self::CloseVault => "vault_close",
+            Self::CloseWindow => "window_close",
+            Self::Quit => "app_quit",
+            Self::Rename { .. } => "rename",
+        }
+    }
 }
 
 /// 预览里点 wikilink 后的动作：打开已存在的笔记，或提示同名候选，或失败原因。不创建笔记。
@@ -216,9 +234,12 @@ impl Workspace {
     // ---- vault ----
 
     fn open_vault(&mut self, root: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let operation = crate::diagnostics::Operation::new("vault_open", Default::default());
+        let _scope = operation.enter();
         if self.open.is_some() {
             // Validate first: an unusable destination must not destroy the current session.
             if let Err(error) = Vault::open(root) {
+                operation.finish(crate::diagnostics::Outcome::Failed);
                 window.push_notification(
                     Notification::error(format!("无法打开 {}：{error}", display_path(root))),
                     cx,
@@ -226,6 +247,7 @@ impl Workspace {
                 return;
             }
             self.request_operation(PendingOperation::OpenVault(root.to_owned()), window, cx);
+            operation.finish(crate::diagnostics::Outcome::Noop);
             return;
         }
         match Vault::open(root) {
@@ -326,12 +348,14 @@ impl Workspace {
                 }
             }
             Err(err) => {
+                operation.finish(crate::diagnostics::Outcome::Failed);
                 self.error = Some(format!("无法打开 {}：{err}", display_path(root)));
                 self.state.forget_vault(root);
                 self.state.save(&self.data_dir);
             }
         }
         cx.notify();
+        operation.finish(crate::diagnostics::Outcome::Ok);
     }
 
     /// 后台扫一遍附件引用（读每篇笔记的正文），算完把报告交给文件树标"未引用"。
@@ -530,7 +554,11 @@ impl Workspace {
                 this.continue_operation(window, cx);
                 cx.notify()
             }
-            EditorEvent::Saved | EditorEvent::Reloaded => {
+            EditorEvent::Saved(operation) => {
+                operation.scope(|| this.index_editor(editor, cx));
+                cx.notify();
+            }
+            EditorEvent::Reloaded => {
                 this.index_editor(editor, cx);
                 cx.notify();
             }
@@ -1128,6 +1156,7 @@ impl Workspace {
 
     fn prepare_change_name(
         &mut self,
+        diagnostic: crate::diagnostics::Operation,
         old: VaultPath,
         target: VaultPath,
         title: Option<String>,
@@ -1150,16 +1179,19 @@ impl Workspace {
             title.as_ref().map_or_else(|| format!("{old} → {target}"), |title| format!("标题 → {title}"));
         self.rename_pending = true;
         let (from, to) = (old.clone(), target.clone());
+        let prepare_diagnostic = diagnostic.clone();
         let prepare = cx.background_spawn(async move {
-            match title {
+            prepare_diagnostic.stage("prepare", Default::default());
+            prepare_diagnostic.scope(|| match title {
                 Some(title) => aero_core::rename::RenamePlan::prepare_title(&vault, from, title),
                 None => aero_core::rename::RenamePlan::prepare(&vault, from, to),
-            }
+            })
         });
         cx.spawn_in(window, async move |this, cx| {
             let plan = match prepare.await {
                 Ok(plan) => plan,
                 Err(error) => {
+                    diagnostic.finish(crate::diagnostics::Outcome::Failed);
                     let _ = this.update_in(cx, |this, window, cx| {
                         this.rename_pending = false;
                         window.push_notification(
@@ -1190,6 +1222,7 @@ impl Workspace {
                     return;
                 };
                 if answer.await.ok() != Some(1) {
+                    diagnostic.finish(crate::diagnostics::Outcome::Cancelled);
                     let _ = this.update(cx, |this, cx| {
                         this.rename_pending = false;
                         cx.notify();
@@ -1212,13 +1245,14 @@ impl Workspace {
                         }
                     })
                 {
+                    diagnostic.finish(crate::diagnostics::Outcome::Stale);
                     window.push_notification(
                         Notification::warning("笔记在准备期间已变化，重命名已取消，请保存后重试。"),
                         cx,
                     );
                     return;
                 }
-                this.execute_change_name(plan, old, target, directory, description, window, cx);
+                this.execute_change_name(diagnostic, plan, old, target, directory, description, window, cx);
             });
         })
         .detach();
@@ -1226,6 +1260,7 @@ impl Workspace {
 
     fn execute_change_name(
         &mut self,
+        diagnostic: crate::diagnostics::Operation,
         plan: aero_core::rename::RenamePlan,
         old: VaultPath,
         target: VaultPath,
@@ -1263,9 +1298,12 @@ impl Workspace {
         self.focus_handle.focus(window, cx);
         self.io_task = Some(cx.spawn_in(window, async move |this, cx| {
             let (from, to) = (old.clone(), target.clone());
+            let worker_diagnostic = diagnostic.clone();
             let (result, loaded) = cx
                 .background_spawn(async move {
-                    let result = plan.execute();
+                    worker_diagnostic.stage("running", Default::default());
+                    let result = worker_diagnostic.scope(|| plan.execute());
+                    worker_diagnostic.stage("written", Default::default());
                     // Read and parse the resulting documents before re-enabling input.
                     // On a failed rollback, follow whichever path actually survived.
                     let loaded = paths
@@ -1284,7 +1322,9 @@ impl Workspace {
                     (result, loaded)
                 })
                 .await;
+            let succeeded = result.is_ok();
             let _ = this.update_in(cx, |this, window, cx| {
+                diagnostic.stage("ui_apply", Default::default());
                 this.rename_pending = false;
                 this.session_closing = false;
                 this.io_task = None;
@@ -1338,6 +1378,11 @@ impl Workspace {
                 }
                 cx.notify();
             });
+            diagnostic.finish(if succeeded {
+                crate::diagnostics::Outcome::Ok
+            } else {
+                crate::diagnostics::Outcome::Failed
+            });
         }));
         cx.notify();
     }
@@ -1346,13 +1391,20 @@ impl Workspace {
     /// polling its futures. User actions use `request_operation` BEFORE reaching here.
     /// Keep raw shutdown guards: if GPUI times out, their Drop still joins/destroys C++.
     fn shutdown_on_quit(&mut self, cx: &mut Context<Self>) -> impl std::future::Future<Output = ()> + use<> {
+        let diagnostic = crate::diagnostics::Operation::new("native_quit", Default::default());
         self.session_closing = true;
         // OS-initiated termination cannot be vetoed in GPUI 0.3.5. This is the final
         // safety fallback; asynchronous user saves must finish before calling quit.
         let mut file_guard = self.file_guard.take();
         let queued = std::mem::take(&mut self.operation_queue)
             .into_iter()
-            .filter_map(|op| if let PendingOperation::File(operation) = op { Some(operation) } else { None })
+            .filter_map(|op| {
+                if let PendingOperation::File(operation) = op.operation {
+                    Some((operation, op.diagnostic))
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>();
         if let Some(open) = &self.open {
             file_guard = files::finish_on_shutdown(file_guard, queued, open.vault.clone());
@@ -1375,17 +1427,20 @@ impl Workspace {
             )
         });
         async move {
-            drop(file_guard);
+            diagnostic.scope(|| drop(file_guard));
+            diagnostic.stage("files_drained", Default::default());
             for (guard, wait) in saves {
                 wait.await;
                 drop(guard);
             }
+            diagnostic.stage("saves_drained", Default::default());
             if let Some((search_guard, semantic_guard, search, semantic)) = shutdown {
                 search.await;
                 semantic.await;
                 drop((search_guard, semantic_guard));
             }
             drop(open);
+            diagnostic.finish(crate::diagnostics::Outcome::Ok);
         }
     }
 
@@ -1415,21 +1470,30 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let file_pending =
-            self.file_guard.is_some() || matches!(self.pending_operation, Some(PendingOperation::File(_)));
+        let diagnostic = crate::diagnostics::Operation::new(operation.name(), Default::default());
+        let file_pending = self.file_guard.is_some()
+            || self
+                .pending_operation
+                .as_ref()
+                .is_some_and(|op| matches!(op.operation, PendingOperation::File(_)));
         if file_pending
             && !matches!(operation, PendingOperation::Rename { .. })
-            && self.operation_queue.iter().all(|op| matches!(op, PendingOperation::File(_)))
+            && self.operation_queue.iter().all(|op| matches!(op.operation, PendingOperation::File(_)))
         {
-            self.operation_queue.push_back(operation);
+            diagnostic.stage(
+                "queued",
+                crate::diagnostics::Facts { count: self.operation_queue.len() as u64, ..Default::default() },
+            );
+            self.operation_queue.push_back(QueuedOperation { operation, diagnostic });
             return;
         }
         if self.rename_pending || self.pending_operation.is_some() || self.session_busy() {
+            diagnostic.finish(crate::diagnostics::Outcome::Cancelled);
             window
                 .push_notification(Notification::warning("正在完成文件操作，请稍后再试。").title("Aero"), cx);
             return;
         }
-        self.pending_operation = Some(operation);
+        self.pending_operation = Some(QueuedOperation { operation, diagnostic });
         self.continue_operation(window, cx);
     }
 
@@ -1455,26 +1519,30 @@ impl Workspace {
             return;
         }
         let mut waiting = false;
+        let diagnostic = self.pending_operation.as_ref().unwrap().diagnostic.clone();
         for editor in editors {
             match editor.read(cx).save_state() {
                 SaveState::Dirty => {
                     waiting = true;
-                    editor.update(cx, |e, cx| e.save_now(cx));
+                    diagnostic.scope(|| editor.update(cx, |e, cx| e.save_now(cx)));
                 }
                 SaveState::Saving => waiting = true,
                 _ => {}
             }
         }
         if waiting {
+            diagnostic.stage("waiting_for_save", Default::default());
             return;
         }
-        let operation = self.pending_operation.take().unwrap();
+        let QueuedOperation { operation, diagnostic } = self.pending_operation.take().unwrap();
+        let _scope = diagnostic.enter();
+        diagnostic.stage("running", Default::default());
         if let PendingOperation::File(operation) = operation {
-            self.execute_file_operation(operation, window, cx);
+            self.execute_file_operation(operation, diagnostic, window, cx);
             return;
         }
         if let PendingOperation::Rename { old, target, title } = operation {
-            self.prepare_change_name(old, target, title, window, cx);
+            self.prepare_change_name(diagnostic, old, target, title, window, cx);
             return;
         }
         for editor in self.open.iter().flat_map(|open| open.editors()) {
@@ -1498,6 +1566,7 @@ impl Workspace {
                 search.await;
                 semantic.await;
             }
+            diagnostic.stage("services_stopped", Default::default());
             log::debug!("workspace close: services stopped after {:?}", started.elapsed());
             let _ = this.update_in(cx, |this, window, cx| {
                 this.open = None;
@@ -1507,6 +1576,7 @@ impl Workspace {
                 this.references_task = None;
                 this.references_again = false;
                 this.sync_editor_menus(cx);
+                diagnostic.finish(crate::diagnostics::Outcome::Ok);
                 match operation {
                     PendingOperation::OpenVault(root) => {
                         this.open_vault(&root, window, cx);
@@ -1533,8 +1603,19 @@ impl Workspace {
     fn index_editor(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_ref() else { return };
         let (path, text, stamp) = editor.read(cx).index_snapshot();
-        open.semantic.update(cx, |s, cx| s.note_changed(vec![path.clone()], cx));
-        open.search.update(cx, |s, cx| s.note_saved(path, text, stamp, cx));
+        let operation = crate::diagnostics::Operation::new(
+            "index_submit",
+            crate::diagnostics::Facts {
+                doc_id: crate::diagnostics::document_id(&open.vault, &path),
+                bytes: text.len() as u64,
+                ..Default::default()
+            },
+        );
+        operation.scope(|| {
+            open.semantic.update(cx, |s, cx| s.note_changed(vec![path.clone()], cx));
+            open.search.update(cx, |s, cx| s.note_saved(path, text, stamp, cx));
+        });
+        operation.finish(crate::diagnostics::Outcome::Ok);
     }
 
     /// 编辑器改动了其他路径：笔记副本 / 另存为对齐索引与标签页；附件导出只刷新树、引用与渲染缓存。
@@ -3452,7 +3533,16 @@ mod tests {
             let target = VaultPath::new("new.md").unwrap();
             let plan =
                 aero_core::rename::RenamePlan::prepare(&open.vault, old.clone(), target.clone()).unwrap();
-            w.execute_change_name(plan, old, target, false, "test rename".into(), window, cx);
+            w.execute_change_name(
+                crate::diagnostics::Operation::new("rename", Default::default()),
+                plan,
+                old,
+                target,
+                false,
+                "test rename".into(),
+                window,
+                cx,
+            );
             assert!(w.session_busy());
             assert!(w.open.is_some(), "session ownership remains until completion");
             assert!(w.focus_handle.is_focused(window));
@@ -3483,7 +3573,16 @@ mod tests {
             let old = VaultPath::new("a.md").unwrap();
             let target = VaultPath::new("new.md").unwrap();
             let plan = aero_core::rename::RenamePlan::prepare(&vault, old.clone(), target.clone()).unwrap();
-            w.execute_change_name(plan, old.clone(), target.clone(), false, "test rename".into(), window, cx);
+            w.execute_change_name(
+                crate::diagnostics::Operation::new("rename", Default::default()),
+                plan,
+                old.clone(),
+                target.clone(),
+                false,
+                "test rename".into(),
+                window,
+                cx,
+            );
             // An external move makes execute fail; watcher/restore/save must not recreate the source.
             vault.rename(&old, &target).unwrap();
             editor.update(cx, |e, cx| {

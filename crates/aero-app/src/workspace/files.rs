@@ -12,6 +12,17 @@ pub(crate) enum Operation {
     Trash { path: VaultPath, note: bool },
 }
 
+impl Operation {
+    pub(super) fn name(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "file_create",
+            Self::Import { .. } => "file_import",
+            Self::AttachmentRename { .. } => "attachment_rename",
+            Self::Trash { .. } => "file_trash",
+        }
+    }
+}
+
 #[derive(Default)]
 struct Outcome {
     open: Option<(VaultPath, bool)>,
@@ -31,7 +42,7 @@ impl Drop for Guard {
 
 pub(super) fn finish_on_shutdown(
     current: Option<Guard>,
-    queued: Vec<Operation>,
+    queued: Vec<(Operation, crate::diagnostics::Operation)>,
     vault: Arc<Vault>,
 ) -> Option<Guard> {
     if queued.is_empty() {
@@ -39,9 +50,12 @@ pub(super) fn finish_on_shutdown(
     }
     Some(Guard(Some(std::thread::spawn(move || {
         drop(current);
-        for operation in queued {
-            if let Err(error) = execute(&vault, operation) {
+        for (operation, diagnostic) in queued {
+            if let Err(error) = diagnostic.scope(|| execute(&vault, operation)) {
+                diagnostic.finish(crate::diagnostics::Outcome::Failed);
                 log::error!("file operation during shutdown: {error}");
+            } else {
+                diagnostic.finish(crate::diagnostics::Outcome::Ok);
             }
         }
     }))))
@@ -138,6 +152,7 @@ impl Workspace {
     pub(super) fn execute_file_operation(
         &mut self,
         operation: Operation,
+        diagnostic: crate::diagnostics::Operation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -163,8 +178,11 @@ impl Workspace {
         self.quick_open = None;
         self.focus_handle.focus(window, cx);
         let (send, receive) = mpsc::channel();
+        let worker_diagnostic = diagnostic.clone();
         let thread = std::thread::spawn(move || {
-            let result = execute(&vault, operation);
+            worker_diagnostic.stage("disk_work", Default::default());
+            let result = worker_diagnostic.scope(|| execute(&vault, operation));
+            worker_diagnostic.stage("disk_finished", Default::default());
             let loaded = paths
                 .into_iter()
                 .filter(|path| {
@@ -183,6 +201,7 @@ impl Workspace {
         self.io_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_spawn(async move { receive.recv() }).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                diagnostic.stage("ui_apply", Default::default());
                 this.file_guard = None;
                 this.io_task = None;
                 this.session_closing = false;
@@ -208,6 +227,11 @@ impl Workspace {
                     Ok(outcome) => outcome,
                     Err(error) => Outcome { error: Some(error), ..Default::default() },
                 };
+                diagnostic.finish(if outcome.error.is_some() {
+                    crate::diagnostics::Outcome::Failed
+                } else {
+                    crate::diagnostics::Outcome::Ok
+                });
                 open.tree.update(cx, |t, cx| {
                     t.set_operation_error(outcome.error.clone());
                     t.rescan_in_background(cx);
@@ -295,7 +319,13 @@ mod tests {
             unique: true,
             text: "kept".into(),
         };
-        drop(finish_on_shutdown(None, vec![operation(), operation()], vault));
+        drop(finish_on_shutdown(
+            None,
+            (0..2)
+                .map(|_| (operation(), crate::diagnostics::Operation::new("file_create", Default::default())))
+                .collect(),
+            vault,
+        ));
         assert_eq!(std::fs::read(root.path().join("queued.md")).unwrap(), b"kept");
         assert_eq!(std::fs::read(root.path().join("queued 1.md")).unwrap(), b"kept");
     }

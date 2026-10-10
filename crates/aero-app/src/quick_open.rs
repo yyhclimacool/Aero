@@ -298,14 +298,40 @@ impl QuickOpen {
             let cancelled = cancel.0.clone();
             self.filter_cancel = Some(cancel);
             let recent = self.recent.clone();
+            let operation = crate::diagnostics::Operation::new(
+                "quick_open_filter",
+                crate::diagnostics::Facts {
+                    count: candidates.len() as u64,
+                    epoch: generation,
+                    bytes: q.len() as u64,
+                    ..Default::default()
+                },
+            );
+            let queued = std::time::Instant::now();
             self.filter_task = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(FILTER_DEBOUNCE).await;
+                let worker_operation = operation.clone();
                 let shown = cx
                     .background_spawn(async move {
-                        filter_prepared(&candidates, &prepared, &recent, &q, &cancelled)
+                        worker_operation.stage(
+                            "running",
+                            crate::diagnostics::Facts {
+                                queue_us: queued.elapsed().as_micros() as u64,
+                                ..Default::default()
+                            },
+                        );
+                        worker_operation
+                            .scope(|| filter_prepared(&candidates, &prepared, &recent, &q, &cancelled))
                     })
                     .await;
-                let _ = this.update(cx, |this, cx| this.receive_filter(generation, shown, selection, cx));
+                let _ = this.update(cx, |this, cx| {
+                    operation.finish(if generation == this.filter_generation {
+                        crate::diagnostics::Outcome::Ok
+                    } else {
+                        crate::diagnostics::Outcome::Stale
+                    });
+                    operation.scope(|| this.receive_filter(generation, shown, selection, cx));
+                });
             }));
         }
         cx.notify();

@@ -4,6 +4,25 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    let output = |program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .unwrap_or_else(|| "unknown".into())
+    };
+    println!("cargo:rustc-env=AERO_BUILD_COMMIT={}", output("git", &["rev-parse", "HEAD"]));
+    println!(
+        "cargo:rustc-env=AERO_BUILD_RUST={}",
+        output(&env::var("RUSTC").unwrap_or_else(|_| "rustc".into()), &["--version"])
+    );
+    println!("cargo:rustc-env=AERO_BUILD_PROFILE={}", env::var("PROFILE").unwrap_or_default());
+    println!("cargo:rustc-env=AERO_BUILD_TARGET={}", env::var("TARGET").unwrap_or_default());
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/refs");
+    println!("cargo:rerun-if-changed=src");
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if os != "macos" && os != "linux" {
         return;

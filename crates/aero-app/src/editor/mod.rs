@@ -138,7 +138,7 @@ pub enum EditorEvent {
     LinkCompletionRequested(u64),
     TagCompletionRequested(u64),
     /// 异步保存成功落盘；工作区据此增量更新索引
-    Saved,
+    Saved(crate::diagnostics::Operation),
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -329,7 +329,24 @@ pub struct Editor {
 impl Editor {
     /// 从磁盘读取笔记。读失败时由调用方展示错误，不构造编辑器。
     pub fn load(vault: Arc<Vault>, path: VaultPath) -> Result<(Document, FileStamp), VaultError> {
-        vault.read(&path)
+        let operation = crate::diagnostics::Operation::new("note_read_parse", Default::default());
+        let result = operation.scope(|| {
+            let (bytes, stamp) = vault.read_bytes(&path)?;
+            operation.stage(
+                "read_done",
+                crate::diagnostics::Facts { bytes: bytes.len() as u64, ..Default::default() },
+            );
+            let doc =
+                Document::from_bytes(&bytes).map_err(|_| VaultError::Utf8 { path: vault.fs_path(&path) })?;
+            operation.stage("parse_done", Default::default());
+            Ok((doc, stamp))
+        });
+        operation.finish(if result.is_ok() {
+            crate::diagnostics::Outcome::Ok
+        } else {
+            crate::diagnostics::Outcome::Failed
+        });
+        result
     }
 
     pub fn new(
@@ -986,6 +1003,26 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let facts = crate::diagnostics::Facts {
+            doc_id: crate::diagnostics::document_id(&self.vault, &self.path),
+            version: self.doc.version(),
+            bytes: range.len() as u64,
+            ..Default::default()
+        };
+        crate::diagnostics::measure("editor_focus", facts, || {
+            self.install_focus_impl(range, id, enter_newline, textarea, window, cx)
+        });
+    }
+
+    fn install_focus_impl(
+        &mut self,
+        range: Range<usize>,
+        id: Option<BlockId>,
+        enter_newline: bool,
+        textarea: Entity<TextareaState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let subscription = cx.subscribe_in(&textarea, window, Self::on_input_event);
         let editor = cx.weak_entity();
         let pair_keys = cx.intercept_keystrokes(move |event, window, cx| {
@@ -1568,6 +1605,16 @@ impl Editor {
 
     /// 控件文本 → 文档：收缩成最小编辑写回。
     fn on_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let facts = crate::diagnostics::Facts {
+            doc_id: crate::diagnostics::document_id(&self.vault, &self.path),
+            version: self.doc.version(),
+            bytes: self.doc.len() as u64,
+            ..Default::default()
+        };
+        crate::diagnostics::measure("edit_input", facts, || self.on_change_impl(window, cx));
+    }
+
+    fn on_change_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.parse_window = Some(window.window_handle());
         self.sanitize_cell(window, cx);
         let paired = self.complete_pairs(window, cx);
@@ -1702,6 +1749,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let operation = crate::diagnostics::Operation::new(
+            "block_convert",
+            crate::diagnostics::Facts {
+                doc_id: crate::diagnostics::document_id(&self.vault, &self.path),
+                version: self.doc.version(),
+                ..Default::default()
+            },
+        );
+        let _scope = operation.enter();
         self.ensure_current_parse();
         // 落在单位上、或只隔着同一行的空白（"hello |" 里的光标）都算那个单位
         let hit = unit_at(&self.units, offset).or_else(|| {
@@ -1714,17 +1770,20 @@ impl Editor {
             None => Some(ops::insert_block(offset, target)),
         };
         let Some(plan) = plan else {
+            operation.finish(crate::diagnostics::Outcome::Noop);
             self.focus_at(offset, None, window, cx);
             return;
         };
         let result = if coalesce { self.doc.edit_coalescing(plan.edit) } else { self.doc.edit(plan.edit) };
         if let Err(err) = result {
+            operation.finish(crate::diagnostics::Outcome::Failed);
             log::error!("edit rejected: {err}");
             return;
         }
         self.focused = None;
         self.after_doc_change(cx);
         self.focus_at(plan.focus_offset, None, window, cx);
+        operation.finish(crate::diagnostics::Outcome::Ok);
     }
 
     /// `⌘⌥0–8`：转换当前块类型。
@@ -1798,14 +1857,26 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let operation = crate::diagnostics::Operation::new(
+            "structural_edit",
+            crate::diagnostics::Facts {
+                doc_id: crate::diagnostics::document_id(&self.vault, &self.path),
+                version: self.doc.version(),
+                bytes: edit.text.len() as u64,
+                ..Default::default()
+            },
+        );
+        let _scope = operation.enter();
         self.ensure_current_parse();
         if let Err(err) = self.doc.edit(edit) {
+            operation.finish(crate::diagnostics::Outcome::Failed);
             log::error!("edit rejected: {err}");
             return;
         }
         self.focused = None;
         self.after_doc_change(cx);
         self.focus_at(focus_offset, None, window, cx);
+        operation.finish(crate::diagnostics::Outcome::Ok);
     }
 
     /// 当前聚焦区间起点上的单位下标。
@@ -2222,14 +2293,36 @@ impl Editor {
     // ---- 撤销 / 重做 ----
 
     fn on_undo(&mut self, _: &DocUndo, window: &mut Window, cx: &mut Context<Self>) {
+        let operation = crate::diagnostics::Operation::new(
+            "undo",
+            crate::diagnostics::Facts {
+                doc_id: crate::diagnostics::document_id(&self.vault, &self.path),
+                version: self.doc.version(),
+                ..Default::default()
+            },
+        );
         if let Some(affected) = self.doc.undo() {
-            self.after_history(affected, window, cx);
+            operation.scope(|| self.after_history(affected, window, cx));
+            operation.finish(crate::diagnostics::Outcome::Ok);
+        } else {
+            operation.finish(crate::diagnostics::Outcome::Noop);
         }
     }
 
     fn on_redo(&mut self, _: &DocRedo, window: &mut Window, cx: &mut Context<Self>) {
+        let operation = crate::diagnostics::Operation::new(
+            "redo",
+            crate::diagnostics::Facts {
+                doc_id: crate::diagnostics::document_id(&self.vault, &self.path),
+                version: self.doc.version(),
+                ..Default::default()
+            },
+        );
         if let Some(affected) = self.doc.redo() {
-            self.after_history(affected, window, cx);
+            operation.scope(|| self.after_history(affected, window, cx));
+            operation.finish(crate::diagnostics::Outcome::Ok);
+        } else {
+            operation.finish(crate::diagnostics::Outcome::Noop);
         }
     }
 
@@ -2292,6 +2385,16 @@ impl Editor {
         }
         let snapshot = self.doc.snapshot();
         let version = snapshot.version();
+        let operation = crate::diagnostics::Operation::new(
+            "note_save",
+            crate::diagnostics::Facts {
+                doc_id: crate::diagnostics::document_id(&self.vault, &self.path),
+                version,
+                epoch: self.io.epoch,
+                bytes: self.doc.len() as u64,
+                ..Default::default()
+            },
+        );
         let (bom, ending) = (self.doc.bom, self.doc.line_ending);
         let (vault, path, stamp) = (self.vault.clone(), self.path.clone(), self.stamp);
         let expected_path = path.clone();
@@ -2302,17 +2405,22 @@ impl Editor {
         self.io.writing = true;
         self.save_state = SaveState::Saving;
         cx.emit(EditorEvent::Changed);
-        let job = io::WriteJob::spawn(path.clone(), epoch, version, move || {
-            io::save(&vault, &path, stamp, conflict_base, snapshot, bom, ending, allow_missing)
+        let job = operation.scope(|| {
+            io::WriteJob::spawn(path.clone(), epoch, version, move || {
+                io::save(&vault, &path, stamp, conflict_base, snapshot, bom, ending, allow_missing)
+            })
         });
         self.io.pending = Some(job.clone());
         let write = cx.background_spawn(async move { job.wait() });
         cx.spawn(async move |this, cx| {
             let outcome = write.await;
+            operation.stage("ui_apply", Default::default());
+            let saved = outcome.result.is_ok();
             let _ = this.update(cx, |this, cx| {
                 this.io.writing = false;
                 this.io.pending = None;
                 if this.io.epoch != epoch || this.path != expected_path {
+                    operation.finish(crate::diagnostics::Outcome::Stale);
                     if this.save_state == SaveState::Saving {
                         this.save_state = if this.dirty { SaveState::Dirty } else { SaveState::Clean };
                     }
@@ -2341,7 +2449,7 @@ impl Editor {
                                 .detach();
                                 cx.emit(EditorEvent::PathsTouched(vec![copy]));
                             }
-                            cx.emit(EditorEvent::Saved);
+                            cx.emit(EditorEvent::Saved(operation.clone()));
                         } else {
                             this.save_state = SaveState::Dirty;
                             this.schedule_save(cx);
@@ -2355,6 +2463,11 @@ impl Editor {
                 }
                 cx.emit(EditorEvent::Changed);
                 cx.notify();
+            });
+            operation.finish(if saved {
+                crate::diagnostics::Outcome::Ok
+            } else {
+                crate::diagnostics::Outcome::Failed
             });
         })
         .detach();
@@ -2699,7 +2812,22 @@ impl Editor {
 
     /// 横幅"另存为…"：写到 vault 内的另一条路径并改跟它。
     pub fn save_as(&mut self, path: VaultPath, cx: &mut Context<Self>) -> Result<(), VaultError> {
-        let stamp = self.vault.write_bytes(&path, &self.doc.to_bytes())?;
+        let operation = crate::diagnostics::Operation::new(
+            "note_save_as",
+            crate::diagnostics::Facts {
+                doc_id: crate::diagnostics::document_id(&self.vault, &path),
+                version: self.doc.version(),
+                bytes: self.doc.len() as u64,
+                ..Default::default()
+            },
+        );
+        let stamp = match operation.scope(|| self.vault.write_bytes(&path, &self.doc.to_bytes())) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                operation.finish(crate::diagnostics::Outcome::Failed);
+                return Err(error);
+            }
+        };
         let old = std::mem::replace(&mut self.path, path.clone());
         self.stamp = stamp;
         self.dirty = false;
@@ -2708,8 +2836,9 @@ impl Editor {
         self.set_banner(None, cx);
         self.repath_link_preview(&old, cx);
         cx.emit(EditorEvent::PathsTouched(vec![old, path]));
-        cx.emit(EditorEvent::Saved);
+        cx.emit(EditorEvent::Saved(operation.clone()));
         cx.emit(EditorEvent::Changed);
+        operation.finish(crate::diagnostics::Outcome::Ok);
         Ok(())
     }
 
@@ -3883,9 +4012,16 @@ impl Render for Editor {
             .restrict_scroll_to_axis()
             .track_scroll(&self.scroll)
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
-                this.cancel_link_preview(cx);
-                this.clear_navigation(cx);
-                this.toolbar_scrolled(cx);
+                let facts = crate::diagnostics::Facts {
+                    doc_id: crate::diagnostics::document_id(&this.vault, &this.path),
+                    version: this.doc.version(),
+                    ..Default::default()
+                };
+                crate::diagnostics::measure("editor_scroll", facts, || {
+                    this.cancel_link_preview(cx);
+                    this.clear_navigation(cx);
+                    this.toolbar_scrolled(cx);
+                });
             }))
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
                 this.preview_modifiers(event.modifiers, cx);

@@ -16,6 +16,7 @@ use crate::workspace::Workspace;
 enum Section {
     Editor,
     Search,
+    Diagnostics,
     About,
 }
 
@@ -77,12 +78,126 @@ struct Settings {
     section: Section,
     search: Option<(EntityId, Entity<SearchSettings>)>,
     _subscription: Subscription,
+    _tick: Task<()>,
+    exporting: bool,
+    diagnostic_status: String,
 }
 
 impl Settings {
     fn new(workspace: Entity<Workspace>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.observe(&workspace, |_, _, cx| cx.notify());
-        Self { workspace, section: Section::Editor, search: None, _subscription: subscription }
+        let tick = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.section == Section::Diagnostics {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            workspace,
+            section: Section::Editor,
+            search: None,
+            _subscription: subscription,
+            _tick: tick,
+            exporting: false,
+            diagnostic_status: String::new(),
+        }
+    }
+
+    fn export_diagnostics(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.exporting {
+            return;
+        }
+        let desktop =
+            std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default().join("Desktop");
+        let suggested = format!("Aero-诊断-{}.aerodiag.json", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+        let selected = cx.prompt_for_new_path(&desktop, Some(&suggested));
+        self.exporting = true;
+        self.diagnostic_status = "请选择保存位置…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = match selected.await {
+                Ok(Ok(Some(path))) => {
+                    Some(cx.background_spawn(async move { crate::diagnostics::export(&path) }).await)
+                }
+                Ok(Ok(None)) => None,
+                _ => Some(Err("无法打开保存对话框。")),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.exporting = false;
+                this.diagnostic_status = match result {
+                    Some(Ok(())) => "诊断包已导出。请检查内容，再决定是否提交。".into(),
+                    Some(Err(error)) => error.into(),
+                    None => String::new(),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn diagnostics_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let remaining = crate::diagnostics::detail_remaining();
+        let status = if remaining > 0 {
+            format!("详细诊断将在 {} 分 {} 秒后关闭。", remaining / 60, remaining % 60)
+        } else {
+            "普通诊断已开启，记录操作、错误和慢任务。".into()
+        };
+        let health = match crate::diagnostics::health() {
+            None => "本次运行无法写入诊断记录，请检查日志目录权限或磁盘空间。".to_owned(),
+            Some((dropped, errors)) if dropped > 0 || errors > 0 => {
+                format!("记录状态：{} 条未写入，{} 次写入失败。", dropped, errors)
+            }
+            _ => "".to_owned(),
+        };
+        v_flex()
+            .id("settings-diagnostics")
+            .debug_selector(|| "settings-diagnostics".into())
+            .gap_3()
+            .text_sm()
+            .child(div().font_weight(FontWeight::MEDIUM).child("日志与诊断"))
+            .child(
+                "记录只保存在本机，不自动上传。保留最近 7 天，历史记录总量最多 50 MB；正在运行的会话受保护。",
+            )
+            .child("记录操作顺序、状态与耗时，不记录笔记正文、标题、路径、搜索词或剪贴板。")
+            .child(
+                div().debug_selector(|| "diagnostics-detail".into()).child(
+                    Switch::new("diagnostics-detail")
+                        .label("详细诊断（15 分钟）")
+                        .checked(remaining > 0)
+                        .on_click(cx.listener(|_, checked: &bool, _, cx| {
+                            crate::diagnostics::set_detail(*checked);
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(status)
+            .child(health)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("diagnostics-open")
+                            .label("打开日志目录")
+                            .on_click(|_, _, cx| cx.reveal_path(&crate::diagnostics::log_directory())),
+                    )
+                    .child(
+                        Button::new("diagnostics-export")
+                            .label(if self.exporting { "正在导出…" } else { "导出诊断包…" })
+                            .on_click(cx.listener(Self::export_diagnostics)),
+                    ),
+            )
+            .child("导出包包含本地记录、应用异常报告和版本信息。系统崩溃报告需另行提供；诊断包不会自动提交。")
+            .child(self.diagnostic_status.clone())
+            .into_any_element()
     }
 
     fn search_view(&mut self, cx: &mut Context<Self>) -> Option<Entity<SearchSettings>> {
@@ -135,6 +250,8 @@ impl Render for Settings {
         let sidebar = cx.theme().sidebar;
         let border = cx.theme().border;
         let search = if self.section == Section::Search { self.search_view(cx) } else { None };
+        let diagnostics =
+            if self.section == Section::Diagnostics { Some(self.diagnostics_section(cx)) } else { None };
         let height = px(420.).min(window.viewport_size().height * 0.7);
 
         h_flex()
@@ -153,6 +270,7 @@ impl Render for Settings {
                     .border_color(border)
                     .child(self.nav("settings-nav-editor", "编辑器", Section::Editor, cx))
                     .child(self.nav("settings-nav-search", "搜索与隐私", Section::Search, cx))
+                    .child(self.nav("settings-nav-diagnostics", "日志与诊断", Section::Diagnostics, cx))
                     .child(self.nav("settings-nav-about", "关于", Section::About, cx)),
             )
             .child(
@@ -170,6 +288,7 @@ impl Render for Settings {
                         el.child(editor_section(focus_source, preview, muted, border, accent, workspace))
                     })
                     .when(self.section == Section::Search, |el| el.child(search_section(search, muted)))
+                    .children(diagnostics)
                     .when(self.section == Section::About, |el| el.child(about_section())),
             )
     }

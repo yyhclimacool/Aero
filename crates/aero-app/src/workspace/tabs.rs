@@ -231,31 +231,62 @@ impl Workspace {
         let vault = open.vault.clone();
         let source = vault.clone();
         let load_path = path.clone();
-        let load = cx.background_spawn(async move { Editor::load(source, load_path) });
+        let operation = crate::diagnostics::Operation::new(
+            "note_open",
+            crate::diagnostics::Facts {
+                doc_id: crate::diagnostics::document_id(&vault, &path),
+                epoch: generation,
+                ..Default::default()
+            },
+        );
+        let worker_operation = operation.clone();
+        let queued = Instant::now();
+        let load = cx.background_spawn(async move {
+            worker_operation.stage(
+                "running",
+                crate::diagnostics::Facts {
+                    queue_us: queued.elapsed().as_micros() as u64,
+                    ..Default::default()
+                },
+            );
+            let result = worker_operation.scope(|| Editor::load(source, load_path));
+            worker_operation.stage("loaded", Default::default());
+            result
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = load.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                let Some(open) = this.open.as_ref().filter(|o| Arc::ptr_eq(&o.vault, &vault)) else { return };
+                let Some(open) = this.open.as_ref().filter(|o| Arc::ptr_eq(&o.vault, &vault)) else {
+                    operation.finish(crate::diagnostics::Outcome::Stale);
+                    return;
+                };
                 let Some(ix) = open
                     .tabs
                     .iter()
                     .position(|t| t.id == id && t.load_generation == generation && t.path(cx) == Some(&path))
                 else {
+                    operation.finish(crate::diagnostics::Outcome::Stale);
                     return;
                 };
                 if this.session_busy() {
+                    operation.finish(crate::diagnostics::Outcome::Cancelled);
                     return;
                 }
                 let (doc, stamp) = match result {
                     Ok(loaded) => loaded,
                     Err(err) => {
+                        operation.finish(crate::diagnostics::Outcome::Failed);
                         window.push_notification(Notification::error(format!("无法打开 {path}：{err}")), cx);
                         this.remove_tab(ix, window, cx);
                         return;
                     }
                 };
                 let (search, images) = (open.search.clone(), open.images.clone());
-                let editor = cx.new(|cx| Editor::new(vault, path, doc, stamp, cx));
+                operation.stage(
+                    "ui_build",
+                    crate::diagnostics::Facts { bytes: doc.len() as u64, ..Default::default() },
+                );
+                let editor = operation.scope(|| cx.new(|cx| Editor::new(vault, path, doc, stamp, cx)));
                 editor.update(cx, |e, cx| {
                     e.connect_link_preview(search, cx);
                     e.connect_images(images, cx);
@@ -271,6 +302,16 @@ impl Workspace {
                 }
                 this.apply_navigation(ix, window, cx);
                 this.tabs_changed(cx);
+                operation.stage("ui_ready", Default::default());
+                // These callbacks run BEFORE a frame. Two boundaries include one rendered frame;
+                // this is a UI scheduling boundary, not a GPU presentation timestamp.
+                let frame_operation = operation.clone();
+                window.on_next_frame(move |window, _| {
+                    window.on_next_frame(move |_, _| {
+                        frame_operation.stage("frame_boundary", Default::default());
+                        frame_operation.finish(crate::diagnostics::Outcome::Ok);
+                    })
+                });
                 cx.notify();
             });
         })
@@ -318,6 +359,7 @@ impl Workspace {
 
     /// 切到第 `ix` 个标签页：按需加载编辑器，文件树、反链、菜单跟上，焦点给编辑器。
     pub(super) fn activate_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        tracing::info!(target: "aero::diagnostics", event = "tab_activate", count = ix as u64);
         if self.session_busy() {
             return;
         }
@@ -441,6 +483,7 @@ impl Workspace {
 
     /// 关闭一页前先落盘；落不了盘就不关，免得丢掉内容。
     pub(super) fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        tracing::info!(target: "aero::diagnostics", event = "tab_close", count = ix as u64);
         if self.session_busy() {
             return false;
         }

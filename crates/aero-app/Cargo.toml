@@ -22,8 +22,11 @@ serde_json = "1"
 toml = "1"
 # 命令行（方案 13.1）。图形界面仍是无参数或直接给库路径时启动
 clap = { version = "4", features = ["derive"] }
-# 日志门面；输出到 stderr 的极简 logger 在 main.rs 里（`AERO_LOG=debug`）
+# 兼容旧日志；本地诊断使用结构化事件，后台写入和容量管理在 diagnostics 中。
 log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+libc = "0.2"
 # 图片解码 / 缩放（渲染服务，方案 9.9）。特性集与 GPUI 已启用的一致，不额外引入编解码器
 image = "0.25"
 # SVG 光栅化进同一条位图管线。版本跟依赖树里已有的 resvg 对齐

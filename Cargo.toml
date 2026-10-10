@@ -47,6 +47,8 @@ opt-level = 2
 [profile.release]
 lto = "thin"
 codegen-units = 1
+debug = "line-tables-only"
+split-debuginfo = "packed"
 
 [patch.crates-io]
 gpui-base = { path = "forks/gpui-base" }

@@ -32,6 +32,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// 本地诊断，不需要打开知识库，也不会联网
+    Diagnostics {
+        #[command(subcommand)]
+        action: DiagnosticCmd,
+    },
     /// 全文检索，结果定位到块
     Search {
         /// 查询。`#tag` / `tag:tag` 与搜索框同一套语法；可以只给 `--tag`
@@ -89,6 +94,14 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum DiagnosticCmd {
+    /// 导出可检查的本地诊断包。目标文件必须尚不存在
+    Export { output: PathBuf },
+    /// 显示本地日志目录
+    Path,
+}
+
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum ExportFormat {
     Md,
@@ -108,7 +121,9 @@ enum IndexCmd {
 pub fn wants_cli(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some(flag) if flag.starts_with('-') => true,
-        Some("search" | "read" | "backlinks" | "append" | "new" | "index" | "export" | "help") => true,
+        Some(
+            "search" | "read" | "backlinks" | "append" | "new" | "index" | "export" | "diagnostics" | "help",
+        ) => true,
         _ => false,
     }
 }
@@ -137,6 +152,47 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 fn execute(cli: &Cli, data_dir: &Path) -> Result<String, String> {
+    if let Cmd::Diagnostics { action } = &cli.command {
+        return match action {
+            DiagnosticCmd::Export { output } => crate::diagnostics::export(output)
+                .map(|_| {
+                    if cli.json {
+                        json!({"exported": output}).to_string()
+                    } else {
+                        format!("已导出：{}", output.display())
+                    }
+                })
+                .map_err(str::to_owned),
+            DiagnosticCmd::Path => Ok(if cli.json {
+                json!({"path": crate::diagnostics::log_directory()}).to_string()
+            } else {
+                crate::diagnostics::log_directory().display().to_string()
+            }),
+        };
+    }
+    let operation = crate::diagnostics::Operation::new(
+        match &cli.command {
+            Cmd::Search { .. } => "cli_search",
+            Cmd::Read { .. } => "cli_read",
+            Cmd::Backlinks { .. } => "cli_backlinks",
+            Cmd::Append { .. } => "cli_append",
+            Cmd::New { .. } => "cli_new",
+            Cmd::Export { .. } => "cli_export",
+            Cmd::Index { .. } => "cli_index",
+            Cmd::Diagnostics { .. } => unreachable!(),
+        },
+        Default::default(),
+    );
+    let result = operation.scope(|| execute_vault(cli, data_dir));
+    operation.finish(if result.is_ok() {
+        crate::diagnostics::Outcome::Ok
+    } else {
+        crate::diagnostics::Outcome::Failed
+    });
+    result
+}
+
+fn execute_vault(cli: &Cli, data_dir: &Path) -> Result<String, String> {
     let root = vault_root(cli.vault.as_deref(), data_dir)?;
     let vault = Arc::new(Vault::open(&root).map_err(|e| e.to_string())?);
     match &cli.command {
@@ -174,7 +230,11 @@ fn execute(cli: &Cli, data_dir: &Path) -> Result<String, String> {
                     IndexCmd::Status => status(&indexer, &vault, cli.json),
                     IndexCmd::Rebuild => rebuild(&mut indexer, cli.json),
                 },
-                Cmd::Read { .. } | Cmd::Export { .. } | Cmd::Append { .. } | Cmd::New { .. } => {
+                Cmd::Read { .. }
+                | Cmd::Export { .. }
+                | Cmd::Append { .. }
+                | Cmd::New { .. }
+                | Cmd::Diagnostics { .. } => {
                     unreachable!("已在上面处理")
                 }
             }

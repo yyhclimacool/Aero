@@ -152,22 +152,32 @@ impl SearchShutdown {
 
 impl Drop for SearchShutdown {
     fn drop(&mut self) {
+        let operation = crate::diagnostics::Operation::new("index_shutdown", Default::default());
         let started = Instant::now();
         self.shared.closing.store(true, Ordering::Release);
         self.shared.cancelled.store(true, Ordering::Release);
         self.shared.wake_waiters();
         let _closing = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         self.join_startup();
+        operation.stage("joined", Default::default());
         log::debug!("index shutdown: joined after {:?}", started.elapsed());
         let mut guard = self.indexer.lock().unwrap_or_else(|p| p.into_inner());
+        let mut failed = false;
         if let Some(ix) = guard.as_mut() {
             if let Err(error) = ix.flush() {
+                failed = true;
                 log::warn!("index flush: {error}");
             }
         }
         log::debug!("index shutdown: flushed after {:?}", started.elapsed());
+        operation.stage("flushed", Default::default());
         *guard = None;
         log::debug!("index shutdown: released after {:?}", started.elapsed());
+        operation.finish(if failed {
+            crate::diagnostics::Outcome::Failed
+        } else {
+            crate::diagnostics::Outcome::Ok
+        });
     }
 }
 
@@ -234,16 +244,46 @@ impl SearchService {
 
     /// 全文搜索。先等调用前已提交的写操作；引擎还没打开时返回空。
     pub fn search(&self, text: String, limit: usize, cx: &App) -> Task<Result<Vec<SearchHit>, String>> {
+        let operation = crate::diagnostics::Operation::new(
+            "fulltext_search",
+            crate::diagnostics::Facts {
+                bytes: text.len() as u64,
+                count: self.submitted_writes as u64,
+                ..Default::default()
+            },
+        );
+        let queued = Instant::now();
         let indexer = self.indexer.clone();
         let shared = self.shared.clone();
         let through = self.submitted_writes;
         cx.background_spawn(async move {
             shared.wait_for_writes(through, false).await;
+            operation.stage(
+                "writes_drained",
+                crate::diagnostics::Facts {
+                    queue_us: queued.elapsed().as_micros() as u64,
+                    ..Default::default()
+                },
+            );
             let guard = indexer.lock().unwrap();
-            match guard.as_ref() {
+            operation.stage("lock_acquired", Default::default());
+            let result = operation.scope(|| match guard.as_ref() {
                 Some(ix) => ix.search(&text, limit).map_err(|e| e.to_string()),
                 None => Ok(Vec::new()),
-            }
+            });
+            operation.stage(
+                "results",
+                crate::diagnostics::Facts {
+                    count: result.as_ref().map_or(0, |hits| hits.len()) as u64,
+                    ..Default::default()
+                },
+            );
+            operation.finish(if result.is_ok() {
+                crate::diagnostics::Outcome::Ok
+            } else {
+                crate::diagnostics::Outcome::Failed
+            });
+            result
         })
     }
 
@@ -538,6 +578,7 @@ impl SearchService {
     /// Await completion BEFORE quitting or reopening the same index. The service must
     /// remain owned until then; forced termination additionally keeps a shutdown guard.
     pub fn close_async(&self, cx: &App) -> Task<()> {
+        let operation = crate::diagnostics::Operation::new("index_close", Default::default());
         self.shared.closing.store(true, Ordering::Release);
         let guard = self.shutdown_guard();
         let through = self.submitted_writes;
@@ -553,10 +594,13 @@ impl SearchService {
                 }
             }
             log::debug!("index close: startup stopped after {:?}", started.elapsed());
+            operation.stage("startup_stopped", Default::default());
             guard.shared.wake_waiters();
             guard.shared.wait_for_writes(through, false).await;
             log::debug!("index close: writes drained after {:?}", started.elapsed());
-            drop(guard);
+            operation.stage("writes_drained", Default::default());
+            operation.scope(|| drop(guard));
+            operation.finish(crate::diagnostics::Outcome::Ok);
         })
     }
 
@@ -602,12 +646,27 @@ impl SearchService {
         self.submitted_writes += 1;
         let indexer = self.indexer.clone();
         let shared = self.shared.clone();
+        let diagnostic = crate::diagnostics::Operation::new(
+            "index_write",
+            crate::diagnostics::Facts { epoch: (previous + 1) as u64, ..Default::default() },
+        );
+        let worker_diagnostic = diagnostic.clone();
+        let queued = Instant::now();
         let task = cx.background_spawn(async move {
             if !shared.wait_for_writes(previous, wait_for_sync).await {
+                worker_diagnostic.finish(crate::diagnostics::Outcome::Cancelled);
                 return Ok(false);
             }
-            let result = {
+            worker_diagnostic.stage(
+                "writes_drained",
+                crate::diagnostics::Facts {
+                    queue_us: queued.elapsed().as_micros() as u64,
+                    ..Default::default()
+                },
+            );
+            let result = worker_diagnostic.scope(|| {
                 let mut guard = indexer.lock().unwrap();
+                worker_diagnostic.stage("lock_acquired", Default::default());
                 // Close can race with acquiring the lock after the asynchronous wait.
                 if shared.cancelled.load(Ordering::Acquire)
                     || (wait_for_sync && shared.phase.load(Ordering::Acquire) == PHASE_FAILED)
@@ -619,20 +678,28 @@ impl SearchService {
                         None => Ok(false),
                     }
                 }
-            };
+            });
+            worker_diagnostic.stage("indexed", Default::default());
             // Errors and no-op writes release the next item too. No foreground callback is needed.
             shared.finish_write(previous + 1);
             result
         });
         cx.spawn(async move |this, cx| {
-            let written = match task.await {
+            let result = task.await;
+            let outcome = match &result {
+                Ok(true) => crate::diagnostics::Outcome::Ok,
+                Ok(false) => crate::diagnostics::Outcome::Noop,
+                Err(_) => crate::diagnostics::Outcome::Failed,
+            };
+            let written = match result {
                 Ok(written) => written,
                 Err(e) => {
                     log::warn!("index update: {e}");
                     true
                 }
             };
-            let _ = this.update(cx, |this, cx| {
+            let updated = this.update(cx, |this, cx| {
+                diagnostic.stage("ui_apply", Default::default());
                 if this.shared.stop_sync() {
                     return;
                 }
@@ -642,6 +709,7 @@ impl SearchService {
                 }
                 cx.notify();
             });
+            diagnostic.finish(if updated.is_ok() { outcome } else { crate::diagnostics::Outcome::Stale });
         })
         .detach();
     }
@@ -703,7 +771,9 @@ fn spawn_sync(
     shared: Arc<Shared>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let shared_outer = shared.clone();
+    let operation = crate::diagnostics::Operation::new("index_startup", Default::default());
     let spawned = std::thread::Builder::new().name("aero-index-sync".into()).spawn(move || {
+        let _scope = operation.enter();
         let opened = Indexer::open(vault, &data_dir);
         let plan = match opened {
             Ok(mut ix) => {
@@ -723,6 +793,7 @@ fn spawn_sync(
                 plan
             }
             Err(e) => {
+                operation.finish(crate::diagnostics::Outcome::Failed);
                 log::error!("index open: {e}");
                 *shared.error.lock().unwrap() = Some(e.to_string());
                 shared.set_phase(PHASE_FAILED);
@@ -733,6 +804,7 @@ fn spawn_sync(
             Ok(Some(p)) => p,
             Ok(None) => return,
             Err(e) => {
+                operation.finish(crate::diagnostics::Outcome::Failed);
                 log::error!("index plan: {e}");
                 *shared.error.lock().unwrap() = Some(e.to_string());
                 shared.set_phase(PHASE_FAILED);
@@ -740,6 +812,10 @@ fn spawn_sync(
             }
         };
         shared.total.store(plan.notes.len(), Ordering::Relaxed);
+        operation.stage(
+            "planned",
+            crate::diagnostics::Facts { count: plan.notes.len() as u64, ..Default::default() },
+        );
         shared.set_phase(PHASE_SYNCING);
         let mut report = SyncReport::default();
         for (i, (path, row)) in plan.notes.iter().enumerate() {
@@ -783,8 +859,16 @@ fn spawn_sync(
             report.removed,
             report.errors.len()
         );
+        let failed = !report.errors.is_empty();
         *shared.report.lock().unwrap() = Some(report);
         shared.set_phase(PHASE_IDLE);
+        operation.finish(if shared.stop_sync() {
+            crate::diagnostics::Outcome::Cancelled
+        } else if failed {
+            crate::diagnostics::Outcome::Failed
+        } else {
+            crate::diagnostics::Outcome::Ok
+        });
     });
     match spawned {
         Ok(handle) => Some(handle),

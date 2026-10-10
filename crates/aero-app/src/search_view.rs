@@ -299,7 +299,11 @@ impl SearchView {
         self.query = text.clone();
         let generation = self.generation;
         // 先发全文，再独立发语义；不要 join 或等待模型加载。
-        let task = self.service.read(cx).search(text.clone(), LIMIT, cx);
+        let operation = crate::diagnostics::Operation::new(
+            "search",
+            crate::diagnostics::Facts { epoch: generation, bytes: text.len() as u64, ..Default::default() },
+        );
+        let task = operation.scope(|| self.service.read(cx).search(text.clone(), LIMIT, cx));
         let semantic_task = self.semantic_service.as_ref().and_then(|service| {
             (self.hybrid
                 && self.semantic_key.enabled
@@ -310,7 +314,23 @@ impl SearchView {
         self.results = SearchResults { semantic_pending: semantic_task.is_some(), ..Default::default() };
         cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| this.receive_fulltext(generation, result, cx));
+            let _ = this.update(cx, |this, cx| {
+                operation.stage(
+                    "ui_apply",
+                    crate::diagnostics::Facts {
+                        count: result.as_ref().map_or(0, |hits| hits.len()) as u64,
+                        ..Default::default()
+                    },
+                );
+                operation.finish(if this.generation != generation {
+                    crate::diagnostics::Outcome::Stale
+                } else if result.is_ok() {
+                    crate::diagnostics::Outcome::Ok
+                } else {
+                    crate::diagnostics::Outcome::Failed
+                });
+                operation.scope(|| this.receive_fulltext(generation, result, cx));
+            });
         })
         .detach();
         if let Some(task) = semantic_task {
@@ -325,9 +345,22 @@ impl SearchView {
         task: Task<Result<Vec<SearchHit>, String>>,
         cx: &mut Context<Self>,
     ) {
+        let operation = crate::diagnostics::Operation::new(
+            "semantic_search",
+            crate::diagnostics::Facts { epoch: generation, ..Default::default() },
+        );
         self.semantic_task = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| this.receive_semantic(generation, result, cx));
+            let _ = this.update(cx, |this, cx| {
+                operation.finish(if this.generation != generation {
+                    crate::diagnostics::Outcome::Stale
+                } else if result.is_ok() {
+                    crate::diagnostics::Outcome::Ok
+                } else {
+                    crate::diagnostics::Outcome::Failed
+                });
+                operation.scope(|| this.receive_semantic(generation, result, cx));
+            });
         }));
     }
 

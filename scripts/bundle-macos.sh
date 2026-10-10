@@ -97,4 +97,9 @@ else
   codesign --force --sign - --timestamp=none "$aero_app"
 fi
 codesign --verify --deep --strict "$aero_app"
+if [[ "${1:-debug}" == release ]]; then
+  # Keep symbols and exact signed images on the developer machine, outside the .app / DMG.
+  python3 scripts/archive-symbols.py --app "$aero_app" --binary "$aero_binary" \
+    --output "$(dirname "$aero_binary")/symbols" --version "$aero_version"
+fi
 printf 'Built: %s\n' "$aero_app"

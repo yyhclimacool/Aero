@@ -125,6 +125,7 @@ dependencies = [
  "gpui-kit",
  "hayro",
  "image",
+ "libc",
  "log",
  "merman",
  "merman-render",
@@ -141,6 +142,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml 1.1.6+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
