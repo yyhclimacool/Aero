@@ -141,6 +141,15 @@ impl TextViewState {
 
     /// Create a new TextViewState.
     fn new(format: TextViewFormat, text: &str, cx: &mut Context<Self>) -> Self {
+        Self::with_markdown_extensions(format, text, Arc::default(), cx)
+    }
+
+    pub(super) fn with_markdown_extensions(
+        format: TextViewFormat,
+        text: &str,
+        markdown_extensions: Arc<MarkdownExtensions>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let selection_adapter = TextViewSelectionAdapter::new(cx.entity().downgrade(), cx);
 
@@ -208,7 +217,7 @@ impl TextViewState {
             table_actions: None,
             link_click_handler: None,
             link_hooks: super::text_view::LinkHooks::default(),
-            markdown_extensions: Arc::default(),
+            markdown_extensions,
             is_selecting: false,
             auto_scroll: AutoScroll::default(),
             selection_adapter,
@@ -1209,5 +1218,36 @@ mod tests {
             assert_eq!(node.name(), "ticker");
             assert_eq!(node.data::<String>().map(String::as_str), Some("TSLA.US"));
         });
+    }
+
+    #[gpui::test]
+    fn configured_constructor_parses_the_initial_content_once(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let extensions = Arc::new(MarkdownExtensions::default().block_parser(|node, context| {
+            let markdown::mdast::Node::Paragraph(_) = node else {
+                return None;
+            };
+            Some(MarkdownNode::new("initial", ()).markdown(context.node_source(node).unwrap_or_default()))
+        }));
+        let state = cx.update(|cx| {
+            cx.new(|cx| {
+                TextViewState::with_markdown_extensions(
+                    super::TextViewFormat::Markdown,
+                    "configured",
+                    extensions,
+                    cx,
+                )
+            })
+        });
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.revision, 1, "construction must submit only one initial configuration");
+            assert_eq!(state.source().as_str(), "configured");
+            assert!(matches!(
+                &state.parsed_content.document.blocks[0],
+                node::BlockNode::Custom(custom) if custom.name() == "initial"
+            ));
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| assert_eq!(state.revision, 1));
     }
 }

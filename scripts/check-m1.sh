@@ -16,8 +16,8 @@ git rev-parse HEAD
 git diff --stat
 rustc --version
 sw_vers
-cargo fmt -p aero-core -p aero-index -p aero-app -- --check
-cargo test --locked -p aero-core -p aero-index -p aero-app
+cargo fmt -p aero-core -p aero-index -p aero-embedding -p aero-app -- --check
+cargo test --locked -p aero-core -p aero-index -p aero-embedding -p aero-app
 if [[ "${1:-}" == --bundle ]]; then
   # 预检测试明确验证 ad-hoc 包会被公证脚本拒绝，故不沿用用户发布凭据。
   unset AERO_SIGN_IDENTITY AERO_NOTARY_PROFILE AERO_NOTARY_APPLE_ID AERO_NOTARY_TEAM_ID AERO_NOTARY_PASSWORD

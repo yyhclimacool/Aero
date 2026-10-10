@@ -90,28 +90,9 @@ impl ListMarker {
 }
 
 /// 字数：CJK 按字计，其他文字按空白分隔的词计（`ui_design.md` 10.1）。
+#[cfg(test)]
 pub fn word_count(text: &str) -> usize {
-    let mut count = 0;
-    let mut in_word = false;
-    for c in text.chars() {
-        if is_cjk(c) {
-            count += 1;
-            in_word = false;
-        } else if c.is_alphanumeric() {
-            if !in_word {
-                count += 1;
-                in_word = true;
-            }
-        } else {
-            in_word = false;
-        }
-    }
-    count
-}
-
-fn is_cjk(c: char) -> bool {
-    matches!(c as u32,
-        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0x3040..=0x30FF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF)
+    aero_core::text::word_count(text)
 }
 
 /// 已经是标题时，正文开头再打 `## `（井号后必须有一个空格）就改成对应级别。

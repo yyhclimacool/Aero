@@ -47,6 +47,7 @@ fn parse_text(text: &str) -> ParseOutput {
 #[derive(Clone, Debug)]
 pub struct Document {
     text: Rope,
+    word_count: usize,
     anchors: MarkerTable,
     blocks: BlockTree,
     /// 每次编辑 +1
@@ -86,6 +87,7 @@ impl Document {
     pub fn from_source(src: SourceText) -> Self {
         let mut doc = Document {
             text: Rope::from_str(&src.text),
+            word_count: text::word_count(&src.text),
             anchors: MarkerTable::new(),
             blocks: BlockTree::default(),
             version: 0,
@@ -119,6 +121,10 @@ impl Document {
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    pub fn word_count(&self) -> usize {
+        self.word_count
     }
 
     pub fn blocks(&self) -> &BlockTree {
@@ -309,6 +315,7 @@ impl Document {
     /// 改 Rope + 平移 anchor + 版本号。调用方保证编辑合法。
     fn apply_raw(&mut self, edit: &Edit) -> Edit {
         self.pending_paragraph = self.paragraph_edit_candidate(edit);
+        self.word_count = text::edited_word_count(&self.text, edit, self.word_count);
         let inverse = text::apply_edit(&mut self.text, edit);
         self.reference_brackets -= inverse.text.bytes().filter(|&b| b == b'[').count();
         self.reference_brackets += edit.text.bytes().filter(|&b| b == b'[').count();
@@ -1373,9 +1380,10 @@ mod tests {
     #[test]
     fn invalid_group_is_rolled_back() {
         let mut d = Document::from_text("abc");
-        let err = d.edit_group(vec![Edit::insert(0, "x"), Edit::delete(0..99)]).unwrap_err();
+        let err = d.edit_group(vec![Edit::insert(0, "雪 "), Edit::delete(0..99)]).unwrap_err();
         assert!(matches!(err, EditError::OutOfBounds { .. }));
         assert_eq!(d.to_string(), "abc");
+        assert_eq!(d.word_count(), 1);
         assert!(!d.can_undo());
     }
 

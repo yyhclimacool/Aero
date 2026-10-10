@@ -24,7 +24,10 @@ fn focus_unit(editor: &Entity<Editor>, ix: usize, cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
-fn open(cx: &mut TestAppContext, body: &str) -> (tempfile::TempDir, Arc<Vault>, VaultPath, Entity<Editor>) {
+pub(super) fn open(
+    cx: &mut TestAppContext,
+    body: &str,
+) -> (tempfile::TempDir, Arc<Vault>, VaultPath, Entity<Editor>) {
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::actions::init(cx);

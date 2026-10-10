@@ -26,7 +26,7 @@ use crate::actions::*;
 use crate::backlinks::{BacklinksView, ReferenceOpened};
 use crate::branding;
 use crate::editor::{Editor, EditorEvent, SaveState};
-use crate::file_tree::{FileTree, FileTreeEvent, unique_note_name};
+use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::paths::{LinkPreviewMode, PersistedState, display_path};
 use crate::quick_open::{QuickOpen, QuickOpenEvent};
 use crate::search::{Phase, SearchService};
@@ -835,7 +835,7 @@ impl Workspace {
                 return;
             }
             open.tree.update(cx, |t, cx| {
-                t.rescan();
+                t.rescan_in_background(cx);
                 cx.notify();
             });
         }
@@ -1002,16 +1002,14 @@ impl Workspace {
         }
         let Some(open) = self.open.as_ref() else { return };
         let vault = open.vault.clone();
-        let existing = vault.notes().unwrap_or_default();
         // 3.5：新建位置 = 当前选中的文件夹；否则 vault 根
         let dir = open.tree.read(cx).selected_dir().unwrap_or_default();
         let dir = if dir == "daily" { String::new() } else { dir };
-        let path = unique_note_name(&existing, &dir, "未命名");
-        let doc = aero_core::Document::from_text("");
-        match vault.write(&path, &doc) {
+        let path = open.tree.read(cx).available_note_path(&dir, "未命名");
+        match vault.create_bytes(&path, b"") {
             Ok(_) => {
                 open.tree.update(cx, |t, cx| {
-                    t.rescan();
+                    t.rescan_in_background(cx);
                     cx.notify();
                 });
                 self.open_note(path.clone(), window, cx);
@@ -1039,7 +1037,7 @@ impl Workspace {
                 return;
             }
             open.tree.update(cx, |t, cx| {
-                t.rescan();
+                t.rescan_in_background(cx);
                 cx.notify();
             });
             true
@@ -1096,7 +1094,7 @@ impl Workspace {
         match crate::trash::move_to_trash(&fs_path) {
             Ok(()) => {
                 open.tree.update(cx, |t, cx| {
-                    t.rescan();
+                    t.rescan_in_background(cx);
                     if t.selected() == Some(path) {
                         t.select(None, cx);
                     }
@@ -1575,7 +1573,7 @@ impl Workspace {
         let current = editor.read(cx).path().clone();
         let active = open.editor() == Some(editor);
         open.tree.update(cx, |t, cx| {
-            t.rescan();
+            t.rescan_in_background(cx);
             if notes_touched && active && t.selected() != Some(&current) {
                 t.select(Some(current.clone()), cx);
             }
@@ -1602,7 +1600,7 @@ impl Workspace {
         let Some(open) = self.open.as_ref() else { return };
         let path = editor.read(cx).path().clone();
         open.tree.update(cx, |t, cx| {
-            t.rescan();
+            t.rescan_in_background(cx);
             if t.selected() == Some(&path) {
                 t.select(None, cx);
             }

@@ -4,7 +4,8 @@
 //! 同篇嵌入直接用未保存的文档；跨篇在后台读盘并缓存，笔记变动时丢缓存重读。
 //! 解析与跳转复用 `link_preview` 的解析器，写法上和 `[[链接]]` 完全一致。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use aero_core::links::Resolution;
 use aero_core::{Document, VaultPath};
@@ -14,17 +15,45 @@ use gpui_kit::*;
 #[derive(Default)]
 pub(super) struct Embeds {
     entries: HashMap<(String, Option<String>), Entry>,
+    targets: HashSet<(String, Option<String>)>,
+    revision: Option<Revision>,
+    scan: Option<Task<()>>,
+    next_request: u64,
+    #[cfg(test)]
+    scan_count: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct Revision {
+    epoch: u64,
+    version: u64,
+    path: VaultPath,
+}
+
+impl Embeds {
+    pub(super) fn clear_content(&mut self) {
+        self.entries.clear();
+        self.targets.clear();
+        self.revision = None;
+    }
 }
 
 enum Entry {
     /// 持有任务句柄：编辑器关掉时后台读盘随之取消
-    Loading(#[allow(dead_code, reason = "句柄只为持有任务，丢弃即取消")] Task<()>),
+    Loading {
+        path: VaultPath,
+        request: u64,
+        _task: Task<()>,
+    },
     Ready {
         path: VaultPath,
         title: String,
         source: String,
     },
-    Failed(SharedString),
+    Failed {
+        path: VaultPath,
+        error: SharedString,
+    },
 }
 
 /// 块元素拿到的嵌入状态。
@@ -64,39 +93,100 @@ impl super::Editor {
                 title: title.clone(),
                 source: source.clone(),
             },
-            Some(Entry::Failed(error)) => EmbedView::Failed(error.clone()),
+            Some(Entry::Failed { error, .. }) => EmbedView::Failed(error.clone()),
             // 还没预取到（刚打开 / 刚改完 / 解析器刚就绪）：占位，不是错误
-            None | Some(Entry::Loading(_)) => EmbedView::Loading,
+            None | Some(Entry::Loading { .. }) => EmbedView::Loading,
         }
     }
 
     /// 预取本篇里所有跨篇嵌入的内容。打开笔记、正文变化、笔记目录就绪、缓存失效后各调一次；
     /// 渲染本身只读缓存。
     pub(super) fn refresh_embeds(&mut self, cx: &mut Context<Self>) {
-        let source = self.doc.to_string();
-        let wanted: Vec<(String, Option<String>)> = aero_core::links::scan_embeds(&source)
-            .into_iter()
-            .filter(|embed| aero_core::attachments::Kind::for_path(&embed.target).is_none())
-            .map(|embed| (embed.target, embed.fragment))
-            .collect();
+        if self.embeds.revision.as_ref() == Some(&self.embed_revision()) {
+            self.prefetch_embeds(cx);
+            return;
+        }
+        if self.embeds.scan.is_some() {
+            return;
+        }
+        let debounce = self.embeds.revision.is_some();
+        self.embeds.scan = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor().timer(Duration::from_millis(100)).await;
+            }
+            let Ok((revision, snapshot)) = this.update(cx, |this, _| {
+                #[cfg(test)]
+                {
+                    this.embeds.scan_count += 1;
+                }
+                (this.embed_revision(), this.doc.snapshot())
+            }) else {
+                return;
+            };
+            let targets = cx
+                .background_spawn(async move {
+                    let source = snapshot.text().to_string();
+                    aero_core::links::scan_embeds(&source)
+                        .into_iter()
+                        .filter(|embed| aero_core::attachments::Kind::for_path(&embed.target).is_none())
+                        .map(|embed| (embed.target, embed.fragment))
+                        .collect()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.receive_embed_scan(revision, targets, cx);
+            });
+        }));
+    }
+
+    fn embed_revision(&self) -> Revision {
+        Revision { epoch: self.io.epoch, version: self.doc.version(), path: self.path.clone() }
+    }
+
+    fn receive_embed_scan(
+        &mut self,
+        revision: Revision,
+        targets: HashSet<(String, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.embeds.scan = None;
+        if self.embed_revision() != revision {
+            self.refresh_embeds(cx);
+            return;
+        }
+        self.embeds.revision = Some(revision);
+        self.embeds.targets = targets;
+        self.prefetch_embeds(cx);
+        cx.notify();
+    }
+
+    fn prefetch_embeds(&mut self, cx: &mut Context<Self>) {
+        let wanted = &self.embeds.targets;
         // 不再被引用的嵌入丢掉，免得改来改去越攒越多
         self.embeds.entries.retain(|key, _| wanted.contains(key));
-        for (target, fragment) in wanted {
+        for (target, fragment) in self.embeds.targets.clone() {
             let key = (target.clone(), fragment.clone());
-            if self.embeds.entries.contains_key(&key) {
-                continue;
-            }
             // 同篇嵌入与解析不出的目标都在渲染时即时算，不进缓存
             let Some(Resolution::Resolved { path, fragment }) =
                 self.resolve_link_target(&target, fragment.as_deref())
             else {
+                self.embeds.entries.remove(&key);
                 continue;
             };
             if path == self.path {
+                self.embeds.entries.remove(&key);
                 continue;
             }
-            let task = self.load_embed(key.clone(), path, fragment, cx);
-            self.embeds.entries.insert(key, Entry::Loading(task));
+            let cached_path = self.embeds.entries.get(&key).map(|entry| match entry {
+                Entry::Loading { path, .. } | Entry::Ready { path, .. } | Entry::Failed { path, .. } => path,
+            });
+            if cached_path == Some(&path) {
+                continue;
+            }
+            self.embeds.next_request += 1;
+            let request = self.embeds.next_request;
+            let task = self.load_embed(key.clone(), path.clone(), fragment, request, cx);
+            self.embeds.entries.insert(key, Entry::Loading { path, request, _task: task });
         }
     }
 
@@ -105,24 +195,34 @@ impl super::Editor {
         key: (String, Option<String>),
         path: VaultPath,
         fragment: Option<String>,
+        request: u64,
         cx: &mut Context<Self>,
     ) -> Task<()> {
         let vault = self.vault.clone();
+        let epoch = self.io.epoch;
+        let origin = self.path.clone();
         cx.spawn(async move |this, cx| {
+            let read_path = path.clone();
             let read = cx
                 .background_spawn(async move {
-                    let (doc, _) = vault.read(&path).map_err(|e| format!("无法读取笔记：{e}"))?;
+                    let (doc, _) = vault.read(&read_path).map_err(|e| format!("无法读取笔记：{e}"))?;
                     let source = slice(&doc, fragment.as_deref())?;
-                    let title = doc.title_or(path.stem());
-                    Ok::<_, String>((path, title, source))
+                    let title = doc.title_or(read_path.stem());
+                    Ok::<_, String>((title, source))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                if this.io.epoch != epoch
+                    || this.path != origin
+                    || !matches!(this.embeds.entries.get(&key), Some(Entry::Loading { request: pending, .. }) if *pending == request)
+                {
+                    return;
+                }
                 this.embeds.entries.insert(
                     key,
                     match read {
-                        Ok((path, title, source)) => Entry::Ready { path, title, source },
-                        Err(error) => Entry::Failed(error.into()),
+                        Ok((title, source)) => Entry::Ready { path, title, source },
+                        Err(error) => Entry::Failed { path, error: error.into() },
                     },
                 );
                 cx.notify();
@@ -135,8 +235,8 @@ impl super::Editor {
         let before = self.embeds.entries.len();
         self.embeds.entries.retain(|_, entry| match entry {
             Entry::Ready { path, .. } => !paths.contains(path),
-            Entry::Failed(_) => false,
-            Entry::Loading(_) => true,
+            Entry::Failed { .. } => false,
+            Entry::Loading { path, .. } => !paths.contains(path),
         });
         if self.embeds.entries.len() != before {
             self.refresh_embeds(cx);
@@ -167,8 +267,78 @@ fn strip_front_matter(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{slice, strip_front_matter};
-    use aero_core::Document;
+    use super::{Entry, slice, strip_front_matter};
+    use aero_core::{Document, Edit, VaultPath};
+    use gpui_kit::{TestAppContext, VisualTestContext};
+    use std::time::Duration;
+
+    #[gpui_kit::test]
+    fn embed_scans_coalesce_edits_and_reuse_a_current_snapshot(cx: &mut TestAppContext) {
+        let (_dir, _vault, _path, editor) = super::super::tests::open(cx, "![[first]]");
+        editor.update(cx, |editor, cx| editor.refresh_embeds(cx));
+        cx.run_until_parked();
+        editor.update(cx, |editor, cx| {
+            assert!(editor.embeds.targets.contains(&("first".into(), None)));
+            assert_eq!(editor.embeds.scan_count, 1);
+            for _ in 0..10 {
+                editor.refresh_embeds(cx);
+            }
+            assert!(editor.embeds.scan.is_none());
+            for target in ["middle", "latest"] {
+                editor.doc.edit(Edit::replace(0..editor.doc.len(), format!("![[{target}]]"))).unwrap();
+                editor.refresh_embeds(cx);
+            }
+            assert_eq!(editor.embeds.scan_count, 1, "scan must not run in the editing callback");
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(editor.embeds.scan_count, 2);
+            assert_eq!(editor.embeds.targets.len(), 1);
+            assert!(editor.embeds.targets.contains(&("latest".into(), None)));
+            assert!(editor.embeds.scan.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn embed_scan_rejects_a_reply_from_before_reload_even_at_the_same_version(cx: &mut TestAppContext) {
+        let (_dir, _vault, _path, editor) = super::super::tests::open(cx, "![[old]]");
+        let visual = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        editor.update(visual, |editor, cx| {
+            let old = editor.embed_revision();
+            let stamp = editor.stamp;
+            editor.install_document(Document::from_text("![[new]]"), stamp, cx);
+            assert_eq!(old.version, editor.doc.version());
+            editor.receive_embed_scan(old, [("old".into(), None)].into_iter().collect(), cx);
+            assert!(!editor.embeds.targets.contains(&("old".into(), None)));
+        });
+        visual.run_until_parked();
+        editor.read_with(visual, |editor, _| {
+            assert_eq!(editor.embeds.targets.len(), 1);
+            assert!(editor.embeds.targets.contains(&("new".into(), None)));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn completed_embed_load_cannot_restore_an_evicted_entry(cx: &mut TestAppContext) {
+        let (dir, _vault, _path, editor) = super::super::tests::open(cx, "![[b]]");
+        std::fs::write(dir.path().join("b.md"), "target body").unwrap();
+        editor.update(cx, |editor, cx| {
+            let key = ("b".into(), None);
+            let path = VaultPath::new("b.md").unwrap();
+            let task = editor.load_embed(key.clone(), path.clone(), None, 1, cx);
+            editor.embeds.entries.insert(key.clone(), Entry::Loading { path, request: 1, _task: task });
+            let Entry::Loading { _task, .. } = editor.embeds.entries.remove(&key).unwrap() else {
+                unreachable!()
+            };
+            // Let an already accepted load finish after eviction to exercise
+            // the callback guard rather than relying on task cancellation.
+            _task.detach();
+        });
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| assert!(editor.embeds.entries.is_empty()));
+    }
 
     #[test]
     fn embedded_source_keeps_markdown_and_drops_front_matter() {

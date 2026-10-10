@@ -496,7 +496,7 @@ impl Editor {
     }
 
     pub fn word_count(&self) -> usize {
-        word_count(&self.doc.to_string())
+        self.doc.word_count()
     }
 
     /// 浏览态聚焦（键盘可用，但没有光标）。
@@ -2547,6 +2547,7 @@ impl Editor {
         self.highlight = None;
         self.highlight_task = None;
         self.doc = doc;
+        self.embeds.clear_content();
         self.update_local_link_names();
         self.stamp = stamp;
         self.refresh_units();

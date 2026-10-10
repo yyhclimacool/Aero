@@ -258,6 +258,7 @@ pub struct FileTree {
     /// 点击行后树持有焦点，`⌘⌫` 等树内快捷键（上下文 `FileTree`）才有处可去
     focus_handle: FocusHandle,
     pub error: Option<String>,
+    operation_error: Option<String>,
 }
 
 impl FileTree {
@@ -287,6 +288,7 @@ impl FileTree {
             scroll: VirtualListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             error: None,
+            operation_error: None,
         };
         this.rebuild_rows();
         this.rescan_in_background(cx);
@@ -294,7 +296,13 @@ impl FileTree {
     }
 
     /// Finder 拖进文件树：`.md` 复制进落点目录；其他文件拖到笔记上时进入该笔记的 `.assets/`。
-    fn import_external(&mut self, paths: &[std::path::PathBuf], directory: &str, note: Option<&VaultPath>) {
+    fn import_external(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        directory: &str,
+        note: Option<&VaultPath>,
+        cx: &mut Context<Self>,
+    ) {
         let mut errors = Vec::new();
         for src in paths {
             if src.is_dir() {
@@ -312,8 +320,7 @@ impl FileTree {
             };
             let imported = if name.to_ascii_lowercase().ends_with(".md") {
                 let stem = &name[..name.len() - 3];
-                let existing = self.vault.notes().unwrap_or_default();
-                let dest = unique_note_name(&existing, directory, stem);
+                let dest = self.available_note_path(directory, stem);
                 self.vault.create_bytes(&dest, &bytes).map(|_| ()).map_err(|e| e.to_string())
             } else if let Some(note) = note {
                 let extension = std::path::Path::new(&name)
@@ -333,11 +340,21 @@ impl FileTree {
                 errors.push(error);
             }
         }
-        self.rescan();
-        self.error = errors.into_iter().next();
+        self.rescan_in_background(cx);
+        self.set_operation_error(errors.into_iter().next());
+    }
+
+    fn set_operation_error(&mut self, error: Option<String>) {
+        self.operation_error = error.clone();
+        self.error = error;
+    }
+
+    pub(crate) fn available_note_path(&self, directory: &str, base: &str) -> VaultPath {
+        next_note_path(directory, base, |path| self.notes.contains(path) || self.vault.exists(path))
     }
 
     /// 重新枚举磁盘上的笔记和目录（包括空目录）与每篇笔记的附件。用户操作之后调用，调用方紧接着要用新树。
+    #[cfg(test)]
     pub fn rescan(&mut self) {
         self.scan_generation += 1;
         self.scan_again = false;
@@ -384,7 +401,7 @@ impl FileTree {
                 }
                 self.root = root;
                 self.notes = notes;
-                self.error = None;
+                self.error = self.operation_error.clone();
             }
             Err(e) => self.error = Some(e),
         }
@@ -623,7 +640,7 @@ impl FileTree {
             || name.contains(['/', '\\'])
             || name.chars().any(char::is_control)
         {
-            self.error = Some("请输入有效文件名，不能包含路径或隐藏目录名".into());
+            self.set_operation_error(Some("请输入有效文件名，不能包含路径或隐藏目录名".into()));
             cx.notify();
             return;
         }
@@ -649,19 +666,19 @@ impl FileTree {
         let to = VaultPath::new(&target).expect("validated entry name");
         let from = edit.path.clone();
         self.rename_input = None;
-        self.error = None;
+        self.set_operation_error(None);
         self.focus_handle.focus(window, cx);
         if from != to && attachment {
             match aero_core::attachments::rewrite_references(&self.vault, &from, &to) {
                 Ok(notes) => {
                     if let Err(err) = self.vault.rename(&from, &to) {
-                        self.error = Some(err.to_string());
+                        self.set_operation_error(Some(err.to_string()));
                     } else {
-                        self.rescan();
+                        self.rescan_in_background(cx);
                         cx.emit(FileTreeEvent::Touched(notes));
                     }
                 }
-                Err(err) => self.error = Some(err.to_string()),
+                Err(err) => self.set_operation_error(Some(err.to_string())),
             }
         } else if from != to {
             cx.emit(FileTreeEvent::Move { from, to });
@@ -670,11 +687,12 @@ impl FileTree {
     }
 
     fn trash_attachment(&mut self, path: VaultPath, cx: &mut Context<Self>) {
+        self.set_operation_error(None);
         let file = self.vault.fs_path(&path);
         if let Err(err) = crate::trash::move_to_trash(&file) {
-            self.error = Some(err);
+            self.set_operation_error(Some(err));
         } else {
-            self.rescan();
+            self.rescan_in_background(cx);
             cx.emit(FileTreeEvent::Touched(Vec::new()));
         }
         cx.notify();
@@ -839,7 +857,7 @@ impl FileTree {
                         }
                     }))
                     .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
-                        this.import_external(paths.paths(), "", None);
+                        this.import_external(paths.paths(), "", None, cx);
                         cx.notify();
                     }))
                     .into_any_element()
@@ -920,7 +938,7 @@ impl FileTree {
                 .on_drop(cx.listener({
                     let path = path.clone();
                     move |this, paths: &gpui_kit::ExternalPaths, _, cx| {
-                        this.import_external(paths.paths(), &path, None);
+                        this.import_external(paths.paths(), &path, None, cx);
                         cx.notify();
                     }
                 }))
@@ -1011,7 +1029,7 @@ impl FileTree {
                     .on_drop(cx.listener({
                         let path = path.clone();
                         move |this, paths: &gpui_kit::ExternalPaths, _, cx| {
-                            this.import_external(paths.paths(), path.parent(), Some(&path));
+                            this.import_external(paths.paths(), path.parent(), Some(&path), cx);
                             cx.notify();
                         }
                     }))
@@ -1181,15 +1199,14 @@ impl Render for FileTree {
     }
 }
 
-/// 供新建笔记时选择不冲突的文件名。
-pub fn unique_note_name(existing: &[VaultPath], dir: &str, base: &str) -> VaultPath {
-    let taken: BTreeMap<&str, ()> = existing.iter().map(|p| (p.as_str(), ())).collect();
+fn next_note_path(dir: &str, base: &str, mut taken: impl FnMut(&VaultPath) -> bool) -> VaultPath {
     let mut n = 0;
     loop {
         let name = if n == 0 { format!("{base}.md") } else { format!("{base} {n}.md") };
         let full = if dir.is_empty() { name } else { format!("{dir}/{name}") };
-        if !taken.contains_key(full.as_str()) {
-            return VaultPath::new(&full).expect("generated note path is valid");
+        let path = VaultPath::new(&full).expect("generated note path is valid");
+        if !taken(&path) {
+            return path;
         }
         n += 1;
     }
@@ -1328,6 +1345,43 @@ mod tests {
             assert!(tree.expanded.contains("nested/deep"));
             assert!(tree.rows.iter().any(|row| matches!(row, Row::Note { path, .. } if path == &note)));
             assert!(tree.rows.iter().any(|row| matches!(row, Row::Favorite { path } if path == &note)));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn naming_checks_only_candidates_and_preserves_files_missing_from_the_cached_tree(
+        cx: &mut TestAppContext,
+    ) {
+        let (dir, vault, tree) = setup(cx);
+        let path = aero_core::VaultPath::new("未命名.md").unwrap();
+        std::fs::write(dir.path().join(path.as_str()), "external contents").unwrap();
+        let next = tree.read_with(cx, |tree, _| {
+            assert!(!tree.contains(&path), "tree deliberately predates the external creation");
+            let reads = super::SCAN_READS.with(|count| count.get());
+            let next = tree.available_note_path("", "未命名");
+            assert_eq!(super::SCAN_READS.with(|count| count.get()), reads);
+            next
+        });
+        assert_eq!(next.as_str(), "未命名 1.md");
+        vault.create_bytes(&next, b"new contents").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join(path.as_str())).unwrap(), "external contents");
+        assert!(vault.create_bytes(&next, b"must not overwrite").is_err());
+        assert_eq!(std::fs::read_to_string(dir.path().join(next.as_str())).unwrap(), "new contents");
+    }
+
+    #[gpui_kit::test]
+    fn background_refresh_preserves_import_failure_feedback(cx: &mut TestAppContext) {
+        let (_dir, _vault, tree) = setup(cx);
+        tree.update(cx, |tree, cx| {
+            let reads = super::SCAN_READS.with(|count| count.get());
+            tree.import_external(&[std::path::PathBuf::from("/missing-aero-import.txt")], "", None, cx);
+            assert_eq!(super::SCAN_READS.with(|count| count.get()), reads);
+            assert!(tree.error.as_ref().is_some_and(|error| error.contains("missing-aero-import.txt")));
+        });
+        cx.run_until_parked();
+        tree.read_with(cx, |tree, _| {
+            assert!(!tree.is_scanning());
+            assert!(tree.error.as_ref().is_some_and(|error| error.contains("missing-aero-import.txt")));
         });
     }
 

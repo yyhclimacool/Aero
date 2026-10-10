@@ -758,14 +758,16 @@ impl Element for TextView {
         } else {
             let default_format = self.format.unwrap_or(TextViewFormat::Markdown);
             let default_text = self.text.clone().unwrap_or_default();
+            let markdown_extensions = self.markdown_extensions.clone();
 
             let state =
                 window.use_keyed_state(SharedString::from(format!("{}/state", self.id)), cx, move |_, cx| {
-                    if default_format == TextViewFormat::Markdown {
-                        TextViewState::markdown(default_text.as_str(), cx)
-                    } else {
-                        TextViewState::html(default_text.as_str(), cx)
-                    }
+                    TextViewState::with_markdown_extensions(
+                        default_format,
+                        default_text.as_str(),
+                        markdown_extensions,
+                        cx,
+                    )
                 });
             self.state = Some(state.clone());
             state
@@ -1055,14 +1057,20 @@ mod tests {
 
     struct StatelessMarkdownRoot {
         renders: Arc<AtomicUsize>,
+        parses: Arc<AtomicUsize>,
+        source: String,
     }
 
     impl Render for StatelessMarkdownRoot {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             self.renders.fetch_add(1, Ordering::Relaxed);
+            let parses = self.parses.clone();
             div().child(
-                TextView::markdown("stateless-markdown", include_str!("../../../../README.md"))
-                    .markdown_block_parser(|_, _| None),
+                TextView::markdown("stateless-markdown", self.source.clone())
+                    .markdown_block_parser(move |_, _| {
+                        parses.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }),
             )
         }
     }
@@ -1088,20 +1096,42 @@ mod tests {
 
     #[gpui::test]
     fn stateless_markdown_with_rebuilt_parser_settles(cx: &mut TestAppContext) {
+        assert_stateless_markdown_settles("# Title\n\nA **bold** paragraph.\n\n- one\n- two\n".into(), 2, cx);
+    }
+
+    #[gpui::test]
+    fn large_stateless_markdown_with_rebuilt_parser_settles(cx: &mut TestAppContext) {
+        // Asynchronous parsing and measuring the newly loaded list can each
+        // schedule a frame. Unchanged redraws must never schedule another parse.
+        assert_stateless_markdown_settles("A long paragraph. ".repeat(1024), 3, cx);
+    }
+
+    fn assert_stateless_markdown_settles(source: String, max_renders: usize, cx: &mut TestAppContext) {
         cx.update(crate::init);
         let renders = Arc::new(AtomicUsize::new(0));
-        let (_, cx) = cx.add_window_view({
+        let parses = Arc::new(AtomicUsize::new(0));
+        let (root, cx) = cx.add_window_view({
             let renders = renders.clone();
-            move |_, _| StatelessMarkdownRoot { renders }
+            let parses = parses.clone();
+            move |_, _| StatelessMarkdownRoot { renders, parses, source }
         });
         let cx: &mut VisualTestContext = cx;
 
         cx.run_until_parked();
         assert!(
-            renders.load(Ordering::Relaxed) <= 2,
+            renders.load(Ordering::Relaxed) <= max_renders,
             "an unchanged TextView must settle after its parse, but rendered {} times",
             renders.load(Ordering::Relaxed),
         );
+        let parsed = parses.load(Ordering::Relaxed);
+        assert!(parsed > 0, "the configured parser must run on initial content");
+        for _ in 0..5 {
+            let before = renders.load(Ordering::Relaxed);
+            root.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert_eq!(renders.load(Ordering::Relaxed), before + 1);
+            assert_eq!(parses.load(Ordering::Relaxed), parsed, "an unchanged redraw must not reparse");
+        }
     }
 
     #[gpui::test]

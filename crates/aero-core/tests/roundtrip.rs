@@ -182,6 +182,7 @@ proptest! {
             }
             reference.replace_range(e.range.clone(), &e.text);
             doc.edit(e.clone()).unwrap();
+            prop_assert_eq!(doc.word_count(), aero_core::text::word_count(&reference));
             // 同步 cur：与 anchor 相同的规则
             let delta = e.text.len() as isize - (en - s) as isize;
             for c in cur.iter_mut() {
@@ -207,6 +208,7 @@ proptest! {
 
         // (a) 文本与参考一致
         prop_assert_eq!(doc.to_string(), reference.clone());
+        prop_assert_eq!(doc.word_count(), aero_core::text::word_count(&reference));
         // (b) 未触碰块的文本不变（边界插入允许原文为子串）
         for (i, (_, _, orig)) in original.iter().enumerate() {
             if touched[i] { continue; }
@@ -234,6 +236,7 @@ proptest! {
         // (d) 全部撤销：文本恢复；重解析后，(c) 中保住 id 的块 id 仍是原来的
         while doc.undo().is_some() {}
         prop_assert_eq!(doc.to_string(), base.clone());
+        prop_assert_eq!(doc.word_count(), aero_core::text::word_count(&base));
         doc.reparse();
         let ids_after: Vec<BlockId> = doc.blocks().iter().map(|(_, b)| b.id).collect();
         prop_assert_eq!(ids_after.len(), original.len());

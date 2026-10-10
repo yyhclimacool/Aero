@@ -80,6 +80,41 @@ pub fn apply_edit(rope: &mut Rope, edit: &Edit) -> Edit {
     Edit { range: edit.new_range(), text: removed }
 }
 
+pub fn word_count(text: &str) -> usize {
+    count_words(text.chars(), false)
+}
+
+fn in_word(character: char) -> bool {
+    character.is_alphanumeric() && !is_cjk(character)
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(character as u32,
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0x3040..=0x30FF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF)
+}
+
+fn count_words(characters: impl Iterator<Item = char>, mut previous_in_word: bool) -> usize {
+    let mut count = 0;
+    for character in characters {
+        let current_in_word = in_word(character);
+        if is_cjk(character) || (current_in_word && !previous_in_word) {
+            count += 1;
+        }
+        previous_in_word = current_in_word;
+    }
+    count
+}
+
+pub(crate) fn edited_word_count(rope: &Rope, edit: &Edit, previous: usize) -> usize {
+    let left_in_word = rope.chars_at(edit.range.start).reversed().next().is_some_and(in_word);
+    let right = rope.slice(edit.range.end..).chars().next();
+    // A replacement only changes its own contributions and the following
+    // character's word boundary. A preceding character supplies the context.
+    let removed = count_words(rope.slice(edit.range.clone()).chars().chain(right), left_in_word);
+    let inserted = count_words(edit.text.chars().chain(right), left_in_word);
+    previous - removed + inserted
+}
+
 /// 文件的行尾风格。内部文本一律 LF，写回时还原。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LineEnding {
@@ -174,5 +209,29 @@ mod tests {
         assert!(s.bom);
         assert_eq!(s.line_ending, LineEnding::CrLf);
         assert_eq!(SourceText::encode(&s.text, s.bom, s.line_ending), bytes);
+    }
+
+    #[test]
+    fn edited_word_counts_preserve_unicode_and_word_boundaries() {
+        for source in ["", "hello world", "你好école１２3", "foo-bar", "a\n中b", "かな한글", "e\u{301}cole"]
+        {
+            let boundaries: Vec<_> =
+                source.char_indices().map(|(index, _)| index).chain([source.len()]).collect();
+            let rope = Rope::from_str(source);
+            for &start in &boundaries {
+                for &end in boundaries.iter().filter(|&&end| end >= start) {
+                    for inserted in ["", " ", "中文", "é", "hello world", "\n"] {
+                        let edit = Edit::replace(start..end, inserted);
+                        let mut expected = source.to_owned();
+                        expected.replace_range(start..end, inserted);
+                        assert_eq!(
+                            edited_word_count(&rope, &edit, word_count(source)),
+                            word_count(&expected),
+                            "{source:?} {edit:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

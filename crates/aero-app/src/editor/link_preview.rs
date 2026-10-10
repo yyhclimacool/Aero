@@ -286,6 +286,7 @@ impl Editor {
                 this.link_preview.resolver_task = None;
                 this.link_preview.resolver = Some(resolver);
                 this.update_local_link_names();
+                this.refresh_embeds(cx);
                 this.refresh_fragment_marks(cx);
                 if this.link_preview.hovered.is_some() {
                     this.schedule_link_preview(cx);
@@ -312,6 +313,7 @@ impl Editor {
     }
 
     pub(super) fn repath_link_preview(&mut self, old_path: &VaultPath, cx: &mut Context<Self>) {
+        self.embeds.clear_content();
         self.cancel_link_preview(cx);
         self.link_preview.resolver_generation += 1;
         self.link_preview.resolver_task = None;
@@ -319,6 +321,7 @@ impl Editor {
             resolver.remove(old_path);
         }
         self.update_local_link_names();
+        self.refresh_embeds(cx);
     }
 
     fn fragment_request(&self) -> FragmentRequest {

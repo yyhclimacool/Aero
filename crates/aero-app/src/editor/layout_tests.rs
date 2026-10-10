@@ -473,7 +473,10 @@ fn scrollbar_stays_interactive_after_scrolling_a_long_document(cx: &mut TestAppC
         assert!(
             e.unit_bounds.iter().any(|(id, b)| *id == last && b.intersects(&track)),
             "last {last:?}, track {track:?}, offset {:?}, max {:?}, tail {:?}, rows {:?}",
-            e.scroll.offset(), e.scroll.max_offset(), e.unit_bounds.last(), e.viewport.unit_ranges
+            e.scroll.offset(),
+            e.scroll.max_offset(),
+            e.unit_bounds.last(),
+            e.viewport.unit_ranges
         );
         assert!(e.presenters.len() < 100, "scrollbar jumps must preserve virtualization");
     });
