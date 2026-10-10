@@ -10,11 +10,13 @@
 mod actions;
 mod backlinks;
 mod branding;
+mod catalog;
 mod cli;
 mod colors;
 mod demo_vault;
 mod editor;
 mod file_tree;
+mod matching;
 mod paths;
 mod quick_open;
 mod render;

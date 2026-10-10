@@ -196,12 +196,37 @@ impl Viewport {
     }
 }
 
+pub(super) fn structure(doc: &Document) -> Vec<(BlockId, BlockKind, aero_core::Attrs, usize)> {
+    doc.blocks()
+        .iter()
+        .map(|(_, block)| (block.id, block.kind.clone(), block.attrs.clone(), block.children.len()))
+        .collect()
+}
+
 impl Editor {
     /// All unit replacement sites share the selection lookup and viewport invalidation.
     pub(super) fn refresh_units(&mut self) {
-        self.units = units::units(&self.doc);
-        self.unit_indices = self.units.iter().enumerate().map(|(ix, unit)| (unit.id, ix)).collect();
-        self.viewport.dirty = true;
+        let next = units::units(&self.doc);
+        let structure = structure(&self.doc);
+        let same_structure = self.unit_structure == structure
+            && self.units.len() == next.len()
+            && self
+                .units
+                .iter()
+                .zip(&next)
+                .all(|(old, new)| old.id == new.id && old.kind == new.kind && old.list == new.list);
+        if same_structure {
+            for (old, new) in self.units.iter_mut().zip(next) {
+                if *old != new {
+                    *old = new;
+                }
+            }
+        } else {
+            self.units = next;
+            self.unit_indices = self.units.iter().enumerate().map(|(ix, unit)| (unit.id, ix)).collect();
+            self.viewport.dirty = true;
+        }
+        self.unit_structure = structure;
     }
 
     pub(super) fn prepare_viewport(&mut self, window: &Window) {

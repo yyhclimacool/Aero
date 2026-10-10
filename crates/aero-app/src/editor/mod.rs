@@ -28,6 +28,7 @@ mod navigation;
 mod ops;
 mod pairs;
 mod pairs_ui;
+mod parsing;
 mod pdf_reader;
 mod presenter;
 mod preview;
@@ -238,7 +239,10 @@ pub struct Editor {
     stamp: FileStamp,
     units: Vec<Unit>,
     unit_indices: std::collections::HashMap<BlockId, usize>,
+    unit_structure: Vec<(BlockId, BlockKind, aero_core::Attrs, usize)>,
     viewport: viewport::Viewport,
+    parse_task: Option<Task<()>>,
+    parse_window: Option<AnyWindowHandle>,
     preview: Entity<preview::PreviewState>,
     _preview_subscription: Subscription,
     link_preview: link_preview::LinkPreview,
@@ -331,11 +335,13 @@ impl Editor {
     pub fn new(
         vault: Arc<Vault>,
         path: VaultPath,
-        doc: Document,
+        mut doc: Document,
         stamp: FileStamp,
         cx: &mut Context<Self>,
     ) -> Self {
+        doc.track_edits();
         let units = units::units(&doc);
+        let unit_structure = viewport::structure(&doc);
         let preview = cx.new(|_| preview::PreviewState::default());
         let preview_subscription = cx.observe(&preview, |_, _, cx| cx.notify());
         let poll = cx.spawn(async move |this, cx| {
@@ -352,7 +358,10 @@ impl Editor {
             doc,
             stamp,
             unit_indices: units.iter().enumerate().map(|(ix, unit)| (unit.id, ix)).collect(),
+            unit_structure,
             viewport: viewport::Viewport::default(),
+            parse_task: None,
+            parse_window: None,
             units,
             preview,
             _preview_subscription: preview_subscription,
@@ -1198,9 +1207,21 @@ impl Editor {
         if self.doc.slice(start..end).to_string() != text {
             return false;
         }
-        if let Err(err) = self.doc.edit_coalescing(Edit::replace(start..end, rewritten)) {
+        let rewritten_len = rewritten.len();
+        if let Err(err) = self.doc.edit_coalescing(Edit::replace(start..end, rewritten.clone())) {
             log::error!("heading retarget rejected: {err}");
             return false;
+        }
+        if self.doc.len() >= 256 * 1024 {
+            if let Some(focused) = &mut self.focused {
+                focused.range.end = start + rewritten_len;
+            }
+            textarea.update(cx, |ta, cx| {
+                ta.set_value(rewritten, window, cx);
+                ta.set_selected_range(new_cursor..new_cursor, cx);
+            });
+            self.after_doc_change(cx);
+            return true;
         }
         // 区间还指着替换前的字节，缩短后会落进后面的汉字中间
         self.focused = None;
@@ -1428,6 +1449,7 @@ impl Editor {
 
     /// ⌫ / ⌦：删掉选中的块，一个撤销组；选区落到原位置上的下一块（没有就上一块；文档空了回浏览态）。
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_current_parse();
         let Some(sel) = self.selection else { return };
         let edit = ops::delete_units(&self.doc, &self.units, sel.first(), sel.last());
         if let Err(err) = self.doc.edit(edit) {
@@ -1494,6 +1516,7 @@ impl Editor {
 
     /// gutter 的 `+`：在块下方新开段落并打开 `/` 菜单。
     fn insert_block_below(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_current_parse();
         self.block_menu = None;
         let Some(ix) = self.unit_index(id) else { return };
         let plan = ops::insert_slash_below(&self.doc, &self.units, ix);
@@ -1502,6 +1525,7 @@ impl Editor {
     }
 
     fn on_copy_selected(&mut self, _: &CopySelectedBlocks, _: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_current_parse();
         match self.selected_source() {
             Some(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             None => cx.propagate(),
@@ -1509,6 +1533,7 @@ impl Editor {
     }
 
     fn on_cut_selected(&mut self, _: &CutSelectedBlocks, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_current_parse();
         match self.selected_source() {
             Some(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1543,6 +1568,7 @@ impl Editor {
 
     /// 控件文本 → 文档：收缩成最小编辑写回。
     fn on_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.parse_window = Some(window.window_handle());
         self.sanitize_cell(window, cx);
         let paired = self.complete_pairs(window, cx);
         let Some(f) = self.focused.as_mut() else { return };
@@ -1563,7 +1589,7 @@ impl Editor {
         f.range.end = (f.range.end as isize + delta).max(f.range.start as isize) as usize;
         self.last_edit_at = (!paired).then_some(now);
         self.after_doc_change(cx);
-        self.update_wiki(cx);
+        self.update_wiki(window, cx);
         self.update_tags(cx);
         self.update_slash(cx);
         if !self.promote_typed_prefix(window, cx) && !self.retarget_typed_heading(window, cx) {
@@ -1676,6 +1702,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ensure_current_parse();
         // 落在单位上、或只隔着同一行的空白（"hello |" 里的光标）都算那个单位
         let hit = unit_at(&self.units, offset).or_else(|| {
             let ix = self.units.iter().rposition(|u| u.range.end <= offset)?;
@@ -1702,6 +1729,7 @@ impl Editor {
 
     /// `⌘⌥0–8`：转换当前块类型。
     fn on_convert_block(&mut self, action: &ConvertBlock, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_current_parse();
         let Some(target) = BlockType::from_shortcut(action.0) else { return };
         let Some(f) = self.focused.as_ref() else {
             cx.propagate();
@@ -1737,9 +1765,7 @@ impl Editor {
     /// 文本已改：重解析、刷新单位、标脏、排队保存。
     fn after_doc_change(&mut self, cx: &mut Context<Self>) {
         self.cancel_link_preview(cx);
-        self.doc.reparse();
-        self.update_local_link_names();
-        self.refresh_units();
+        self.refresh_parse(cx);
         self.refresh_embeds(cx);
         if let Some(f) = self.focused.as_mut() {
             // 单元格、callout 标题与正文从块中间开始：仍属于原来那一块，否则控件会在别处再画一份
@@ -1772,6 +1798,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ensure_current_parse();
         if let Err(err) = self.doc.edit(edit) {
             log::error!("edit rejected: {err}");
             return;
@@ -1815,6 +1842,7 @@ impl Editor {
             self.slash_confirm(None, window, cx);
             return;
         }
+        self.ensure_current_parse();
         let Some((_, cursor)) = self.textarea_text_and_cursor(cx) else {
             cx.propagate();
             return;
@@ -1958,6 +1986,7 @@ impl Editor {
 
     /// 块首退格：列表项脱离列表、段落并入上一块，或移到上一块末尾。
     fn backspace_at_block_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_current_parse();
         // 单元格、callout 的标题与正文、代码：开头退格不跨出这一格
         if self.editing_code()
             || self
@@ -2000,6 +2029,7 @@ impl Editor {
     /// 离开时保持光标的横向位置（9.4）：表格里到上 / 下一行的同一列，callout 标题与正文互通，
     /// 其余到上 / 下一个单位里离得最近的那个字。
     fn move_across_blocks(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_current_parse();
         if self.input_composing(window, cx) {
             cx.propagate();
             return;
@@ -2143,6 +2173,7 @@ impl Editor {
 
     /// 在文末新建空段落并聚焦。
     fn append_paragraph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_current_parse();
         match ops::append_paragraph(&self.doc) {
             (Some(edit), at) => self.structural_edit(edit, at, window, cx),
             (None, at) => {
@@ -2547,6 +2578,7 @@ impl Editor {
         self.highlight = None;
         self.highlight_task = None;
         self.doc = doc;
+        self.doc.track_edits();
         self.embeds.clear_content();
         self.update_local_link_names();
         self.stamp = stamp;
@@ -3169,6 +3201,7 @@ impl Editor {
 
     /// 勾选 / 取消勾选一个任务：只改 `[ ]` 里那一个字符，长度不变，编辑中的光标也不用挪。
     pub(super) fn toggle_task(&mut self, item: BlockId, cx: &mut Context<Self>) {
+        self.ensure_current_parse();
         let Some(block) = self.doc.blocks().find(item) else { return };
         let range = self.doc.range_of(block);
         let src = self.doc.slice(range.clone()).to_string();

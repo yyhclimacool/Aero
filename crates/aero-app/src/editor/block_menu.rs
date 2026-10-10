@@ -159,6 +159,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ensure_current_parse();
         self.dragging_block = false;
         let cursor = window.mouse_position();
         let hint = self.block_drop_hint(cursor);

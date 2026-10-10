@@ -8,7 +8,7 @@ use std::ops::Range;
 use aero_core::{Block, BlockId, BlockKind, Document};
 
 /// 一个单位所处的列表上下文，Enter / Backspace 需要它来续行或脱离列表。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListCtx {
     /// 列表项（含子块）的源区间
     pub item_range: Range<usize>,
@@ -23,7 +23,7 @@ pub struct ListCtx {
     pub parent: Option<Box<ListCtx>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unit {
     pub id: BlockId,
     pub kind: BlockKind,

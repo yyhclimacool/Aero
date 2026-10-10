@@ -34,6 +34,7 @@ pub struct RenamePlan {
     observed: Vec<(VaultPath, FileStamp)>,
     changes: Vec<Change>,
     links_changed: usize,
+    source_stamp: Option<FileStamp>,
 }
 
 pub struct RenameReport {
@@ -50,11 +51,23 @@ impl RenamePlan {
         if title.trim().is_empty() || title.chars().any(char::is_control) {
             return Err(RenameError::Invalid("标题不能为空或包含控制字符".into()));
         }
-        Self::prepare_inner(vault, path.clone(), path, Some(title.trim()))
+        Self::prepare_inner(vault, path.clone(), path, Some(title.trim()), false)
     }
 
     pub fn prepare(vault: &Vault, from: VaultPath, to: VaultPath) -> Result<Self, RenameError> {
-        Self::prepare_inner(vault, from, to, None)
+        Self::prepare_inner(vault, from, to, None, false)
+    }
+
+    /// Attachment moves use the same validation, recovery copies and rollback
+    /// as note moves. Link destinations are resolved against both catalogs.
+    pub fn prepare_attachment(vault: &Vault, from: VaultPath, to: VaultPath) -> Result<Self, RenameError> {
+        if crate::attachments::Kind::for_path(from.as_str()).is_none()
+            || crate::attachments::Kind::for_path(from.as_str())
+                != crate::attachments::Kind::for_path(to.as_str())
+        {
+            return Err(RenameError::Invalid("请选择相同类型的附件路径".into()));
+        }
+        Self::prepare_inner(vault, from, to, None, true)
     }
 
     fn prepare_inner(
@@ -62,6 +75,7 @@ impl RenamePlan {
         from: VaultPath,
         to: VaultPath,
         new_title: Option<&str>,
+        attachment: bool,
     ) -> Result<Self, RenameError> {
         if new_title.is_none() {
             vault.validate_rename(&from, &to)?;
@@ -71,16 +85,23 @@ impl RenamePlan {
         let directory = vault.fs_path(&from).is_dir();
         if (from == to && new_title.is_none())
             || (directory && new_title.is_some())
-            || (!directory && (!from.is_note() || !to.is_note()))
-            || to.as_str().split('/').any(|part| part.starts_with('.') || part.ends_with(".assets"))
+            || (!attachment && !directory && (!from.is_note() || !to.is_note()))
+            || to
+                .as_str()
+                .split('/')
+                .any(|part| part.starts_with('.') || (!attachment && part.ends_with(".assets")))
         {
             return Err(RenameError::Invalid("请选择不同的笔记路径或文件夹，不能移入隐藏或附件目录".into()));
         }
         let paths = vault.notes()?;
-        if !directory && !paths.contains(&from) {
+        if !attachment && !directory && !paths.contains(&from) {
             return Err(RenameError::Invalid("被忽略的笔记不能参与全库链接更新".into()));
         }
+        let source_stamp = if attachment { Some(vault.read_bytes(&from)?.1) } else { None };
         let files = file_catalog(vault)?;
+        if attachment && !files.contains(&from) {
+            return Err(RenameError::Invalid("被忽略的附件不能参与链接更新".into()));
+        }
         let folders = vault.folders()?;
         if directory && !folders.contains(&from) {
             return Err(RenameError::Invalid("被忽略的目录不能移动".into()));
@@ -140,6 +161,7 @@ impl RenamePlan {
             observed,
             changes,
             links_changed,
+            source_stamp,
         })
     }
 
@@ -156,6 +178,11 @@ impl RenamePlan {
             self.vault.validate_rename(&self.from, &self.to)?;
         } else {
             self.vault.validate_local_path(&self.from)?;
+        }
+        if let Some(stamp) = self.source_stamp {
+            if self.vault.read_bytes(&self.from)?.1.hash != stamp.hash {
+                return Err(RenameError::Changed(self.from.to_string()));
+            }
         }
         let paths: Vec<_> = self.observed.iter().map(|(p, _)| p.clone()).collect();
         self.vault.validate_local_path(&VaultPath::new(".aero")?)?;
@@ -1047,5 +1074,47 @@ mod tests {
         assert!(vault.exists(&path("a.md")));
         assert!(!vault.exists(&path("b.md")));
         assert!(dir.path().join("a.assets").exists());
+    }
+
+    #[test]
+    fn attachment_rename_preserves_binary_and_rewrites_both_link_forms() {
+        let original = "![[old.png]] [image](a.assets/old.png#part)\n";
+        let (dir, vault) = setup(&[("a.md", original)]);
+        std::fs::create_dir(dir.path().join("a.assets")).unwrap();
+        std::fs::write(dir.path().join("a.assets/old.png"), [0, 255, 128, 9]).unwrap();
+        let report =
+            RenamePlan::prepare_attachment(&vault, path("a.assets/old.png"), path("a.assets/new.png"))
+                .unwrap()
+                .execute()
+                .unwrap();
+        assert_eq!(report.updated, [path("a.md")]);
+        assert_eq!(std::fs::read(dir.path().join("a.assets/new.png")).unwrap(), [0, 255, 128, 9]);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.md")).unwrap(),
+            original.replace("old.png", "new.png")
+        );
+        assert!(!vault.exists(&path("a.assets/old.png")));
+    }
+
+    #[test]
+    fn attachment_rename_rejects_changed_source_and_rolls_back_write_failure() {
+        let (dir, vault) = setup(&[("a.md", "![[old.png]]\n"), ("b.md", "[image](old.png)\n")]);
+        std::fs::write(dir.path().join("old.png"), b"original").unwrap();
+        let plan = RenamePlan::prepare_attachment(&vault, path("old.png"), path("new.png")).unwrap();
+        std::fs::write(dir.path().join("old.png"), b"external change").unwrap();
+        assert!(matches!(plan.execute(), Err(RenameError::Changed(_))));
+        assert!(!vault.exists(&path("new.png")));
+        let plan = RenamePlan::prepare_attachment(&vault, path("old.png"), path("new.png")).unwrap();
+        let result = plan.execute_with(|path| {
+            if path.as_str() == "b.md" {
+                Err(RenameError::Invalid("injected failure".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(RenameError::Commit { .. })));
+        assert!(vault.exists(&path("old.png")));
+        assert!(!vault.exists(&path("new.png")));
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "![[old.png]]\n");
     }
 }

@@ -98,7 +98,7 @@ impl MarkerTable {
 }
 
 #[inline]
-fn shift(p: usize, bias: Bias, start: usize, end: usize, new_len: usize, delta: isize) -> usize {
+pub(crate) fn shift(p: usize, bias: Bias, start: usize, end: usize, new_len: usize, delta: isize) -> usize {
     if p < start {
         p
     } else if p >= end && !(p == start && bias == Bias::Left) {

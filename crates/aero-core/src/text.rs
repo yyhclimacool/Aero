@@ -80,6 +80,41 @@ pub fn apply_edit(rope: &mut Rope, edit: &Edit) -> Edit {
     Edit { range: edit.new_range(), text: removed }
 }
 
+/// Text positions changed by an edit, without retaining inserted or removed text.
+#[derive(Clone, Debug)]
+pub struct EditSummary {
+    pub range: Range<usize>,
+    pub inserted: usize,
+}
+
+impl From<&Edit> for EditSummary {
+    fn from(edit: &Edit) -> Self {
+        Self { range: edit.range.clone(), inserted: edit.text.len() }
+    }
+}
+
+impl EditSummary {
+    pub fn shift_range(&self, range: &mut Range<usize>) {
+        let delta = self.inserted as isize - self.range.len() as isize;
+        range.start = crate::anchors::shift(
+            range.start,
+            crate::anchors::Bias::Left,
+            self.range.start,
+            self.range.end,
+            self.inserted,
+            delta,
+        );
+        range.end = crate::anchors::shift(
+            range.end,
+            crate::anchors::Bias::Right,
+            self.range.start,
+            self.range.end,
+            self.inserted,
+            delta,
+        );
+    }
+}
+
 pub fn word_count(text: &str) -> usize {
     count_words(text.chars(), false)
 }

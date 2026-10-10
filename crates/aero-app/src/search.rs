@@ -114,6 +114,7 @@ impl Shared {
 }
 
 pub struct SearchService {
+    pub(crate) catalog: Arc<crate::catalog::Catalog>,
     indexer: Arc<Mutex<Option<Indexer>>>,
     shared: Arc<Shared>,
     submitted_writes: usize,
@@ -175,6 +176,7 @@ impl SearchService {
     pub fn new(vault: Arc<Vault>, data_dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let indexer: Arc<Mutex<Option<Indexer>>> = Arc::default();
         let shared = Arc::new(Shared::default());
+        let catalog = crate::catalog::Catalog::new(vault.clone());
         let sync_thread = spawn_sync(vault, data_dir, indexer.clone(), shared.clone());
 
         // 前台轮询进度，直到进入稳定状态
@@ -199,6 +201,7 @@ impl SearchService {
             }
         });
         SearchService {
+            catalog,
             indexer,
             shared,
             submitted_writes: 0,
@@ -266,6 +269,7 @@ impl SearchService {
     }
 
     /// Indexed catalog entries; empty while the engine is unavailable.
+    #[cfg(test)]
     pub fn note_summaries(&self, cx: &App) -> Task<Vec<NoteSummary>> {
         let indexer = self.indexer.clone();
         let shared = self.shared.clone();
@@ -279,29 +283,31 @@ impl SearchService {
 
     /// 补全始终以当前文件列表为准；尚未索引的笔记从磁盘补标题与别名，全部在后台完成。
     pub fn completion_notes(&self, vault: Arc<Vault>, cx: &App) -> Task<Result<Vec<NoteSummary>, String>> {
-        let summaries = self.note_summaries(cx);
+        let snapshot = self.catalog_snapshot_for(vault, cx);
+        cx.background_spawn(async move { snapshot.await.map(|s| s.notes.as_ref().clone()) })
+    }
+
+    pub(crate) fn catalog_snapshot_for(
+        &self,
+        vault: Arc<Vault>,
+        cx: &App,
+    ) -> Task<Result<Arc<crate::catalog::Snapshot>, String>> {
+        if self.catalog.vault_id() == vault.id() {
+            return self.catalog_snapshot(cx);
+        }
+        let catalog = crate::catalog::Catalog::new(vault);
+        cx.background_spawn(async move { catalog.snapshot() })
+    }
+
+    pub(crate) fn catalog_snapshot(&self, cx: &App) -> Task<Result<Arc<crate::catalog::Snapshot>, String>> {
+        let catalog = self.catalog.clone();
         let shared = self.shared.clone();
-        // A service already closed by the caller can still provide disk fallback.
-        // Requests made before shutdown must stop instead of extending its work.
-        let disk_fallback = shared.cancelled.load(Ordering::Acquire);
+        let through = self.submitted_writes;
         cx.background_spawn(async move {
-            let mut summaries: std::collections::HashMap<_, _> =
-                summaries.await.into_iter().map(|note| (note.path.clone(), note)).collect();
-            let cancelled = || !disk_fallback && shared.stop_sync();
-            let Some(notes) = vault.notes_cancellable(cancelled).map_err(|e| e.to_string())? else {
-                return Ok(Vec::new());
-            };
-            let mut catalog = Vec::with_capacity(notes.len());
-            for path in notes {
-                if cancelled() {
-                    return Ok(Vec::new());
-                }
-                catalog.push(summaries.remove(&path).unwrap_or_else(|| match vault.read(&path) {
-                    Ok((doc, _)) => NoteSummary::from_document(path, &doc),
-                    Err(_) => NoteSummary { title: path.stem().to_owned(), path, aliases: Vec::new() },
-                }));
-            }
-            Ok(catalog)
+            shared.wait_for_writes(through, false).await;
+            let snapshot = catalog.snapshot()?;
+            log::trace!("vault catalog version {}", snapshot.version);
+            Ok(snapshot)
         })
     }
 
@@ -386,35 +392,44 @@ impl SearchService {
     /// 预览点 wikilink 用的解析表：已索引笔记（含 front matter 标题与别名）加尚未索引的文件。
     /// 引擎不可用时在后台读取文档，保留标题与别名匹配。
     pub fn link_resolver(&self, vault: Arc<Vault>, cx: &App) -> Task<Resolver> {
-        // Snapshot metadata only under the index lock. Reading unindexed notes
-        // must never block saves or native handle destruction behind a full vault.
-        let notes = self.completion_notes(vault, cx);
-        cx.background_spawn(async move {
-            let mut resolver = Resolver::new();
-            for note in notes.await.unwrap_or_default() {
-                resolver.insert(note.path, Some(&note.title), &note.aliases);
-            }
-            resolver
-        })
+        let snapshot = self.catalog_snapshot_for(vault, cx);
+        cx.background_spawn(async move { snapshot.await.map(|s| s.resolver.clone()).unwrap_or_default() })
     }
 
     /// 编辑器保存后：用刚落盘的文本增量索引。
     pub fn note_saved(&mut self, path: VaultPath, text: String, stamp: FileStamp, cx: &mut Context<Self>) {
+        self.catalog.touch([path.clone()]);
+        cx.notify();
         self.run(cx, false, move |ix| {
             ix.index_text(&path, &text, stamp).map(|_| true).map_err(|e| e.to_string())
         });
     }
 
     /// 文件在磁盘上被外部改动后重读。
+    #[cfg(test)]
     pub fn note_changed(&mut self, path: VaultPath, cx: &mut Context<Self>) {
+        self.catalog.touch([path.clone()]);
+        cx.notify();
         self.run(cx, false, move |ix| ix.index_note(&path).map(|_| true).map_err(|e| e.to_string()));
     }
 
     pub fn note_removed(&mut self, path: VaultPath, cx: &mut Context<Self>) {
+        self.catalog.touch([path.clone()]);
+        cx.notify();
         self.run(cx, false, move |ix| ix.remove_note(&path).map(|_| true).map_err(|e| e.to_string()));
     }
 
     pub fn notes_renamed(&mut self, report: aero_core::rename::RenameReport, cx: &mut Context<Self>) {
+        if report.directory {
+            self.catalog.invalidate();
+        } else {
+            self.catalog.touch(
+                std::iter::once(report.from.clone())
+                    .chain(std::iter::once(report.to.clone()))
+                    .chain(report.updated.iter().cloned()),
+            );
+        }
+        cx.notify();
         // 启动同步可能仍持有旧文件列表；在队列内等它结束，后续 Reloaded 保存不能插队。
         self.run(cx, true, move |ix| {
             if report.directory {
@@ -452,9 +467,11 @@ impl SearchService {
 
     /// 文件监听报告这些路径有动静：逐篇按指纹对齐（新建 / 改动 → 重索引，消失 → 删除，没变 → 跳过）。
     pub fn notes_touched(&mut self, paths: Vec<VaultPath>, cx: &mut Context<Self>) {
+        self.catalog.touch(paths.iter().cloned());
         if paths.is_empty() {
             return;
         }
+        cx.notify();
         let shared = self.shared.clone();
         self.run(cx, false, move |ix| {
             if shared.stop_sync() {
@@ -480,6 +497,8 @@ impl SearchService {
     /// 目录级变化（重命名 / 删除文件夹、事件溢出）后与磁盘整体对齐一次：新文件索引、消失的删掉、
     /// 指纹没变的跳过。只 stat 不读内容，万篇量级也在百毫秒内。
     pub fn resync(&mut self, cx: &mut Context<Self>) {
+        self.catalog.invalidate();
+        cx.notify();
         let shared = self.shared.clone();
         self.run(cx, false, move |ix| {
             // Watcher bursts can queue many scans. They are rebuildable on the next

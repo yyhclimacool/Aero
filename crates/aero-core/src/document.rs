@@ -48,6 +48,7 @@ fn parse_text(text: &str) -> ParseOutput {
 pub struct Document {
     text: Rope,
     word_count: usize,
+    edits: Option<Vec<text::EditSummary>>,
     anchors: MarkerTable,
     blocks: BlockTree,
     /// 每次编辑 +1
@@ -88,12 +89,13 @@ impl Document {
         let mut doc = Document {
             text: Rope::from_str(&src.text),
             word_count: text::word_count(&src.text),
+            edits: None,
             anchors: MarkerTable::new(),
             blocks: BlockTree::default(),
             version: 0,
             parsed_version: u64::MAX,
             pending_paragraph: None,
-            reference_brackets: 0,
+            reference_brackets: src.text.bytes().filter(|&byte| byte == b'[').count(),
             next_id: 1,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -121,6 +123,30 @@ impl Document {
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Enable a lightweight edit subscription; headless documents retain no log.
+    pub fn track_edits(&mut self) {
+        self.edits = Some(Vec::new());
+    }
+
+    pub fn take_edits(&mut self) -> Vec<text::EditSummary> {
+        self.edits.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Try a bounded local parse without falling back to the whole document.
+    pub fn try_reparse_local(&mut self, max_bytes: usize) -> bool {
+        if !self.is_parse_stale() {
+            return true;
+        }
+        if self
+            .pending_paragraph
+            .is_some_and(|index| self.range_of(&self.blocks.roots[index]).len() <= max_bytes)
+        {
+            self.reparse_paragraph()
+        } else {
+            false
+        }
     }
 
     pub fn word_count(&self) -> usize {
@@ -314,6 +340,9 @@ impl Document {
 
     /// 改 Rope + 平移 anchor + 版本号。调用方保证编辑合法。
     fn apply_raw(&mut self, edit: &Edit) -> Edit {
+        if let Some(edits) = &mut self.edits {
+            edits.push(text::EditSummary::from(edit));
+        }
         self.pending_paragraph = self.paragraph_edit_candidate(edit);
         self.word_count = text::edited_word_count(&self.text, edit, self.word_count);
         let inverse = text::apply_edit(&mut self.text, edit);
@@ -427,8 +456,6 @@ impl Document {
         self.rebuild(out.blocks);
         self.parsed_version = version;
         self.pending_paragraph = None;
-        self.reference_brackets =
-            self.text.chunks().map(|chunk| chunk.bytes().filter(|&b| b == b'[').count()).sum();
         true
     }
 
@@ -706,6 +733,35 @@ mod tests {
 
     fn take_parse_work() -> Vec<usize> {
         PARSED_BYTES.with(|bytes| std::mem::take(&mut *bytes.borrow_mut()))
+    }
+
+    #[test]
+    fn edit_subscription_drains_utf8_changes_including_undo() {
+        let mut doc = Document::from_text("hello\n");
+        doc.track_edits();
+        doc.edit(Edit::insert(0, "中文")).unwrap();
+        let edits = doc.take_edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range, 0..0);
+        assert_eq!(edits[0].inserted, 6);
+        assert!(doc.take_edits().is_empty());
+        doc.undo().unwrap();
+        let edits = doc.take_edits();
+        assert_eq!(edits[0].range, 0..6);
+        assert_eq!(edits[0].inserted, 0);
+        assert_eq!(doc.to_string(), "hello\n");
+    }
+
+    #[test]
+    fn bounded_local_parse_does_not_parse_an_enormous_paragraph() {
+        let mut doc = Document::from_text(&("word ".repeat(60_000) + "\n"));
+        take_parse_work();
+        doc.edit(Edit::insert(10, "中文")).unwrap();
+        assert!(!doc.try_reparse_local(64 * 1024));
+        assert!(take_parse_work().is_empty(), "the caller can send the snapshot to a worker");
+        let snapshot = doc.snapshot();
+        assert!(doc.apply_parse(snapshot.version(), snapshot.parse()));
+        assert!(!doc.is_parse_stale());
     }
 
     fn assert_same_parse(doc: &Document, full: &Document) {

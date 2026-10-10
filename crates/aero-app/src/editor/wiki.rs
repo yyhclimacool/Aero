@@ -1,11 +1,11 @@
 //! 笔记补全的触发、排序与源码生成；编辑器只负责菜单和一次文档编辑。
 
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use aero_core::VaultPath;
 use aero_core::links::{self, NoteSummary, Resolution, Resolver};
-
-use crate::quick_open::fuzzy_score;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Trigger {
@@ -65,57 +65,98 @@ pub(super) struct Catalog {
     pub resolver: Resolver,
     pub attachments: aero_core::attachments::Catalog,
     pub embed_source: Option<VaultPath>,
-    recent: Vec<VaultPath>,
+    recent: HashMap<VaultPath, usize>,
+    prepared: crate::matching::Notes,
+    attachment_targets: Vec<(Vec<char>, Vec<char>)>,
 }
 
 impl Catalog {
+    #[cfg(test)]
     pub fn new(notes: Vec<NoteSummary>, recent: Vec<VaultPath>) -> Self {
+        let prepared = crate::matching::Notes::new(&notes);
+        Self::with_prepared(notes, recent, prepared)
+    }
+
+    pub fn with_prepared(
+        notes: Vec<NoteSummary>,
+        recent: Vec<VaultPath>,
+        prepared: crate::matching::Notes,
+    ) -> Self {
         let mut resolver = Resolver::new();
         for note in &notes {
             resolver.insert(note.path.clone(), Some(&note.title), &note.aliases);
         }
-        Self { notes, resolver, recent, attachments: Default::default(), embed_source: None }
+        let mut positions = HashMap::new();
+        for (rank, path) in recent.into_iter().enumerate() {
+            positions.entry(path).or_insert(rank);
+        }
+        Self {
+            notes,
+            resolver,
+            recent: positions,
+            prepared,
+            attachment_targets: Vec::new(),
+            attachments: Default::default(),
+            embed_source: None,
+        }
     }
 
-    pub fn filter(&self, query: &str) -> Vec<usize> {
-        let query = query.trim();
-        let mut scored: Vec<_> = self
-            .notes
+    pub fn set_attachments(&mut self, attachments: aero_core::attachments::Catalog) {
+        self.attachment_targets = attachments
+            .entries
             .iter()
-            .enumerate()
-            .filter_map(|(i, note)| {
-                let score = fuzzy_score(query, &note.title)
-                    .max(fuzzy_score(query, note.path.as_str()))
-                    .max(note.aliases.iter().filter_map(|alias| fuzzy_score(query, alias)).max())?;
-                let recent = self.recent.iter().position(|p| p == &note.path);
-                let bonus = recent.map_or(0, |r| 20 - r.min(19) as i32);
-                Some((i, score + bonus))
+            .map(|entry| {
+                (
+                    crate::matching::prepare(entry.path.file_name()),
+                    crate::matching::prepare(entry.path.as_str()),
+                )
             })
             .collect();
-        if let Some(source) = &self.embed_source {
-            let assets = source.assets_dir();
-            scored.extend(self.attachments.entries.iter().enumerate().filter_map(|(i, entry)| {
-                let score = fuzzy_score(query, entry.path.file_name())
-                    .max(fuzzy_score(query, entry.path.as_str()))?;
+        self.attachments = attachments;
+    }
+
+    #[cfg(test)]
+    pub fn filter(&self, query: &str) -> Vec<usize> {
+        self.filter_cancelled(query, &AtomicBool::new(false))
+    }
+
+    pub fn filter_cancelled(&self, query: &str, cancelled: &AtomicBool) -> Vec<usize> {
+        let query = crate::matching::prepare(query.trim());
+        let assets = self.embed_source.as_ref().and_then(VaultPath::assets_dir);
+        let count =
+            self.notes.len() + if self.embed_source.is_some() { self.attachments.entries.len() } else { 0 };
+        crate::matching::top_k(count, 8, cancelled, |index| {
+            if let Some(note) = self.notes.get(index) {
+                let bonus = self.recent.get(&note.path).map_or(0, |&r| 20 - r.min(19) as i32);
+                Some((self.prepared.score(index, &query)? + bonus, note.path.as_str()))
+            } else {
+                let i = index - self.notes.len();
+                let entry = &self.attachments.entries[i];
+                let fallback;
+                let (name, path) = if let Some(prepared) = self.attachment_targets.get(i) {
+                    prepared
+                } else {
+                    fallback = (
+                        crate::matching::prepare(entry.path.file_name()),
+                        crate::matching::prepare(entry.path.as_str()),
+                    );
+                    &fallback
+                };
+                let score = crate::matching::score(&query, name).max(crate::matching::score(&query, path))?;
                 let bonus = if assets.as_ref().is_some_and(|dir| entry.path.parent() == dir.as_str()) {
                     20
-                } else if entry.path.parent() == source.parent() {
+                } else if self
+                    .embed_source
+                    .as_ref()
+                    .is_some_and(|source| entry.path.parent() == source.parent())
+                {
                     10
                 } else {
                     0
                 };
-                Some((self.notes.len() + i, score + bonus))
-            }));
-        }
-        let path = |i: usize| {
-            if i < self.notes.len() {
-                &self.notes[i].path
-            } else {
-                &self.attachments.entries[i - self.notes.len()].path
+                Some((score + bonus, entry.path.as_str()))
             }
-        };
-        scored.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then_with(|| path(*a).cmp(path(*b))));
-        scored.into_iter().take(8).map(|(i, _)| i).collect()
+        })
     }
 
     /// 先尝试短文件名、路径与标题，最后尝试唯一别名；用同一解析器验证，不猜目标。
@@ -171,36 +212,65 @@ pub(super) fn insertion(
 pub(super) struct Menu {
     pub trigger: Trigger,
     pub generation: u64,
-    pub catalog: Option<Catalog>,
-    pub headings: Option<HeadingCatalog>,
-    pub blocks: Option<BlockCatalog>,
+    pub catalog: Option<Arc<Catalog>>,
+    pub filtering: bool,
+    pub filter_generation: u64,
+    pub filter_task: Option<gpui_kit::Task<()>>,
+    pub filter_cancel: Option<crate::matching::Cancel>,
+    pub pending_confirmation: Option<(Option<usize>, bool)>,
+    pub pending_move: isize,
+    pub headings: Option<Arc<HeadingCatalog>>,
+    pub blocks: Option<Arc<BlockCatalog>>,
     pub error: Option<String>,
     pub matches: Vec<usize>,
     pub selected: usize,
 }
 
 impl Menu {
-    pub fn refilter(&mut self) {
-        self.matches = if self.trigger.block_ref {
-            self.blocks.as_ref().map_or_else(Vec::new, |b| b.filter(&self.trigger.query))
+    pub fn filter_source(&self) -> Option<FilterSource> {
+        if self.trigger.block_ref {
+            self.blocks.clone().map(|blocks| {
+                let exclude =
+                    blocks.hash.is_none().then_some((self.trigger.cursor, self.trigger.range.start));
+                FilterSource::Blocks(blocks, exclude)
+            })
         } else if self.trigger.fragment_target.is_some() {
-            self.headings.as_ref().map_or_else(Vec::new, |h| h.filter(&self.trigger.query))
+            self.headings.clone().map(FilterSource::Headings)
         } else {
-            self.catalog.as_ref().map_or_else(Vec::new, |c| c.filter(&self.trigger.query))
-        };
-        // 本篇排除正在插链接的块及其容器，避免半成品查询成为自己的候选。
-        if let Some(blocks) = &self.blocks
-            && blocks.hash.is_none()
-        {
-            self.matches.retain(|&i| {
-                let range = &blocks.entries[i].range;
-                !(range.start <= self.trigger.cursor && self.trigger.range.start <= range.end)
-            });
+            self.catalog.clone().map(FilterSource::Notes)
         }
-        self.matches.truncate(8);
+    }
+
+    pub fn refilter(&mut self) {
+        self.matches = self
+            .filter_source()
+            .map_or_else(Vec::new, |source| source.filter(&self.trigger.query, &AtomicBool::new(false)));
         self.selected = 0;
         if self.catalog.is_some() || self.headings.is_some() || self.blocks.is_some() {
             self.error = None;
+        }
+    }
+}
+
+pub(super) enum FilterSource {
+    Notes(Arc<Catalog>),
+    Headings(Arc<HeadingCatalog>),
+    Blocks(Arc<BlockCatalog>, Option<(usize, usize)>),
+}
+
+impl FilterSource {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Notes(c) => c.notes.len() + c.attachments.entries.len(),
+            Self::Headings(c) => c.entries.len(),
+            Self::Blocks(c, _) => c.entries.len(),
+        }
+    }
+    pub fn filter(&self, query: &str, cancelled: &AtomicBool) -> Vec<usize> {
+        match self {
+            Self::Notes(c) => c.filter_cancelled(query, cancelled),
+            Self::Headings(c) => c.filter_cancelled(query, cancelled),
+            Self::Blocks(c, exclude) => c.filter_cancelled(query, *exclude, cancelled),
         }
     }
 }
@@ -209,54 +279,78 @@ pub(super) struct BlockCatalog {
     pub path: VaultPath,
     pub entries: Vec<aero_core::block_refs::Candidate>,
     pub hash: Option<u64>,
+    targets: Vec<(Vec<char>, Vec<char>)>,
 }
 
 impl BlockCatalog {
     pub fn new(path: VaultPath, doc: &aero_core::Document, hash: Option<u64>) -> Self {
-        Self { path, entries: aero_core::block_refs::candidates(doc), hash }
-    }
-
-    pub fn filter(&self, query: &str) -> Vec<usize> {
-        let mut scored: Vec<_> = self
-            .entries
+        let entries = aero_core::block_refs::candidates(doc);
+        let targets = entries
             .iter()
-            .enumerate()
-            .filter_map(|(i, b)| {
-                fuzzy_score(query.trim(), &b.excerpt)
-                    .max(b.persisted_id.as_deref().and_then(|id| fuzzy_score(query.trim(), id)))
-                    .map(|score| (i, score))
+            .map(|b| {
+                (
+                    crate::matching::prepare(&b.excerpt),
+                    crate::matching::prepare(b.persisted_id.as_deref().unwrap_or_default()),
+                )
             })
             .collect();
-        scored.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then(a.cmp(b)));
-        scored.into_iter().map(|(i, _)| i).collect()
+        Self { path, entries, hash, targets }
+    }
+
+    #[cfg(test)]
+    pub fn filter(&self, query: &str) -> Vec<usize> {
+        self.filter_cancelled(query, None, &AtomicBool::new(false))
+    }
+
+    fn filter_cancelled(
+        &self,
+        query: &str,
+        exclude: Option<(usize, usize)>,
+        cancelled: &AtomicBool,
+    ) -> Vec<usize> {
+        let query = crate::matching::prepare(query.trim());
+        crate::matching::top_k(self.entries.len(), 8, cancelled, |i| {
+            let entry = &self.entries[i];
+            if exclude.is_some_and(|(cursor, start)| entry.range.start <= cursor && start <= entry.range.end)
+            {
+                return None;
+            }
+            let (excerpt, id) = &self.targets[i];
+            crate::matching::score(&query, excerpt)
+                .max(crate::matching::score(&query, id))
+                .map(|score| (score, ""))
+        })
     }
 }
 
 pub(super) struct HeadingCatalog {
     pub path: VaultPath,
     pub entries: Vec<aero_core::headings::Heading>,
+    targets: Vec<Vec<char>>,
 }
 
 impl HeadingCatalog {
     pub fn new(path: VaultPath, doc: &aero_core::Document) -> Self {
         let mut seen = std::collections::HashSet::new();
-        let entries = aero_core::headings::list(doc)
+        let entries: Vec<_> = aero_core::headings::list(doc)
             .into_iter()
             // 同文本标题只提供首处，片段链接本身不能区分重复标题。
             .filter(|h| !h.text.is_empty() && seen.insert(h.text.clone()))
             .collect();
-        Self { path, entries }
+        let targets = entries.iter().map(|h| crate::matching::prepare(&h.text)).collect();
+        Self { path, entries, targets }
     }
 
+    #[cfg(test)]
     pub fn filter(&self, query: &str) -> Vec<usize> {
-        let mut scored: Vec<_> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, h)| fuzzy_score(query.trim(), &h.text).map(|s| (i, s)))
-            .collect();
-        scored.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then(a.cmp(b)));
-        scored.into_iter().take(8).map(|(i, _)| i).collect()
+        self.filter_cancelled(query, &AtomicBool::new(false))
+    }
+
+    fn filter_cancelled(&self, query: &str, cancelled: &AtomicBool) -> Vec<usize> {
+        let query = crate::matching::prepare(query.trim());
+        crate::matching::top_k(self.entries.len(), 8, cancelled, |i| {
+            crate::matching::score(&query, &self.targets[i]).map(|score| (score, ""))
+        })
     }
 
     /// 用链接解析器验证片段原样往返，不把无法表示的标题插成另一条链接。

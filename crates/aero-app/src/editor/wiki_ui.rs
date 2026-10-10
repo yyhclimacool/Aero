@@ -26,7 +26,7 @@ impl Editor {
             .is_some_and(|f| f.textarea.update(cx, |ta, cx| ta.marked_text_range(window, cx).is_some()))
     }
 
-    pub(super) fn update_wiki(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn update_wiki(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(trigger) = self.wiki_trigger(cx) else {
             self.wiki = None;
             return;
@@ -39,12 +39,11 @@ impl Editor {
         {
             menu.trigger = trigger;
             if menu.headings.as_ref().is_some_and(|h| h.path == self.path) {
-                menu.headings = Some(wiki::HeadingCatalog::new(self.path.clone(), &self.doc));
+                menu.headings = Some(Arc::new(wiki::HeadingCatalog::new(self.path.clone(), &self.doc)));
             }
             if menu.blocks.as_ref().is_some_and(|b| b.path == self.path) {
-                menu.blocks = Some(wiki::BlockCatalog::new(self.path.clone(), &self.doc, None));
+                menu.blocks = Some(Arc::new(wiki::BlockCatalog::new(self.path.clone(), &self.doc, None)));
             }
-            menu.refilter();
         } else {
             self.wiki_generation += 1;
             let local = trigger.fragment_target.as_deref() == Some("");
@@ -53,20 +52,26 @@ impl Editor {
                 trigger,
                 generation: self.wiki_generation,
                 catalog: None,
+                filtering: false,
+                filter_generation: 0,
+                filter_task: None,
+                filter_cancel: None,
+                pending_confirmation: None,
+                pending_move: 0,
                 headings: (local && !block_ref)
-                    .then(|| wiki::HeadingCatalog::new(self.path.clone(), &self.doc)),
+                    .then(|| Arc::new(wiki::HeadingCatalog::new(self.path.clone(), &self.doc))),
                 blocks: (local && block_ref)
-                    .then(|| wiki::BlockCatalog::new(self.path.clone(), &self.doc, None)),
+                    .then(|| Arc::new(wiki::BlockCatalog::new(self.path.clone(), &self.doc, None))),
                 error: None,
                 matches: Vec::new(),
                 selected: 0,
             });
             if local {
-                self.wiki.as_mut().unwrap().refilter();
             } else {
                 cx.emit(EditorEvent::LinkCompletionRequested(self.wiki_generation));
             }
         }
+        self.refilter_wiki(window, cx);
         cx.notify();
     }
 
@@ -75,6 +80,7 @@ impl Editor {
         generation: u64,
         notes: Task<Result<Vec<aero_core::links::NoteSummary>, String>>,
         recent: Vec<VaultPath>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(menu) = self.wiki.as_ref().filter(|m| m.generation == generation) else { return };
@@ -85,19 +91,33 @@ impl Editor {
         let summary = aero_core::links::NoteSummary::from_document(path.clone(), &self.doc);
         let source = fragment_target.as_ref().map(|_| self.doc.to_string());
         let vault = self.vault.clone();
+        let directory = self.link_preview.catalog.clone();
         let task = cx.background_spawn(async move {
             notes.await.and_then(|mut notes| {
-                if let Some(note) = notes.iter_mut().find(|note| note.path == path) {
-                    *note = summary;
+                let snapshot = directory.as_ref().map(|directory| directory.snapshot()).transpose()?;
+                let mut prepared = if let Some(snapshot) = &snapshot {
+                    notes = snapshot.notes.as_ref().clone();
+                    snapshot.prepared.as_ref().clone()
                 } else {
+                    crate::matching::Notes::new(&notes)
+                };
+                if let Some(index) = notes.iter().position(|note| note.path == path) {
+                    prepared.replace(index, &summary);
+                    notes[index] = summary;
+                } else {
+                    prepared.push(&summary);
                     notes.push(summary);
                 }
-                let mut catalog = wiki::Catalog::new(notes, recent);
+                let mut catalog = wiki::Catalog::with_prepared(notes, recent, prepared);
                 if embed {
                     catalog.embed_source = Some(path.clone());
                     if fragment_target.is_none() {
-                        catalog.attachments =
-                            aero_core::attachments::Catalog::read(&vault).map_err(|e| e.to_string())?;
+                        let attachments = if let Some(directory) = &directory {
+                            directory.snapshot()?.attachments.clone()
+                        } else {
+                            aero_core::attachments::Catalog::read(&vault).map_err(|e| e.to_string())?
+                        };
+                        catalog.set_attachments(attachments);
                     }
                 }
                 let (headings, blocks) = if let Some(target) = fragment_target {
@@ -127,35 +147,91 @@ impl Editor {
                 Ok((catalog, headings, blocks))
             })
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 let Some(menu) = this.wiki.as_mut().filter(|m| m.generation == generation) else { return };
                 match result {
                     Ok((catalog, headings, blocks)) => {
-                        menu.catalog = Some(catalog);
+                        menu.catalog = Some(Arc::new(catalog));
                         menu.headings = headings.map(|h| {
-                            if h.path == this.path {
-                                wiki::HeadingCatalog::new(this.path.clone(), &this.doc)
-                            } else {
-                                h
-                            }
+                            Arc::new({
+                                if h.path == this.path {
+                                    wiki::HeadingCatalog::new(this.path.clone(), &this.doc)
+                                } else {
+                                    h
+                                }
+                            })
                         });
                         menu.blocks = blocks.map(|b| {
-                            if b.path == this.path {
-                                wiki::BlockCatalog::new(this.path.clone(), &this.doc, None)
-                            } else {
-                                b
-                            }
+                            Arc::new({
+                                if b.path == this.path {
+                                    wiki::BlockCatalog::new(this.path.clone(), &this.doc, None)
+                                } else {
+                                    b
+                                }
+                            })
                         });
-                        menu.refilter();
                     }
                     Err(err) => menu.error = Some(format!("{err}。Esc 关闭后重试")),
                 }
+                this.refilter_wiki(window, cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn refilter_wiki(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.wiki.as_mut() else { return };
+        menu.filter_cancel = None;
+        menu.filter_task = None;
+        menu.filter_generation += 1;
+        menu.pending_confirmation = None;
+        menu.pending_move = 0;
+        let source = menu.filter_source();
+        if source.as_ref().is_none_or(|source| source.len() < 256) {
+            menu.filtering = false;
+            menu.refilter();
+            return;
+        }
+        let source = source.unwrap();
+        let query = menu.trigger.query.clone();
+        let generation = menu.generation;
+        let filter_generation = menu.filter_generation;
+        menu.matches.clear();
+        menu.filtering = true;
+        let cancel = crate::matching::Cancel::default();
+        let cancelled = cancel.0.clone();
+        menu.filter_cancel = Some(cancel);
+        menu.filter_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(40)).await;
+            let matches = cx.background_spawn(async move { source.filter(&query, &cancelled) }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(menu) = this
+                    .wiki
+                    .as_mut()
+                    .filter(|m| m.generation == generation && m.filter_generation == filter_generation)
+                else {
+                    return;
+                };
+                menu.filter_task = None;
+                menu.filter_cancel = None;
+                menu.filtering = false;
+                menu.matches = matches;
+                menu.selected = if menu.matches.is_empty() {
+                    0
+                } else {
+                    menu.pending_move.rem_euclid(menu.matches.len() as isize) as usize
+                };
+                menu.error = None;
+                let confirmation = menu.pending_confirmation.take();
+                if let Some((row, alias)) = confirmation {
+                    this.confirm_wiki(row, alias, window, cx);
+                }
+                cx.notify();
+            });
+        }));
     }
 
     pub(super) fn move_wiki(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
@@ -164,7 +240,9 @@ impl Editor {
             return false;
         }
         let menu = self.wiki.as_mut().unwrap();
-        if !menu.matches.is_empty() {
+        if menu.filtering {
+            menu.pending_move += delta;
+        } else if !menu.matches.is_empty() {
             menu.selected = (menu.selected as isize + delta).rem_euclid(menu.matches.len() as isize) as usize;
         }
         cx.notify();
@@ -189,6 +267,10 @@ impl Editor {
             return false;
         }
         if self.input_composing(window, cx) {
+            return true;
+        }
+        if let Some(menu) = self.wiki.as_mut().filter(|m| m.filtering) {
+            menu.pending_confirmation = Some((row, alias));
             return true;
         }
         if self.wiki.as_ref().is_some_and(|m| m.trigger.block_ref) {
@@ -362,6 +444,8 @@ impl Editor {
         }
         let hint = if let Some(error) = &menu.error {
             error.clone()
+        } else if menu.filtering {
+            "正在匹配…".into()
         } else if menu.trigger.block_ref && menu.blocks.is_none() {
             "正在读取块…".into()
         } else if menu.trigger.block_ref && menu.matches.is_empty() {

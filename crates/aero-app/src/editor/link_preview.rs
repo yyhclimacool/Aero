@@ -22,6 +22,7 @@ pub fn set_preview_mode(mode: LinkPreviewMode, cx: &mut App) {
 
 #[derive(Default)]
 pub(super) struct LinkPreview {
+    pub(super) catalog: Option<Arc<crate::catalog::Catalog>>,
     resolver: Option<Resolver>,
     resolver_generation: u64,
     resolver_task: Option<Task<()>>,
@@ -258,6 +259,7 @@ pub(super) fn fragment_range(doc: &Document, fragment: Option<&str>) -> Result<R
 
 impl Editor {
     pub fn connect_link_preview(&mut self, service: Entity<SearchService>, cx: &mut Context<Self>) {
+        self.link_preview.catalog = Some(service.read(cx).catalog.clone());
         self.link_preview.subscription = Some(cx.observe(&service, |this, service, cx| {
             this.refresh_link_resolver(&service, cx);
         }));
@@ -1203,7 +1205,10 @@ mod tests {
                 None => std::fs::remove_file(dir.path().join("b.md")).unwrap(),
             }
             // SearchService's save/watch/index completion calls notify, not a source edit.
-            service.update(cx, |_, cx| cx.notify());
+            service.update(cx, |s, cx| {
+                s.catalog.touch([aero_core::VaultPath::new("b.md").unwrap()]);
+                cx.notify();
+            });
             cx.run_until_parked();
             editor.update(cx, |e, cx| {
                 assert_eq!(e.doc.version(), 0, "the source was not edited");

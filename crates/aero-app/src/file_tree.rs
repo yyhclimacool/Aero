@@ -31,8 +31,7 @@ pub enum FileTreeEvent {
         from: VaultPath,
         to: VaultPath,
     },
-    /// 附件改名改写了这些笔记，或附件被删除。
-    Touched(Vec<VaultPath>),
+    Operation(crate::workspace::files::Operation),
 }
 
 actions!(file_tree, [RenameSelection]);
@@ -164,27 +163,24 @@ thread_local! {
 }
 
 impl Scan {
-    fn read(vault: &Vault) -> Scan {
+    #[cfg(test)]
+    fn read(vault: &Arc<Vault>) -> Scan {
         #[cfg(test)]
         SCAN_READS.with(|count| count.set(count.get() + 1));
-        let tree = vault
-            .notes()
-            .and_then(|notes| {
-                vault.folders().map(|folders| {
-                    let root = Folder::build(&notes, &folders);
-                    (root, notes.into_iter().collect())
-                })
-            })
-            .map_err(|e| e.to_string());
-        // 附件只按后缀枚举、不读内容；枚举失败不影响笔记树
+        Self::from_catalog(crate::catalog::Catalog::new(vault.clone()).snapshot())
+    }
+
+    fn from_catalog(snapshot: Result<Arc<crate::catalog::Snapshot>, String>) -> Scan {
         let mut attachments: BTreeMap<VaultPath, Vec<VaultPath>> = BTreeMap::new();
-        if let Ok(catalog) = aero_core::attachments::Catalog::read(vault) {
-            for entry in catalog.entries {
+        let tree = snapshot.map(|snapshot| {
+            let notes = snapshot.notes.iter().map(|n| n.path.clone()).collect::<Vec<_>>();
+            for entry in &snapshot.attachments.entries {
                 if let Some(note) = owner_note(&entry.path) {
-                    attachments.entry(note).or_default().push(entry.path);
+                    attachments.entry(note).or_default().push(entry.path.clone());
                 }
             }
-        }
+            (Folder::build(&notes, &snapshot.folders), notes.into_iter().collect())
+        });
         Scan { tree, attachments }
     }
 }
@@ -226,6 +222,7 @@ enum Row {
 }
 
 pub struct FileTree {
+    catalog: Arc<crate::catalog::Catalog>,
     vault: Arc<Vault>,
     root: Folder,
     /// 与 root 同一快照的路径索引，监听批次只查询成员关系，不遍历或重建目录树。
@@ -262,8 +259,18 @@ pub struct FileTree {
 }
 
 impl FileTree {
+    #[cfg(test)]
     pub fn new(vault: Arc<Vault>, cx: &mut Context<Self>) -> Self {
+        Self::with_catalog(vault.clone(), crate::catalog::Catalog::new(vault), cx)
+    }
+
+    pub(crate) fn with_catalog(
+        vault: Arc<Vault>,
+        catalog: Arc<crate::catalog::Catalog>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = FileTree {
+            catalog,
             vault,
             root: Folder::default(),
             notes: HashSet::new(),
@@ -303,52 +310,19 @@ impl FileTree {
         note: Option<&VaultPath>,
         cx: &mut Context<Self>,
     ) {
-        let mut errors = Vec::new();
-        for src in paths {
-            if src.is_dir() {
-                continue;
-            }
-            let Some(name) = src.file_name().map(|name| name.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            let bytes = match std::fs::read(src) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    errors.push(format!("{name}：{error}"));
-                    continue;
-                }
-            };
-            let imported = if name.to_ascii_lowercase().ends_with(".md") {
-                let stem = &name[..name.len() - 3];
-                let dest = self.available_note_path(directory, stem);
-                self.vault.create_bytes(&dest, &bytes).map(|_| ()).map_err(|e| e.to_string())
-            } else if let Some(note) = note {
-                let extension = std::path::Path::new(&name)
-                    .extension()
-                    .map(|ext| ext.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                match aero_core::attachments::import_path(&self.vault, note, Some(&name), &extension) {
-                    Some(dest) => {
-                        self.vault.create_bytes(&dest, &bytes).map(|_| ()).map_err(|e| e.to_string())
-                    }
-                    None => Err(format!("无法导入 {name}")),
-                }
-            } else {
-                Err(format!("{name} 不是笔记。请拖到某一篇笔记上，它会进入这篇笔记的附件目录。"))
-            };
-            if let Err(error) = imported {
-                errors.push(error);
-            }
-        }
-        self.rescan_in_background(cx);
-        self.set_operation_error(errors.into_iter().next());
+        cx.emit(FileTreeEvent::Operation(crate::workspace::files::Operation::Import {
+            paths: paths.to_vec(),
+            directory: directory.to_owned(),
+            note: note.cloned(),
+        }));
     }
 
-    fn set_operation_error(&mut self, error: Option<String>) {
+    pub(crate) fn set_operation_error(&mut self, error: Option<String>) {
         self.operation_error = error.clone();
         self.error = error;
     }
 
+    #[cfg(test)]
     pub(crate) fn available_note_path(&self, directory: &str, base: &str) -> VaultPath {
         next_note_path(directory, base, |path| self.notes.contains(path) || self.vault.exists(path))
     }
@@ -373,8 +347,9 @@ impl FileTree {
         }
         self.scan_generation += 1;
         let generation = self.scan_generation;
-        let vault = self.vault.clone();
-        let scan = cx.background_spawn(async move { Scan::read(&vault) });
+        let catalog = self.catalog.clone();
+        catalog.invalidate();
+        let scan = cx.background_spawn(async move { Scan::from_catalog(catalog.snapshot()) });
         self.scanning = Some(cx.spawn(async move |this, cx| {
             let scan = scan.await;
             let _ = this.update(cx, |this, cx| {
@@ -669,17 +644,10 @@ impl FileTree {
         self.set_operation_error(None);
         self.focus_handle.focus(window, cx);
         if from != to && attachment {
-            match aero_core::attachments::rewrite_references(&self.vault, &from, &to) {
-                Ok(notes) => {
-                    if let Err(err) = self.vault.rename(&from, &to) {
-                        self.set_operation_error(Some(err.to_string()));
-                    } else {
-                        self.rescan_in_background(cx);
-                        cx.emit(FileTreeEvent::Touched(notes));
-                    }
-                }
-                Err(err) => self.set_operation_error(Some(err.to_string())),
-            }
+            cx.emit(FileTreeEvent::Operation(crate::workspace::files::Operation::AttachmentRename {
+                from,
+                to,
+            }));
         } else if from != to {
             cx.emit(FileTreeEvent::Move { from, to });
         }
@@ -687,15 +655,7 @@ impl FileTree {
     }
 
     fn trash_attachment(&mut self, path: VaultPath, cx: &mut Context<Self>) {
-        self.set_operation_error(None);
-        let file = self.vault.fs_path(&path);
-        if let Err(err) = crate::trash::move_to_trash(&file) {
-            self.set_operation_error(Some(err));
-        } else {
-            self.rescan_in_background(cx);
-            cx.emit(FileTreeEvent::Touched(Vec::new()));
-        }
-        cx.notify();
+        cx.emit(FileTreeEvent::Operation(crate::workspace::files::Operation::Trash { path, note: false }));
     }
 
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1199,6 +1159,7 @@ impl Render for FileTree {
     }
 }
 
+#[cfg(test)]
 fn next_note_path(dir: &str, base: &str, mut taken: impl FnMut(&VaultPath) -> bool) -> VaultPath {
     let mut n = 0;
     loop {
@@ -1216,7 +1177,7 @@ fn next_note_path(dir: &str, base: &str, mut taken: impl FnMut(&VaultPath) -> bo
 mod tests {
     use super::{FileTree, Row};
     use aero_core::Vault;
-    use gpui_kit::{Entity, Modifiers, TestAppContext, VisualTestContext};
+    use gpui_kit::{AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext};
     use std::sync::Arc;
 
     fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Arc<Vault>, Entity<FileTree>) {
@@ -1232,6 +1193,31 @@ mod tests {
         let vault = Arc::new(Vault::open(dir.path()).unwrap());
         let (tree, _) = cx.add_window_view(|_, cx| FileTree::new(vault.clone(), cx));
         cx.run_until_parked();
+        // Standalone tree fixtures route requests through the same background worker.
+        cx.update(|cx| {
+            let vault = vault.clone();
+            cx.subscribe(&tree, move |tree, event, cx| {
+                if let super::FileTreeEvent::Operation(operation) = event {
+                    let operation = operation.clone();
+                    let vault = vault.clone();
+                    let weak = tree.downgrade();
+                    cx.spawn(async move |cx| {
+                        let error = cx
+                            .background_spawn(async move {
+                                crate::workspace::files::execute_test(&vault, operation).unwrap_or_else(Some)
+                            })
+                            .await;
+                        let _ = weak.update(cx, |tree, cx| {
+                            tree.set_operation_error(error);
+                            tree.rescan_in_background(cx);
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+            })
+            .detach();
+        });
         tree.read_with(cx, |tree, _| {
             assert!(!tree.is_scanning(), "setup must wait for the initial scan");
             assert!(tree.contains(&aero_core::VaultPath::new("source/a.md").unwrap()));
@@ -1376,7 +1362,7 @@ mod tests {
             let reads = super::SCAN_READS.with(|count| count.get());
             tree.import_external(&[std::path::PathBuf::from("/missing-aero-import.txt")], "", None, cx);
             assert_eq!(super::SCAN_READS.with(|count| count.get()), reads);
-            assert!(tree.error.as_ref().is_some_and(|error| error.contains("missing-aero-import.txt")));
+            assert!(tree.error.is_none(), "the UI only submits the import request");
         });
         cx.run_until_parked();
         tree.read_with(cx, |tree, _| {
@@ -1626,7 +1612,7 @@ mod tests {
                 super::FileTreeEvent::Open(_) | super::FileTreeEvent::OpenInNewTab(_) => {
                     *opened.borrow_mut() += 1
                 }
-                super::FileTreeEvent::Touched(_) | super::FileTreeEvent::ToggleFavorite(_) => {}
+                super::FileTreeEvent::Operation(_) | super::FileTreeEvent::ToggleFavorite(_) => {}
             })
             .detach();
         });

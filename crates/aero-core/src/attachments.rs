@@ -26,7 +26,7 @@ pub struct Entry {
     pub kind: Kind,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Catalog {
     pub entries: Vec<Entry>,
 }

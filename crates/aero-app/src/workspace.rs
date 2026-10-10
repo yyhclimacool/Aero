@@ -5,6 +5,7 @@
 //! 标签页见 `tabs`，标题栏、三栏布局与分割线、路径行见 `chrome`。
 
 mod chrome;
+pub(crate) mod files;
 #[cfg(test)]
 mod layout_tests;
 mod tabs;
@@ -81,8 +82,10 @@ pub struct Workspace {
     rename_pending: bool,
     rename_changes: Batch,
     pending_operation: Option<PendingOperation>,
+    operation_queue: std::collections::VecDeque<PendingOperation>,
     session_closing: bool,
     io_task: Option<Task<()>>,
+    file_guard: Option<files::Guard>,
     sidebar_visible: bool,
     panel_visible: bool,
     /// 两侧拖出来的宽度；实际画多宽还看窗口宽度（`chrome::column_widths`）
@@ -107,6 +110,7 @@ pub struct Workspace {
 }
 
 enum PendingOperation {
+    File(files::Operation),
     OpenVault(PathBuf),
     CloseVault,
     CloseWindow,
@@ -173,8 +177,10 @@ impl Workspace {
             rename_pending: false,
             rename_changes: Batch::default(),
             pending_operation: None,
+            operation_queue: Default::default(),
             session_closing: false,
             io_task: None,
+            file_guard: None,
             sidebar_visible: state.sidebar_visible.unwrap_or(true),
             panel_visible: state.panel_visible.unwrap_or(true),
             sidebar_width: px(state.sidebar_width.unwrap_or(SIDEBAR_DEFAULT)),
@@ -225,11 +231,12 @@ impl Workspace {
         match Vault::open(root) {
             Ok(vault) => {
                 let vault = Arc::new(vault);
-                let tree = cx.new(|cx| FileTree::new(vault.clone(), cx));
-                let sub = self.subscribe_tree(&tree, window, cx);
                 // Any previous session has already completed asynchronous shutdown.
                 let index_dir = self.data_dir.join("index");
                 let search = cx.new(|cx| SearchService::new(vault.clone(), index_dir, cx));
+                let catalog = search.read(cx).catalog.clone();
+                let tree = cx.new(|cx| FileTree::with_catalog(vault.clone(), catalog, cx));
+                let sub = self.subscribe_tree(&tree, window, cx);
                 let search_sub = cx.observe(&search, |_, _, cx| cx.notify());
                 let progress_sub = cx.subscribe(&search, |_, _, _: &crate::search::SearchEvent, cx| {
                     cx.notify();
@@ -499,17 +506,11 @@ impl Workspace {
                     open.tree.update(cx, |t, cx| t.focus(window, cx));
                 }
             }
+            FileTreeEvent::Operation(operation) => {
+                this.request_operation(PendingOperation::File(operation.clone()), window, cx)
+            }
             FileTreeEvent::ToggleFavorite(path) => this.toggle_favorite(path.clone(), cx),
             FileTreeEvent::Move { from, to } => this.move_entry(from.clone(), to.clone(), window, cx),
-            FileTreeEvent::Touched(paths) => {
-                if !paths.is_empty() {
-                    let search = this.open.as_ref().map(|open| open.search.clone());
-                    if let Some(search) = search {
-                        search.update(cx, |search, cx| search.notes_touched(paths.clone(), cx));
-                    }
-                }
-                this.refresh_attachment_references(cx);
-            }
         })
     }
 
@@ -550,7 +551,7 @@ impl Workspace {
                 let Some(open) = this.open.as_ref() else { return };
                 let notes = open.search.read(cx).completion_notes(open.vault.clone(), cx);
                 let recent = open.recent.clone();
-                editor.update(cx, |e, cx| e.load_wiki_notes(*generation, notes, recent, cx));
+                editor.update(cx, |e, cx| e.load_wiki_notes(*generation, notes, recent, window, cx));
             }
             EditorEvent::TagCompletionRequested(generation) => {
                 let Some(open) = this.open.as_ref() else { return };
@@ -820,7 +821,9 @@ impl Workspace {
         if self.session_busy() {
             return;
         }
-        let Some(open) = self.open.as_ref() else { return };
+        if self.open.is_none() {
+            return;
+        }
         let path = match note_path_in("", name) {
             Ok(p) => p,
             Err(msg) => {
@@ -828,19 +831,16 @@ impl Workspace {
                 return;
             }
         };
-        if !open.vault.exists(&path) {
-            let doc = aero_core::Document::from_text(&format!("# {}\n\n", name.trim()));
-            if let Err(err) = open.vault.write(&path, &doc) {
-                window.push_notification(Notification::error(format!("无法新建笔记：{err}")), cx);
-                return;
-            }
-            open.tree.update(cx, |t, cx| {
-                t.rescan_in_background(cx);
-                cx.notify();
-            });
-        }
-        self.open_note(path.clone(), window, cx);
-        self.navigate_note(&path, tabs::Navigation::Write, window, cx);
+        self.request_operation(
+            PendingOperation::File(files::Operation::Create {
+                directory: path.parent().to_owned(),
+                base: path.stem().to_owned(),
+                unique: false,
+                text: format!("# {}\n\n", name.trim()),
+            }),
+            window,
+            cx,
+        );
     }
 
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -997,55 +997,43 @@ impl Workspace {
     }
 
     fn on_new_note(&mut self, _: &NewNote, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session_busy() {
+        if self.session_busy() && self.file_guard.is_none() {
             return;
         }
         let Some(open) = self.open.as_ref() else { return };
-        let vault = open.vault.clone();
-        // 3.5：新建位置 = 当前选中的文件夹；否则 vault 根
         let dir = open.tree.read(cx).selected_dir().unwrap_or_default();
-        let dir = if dir == "daily" { String::new() } else { dir };
-        let path = open.tree.read(cx).available_note_path(&dir, "未命名");
-        match vault.create_bytes(&path, b"") {
-            Ok(_) => {
-                open.tree.update(cx, |t, cx| {
-                    t.rescan_in_background(cx);
-                    cx.notify();
-                });
-                self.open_note(path.clone(), window, cx);
-                self.navigate_note(&path, tabs::Navigation::Write, window, cx);
-            }
-            Err(err) => window.push_notification(Notification::error(format!("无法新建笔记：{err}")), cx),
-        }
+        let directory = if dir == "daily" { String::new() } else { dir };
+        self.request_operation(
+            PendingOperation::File(files::Operation::Create {
+                directory,
+                base: "未命名".into(),
+                unique: true,
+                text: String::new(),
+            }),
+            window,
+            cx,
+        );
     }
 
     /// ⌘⇧D：今日日记 `daily/YYYY-MM-DD.md`，不存在则按模板创建（3.4）。
     fn on_open_daily(&mut self, _: &OpenDaily, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session_busy() {
+        if self.session_busy() && self.file_guard.is_none() {
             return;
         }
-        let Some(open) = self.open.as_ref() else { return };
-        let vault = open.vault.clone();
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let path = VaultPath::new(&format!("daily/{today}.md")).expect("date is a valid file name");
-        let created = if vault.exists(&path) {
-            false
-        } else {
-            let doc = aero_core::Document::from_text(&format!("# {today}\n\n"));
-            if let Err(err) = vault.write(&path, &doc) {
-                window.push_notification(Notification::error(format!("无法创建今日日记：{err}")), cx);
-                return;
-            }
-            open.tree.update(cx, |t, cx| {
-                t.rescan_in_background(cx);
-                cx.notify();
-            });
-            true
-        };
-        self.open_note(path.clone(), window, cx);
-        if created {
-            self.navigate_note(&path, tabs::Navigation::Write, window, cx);
+        if self.open.is_none() {
+            return;
         }
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        self.request_operation(
+            PendingOperation::File(files::Operation::Create {
+                directory: "daily".into(),
+                base: today.clone(),
+                unique: false,
+                text: format!("# {today}\n\n"),
+            }),
+            window,
+            cx,
+        );
     }
 
     fn on_save_now(&mut self, _: &SaveNow, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1084,45 +1072,11 @@ impl Workspace {
 
     /// 移到系统废纸篓。显示这篇的标签页先拿掉、不落盘——它排队中的自动保存会把文件写回来。
     fn trash_note(&mut self, path: &VaultPath, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session_busy() {
-            return;
-        }
-        let Some(open) = self.open.as_ref() else { return };
-        let fs_path = open.vault.fs_path(path);
-        let tab = self.drop_tab_showing(path, window, cx);
-        let Some(open) = self.open.as_ref() else { return };
-        match crate::trash::move_to_trash(&fs_path) {
-            Ok(()) => {
-                open.tree.update(cx, |t, cx| {
-                    t.rescan_in_background(cx);
-                    if t.selected() == Some(path) {
-                        t.select(None, cx);
-                    }
-                    cx.notify();
-                });
-                window.push_notification(
-                    Notification::info(format!("已移到废纸篓：{}", path.as_str())).title("Aero"),
-                    cx,
-                );
-                let p = path.clone();
-                open.search.update(cx, |s, cx| s.note_removed(p, cx));
-                let favorites = self.favorites();
-                if favorites.contains(path) {
-                    self.set_favorites(favorites.into_iter().filter(|p| p != path).collect(), cx);
-                }
-            }
-            Err(err) => {
-                window.push_notification(
-                    Notification::error(format!("无法移到废纸篓：{err}")).title("Aero"),
-                    cx,
-                );
-                // 文件还在：重新打开
-                if tab.is_some() {
-                    self.open_note_in(path.clone(), OpenIn::NewTab, window, cx);
-                }
-            }
-        }
-        cx.notify();
+        self.request_operation(
+            PendingOperation::File(files::Operation::Trash { path: path.clone(), note: true }),
+            window,
+            cx,
+        );
     }
 
     fn on_reveal_in_finder(&mut self, action: &RevealInFinder, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1395,6 +1349,14 @@ impl Workspace {
         self.session_closing = true;
         // OS-initiated termination cannot be vetoed in GPUI 0.3.5. This is the final
         // safety fallback; asynchronous user saves must finish before calling quit.
+        let mut file_guard = self.file_guard.take();
+        let queued = std::mem::take(&mut self.operation_queue)
+            .into_iter()
+            .filter_map(|op| if let PendingOperation::File(operation) = op { Some(operation) } else { None })
+            .collect::<Vec<_>>();
+        if let Some(open) = &self.open {
+            file_guard = files::finish_on_shutdown(file_guard, queued, open.vault.clone());
+        }
         let saves = self
             .open
             .iter()
@@ -1413,6 +1375,7 @@ impl Workspace {
             )
         });
         async move {
+            drop(file_guard);
             for (guard, wait) in saves {
                 wait.await;
                 drop(guard);
@@ -1452,6 +1415,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let file_pending =
+            self.file_guard.is_some() || matches!(self.pending_operation, Some(PendingOperation::File(_)));
+        if file_pending
+            && !matches!(operation, PendingOperation::Rename { .. })
+            && self.operation_queue.iter().all(|op| matches!(op, PendingOperation::File(_)))
+        {
+            self.operation_queue.push_back(operation);
+            return;
+        }
         if self.rename_pending || self.pending_operation.is_some() || self.session_busy() {
             window
                 .push_notification(Notification::warning("正在完成文件操作，请稍后再试。").title("Aero"), cx);
@@ -1463,6 +1435,9 @@ impl Workspace {
 
     /// Save completion drives this continuation; newer edits cause another save, never a discard.
     fn continue_operation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_operation.is_none() {
+            self.pending_operation = self.operation_queue.pop_front();
+        }
         if self.pending_operation.is_none() || self.session_busy() {
             return;
         }
@@ -1472,6 +1447,7 @@ impl Workspace {
             e.has_pending_export() || e.is_deleted() || matches!(e.save_state(), SaveState::Failed(_))
         }) {
             self.pending_operation = None;
+            self.operation_queue.clear();
             window.push_notification(
                 Notification::warning("笔记尚未安全保存，请处理保存错误或导出后重试。").title("Aero"),
                 cx,
@@ -1493,6 +1469,10 @@ impl Workspace {
             return;
         }
         let operation = self.pending_operation.take().unwrap();
+        if let PendingOperation::File(operation) = operation {
+            self.execute_file_operation(operation, window, cx);
+            return;
+        }
         if let PendingOperation::Rename { old, target, title } = operation {
             self.prepare_change_name(old, target, title, window, cx);
             return;
@@ -1537,7 +1517,7 @@ impl Workspace {
                     PendingOperation::CloseVault => {}
                     PendingOperation::CloseWindow => window.remove_window(),
                     PendingOperation::Quit => cx.quit(),
-                    PendingOperation::Rename { .. } => unreachable!(),
+                    PendingOperation::Rename { .. } | PendingOperation::File(_) => unreachable!(),
                 }
                 cx.notify();
             });
@@ -1614,7 +1594,7 @@ impl Workspace {
     /// vault 目录有动静（文件监听）：文件树重扫；标签页里打开着的笔记立刻检查外部修改；其余按指纹对齐索引。
     fn on_vault_changed(&mut self, batch: &Batch, _window: &mut Window, cx: &mut Context<Self>) {
         if self.session_busy() {
-            if self.rename_pending {
+            if self.rename_pending || self.file_guard.is_some() {
                 // Do not lose events delivered while the transaction owns the files.
                 self.rename_changes.changed.extend(batch.changed.iter().cloned());
                 self.rename_changes.removed.extend(batch.removed.iter().cloned());
@@ -1632,6 +1612,13 @@ impl Workspace {
             return;
         }
         let Some(open) = self.open.as_ref() else { return };
+        open.search
+            .read(cx)
+            .catalog
+            .touch(batch.changed.iter().chain(&batch.removed).chain(&batch.attachments).cloned());
+        if batch.rescan {
+            open.search.read(cx).catalog.invalidate();
+        }
         let editors: Vec<Entity<Editor>> = open.editors().cloned().collect();
         let shown: Vec<VaultPath> = editors.iter().map(|e| e.read(cx).path().clone()).collect();
         // 只改了已有笔记的内容（包括我们自己的自动保存）不动文件树；增删、目录与附件变化才重扫，而且在后台扫
@@ -2254,8 +2241,10 @@ mod tests {
                 rename_pending: false,
                 rename_changes: Batch::default(),
                 pending_operation: None,
+                operation_queue: Default::default(),
                 session_closing: false,
                 io_task: None,
+                file_guard: None,
                 sidebar_visible: true,
                 panel_visible: true,
                 sidebar_width: px(super::SIDEBAR_DEFAULT),
@@ -3091,6 +3080,8 @@ mod tests {
             })
         });
         cx.run_until_parked();
+        // Standalone fixtures have no watcher; deliver the disk change explicitly.
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).catalog.invalidate());
         cx.simulate_input(" [[尚未索引");
         wait_until(cx, |cx| {
             cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -3117,6 +3108,8 @@ mod tests {
             .unwrap();
         cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx)));
         cx.run_until_parked();
+        // Standalone fixtures have no watcher; deliver the disk change explicitly.
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).catalog.invalidate());
         cx.simulate_input(" [[尚未索引#文");
         wait_until(cx, |cx| {
             cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -3161,6 +3154,8 @@ mod tests {
         std::fs::write(dir.path().join("b.md"), original).unwrap();
         cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx)));
         cx.run_until_parked();
+        // Standalone fixtures have no watcher; deliver the disk change explicitly.
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).catalog.invalidate());
         cx.simulate_input(" [[尚未索引#^needle");
         wait_until(cx, |cx| {
             cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -3211,6 +3206,8 @@ mod tests {
         });
         std::fs::write(dir.path().join("b.md"), "---\ntitle: Target\n---\n正文\n").unwrap();
         cx.run_until_parked();
+        // Standalone fixtures have no watcher; deliver the disk change explicitly.
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).catalog.invalidate());
         cx.simulate_input(" (**中文**) [[Target");
         wait_until(cx, |cx| {
             cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -3294,6 +3291,8 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_keystrokes("alt-shift-left");
         cx.simulate_keystrokes("cmd-shift-p");
+        // Standalone fixtures have no watcher; deliver the disk change explicitly.
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).catalog.invalidate());
         cx.simulate_input("插入或编辑链接");
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let row = cx.debug_bounds("picker-row-0").unwrap();
@@ -3343,6 +3342,8 @@ mod tests {
         cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_block(e.headings()[0].2, window, cx)));
         cx.run_until_parked();
         for query in [" ![[图", " ![[嵌入笔记", " ![[b#^needle"] {
+            // Standalone fixtures have no watcher; deliver the disk change explicitly.
+            cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).catalog.invalidate());
             cx.simulate_input(query);
             wait_until(cx, |cx| {
                 cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -3903,6 +3904,8 @@ mod tests {
         wait_until(cx, |cx| cx.update(|_, cx| search.read(cx).phase() == crate::search::Phase::Idle));
         let source = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().cloned().unwrap());
 
+        // Standalone fixtures have no watcher; deliver the disk change explicitly.
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).catalog.invalidate());
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let block = cx.debug_bounds("unit-1").expect("段落已渲染");
         let at = block.origin + gpui_kit::point(gpui_kit::px(6.), gpui_kit::px(10.));

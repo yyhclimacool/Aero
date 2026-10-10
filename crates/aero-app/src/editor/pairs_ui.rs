@@ -58,7 +58,7 @@ impl Editor {
             });
             // 跳过只是光标移动，不产生保存或撤销记录；菜单仍需跟随光标关闭。
             self.last_edit_at = None;
-            self.update_wiki(cx);
+            self.update_wiki(window, cx);
             self.update_tags(cx);
             return true;
         }

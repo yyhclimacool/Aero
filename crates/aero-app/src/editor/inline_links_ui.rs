@@ -22,7 +22,7 @@ impl Editor {
         let selected = ta.selected_range();
         // 已在半成品 wikilink 中时重新打开现有菜单，不插入另一对括号。
         if selected.is_empty() && wiki::trigger(&ta.value(), ta.cursor()).is_some() {
-            self.update_wiki(cx);
+            self.update_wiki(window, cx);
             return true;
         }
         let selection = f.range.start + selected.start..f.range.start + selected.end;
@@ -48,7 +48,7 @@ impl Editor {
             f.textarea.update(cx, |ta, cx| ta.set_selected_range(selection, cx));
         }
         if plan.complete_note {
-            self.update_wiki(cx);
+            self.update_wiki(window, cx);
         }
         if self.toolbar.is_some() {
             self.refresh_toolbar(cx);

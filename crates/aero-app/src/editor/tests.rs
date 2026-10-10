@@ -983,7 +983,7 @@ fn double_click(cx: &mut VisualTestContext, position: gpui_kit::Point<gpui_kit::
 }
 
 fn wiki_catalog(editor: &Entity<Editor>, recent: &[&str], cx: &mut VisualTestContext) {
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         editor.update(cx, |e, cx| {
             let notes = e
                 .vault
@@ -1001,6 +1001,7 @@ fn wiki_catalog(editor: &Entity<Editor>, recent: &[&str], cx: &mut VisualTestCon
                 generation,
                 task,
                 recent.iter().map(|p| VaultPath::new(p).unwrap()).collect(),
+                window,
                 cx,
             );
         })
@@ -2640,22 +2641,22 @@ fn embed_completion_loading_errors_stale_replies_and_unresolved_targets(cx: &mut
         })
     });
     cx.simulate_input("body ![[missing");
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         editor.update(cx, |e, cx| {
             assert_ne!(old, e.wiki.as_ref().unwrap().generation);
             let task = cx.background_spawn(async { Ok(vec![]) });
-            e.load_wiki_notes(old, task, vec![], cx);
+            e.load_wiki_notes(old, task, vec![], window, cx);
         })
     });
     cx.run_until_parked();
     cx.simulate_keystrokes("enter");
     assert_eq!(text(&editor, cx), "body ![[missing]]\n");
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         editor.update(cx, |e, cx| {
             assert!(e.wiki.as_ref().unwrap().catalog.is_none());
             let generation = e.wiki.as_ref().unwrap().generation;
             let task = cx.background_spawn(async { Err("目录不可读".into()) });
-            e.load_wiki_notes(generation, task, vec![], cx);
+            e.load_wiki_notes(generation, task, vec![], window, cx);
         })
     });
     cx.run_until_parked();
@@ -2901,11 +2902,11 @@ fn block_ref_mode_transition_empty_and_duplicate_ids_are_safe(cx: &mut TestAppCo
     cx.simulate_input(" [[b#");
     let old = cx.update(|_, cx| editor.read(cx).wiki.as_ref().unwrap().generation);
     cx.simulate_input("^");
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         editor.update(cx, |e, cx| {
             assert_ne!(old, e.wiki.as_ref().unwrap().generation);
             let task = cx.background_spawn(async { Ok(vec![]) });
-            e.load_wiki_notes(old, task, vec![], cx);
+            e.load_wiki_notes(old, task, vec![], window, cx);
         })
     });
     cx.run_until_parked();
@@ -3012,11 +3013,11 @@ fn heading_completion_mode_change_rejects_old_reply_and_blocks_empty_results(cx:
     cx.simulate_input(" [[b");
     let old = cx.update(|_, cx| editor.read(cx).wiki.as_ref().unwrap().generation);
     cx.simulate_input("#");
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         editor.update(cx, |e, cx| {
             assert_ne!(e.wiki.as_ref().unwrap().generation, old);
             let notes = cx.background_spawn(async { Ok(vec![]) });
-            e.load_wiki_notes(old, notes, vec![], cx);
+            e.load_wiki_notes(old, notes, vec![], window, cx);
         })
     });
     cx.run_until_parked();
@@ -3208,20 +3209,20 @@ fn wiki_loading_failure_escape_and_stale_catalog(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("escape");
     cx.update(|_, cx| assert!(editor.read(cx).focused.is_some()));
     cx.simulate_input("2");
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         editor.update(cx, |e, cx| {
             let task = cx.background_spawn(async { Ok(vec![]) });
-            e.load_wiki_notes(old, task, vec![], cx);
+            e.load_wiki_notes(old, task, vec![], window, cx);
         })
     });
     cx.run_until_parked();
-    cx.update(|_, cx| {
+    cx.update(|window, cx| {
         editor.update(cx, |e, cx| {
             let m = e.wiki.as_ref().unwrap();
             assert!(m.catalog.is_none(), "old reply must not replace the new menu");
             let generation = m.generation;
             let task = cx.background_spawn(async { Err("test failure".into()) });
-            e.load_wiki_notes(generation, task, vec![], cx);
+            e.load_wiki_notes(generation, task, vec![], window, cx);
         })
     });
     cx.run_until_parked();
@@ -5318,4 +5319,114 @@ fn editing_a_math_block_keeps_a_live_preview(cx: &mut TestAppContext) {
     assert!((next_again.origin.y - next.origin.y).abs() < px(1.), "后面的段落不能因为弹窗而挪动");
     cx.simulate_input("+1");
     assert!(text(&editor, cx).contains("+1"), "弹窗里的修改写回公式");
+}
+
+#[gpui_kit::test]
+fn local_parse_retains_units_and_drifts_nested_list_ranges(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "first paragraph\n\n- item\n  - nested\n\nlast paragraph\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    editor.update(cx, |e, cx| {
+        let units = e.units.as_ptr();
+        let structure = e.unit_structure.as_ptr();
+        e.doc.edit(aero_core::Edit::insert(5, "中文")).unwrap();
+        e.focused.as_mut().unwrap().range.end += "中文".len();
+        e.after_doc_change(cx);
+        assert!(!e.doc.is_parse_stale());
+        assert_eq!(e.units.as_ptr(), units);
+        assert_eq!(e.unit_structure.as_ptr(), structure);
+        assert_eq!(e.units, super::units::units(&e.doc));
+    });
+}
+
+fn large_source() -> String {
+    format!("intro\n\n{}", ("other paragraph with words ".repeat(40) + "\n\n").repeat(300))
+}
+
+#[gpui_kit::test]
+fn large_syntax_edits_coalesce_and_keep_the_input_entity(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, &large_source());
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    let input = editor.read_with(cx, |e, _| e.focused.as_ref().unwrap().textarea.clone());
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.parse_window = Some(window.window_handle());
+            e.doc.edit(aero_core::Edit::insert(0, "## ")).unwrap();
+            e.focused.as_mut().unwrap().range.end += 3;
+            e.after_doc_change(cx);
+            assert!(e.doc.is_parse_stale(), "the input callback does not perform full parsing");
+            assert!(e.parse_task.is_some());
+            e.doc.edit(aero_core::Edit::insert(3, "中文")).unwrap();
+            e.focused.as_mut().unwrap().range.end += "中文".len();
+            e.after_doc_change(cx);
+            assert!(e.doc.is_parse_stale());
+        })
+    });
+    cx.run_until_parked();
+    editor.read_with(cx, |e, _| {
+        assert!(!e.doc.is_parse_stale());
+        assert!(e.parse_task.is_none());
+        assert_eq!(e.units[0].kind, aero_core::BlockKind::Heading { level: 2 });
+        assert_eq!(e.units, super::units::units(&e.doc));
+        assert_eq!(e.focused.as_ref().unwrap().textarea, input);
+        assert_eq!(e.focused.as_ref().unwrap().id, Some(e.units[0].id));
+        assert!(e.doc.to_string().starts_with("## 中文intro"));
+    });
+}
+
+#[gpui_kit::test]
+fn reload_rejects_a_parse_from_the_previous_session(cx: &mut TestAppContext) {
+    let (_dir, vault, path, editor) = open(cx, &large_source());
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    editor.update(cx, |e, cx| {
+        e.doc.edit(aero_core::Edit::insert(0, "## ")).unwrap();
+        e.focused.as_mut().unwrap().range.end += 3;
+        e.after_doc_change(cx);
+        assert!(e.parse_task.is_some());
+        let stamp = vault.write_bytes(&path, b"replacement\n").unwrap();
+        e.install_document(aero_core::Document::from_text("replacement\n"), stamp, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "replacement\n");
+    editor.read_with(cx, |e, _| assert!(!e.doc.is_parse_stale()));
+}
+
+#[gpui_kit::test]
+fn large_wiki_query_cancels_old_work_and_defers_enter(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "body\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" [[Target");
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let mut notes = (0..300)
+                .map(|i| aero_core::links::NoteSummary {
+                    path: VaultPath::new(&format!("note-{i}.md")).unwrap(),
+                    title: format!("Target {i}"),
+                    aliases: vec![],
+                })
+                .collect::<Vec<_>>();
+            notes.push(aero_core::links::NoteSummary {
+                path: e.path.clone(),
+                title: "Target Z".into(),
+                aliases: vec![],
+            });
+            let task = cx.background_spawn(async move { Ok(notes) });
+            e.load_wiki_notes(e.wiki.as_ref().unwrap().generation, task, vec![], window, cx);
+        })
+    });
+    cx.run_until_parked();
+    let cancelled =
+        editor.read_with(cx, |e, _| e.wiki.as_ref().unwrap().filter_cancel.as_ref().unwrap().0.clone());
+    cx.simulate_input(" Z");
+    assert!(cancelled.load(std::sync::atomic::Ordering::Relaxed));
+    cx.simulate_keystrokes("enter");
+    editor.read_with(cx, |e, _| assert!(e.wiki.as_ref().unwrap().pending_confirmation.is_some()));
+    cx.executor().advance_clock(Duration::from_millis(50));
+    cx.run_until_parked();
+    // Current unsaved metadata replaces the supplied title, so no result is a
+    // deliberate unresolved link; Enter must wait for this query, never Target 0.
+    assert_eq!(text(&editor, cx), "body [[Target Z]]\n");
 }

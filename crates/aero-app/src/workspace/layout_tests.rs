@@ -449,9 +449,30 @@ fn favorites_follow_renames_and_drop_trashed_notes(cx: &mut TestAppContext) {
     workspace.update_in(cx, |w, window, cx| {
         assert_eq!(tab_paths(w, cx), ["renamed.md"], "标签页跟着改名");
         w.trash_note(&note("b.md"), window, cx);
-        assert_eq!(w.favorites(), [note("renamed.md")], "移进废纸篓的不再留在收藏里");
     });
+    wait_until(cx, |cx| cx.update(|_, cx| workspace.read(cx).favorites() == [note("renamed.md")]));
+    assert!(!dir.path().join("b.md").exists());
     close_index(cx, &workspace);
+}
+
+#[gpui_kit::test]
+fn consecutive_creates_finish_before_queued_vault_close(cx: &mut TestAppContext) {
+    let (dir, _data, workspace) = open(cx, Some("# A\n"));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    with_root(cx, &workspace);
+    workspace.update_in(cx, |w, window, cx| {
+        for _ in 0..3 {
+            w.on_new_note(&crate::actions::NewNote, window, cx);
+        }
+        w.request_operation(super::PendingOperation::CloseVault, window, cx);
+        assert!(w.file_guard.is_some());
+        assert_eq!(w.operation_queue.len(), 3);
+    });
+    wait_until(cx, |cx| cx.update(|_, cx| workspace.read(cx).open.is_none()));
+    for name in ["未命名.md", "未命名 1.md", "未命名 2.md"] {
+        assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), b"");
+    }
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "# A\n");
 }
 
 fn open_long_title_tabs(

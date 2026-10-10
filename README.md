@@ -29,7 +29,7 @@ bash scripts/check-m1.sh --bundle
 
 M1 验收状态及复跑说明见 [docs/qa/m1.md](docs/qa/m1.md)，包含保存失败回归、输入法清单和真实性能基准；自动化通过不代表原生 IME、GUI 性能与正式公证全部通过。
 
-`check-m1.sh` 验收 `aero-core`、`aero-index`、`aero-embedding` 和 `aero-app` 四个 crate。本地 GPUI 补丁另用 `cargo test --locked -p gpui-base` 检查。近期性能优化与测试、真实窗口记录见 [2026-09-26 验收](docs/qa/performance-followup-2026-09-26.md)和 [2026-10-08 首批优化验收](docs/qa/performance-o1-o2-2026-10-08.md)，尚未据此证明 GUI 延迟、帧率和内存预算全部达标。首次构建还需下载 Cargo 依赖与 ONNX Runtime 构建依赖；语义模型由用户在应用内另行授权下载。
+`check-m1.sh` 验收 `aero-core`、`aero-index`、`aero-embedding` 和 `aero-app` 四个 crate。本地 GPUI 补丁另用 `cargo test --locked -p gpui-base` 检查。近期性能优化与测试、真实窗口记录见 [2026-09-26 验收](docs/qa/performance-followup-2026-09-26.md)、[2026-10-08 首批优化验收](docs/qa/performance-o1-o2-2026-10-08.md)和 [2026-10-10 剩余优化验收](docs/qa/performance-o2-o6-2026-10-10.md)，尚未据此证明 GUI 延迟、帧率和内存预算全部达标。首次构建还需下载 Cargo 依赖与 ONNX Runtime 构建依赖；语义模型由用户在应用内另行授权下载。
 
 全文索引存放在 `~/Library/Application Support/Aero/index/<vault-id>/`，是可随时删除重建的缓存；首次打开 vault 时后台建索引，状态栏显示进度。
 

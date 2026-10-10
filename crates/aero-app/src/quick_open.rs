@@ -3,9 +3,9 @@
 //! 空输入显示最近打开的笔记；`⏎` 打开，`⌘⏎` 或无匹配时新建同名笔记；`Esc` 关闭。
 //! 复用当前目录缓存，后台读取标题与别名；大目录的模糊匹配也在后台完成。
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use aero_core::{Vault, VaultPath};
@@ -51,6 +51,9 @@ struct PendingConfirmation {
 pub struct QuickOpen {
     input: Entity<InputState>,
     candidates: Arc<Vec<NoteSummary>>,
+    prepared: Arc<crate::matching::Notes>,
+    prepared_for: Option<Arc<Vec<NoteSummary>>>,
+    filter_cancel: Option<crate::matching::Cancel>,
     catalog_vault: Option<String>,
     /// 丢弃上一次 set_notes 尚未完成的目录结果。
     catalog_generation: u64,
@@ -89,6 +92,9 @@ impl QuickOpen {
         let mut this = QuickOpen {
             input,
             candidates: Arc::default(),
+            prepared: Arc::new(crate::matching::Notes::new(&[])),
+            prepared_for: None,
+            filter_cancel: None,
             catalog_vault: None,
             catalog_generation: 0,
             catalog_status: None,
@@ -133,25 +139,46 @@ impl QuickOpen {
         self.catalog_generation += 1;
         self.refilter(cx);
         let generation = self.catalog_generation;
-        let notes = service.read(cx).completion_notes(vault, cx);
+        let notes = service.read(cx).catalog_snapshot_for(vault, cx);
         cx.spawn(async move |this, cx| {
-            let notes = notes.await;
-            let _ = this.update(cx, |this, cx| this.receive_catalog(generation, notes, cx));
+            let notes = notes.await.map(|snapshot| (snapshot.notes.clone(), snapshot.prepared.clone()));
+            let _ = this.update(cx, |this, cx| this.apply_catalog(generation, notes, cx));
         })
         .detach();
     }
 
+    #[cfg(test)]
     fn receive_catalog(
         &mut self,
         generation: u64,
         notes: Result<Vec<NoteSummary>, String>,
         cx: &mut Context<Self>,
     ) {
+        self.apply_catalog(
+            generation,
+            notes.map(|notes| {
+                let prepared = Arc::new(crate::matching::Notes::new(&notes));
+                (Arc::new(notes), prepared)
+            }),
+            cx,
+        );
+    }
+
+    fn apply_catalog(
+        &mut self,
+        generation: u64,
+        notes: Result<(Arc<Vec<NoteSummary>>, Arc<crate::matching::Notes>), String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.catalog_generation != generation {
             return;
         }
         let selection = self.selected_path();
-        self.catalog_status = Some(notes.map(|notes| self.candidates = Arc::new(notes)));
+        self.catalog_status = Some(notes.map(|(notes, prepared)| {
+            self.prepared = prepared;
+            self.prepared_for = Some(notes.clone());
+            self.candidates = notes;
+        }));
         if !self.command_mode {
             self.refilter_with_selection(selection, cx);
         } else {
@@ -216,6 +243,10 @@ impl QuickOpen {
     }
 
     fn refilter_with_selection(&mut self, selection: Option<VaultPath>, cx: &mut Context<Self>) {
+        if self.prepared_for.as_ref().is_none_or(|notes| !Arc::ptr_eq(notes, &self.candidates)) {
+            self.prepared = Arc::new(crate::matching::Notes::new(&self.candidates));
+            self.prepared_for = Some(self.candidates.clone());
+        }
         let q = self.query(cx);
         let selection = selection.filter(|_| self.filter_query == q);
         self.filter_query = q.clone();
@@ -229,6 +260,7 @@ impl QuickOpen {
             // 同一查询的目录完成会重新筛选；确认跟随这次筛选，不能接受旧结果。
             pending.filter_generation = generation;
         }
+        self.filter_cancel = None;
         self.filter_task = None;
         self.filtering = false;
         self.pending_selection = selection.clone();
@@ -254,16 +286,25 @@ impl QuickOpen {
             scored.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.cmp(&a.1)).then_with(|| a.0.cmp(&b.0)));
             self.shown = scored.into_iter().map(|(i, _, _)| i).collect();
         } else if self.candidates.len() <= SYNC_CATALOG_LIMIT {
-            let shown = filter_notes(&self.candidates, &self.recent, &q);
+            let shown =
+                filter_prepared(&self.candidates, &self.prepared, &self.recent, &q, &AtomicBool::new(false));
             self.receive_filter(generation, shown, selection, cx);
             return;
         } else {
             self.filtering = true;
             let candidates = self.candidates.clone();
+            let prepared = self.prepared.clone();
+            let cancel = crate::matching::Cancel::default();
+            let cancelled = cancel.0.clone();
+            self.filter_cancel = Some(cancel);
             let recent = self.recent.clone();
             self.filter_task = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(FILTER_DEBOUNCE).await;
-                let shown = cx.background_spawn(async move { filter_notes(&candidates, &recent, &q) }).await;
+                let shown = cx
+                    .background_spawn(async move {
+                        filter_prepared(&candidates, &prepared, &recent, &q, &cancelled)
+                    })
+                    .await;
                 let _ = this.update(cx, |this, cx| this.receive_filter(generation, shown, selection, cx));
             }));
         }
@@ -385,7 +426,24 @@ impl QuickOpen {
 }
 
 /// 只保留最好的 12 项，不为整个目录分配排序数组。大目录在后台调用。
+#[cfg(test)]
 fn filter_notes(candidates: &[NoteSummary], recent: &[VaultPath], query: &str) -> Vec<usize> {
+    filter_prepared(
+        candidates,
+        &crate::matching::Notes::new(candidates),
+        recent,
+        query,
+        &AtomicBool::new(false),
+    )
+}
+
+fn filter_prepared(
+    candidates: &[NoteSummary],
+    prepared: &crate::matching::Notes,
+    recent: &[VaultPath],
+    query: &str,
+    cancelled: &AtomicBool,
+) -> Vec<usize> {
     let mut recent_positions = HashMap::new();
     for (i, path) in recent.iter().enumerate() {
         recent_positions.entry(path).or_insert(i);
@@ -408,53 +466,18 @@ fn filter_notes(candidates: &[NoteSummary], recent: &[VaultPath], query: &str) -
         }
         return shown;
     }
-    let query: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    let mut best = BinaryHeap::with_capacity(MAX_SHOWN);
-    for (i, note) in candidates.iter().enumerate() {
-        let score = fuzzy_score_prepared(&query, &note.title)
-            .max(fuzzy_score_prepared(&query, note.path.as_str()))
-            .max(note.aliases.iter().filter_map(|alias| fuzzy_score_prepared(&query, alias)).max());
-        let Some(score) = score else { continue };
+    let query = crate::matching::prepare(query);
+    crate::matching::top_k(candidates.len(), MAX_SHOWN, cancelled, |i| {
+        let note = &candidates[i];
+        let score = prepared.score(i, &query)?;
         let bonus = recent_positions.get(&note.path).map_or(0, |&p| 20 - p.min(10) as i32);
-        let ranked = (score + bonus, Reverse(&note.path), Reverse(i));
-        if best.len() < MAX_SHOWN {
-            best.push(Reverse(ranked));
-        } else if best.peek().is_some_and(|worst| ranked > worst.0) {
-            *best.peek_mut().unwrap() = Reverse(ranked);
-        }
-    }
-    best.into_sorted_vec().into_iter().map(|Reverse((_, _, Reverse(i)))| i).collect()
+        Some((score + bonus, note.path.as_str()))
+    })
 }
 
-/// 子序列模糊匹配得分：不匹配返回 `None`。前缀 / 连续 / 词首命中加分，越长的候选略减分。
+/// 子序列匹配，命令列表等小候选集可直接调用。
 pub fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
-    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    fuzzy_score_prepared(&q, target)
-}
-
-fn fuzzy_score_prepared(q: &[char], target: &str) -> Option<i32> {
-    if q.is_empty() {
-        return Some(0);
-    }
-    let t: Vec<char> = target.chars().flat_map(char::to_lowercase).collect();
-    let mut score = 0i32;
-    let mut ti = 0usize;
-    let mut prev_hit: Option<usize> = None;
-    for &qc in q {
-        let pos = t[ti..].iter().position(|&c| c == qc)? + ti;
-        score += 10;
-        if pos == 0 {
-            score += 15;
-        } else if !t[pos - 1].is_alphanumeric() {
-            score += 8;
-        }
-        if prev_hit == Some(pos.saturating_sub(1)) && pos > 0 {
-            score += 12;
-        }
-        prev_hit = Some(pos);
-        ti = pos + 1;
-    }
-    Some(score - (t.len() as i32 / 8))
+    crate::matching::score(&crate::matching::prepare(query), &crate::matching::prepare(target))
 }
 
 impl Render for QuickOpen {
@@ -948,6 +971,7 @@ mod tests {
         });
         visual.run_until_parked();
         std::fs::write(dir.path().join("a.md"), "new").unwrap();
+        service.update(visual, |s, _| s.catalog.touch([VaultPath::new("a.md").unwrap()]));
         picker.update_in(visual, |p, window, cx| {
             assert_eq!(p.shown_paths(), ["b.md", "c.md"]);
             p.on_select_next(&crate::actions::SelectNext, window, cx);
