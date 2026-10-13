@@ -23,7 +23,7 @@ pub fn set_preview_mode(mode: LinkPreviewMode, cx: &mut App) {
 #[derive(Default)]
 pub(super) struct LinkPreview {
     pub(super) catalog: Option<Arc<crate::catalog::Catalog>>,
-    resolver: Option<Resolver>,
+    pub(super) resolver: Option<Resolver>,
     resolver_generation: u64,
     resolver_task: Option<Task<()>>,
     subscription: Option<Subscription>,
@@ -223,7 +223,7 @@ pub(super) fn fragment_range(doc: &Document, fragment: Option<&str>) -> Result<R
     Ok(if let Some(id) = fragment.and_then(|f| f.strip_prefix('^')) {
         let id = aero_core::block_refs::resolve(doc, id)?;
         let block = doc.blocks().iter().find(|(_, b)| b.id == id).unwrap().1;
-        doc.range_of(block)
+        aero_core::properties::owned_range(doc, block.id).unwrap_or_else(|| doc.range_of(block))
     } else if let Some(heading) = fragment.filter(|f| !f.is_empty()) {
         let blocks: Vec<_> = doc.blocks().iter().collect();
         let matches = |b: &Block, exact: bool| {

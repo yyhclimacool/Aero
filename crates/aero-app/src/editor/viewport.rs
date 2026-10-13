@@ -11,14 +11,14 @@ const PLAIN_UNIT_LIMIT: usize = 64;
 enum RowKey {
     Root(BlockId),
     Item(BlockId),
-    Pending,
+    Pending(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RowContent {
     Root(usize),
     ListItem { root: usize, item: usize, number: Option<u32> },
-    Pending,
+    Pending(usize),
 }
 
 struct Row {
@@ -33,7 +33,7 @@ struct Row {
 /// item's entire subtree stay intact so inherited paint and nested layout are unchanged.
 pub(super) struct Viewport {
     dirty: bool,
-    pending: Option<usize>,
+    pending: Vec<usize>,
     rows: Vec<Row>,
     prefix: Vec<Pixels>,
     unit_rows: Vec<usize>,
@@ -47,7 +47,7 @@ impl Default for Viewport {
     fn default() -> Self {
         Self {
             dirty: true,
-            pending: None,
+            pending: Vec::new(),
             rows: Vec::new(),
             prefix: vec![px(0.)],
             unit_rows: Vec::new(),
@@ -60,21 +60,20 @@ impl Default for Viewport {
 }
 
 impl Viewport {
-    fn rebuild(&mut self, doc: &Document, units: &[Unit], pending: Option<usize>) {
+    fn rebuild(&mut self, doc: &Document, units: &[Unit], pending: &[usize]) {
         let heights: HashMap<_, _> = self.rows.iter().map(|r| (r.key, r.height)).collect();
         self.rows.clear();
         self.unit_rows = vec![0; units.len()];
-        self.pending = pending;
-        let mut pending = pending;
+        self.pending = pending.to_vec();
+        let mut pending = pending.iter().copied().peekable();
         let mut unit = 0;
         for (root, block) in doc.blocks().roots.iter().enumerate() {
-            if block.kind == BlockKind::Marker {
+            if matches!(block.kind, BlockKind::Marker | BlockKind::FrontMatter) {
                 continue;
             }
             let range = doc.range_of(block);
-            if pending.is_some_and(|off| off <= range.start) {
-                self.push_pending(&heights);
-                pending = None;
+            while pending.peek().is_some_and(|off| *off <= range.start) {
+                self.push_pending(pending.next().unwrap(), &heights);
             }
             if units.len() > PLAIN_UNIT_LIMIT
                 && block.attrs.is_empty()
@@ -98,8 +97,8 @@ impl Viewport {
                 self.push_block(block, RowContent::Root(root), doc, units, &mut unit, &heights);
             }
         }
-        if pending.is_some() {
-            self.push_pending(&heights);
+        for offset in pending {
+            self.push_pending(offset, &heights);
         }
         self.rebuild_prefix();
         self.dirty = false;
@@ -136,12 +135,15 @@ impl Viewport {
         self.rows.push(Row { key, content, units: first..*unit, height, gap: px(gap) });
     }
 
-    fn push_pending(&mut self, heights: &HashMap<RowKey, Pixels>) {
+    fn push_pending(&mut self, offset: usize, heights: &HashMap<RowKey, Pixels>) {
         self.rows.push(Row {
-            key: RowKey::Pending,
-            content: RowContent::Pending,
+            key: RowKey::Pending(offset),
+            content: RowContent::Pending(offset),
             units: 0..0,
-            height: heights.get(&RowKey::Pending).copied().unwrap_or(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT)),
+            height: heights
+                .get(&RowKey::Pending(offset))
+                .copied()
+                .unwrap_or(px(BODY_FONT_SIZE * BODY_LINE_HEIGHT)),
             gap: px(GAP),
         });
     }
@@ -175,9 +177,12 @@ impl Viewport {
         };
         self.mounted.extend(first..=last);
         self.mounted.extend_from_slice(pinned);
-        if let Some(ix) = self.rows.iter().position(|r| r.key == RowKey::Pending) {
-            self.mounted.push(ix);
-        }
+        self.mounted.extend(
+            self.rows
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, r)| matches!(r.key, RowKey::Pending(_)).then_some(ix)),
+        );
         self.mounted.sort_unstable();
         self.mounted.dedup();
         for &ix in &self.mounted {
@@ -203,6 +208,30 @@ pub(super) fn structure(doc: &Document) -> Vec<(BlockId, BlockKind, aero_core::A
         .collect()
 }
 
+/// Match the actual container padding and list marker column, rather than
+/// treating every ancestor as a list level. Built only when structure changes.
+pub(super) fn gutter_reaches(doc: &Document) -> HashMap<BlockId, Pixels> {
+    fn walk(blocks: &[Block], inset: Pixels, reaches: &mut HashMap<BlockId, Pixels>) {
+        for block in blocks {
+            // The list's operation pair owns the next column outside the
+            // item handles, so the first item cannot cover the whole list.
+            let width = if matches!(block.kind, BlockKind::List { .. }) { GUTTER + 24. } else { GUTTER };
+            reaches.insert(block.id, px(width) + inset);
+            let child = if aero_core::containers::is_editable(&block.kind) {
+                px(17.) // 16pt padding plus the container's 1pt border
+            } else if matches!(block.kind, BlockKind::ListItem { .. }) {
+                px(LIST_INDENT)
+            } else {
+                px(0.)
+            };
+            walk(&block.children, inset + child, reaches);
+        }
+    }
+    let mut reaches = HashMap::new();
+    walk(&doc.blocks().roots, px(0.), &mut reaches);
+    reaches
+}
+
 impl Editor {
     /// All unit replacement sites share the selection lookup and viewport invalidation.
     pub(super) fn refresh_units(&mut self) {
@@ -222,6 +251,7 @@ impl Editor {
                 }
             }
         } else {
+            self.gutter_reaches = gutter_reaches(&self.doc);
             self.units = next;
             self.unit_indices = self.units.iter().enumerate().map(|(ix, unit)| (unit.id, ix)).collect();
             self.viewport.dirty = true;
@@ -230,7 +260,15 @@ impl Editor {
     }
 
     pub(super) fn prepare_viewport(&mut self, window: &Window) {
-        let pending = self.focused.as_ref().filter(|f| f.id.is_none()).map(|f| f.range.start);
+        let mut pending: Vec<_> = self
+            .empty_slots
+            .iter()
+            .filter(|slot| self.available_empty_slot(slot))
+            .map(|slot| slot.range.start)
+            .collect();
+        pending.extend(self.focused.as_ref().filter(|f| f.id.is_none()).map(|f| f.range.start));
+        pending.sort_unstable();
+        pending.dedup();
         if self.viewport.dirty || self.viewport.pending != pending {
             let offset = self.scroll.offset();
             let top = -offset.y - self.viewport.origin;
@@ -240,7 +278,7 @@ impl Editor {
             } else {
                 None
             };
-            self.viewport.rebuild(&self.doc, &self.units, pending);
+            self.viewport.rebuild(&self.doc, &self.units, &pending);
             if let Some((key, before)) = anchor {
                 if let Some(row) = self.viewport.rows.iter().position(|row| row.key == key) {
                     let delta = self.viewport.prefix[row] - before;
@@ -293,10 +331,23 @@ impl Editor {
             let body = match row.content {
                 RowContent::Root(root) => self.render_block(&self.doc.blocks().roots[root], 0, None, cx),
                 RowContent::ListItem { root, item, number } => {
-                    let item = &self.doc.blocks().roots[root].children[item];
-                    Some(self.render_list_item(item, number, 0, None, cx))
+                    let list = &self.doc.blocks().roots[root];
+                    let body = self.render_list_item(&list.children[item], number, 0, None, cx);
+                    // Keep the list-level entry at its first item without
+                    // mounting the entire subtree in a virtualized document.
+                    Some(if item == 0 {
+                        self.with_gutter(list.id, 0, body, cx)
+                    } else {
+                        let active = self.block_menu.as_ref().map(|menu| menu.block).or(self.hovered_block)
+                            == Some(list.id);
+                        div()
+                            .w_full()
+                            .when(active, |el| el.bg(cx.theme().list_hover.opacity(0.3)))
+                            .child(body)
+                            .into_any_element()
+                    })
                 }
-                RowContent::Pending => Some(self.render_textarea(None, cx)),
+                RowContent::Pending(offset) => Some(self.render_empty_slot(offset, cx)),
             };
             if plain {
                 if let Some(body) = body {
@@ -401,7 +452,7 @@ mod tests {
         let doc = Document::from_text(&source);
         let units = units::units(&doc);
         let mut viewport = Viewport::default();
-        viewport.rebuild(&doc, &units, None);
+        viewport.rebuild(&doc, &units, &[]);
         assert_eq!(viewport.rows.len(), 75);
         assert_eq!(&viewport.unit_rows[..6], [0, 1, 1, 2, 3, 4]);
         assert_eq!(viewport.rows[1].units, 1..3, "nested content stays in its outer item row");
@@ -427,13 +478,13 @@ mod tests {
         let doc = Document::from_text(&styled);
         assert!(!doc.blocks().roots[0].attrs.is_empty());
         let mut viewport = Viewport::default();
-        viewport.rebuild(&doc, &units::units(&doc), None);
+        viewport.rebuild(&doc, &units::units(&doc), &[]);
         assert_eq!(viewport.rows[0].content, RowContent::Root(0));
         assert_eq!(viewport.rows[0].units, 0..2);
 
         let nested = format!("- outer\n{}- next\n", "  - nested\n".repeat(1000));
         let doc = Document::from_text(&nested);
-        viewport.rebuild(&doc, &units::units(&doc), None);
+        viewport.rebuild(&doc, &units::units(&doc), &[]);
         assert_eq!(viewport.rows.len(), 2, "never split inside an item container");
         assert_eq!(viewport.rows[0].units, 0..1001);
         assert_eq!(viewport.rows[1].content, RowContent::ListItem { root: 0, item: 1, number: None });
@@ -445,7 +496,7 @@ mod tests {
         let source = (0..80).map(|i| format!("7. Item {i}.\n")).collect::<String>();
         let mut doc = Document::from_text(&source);
         let mut viewport = Viewport::default();
-        viewport.rebuild(&doc, &units::units(&doc), None);
+        viewport.rebuild(&doc, &units::units(&doc), &[]);
         assert_eq!(viewport.rows.len(), 80);
         for (i, row) in viewport.rows.iter_mut().enumerate() {
             row.height = px(40. + i as f32);
@@ -456,7 +507,7 @@ mod tests {
         for edit in [Edit::insert(0, inserted), Edit::delete(0..inserted.len())] {
             doc.edit(edit).unwrap();
             doc.reparse();
-            viewport.rebuild(&doc, &units::units(&doc), None);
+            viewport.rebuild(&doc, &units::units(&doc), &[]);
             for row in &viewport.rows {
                 if let Some(height) = heights.get(&row.key) {
                     assert_eq!(&row.height, height);
@@ -473,7 +524,7 @@ mod tests {
         let text = doc.slice(range.clone()).to_string();
         doc.edit_group(vec![Edit::delete(range), Edit::insert(0, text)]).unwrap();
         doc.reparse();
-        viewport.rebuild(&doc, &units::units(&doc), None);
+        viewport.rebuild(&doc, &units::units(&doc), &[]);
         assert_eq!(viewport.rows[0].key, key);
         for (i, row) in viewport.rows.iter().enumerate() {
             assert_eq!(row.height, heights[&row.key]);
@@ -488,12 +539,12 @@ mod tests {
     fn measured_root_heights_survive_edits() {
         let mut doc = Document::from_text("First paragraph.\n\nSecond paragraph.\n");
         let mut viewport = Viewport::default();
-        viewport.rebuild(&doc, &units::units(&doc), None);
+        viewport.rebuild(&doc, &units::units(&doc), &[]);
         viewport.rows[0].height = px(142.);
         viewport.rows[1].height = px(76.);
         doc.edit(Edit::insert(5, " edited")).unwrap();
         doc.reparse();
-        viewport.rebuild(&doc, &units::units(&doc), None);
+        viewport.rebuild(&doc, &units::units(&doc), &[]);
         assert_eq!(viewport.rows[0].height, px(142.));
         assert_eq!(viewport.rows[1].height, px(76.));
         assert_eq!(viewport.prefix, [px(0.), px(150.), px(226.)]);
@@ -504,7 +555,7 @@ mod tests {
         let doc = Document::from_text("Before.\n\n^before\n\n- outer\n  - nested\n- next\n\nAfter.\n");
         let units = units::units(&doc);
         let mut viewport = Viewport::default();
-        viewport.rebuild(&doc, &units, None);
+        viewport.rebuild(&doc, &units, &[]);
         assert_eq!(viewport.rows.len(), 3);
         assert_eq!(viewport.rows[1].units, 1..4);
         assert_eq!(viewport.unit_rows, [0, 1, 1, 1, 2]);

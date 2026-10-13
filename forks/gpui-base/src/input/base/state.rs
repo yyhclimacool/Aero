@@ -33,8 +33,8 @@ use super::{
 };
 use crate::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
 use crate::input::blink_cursor::CURSOR_WIDTH;
-use crate::input::movement::MoveDirection;
 use crate::input::display_map::FontOverride;
+use crate::input::movement::MoveDirection;
 use crate::input::{InputExtras as _, Position, RopeExt as _, element::RIGHT_MARGIN, layout::LastLayout};
 use crate::{AutoScroll, StepAction};
 
@@ -328,17 +328,19 @@ impl Markup {
     /// The font changes the wrapper has to measure with, so a line breaks where its styled
     /// glyphs actually run out of room.
     fn font_overrides(&self) -> Vec<(Range<usize>, FontOverride)> {
-        let styles = self.styles.iter().filter(|(_, style)| style.font_weight.is_some() || style.font_style.is_some());
+        let styles =
+            self.styles.iter().filter(|(_, style)| style.font_weight.is_some() || style.font_style.is_some());
         let mut out: Vec<_> = styles
             .map(|(range, style)| {
-                (range.clone(), FontOverride { weight: style.font_weight, style: style.font_style, family: None })
+                (
+                    range.clone(),
+                    FontOverride { weight: style.font_weight, style: style.font_style, family: None },
+                )
             })
             .collect();
-        out.extend(
-            self.fonts
-                .iter()
-                .map(|(range, family)| (range.clone(), FontOverride { family: Some(family.clone()), ..Default::default() })),
-        );
+        out.extend(self.fonts.iter().map(|(range, family)| {
+            (range.clone(), FontOverride { family: Some(family.clone()), ..Default::default() })
+        }));
         out
     }
 }
@@ -396,6 +398,7 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) disabled: bool,
     pub(crate) readonly: bool,
     pub(crate) text_align: TextAlign,
+    pub(crate) justify: bool,
     pub(super) masked: bool,
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
@@ -649,12 +652,20 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub fn set_text_align(&mut self, text_align: TextAlign, cx: &mut Context<Self>) {
-        if !self.is_single_line() || self.text_align == text_align {
+        if self.text_align == text_align {
             return;
         }
 
         self.text_align = text_align;
         cx.notify();
+    }
+
+    /// Justify automatic wraps through the same shaped glyphs used for hit testing.
+    pub fn set_justify(&mut self, justify: bool, cx: &mut Context<Self>) {
+        if self.justify != justify {
+            self.justify = justify;
+            cx.notify();
+        }
     }
 
     /// Flip the password mask.
@@ -735,6 +746,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             disabled: false,
             readonly: false,
             text_align: TextAlign::Left,
+            justify: false,
             masked: false,
             clean_on_escape: false,
             submit_on_enter: false,
@@ -3005,7 +3017,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub(super) fn previous_visible_boundary(&self, offset: usize) -> usize {
         let mut at = offset;
         loop {
-            if let Some(range) = self.markup.hard_breaks.iter().find(|range| range.start < at && at <= range.end) {
+            if let Some(range) =
+                self.markup.hard_breaks.iter().find(|range| range.start < at && at <= range.end)
+            {
                 return range.start;
             }
             let prev = self.previous_boundary(at);
@@ -4177,28 +4191,33 @@ mod tests {
     #[gpui::test]
     fn hard_breaks_are_atomic_arrow_stops(cx: &mut TestAppContext) {
         let view = InputView::build_textarea(cx, |state| state);
-        view.window_handle.update(cx, |_, window, cx| {
-            view.input.update(cx, |state, cx| {
-                state.set_value("甲<br><br>乙<br>", window, cx);
-                state.set_markup(Markup {
-                    conceal: vec![3..11, 14..18],
-                    hard_breaks: vec![3..7, 7..11, 14..18],
-                    ..Default::default()
-                }, cx);
-                let stops = [0, 3, 7, 11, 14, 18];
-                for pair in stops.windows(2) {
-                    assert_eq!(state.next_visible_boundary(pair[0]), pair[1]);
-                    assert_eq!(state.previous_visible_boundary(pair[1]), pair[0]);
-                }
-                for (inside, before, after) in [(4, 3, 7), (8, 7, 11), (15, 14, 18)] {
-                    assert_eq!(state.previous_visible_boundary(inside), before);
-                    assert_eq!(state.next_visible_boundary(inside), after);
-                }
-                assert_eq!(state.previous_visible_boundary(0), 0);
-                assert_eq!(state.next_visible_boundary(18), 18);
-                assert_eq!(state.text.to_string(), "甲<br><br>乙<br>");
-            });
-        }).unwrap();
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.set_value("甲<br><br>乙<br>", window, cx);
+                    state.set_markup(
+                        Markup {
+                            conceal: vec![3..11, 14..18],
+                            hard_breaks: vec![3..7, 7..11, 14..18],
+                            ..Default::default()
+                        },
+                        cx,
+                    );
+                    let stops = [0, 3, 7, 11, 14, 18];
+                    for pair in stops.windows(2) {
+                        assert_eq!(state.next_visible_boundary(pair[0]), pair[1]);
+                        assert_eq!(state.previous_visible_boundary(pair[1]), pair[0]);
+                    }
+                    for (inside, before, after) in [(4, 3, 7), (8, 7, 11), (15, 14, 18)] {
+                        assert_eq!(state.previous_visible_boundary(inside), before);
+                        assert_eq!(state.next_visible_boundary(inside), after);
+                    }
+                    assert_eq!(state.previous_visible_boundary(0), 0);
+                    assert_eq!(state.next_visible_boundary(18), 18);
+                    assert_eq!(state.text.to_string(), "甲<br><br>乙<br>");
+                });
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -4209,11 +4228,14 @@ mod tests {
         cx.update(|window, cx| {
             view.input.update(cx, |state, cx| {
                 state.set_value("甲<br><br>乙<br>", window, cx);
-                state.set_markup(Markup {
-                    conceal: vec![3..11, 14..18],
-                    hard_breaks: vec![3..7, 7..11, 14..18],
-                    ..Default::default()
-                }, cx);
+                state.set_markup(
+                    Markup {
+                        conceal: vec![3..11, 14..18],
+                        hard_breaks: vec![3..7, 7..11, 14..18],
+                        ..Default::default()
+                    },
+                    cx,
+                );
             });
         });
         cx.run_until_parked();
@@ -4221,25 +4243,44 @@ mod tests {
             assert_eq!(state.display_map.display_row_count(), 4);
             let layout = state.last_layout.as_ref().unwrap();
             let line = layout.line(0).unwrap();
-            assert_eq!(line.wrapped_lines.iter().map(|l| l.text.as_ref()).collect::<Vec<_>>(), ["甲", "", "乙", ""]);
+            assert_eq!(
+                line.wrapped_lines.iter().map(|l| l.text.as_ref()).collect::<Vec<_>>(),
+                ["甲", "", "乙", ""]
+            );
             for (row, expected) in [3, 7, 14, 18].into_iter().enumerate() {
-                let (offset, affinity) = line.closest_index_for_position(
-                    point(px(999.), layout.line_height * (row as f32 + 0.5)), layout,
-                ).unwrap();
+                let (offset, affinity) = line
+                    .closest_index_for_position(
+                        point(px(999.), layout.line_height * (row as f32 + 0.5)),
+                        layout,
+                    )
+                    .unwrap();
                 assert_eq!(offset, expected);
-                assert_eq!(line.position_for_index(offset, layout, affinity).unwrap().y, layout.line_height * row);
-                assert_eq!(state.display_map.offset_to_wrap_display_point_with_affinity(offset, affinity).row, row);
+                assert_eq!(
+                    line.position_for_index(offset, layout, affinity).unwrap().y,
+                    layout.line_height * row
+                );
+                assert_eq!(
+                    state.display_map.offset_to_wrap_display_point_with_affinity(offset, affinity).row,
+                    row
+                );
             }
             for (offset, row) in [(0, 0), (3, 0), (7, 1), (11, 2), (14, 2), (18, 3)] {
                 for affinity in [false, true] {
-                    assert_eq!(line.position_for_index(offset, layout, affinity).unwrap().y, layout.line_height * row);
+                    assert_eq!(
+                        line.position_for_index(offset, layout, affinity).unwrap().y,
+                        layout.line_height * row
+                    );
                 }
             }
-            for (from, to, direction) in [(3, 7, 1), (7, 14, 1), (14, 18, 1), (18, 14, -1), (14, 7, -1), (7, 3, -1)] {
+            for (from, to, direction) in
+                [(3, 7, 1), (7, 14, 1), (14, 18, 1), (18, 14, -1), (14, 7, -1), (7, 3, -1)]
+            {
                 let (offset, affinity) = state.vertical_target(from, Some((px(999.), 0)), false, direction);
                 assert_eq!(offset, to);
-                assert_eq!(line.position_for_index(offset, layout, affinity).unwrap().y,
-                    line.position_for_index(to, layout, false).unwrap().y);
+                assert_eq!(
+                    line.position_for_index(offset, layout, affinity).unwrap().y,
+                    line.position_for_index(to, layout, false).unwrap().y
+                );
             }
             assert_eq!(state.text.to_string(), "甲<br><br>乙<br>");
         });
@@ -4252,25 +4293,40 @@ mod tests {
         cx.update(|window, cx| {
             view.input.update(cx, |state, cx| {
                 state.set_value("**<br><br>甲**", window, cx);
-                state.set_markup(Markup {
-                    conceal: vec![0..10, 13..15],
-                    hard_breaks: vec![2..6, 6..10],
-                    ..Default::default()
-                }, cx);
+                state.set_markup(
+                    Markup {
+                        conceal: vec![0..10, 13..15],
+                        hard_breaks: vec![2..6, 6..10],
+                        ..Default::default()
+                    },
+                    cx,
+                );
             });
         });
         cx.run_until_parked();
         view.input.read_with(&cx, |state, _| {
             let layout = state.last_layout.as_ref().unwrap();
             let line = layout.line(0).unwrap();
-            assert_eq!(line.wrapped_lines.iter().map(|l| l.text.as_ref()).collect::<Vec<_>>(), ["", "", "甲"]);
+            assert_eq!(
+                line.wrapped_lines.iter().map(|l| l.text.as_ref()).collect::<Vec<_>>(),
+                ["", "", "甲"]
+            );
             for (row, expected) in [2, 6, 13].into_iter().enumerate() {
-                let (offset, affinity) = line.closest_index_for_position(
-                    point(px(999.), layout.line_height * (row as f32 + 0.5)), layout,
-                ).unwrap();
+                let (offset, affinity) = line
+                    .closest_index_for_position(
+                        point(px(999.), layout.line_height * (row as f32 + 0.5)),
+                        layout,
+                    )
+                    .unwrap();
                 assert_eq!(offset, expected);
-                assert_eq!(line.position_for_index(offset, layout, affinity).unwrap().y, layout.line_height * row);
-                assert_eq!(state.display_map.offset_to_wrap_display_point_with_affinity(offset, affinity).row, row);
+                assert_eq!(
+                    line.position_for_index(offset, layout, affinity).unwrap().y,
+                    layout.line_height * row
+                );
+                assert_eq!(
+                    state.display_map.offset_to_wrap_display_point_with_affinity(offset, affinity).row,
+                    row
+                );
             }
         });
     }
@@ -4282,11 +4338,14 @@ mod tests {
         cx.update(|window, cx| {
             view.input.update(cx, |state, cx| {
                 state.set_value("甲<br><br>乙<br>", window, cx);
-                state.set_markup(Markup {
-                    conceal: vec![3..11, 14..18],
-                    hard_breaks: vec![3..7, 7..11, 14..18],
-                    ..Default::default()
-                }, cx);
+                state.set_markup(
+                    Markup {
+                        conceal: vec![3..11, 14..18],
+                        hard_breaks: vec![3..7, 7..11, 14..18],
+                        ..Default::default()
+                    },
+                    cx,
+                );
             });
         });
         cx.run_until_parked();
@@ -4311,11 +4370,14 @@ mod tests {
             view.input.update(cx, |state, cx| {
                 let source = format!("  {}<br>  {}<br>", "甲".repeat(20), "乙".repeat(20));
                 state.set_value(source, window, cx);
-                state.set_markup(Markup {
-                    conceal: vec![62..66, 128..132],
-                    hard_breaks: vec![62..66, 128..132],
-                    ..Default::default()
-                }, cx);
+                state.set_markup(
+                    Markup {
+                        conceal: vec![62..66, 128..132],
+                        hard_breaks: vec![62..66, 128..132],
+                        ..Default::default()
+                    },
+                    cx,
+                );
             });
         });
         cx.run_until_parked();

@@ -17,6 +17,8 @@ use crate::meta::{Meta, NoteRow};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexerError {
+    #[error("文档身份冲突: {0}")]
+    Identity(String),
     #[error(transparent)]
     Index(#[from] IndexError),
     #[error("metadata db: {0}")]
@@ -101,12 +103,16 @@ const FTS_VERSION: i64 = 5;
 struct LinkUniverse {
     resolver: Resolver,
     id_by_path: HashMap<String, String>,
+    identities: HashMap<VaultPath, Vec<String>>,
 }
 
 impl LinkUniverse {
     fn from_rows(rows: Vec<NoteRow>) -> Self {
-        let mut u =
-            LinkUniverse { resolver: Resolver::new(), id_by_path: HashMap::with_capacity(rows.len()) };
+        let mut u = LinkUniverse {
+            resolver: Resolver::new(),
+            id_by_path: HashMap::with_capacity(rows.len()),
+            identities: HashMap::new(),
+        };
         for row in rows {
             if let Ok(path) = VaultPath::new(&row.path) {
                 u.insert(path, &row.note_id, Some(&row.title), &row.aliases);
@@ -123,7 +129,19 @@ impl LinkUniverse {
 
     fn remove(&mut self, path: &VaultPath) {
         self.id_by_path.remove(path.as_str());
+        self.identities.remove(path);
         self.resolver.remove(path);
+    }
+
+    fn register_identity(&mut self, path: &VaultPath, doc: &aero_core::Document) -> bool {
+        let mut keys: Vec<_> = aero_core::identity::read(doc).ok().and_then(|m| m.id).into_iter().collect();
+        for (_, block) in doc.blocks().iter() {
+            keys.extend(block.persisted_id.iter().map(|id| id.to_string()));
+            keys.extend(aero_core::block_refs::aliases(block).map(str::to_owned));
+        }
+        keys.sort();
+        self.resolver.register_identity(path, doc);
+        self.identities.insert(path.clone(), keys.clone()).as_ref() != Some(&keys)
     }
 
     /// 解析到的目标的 `note_id`；歧义 / 不存在都是 None。
@@ -493,12 +511,39 @@ impl Indexer {
         stamp: FileStamp,
     ) -> Result<usize, IndexerError> {
         let existing = self.meta.note_by_path(path.as_str())?;
-        let note_id = match &existing {
-            Some(r) => r.note_id.clone(),
-            None => {
+        let formal = aero_core::identity::read(doc).map_err(IndexerError::Identity)?.id;
+        if let Some(id) = &formal
+            && let Some(owner) = self.meta.note_by_id(id)?
+            && owner.path != path.as_str()
+            && self.vault.exists(&VaultPath::new(&owner.path)?)
+        {
+            self.universe()?.resolver.insert(
+                path.clone(),
+                Some(&doc.title_or(path.stem())),
+                &doc.front_matter_aliases(),
+            );
+            self.universe()?.register_identity(path, doc);
+            self.flush_link_batch()?;
+            self.meta.unresolve_identity_links()?;
+            return Err(IndexerError::Identity(format!("{id} 同时出现在 {} 和 {path}", owner.path)));
+        }
+        let note_id = match (formal, &existing) {
+            (Some(id), _) => id,
+            (None, Some(r)) => r.note_id.clone(),
+            (None, None) => {
                 self.preassigned.remove(path.as_str()).unwrap_or_else(|| ulid::Ulid::generate().to_string())
             }
         };
+        if let Some(old) = &existing
+            && old.note_id != note_id
+        {
+            self.flush_link_batch()?;
+            self.meta.unresolve_incoming(&old.note_id)?;
+            self.fts.delete(
+                &(0..old.block_count).map(|ord| IndexBlock::pk_of(&old.note_id, ord)).collect::<Vec<_>>(),
+            )?;
+            self.meta.remove_note(&old.note_id)?;
+        }
         let old_count = existing.as_ref().map_or(0, |r| r.block_count);
         let title = doc.title_or(path.stem());
         let (blocks, spans) = blocks_and_links_for_note(doc, &note_id, path.as_str(), &title);
@@ -540,6 +585,10 @@ impl Indexer {
             );
         }
         self.universe()?.insert(path.clone(), &note_id, Some(&title), &aliases);
+        if self.universe()?.register_identity(path, doc) {
+            self.flush_link_batch()?;
+            self.meta.unresolve_identity_links()?;
+        }
         // 同篇锚点 `[[#h]]` 不是笔记间关系，不进表
         let universe = self.links.as_ref().expect("universe built above");
         let rows: Vec<LinkRow> = spans
@@ -671,11 +720,14 @@ impl Indexer {
         for path in self.vault.notes()? {
             if !resolver.contains(&path) || self.preassigned.contains_key(path.as_str()) {
                 match self.vault.read(&path) {
-                    Ok((doc, _)) => resolver.insert(
-                        path.clone(),
-                        Some(&doc.title_or(path.stem())),
-                        &doc.front_matter_aliases(),
-                    ),
+                    Ok((doc, _)) => {
+                        resolver.insert(
+                            path.clone(),
+                            Some(&doc.title_or(path.stem())),
+                            &doc.front_matter_aliases(),
+                        );
+                        resolver.register_identity(&path, &doc);
+                    }
                     Err(_) => resolver.insert(path, None, &[]),
                 }
             }
@@ -685,7 +737,15 @@ impl Indexer {
 
     fn universe(&mut self) -> Result<&mut LinkUniverse, IndexerError> {
         if self.links.is_none() {
-            self.links = Some(LinkUniverse::from_rows(self.meta.all_notes()?));
+            let rows = self.meta.all_notes()?;
+            let mut universe = LinkUniverse::from_rows(rows.clone());
+            for row in rows {
+                let path = VaultPath::new(&row.path)?;
+                if let Ok((doc, _)) = self.vault.read(&path) {
+                    universe.register_identity(&path, &doc);
+                }
+            }
+            self.links = Some(universe);
         }
         Ok(self.links.as_mut().expect("just built"))
     }
@@ -872,6 +932,32 @@ impl Indexer {
 mod tests {
     use super::*;
     use aero_core::index::MemoryFullTextIndex;
+
+    #[test]
+    fn identity_links_and_backlinks_follow_a_block_move_and_rebuild() {
+        let a = aero_core::identity::new_document_id();
+        let b = aero_core::identity::new_document_id();
+        let block = aero_core::identity::new_block_id();
+        let text = |id: &str, body: &str| format!("---\naero:\n  id: {id}\n---\n\n{body}\n");
+        let (dir, mut ix) = setup(&[
+            ("a.md", &text(&a, &format!("source ^{block}"))),
+            ("b.md", &text(&b, "destination")),
+            ("ref.md", &format!("[[id:{a}#^{block}|ref]]\n")),
+        ]);
+        assert!(ix.sync_all(|_, _| {}).errors.is_empty());
+        assert_eq!(ix.meta.links_rows().unwrap()[0].1.as_deref(), Some(a.as_str()));
+        std::fs::write(dir.path().join("a.md"), text(&a, "remaining")).unwrap();
+        std::fs::write(dir.path().join("b.md"), text(&b, &format!("moved ^{block}"))).unwrap();
+        ix.refresh_note(&VaultPath::new("a.md").unwrap()).unwrap();
+        ix.refresh_note(&VaultPath::new("b.md").unwrap()).unwrap();
+        assert_eq!(ix.meta.links_rows().unwrap()[0].1.as_deref(), Some(b.as_str()));
+        assert!(ix.rebuild(|_, _| {}).unwrap().errors.is_empty());
+        assert_eq!(ix.meta.links_rows().unwrap()[0].1.as_deref(), Some(b.as_str()));
+        assert!(
+            matches!(ix.link_resolver().unwrap().resolve(&format!("id:{a}"), Some(&format!("^{block}")), ""),
+            Resolution::Resolved { path, .. } if path.as_str() == "b.md")
+        );
+    }
 
     fn setup(files: &[(&str, &str)]) -> (tempfile::TempDir, Indexer) {
         let dir = tempfile::tempdir().unwrap();

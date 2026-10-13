@@ -169,6 +169,13 @@ impl Meta {
         rows.collect()
     }
 
+    pub fn note_by_id(&self, id: &str) -> rusqlite::Result<Option<NoteRow>> {
+        self.conn.query_row(
+            "SELECT note_id, path, title, mtime_ns, size, hash, block_count, aliases FROM notes WHERE note_id = ?1",
+            params![id], row_to_note,
+        ).optional()
+    }
+
     pub fn upsert_note(&self, row: &NoteRow) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT INTO notes (note_id, path, title, mtime_ns, size, hash, block_count, aliases)
@@ -358,6 +365,10 @@ impl Meta {
     pub fn unresolve_incoming(&mut self, note_id: &str) -> rusqlite::Result<usize> {
         self.conn
             .execute("UPDATE links SET resolved_note_id = NULL WHERE resolved_note_id = ?1", params![note_id])
+    }
+
+    pub fn unresolve_identity_links(&mut self) -> rusqlite::Result<usize> {
+        self.conn.execute("UPDATE links SET resolved_note_id = NULL WHERE target LIKE 'id:%'", [])
     }
 
     /// 还没解析到目标的行：`(源 note_id, 源路径, target, fragment, byte_start)`。

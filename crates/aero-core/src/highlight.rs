@@ -275,7 +275,7 @@ fn classes(attrs: &crate::block::Attrs) -> String {
     let mut out = Vec::new();
     for slot in [colors::Slot::Text, colors::Slot::Background] {
         if let Some(color) = slot.color_of(attrs) {
-            out.push(slot.class(color));
+            out.push(slot.class(&colors::normalize_custom(color).unwrap_or_else(|| color.into())));
         }
     }
     out.join(" ")

@@ -45,6 +45,129 @@ pub struct Plan {
     pub selection: Range<usize>,
 }
 
+/// Split visible inline text without leaving either paragraph with an unpaired
+/// delimiter. Only wrappers crossing the caret are rebuilt; all other source
+/// bytes, including link destinations and inline attributes, stay intact.
+pub fn split_at(src: &str, cursor: usize) -> (String, String) {
+    let arena = Arena::new();
+    let root = parse_document(&arena, src, &parse::comrak_options());
+    let positions = SourceMap::new(src);
+    let mut wrappers = Vec::new();
+    for node in root.descendants() {
+        let Some(mut outer) = positions.range(node) else { continue };
+        if let Some((_, end)) = crate::colors::attrs_at(src, outer.end) {
+            outer.end = end;
+        }
+        let data = node.data();
+        let code = matches!(data.value, NodeValue::Code(_));
+        let body = if code {
+            let raw = &src[outer.clone()];
+            let width = raw.bytes().take_while(|&b| b == b'`').count();
+            if width == 0 {
+                continue;
+            }
+            let mut end = width;
+            while end < raw.len() {
+                if raw.as_bytes()[end] != b'`' {
+                    end += 1;
+                    continue;
+                }
+                let run = raw[end..].bytes().take_while(|&b| b == b'`').count();
+                if run == width {
+                    break;
+                }
+                end += run;
+            }
+            let mut body = outer.start + width..outer.start + end;
+            let raw_body = &src[body.clone()];
+            if raw_body.starts_with(' ') && raw_body.ends_with(' ') && !raw_body.chars().all(|c| c == ' ') {
+                body.start += 1;
+                body.end -= 1;
+            }
+            body
+        } else if matches!(
+            data.value,
+            NodeValue::Strong
+                | NodeValue::Emph
+                | NodeValue::Strikethrough
+                | NodeValue::Highlight
+                | NodeValue::Insert
+                | NodeValue::Superscript
+                | NodeValue::Link(_)
+        ) {
+            let Some(body) = node
+                .first_child()
+                .and_then(|n| positions.range(n))
+                .zip(node.last_child().and_then(|n| positions.range(n)))
+                .map(|(first, last)| first.start..last.end)
+            else {
+                continue;
+            };
+            // Autolinks have no separable label/destination syntax.
+            if matches!(data.value, NodeValue::Link(_)) && !src[outer.clone()].starts_with('[') {
+                continue;
+            }
+            body
+        } else {
+            continue;
+        };
+        if outer.start <= body.start && body.end <= outer.end {
+            wrappers.push((outer, body, code));
+        }
+    }
+    fn divide(
+        src: &str,
+        range: Range<usize>,
+        cursor: usize,
+        wrappers: &[(Range<usize>, Range<usize>, bool)],
+    ) -> (String, String) {
+        if let Some((outer, body, code)) = wrappers.iter().find(|(outer, body, _)| {
+            range.start <= outer.start
+                && outer.end <= range.end
+                && outer.start < cursor
+                && cursor < outer.end
+                && body.start <= cursor
+                && cursor <= body.end
+                && *body != range
+        }) {
+            let (left, right) = divide(src, body.clone(), cursor, wrappers);
+            let wrap = |part: &str| {
+                if part.is_empty() {
+                    return String::new();
+                }
+                if *code {
+                    let raw = &src[outer.clone()];
+                    let width = raw.bytes().take_while(|&b| b == b'`').count();
+                    let marker = &raw[..width];
+                    // Strip the old padding, then choose padding for each half.
+                    let suffix = &src[body.end..outer.end];
+                    let suffix = suffix.strip_prefix(' ').unwrap_or(suffix);
+                    let pad = part.starts_with('`')
+                        || part.ends_with('`')
+                        || (part.starts_with(' ') && part.ends_with(' ') && !part.trim().is_empty());
+                    let padding = if pad { " " } else { "" };
+                    format!("{marker}{padding}{part}{padding}{suffix}")
+                } else {
+                    format!("{}{part}{}", &src[outer.start..body.start], &src[body.end..outer.end])
+                }
+            };
+            return (
+                format!("{}{}", &src[range.start..outer.start], wrap(&left)),
+                format!("{}{}", wrap(&right), &src[outer.end..range.end]),
+            );
+        }
+        (
+            src[range.start..cursor].trim_end_matches([' ', '\t']).to_owned(),
+            src[cursor..range.end].trim_start_matches([' ', '\t']).to_owned(),
+        )
+    }
+    let mut cursor = cursor.min(src.len());
+    while !src.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    divide(src, 0..src.len(), cursor, &wrappers)
+}
+
 /// 选区已经带着的行内格式，按 [`Format`] 的固定顺序返回（选区浮动工具条的按下态，UI 设计 5.9）。
 ///
 /// 判定是"选区落在这种格式的元素里"，恰好覆盖元素或只选中其中一段都算。
@@ -244,6 +367,33 @@ pub fn plan(src: &str, mut selection: Range<usize>, format: Format) -> Option<Pl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_balances_nested_formatting_links_and_inline_attributes() {
+        for (source, needle, expected) in [
+            ("前 **中文😀** 后", "😀", ("前 **中文**", "**😀** 后")),
+            ("***abcd***", "cd", ("***ab***", "***cd***")),
+            ("__ab cd__", " cd", ("__ab__", "__cd__")),
+            ("~~ab cd~~", " cd", ("~~ab~~", "~~cd~~")),
+            ("==ab cd==", " cd", ("==ab==", "==cd==")),
+            ("**ab *cd ef* gh**", " ef", ("**ab *cd***", "***ef* gh**")),
+            (
+                "[**ab cd**](https://example.test \"标题\")",
+                " cd",
+                ("[**ab**](https://example.test \"标题\")", "[**cd**](https://example.test \"标题\")"),
+            ),
+            ("前 **ab cd**{.red} 后", " cd", ("前 **ab**{.red}", "**cd**{.red} 后")),
+            ("`ab cd`", " cd", ("`ab`", "`cd`")),
+            ("`` a`b ``{.red}", "`b", ("``a``{.red}", "`` `b ``{.red}")),
+            ("前 **ab** 后", "ab", ("前 ", "**ab** 后")),
+            ("前 **ab** 后", "** 后", ("前 **ab**", " 后")),
+        ] {
+            let at = source.find(needle).unwrap();
+            assert_eq!(split_at(source, at), (expected.0.into(), expected.1.into()), "{source}");
+        }
+        // Escaped and unmatched delimiters remain ordinary source text.
+        assert_eq!(split_at(r"a \**bc", 5), (r"a \**".into(), "bc".into()));
+    }
 
     fn apply(src: &str, chosen: &str, format: Format) -> (String, Range<usize>) {
         let at = src.find(chosen).unwrap();

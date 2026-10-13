@@ -14,6 +14,7 @@ pub(crate) struct Snapshot {
     pub resolver: Resolver,
     pub folders: Vec<VaultPath>,
     pub attachments: aero_core::attachments::Catalog,
+    pub relations: Vec<aero_core::relations::Note>,
 }
 
 struct State {
@@ -91,13 +92,24 @@ impl Catalog {
                 dirty.iter().filter(|p| p.is_note()).cloned().collect()
             };
             let mut stamps = previous.as_ref().map_or_else(BTreeMap::new, |s| s.stamps.clone());
+            let mut relations: BTreeMap<_, _> = previous.as_ref().map_or_else(BTreeMap::new, |s| {
+                s.relations.iter().cloned().map(|note| (note.path.clone(), note)).collect()
+            });
             let mut membership_changed = false;
+            let mut resolver = previous.as_ref().map_or_else(Resolver::new, |s| s.resolver.clone());
+            if full {
+                for path in stamps.keys().filter(|path| !notes.contains_key(*path)) {
+                    resolver.remove(path);
+                }
+            }
             for path in paths {
                 if visible.as_ref().is_some_and(|visible| !visible.contains(&path))
                     || !self.vault.exists(&path)
                 {
                     membership_changed |= notes.remove(&path).is_some();
                     stamps.remove(&path);
+                    relations.remove(&path);
+                    resolver.remove(&path);
                     continue;
                 }
                 let stamp = self.vault.stat(&path).ok();
@@ -112,8 +124,30 @@ impl Catalog {
                     stamps.insert(path.clone(), stamp);
                 }
                 let note = match self.vault.read(&path) {
-                    Ok((doc, _)) => NoteSummary::from_document(path.clone(), &doc),
+                    Ok((doc, _)) => {
+                        let note = NoteSummary::from_document(path.clone(), &doc);
+                        resolver.insert(path.clone(), Some(&note.title), &note.aliases);
+                        resolver.register_identity(&path, &doc);
+                        relations.insert(
+                            path.clone(),
+                            aero_core::relations::Note {
+                                path: path.clone(),
+                                title: note.title.clone(),
+                                metadata: aero_core::identity::read(&doc),
+                            },
+                        );
+                        note
+                    }
                     Err(_) => {
+                        resolver.remove(&path);
+                        relations.insert(
+                            path.clone(),
+                            aero_core::relations::Note {
+                                path: path.clone(),
+                                title: path.stem().into(),
+                                metadata: Err("无法读取文件".into()),
+                            },
+                        );
                         NoteSummary { title: path.stem().into(), path: path.clone(), aliases: Vec::new() }
                     }
                 };
@@ -131,14 +165,16 @@ impl Catalog {
                 previous.as_ref().map_or_else(Default::default, |s| s.attachments.clone())
             };
             stamps.retain(|path, _| notes.contains_key(path));
+            relations.retain(|path, _| notes.contains_key(path));
             let notes: Vec<_> = notes.into_values().collect();
             let prepared = Arc::new(previous.as_ref().map_or_else(
                 || crate::matching::Notes::new(&notes),
                 |previous| crate::matching::Notes::reuse(&notes, &previous.notes, &previous.prepared),
             ));
-            let mut resolver = Resolver::new();
             for note in &notes {
-                resolver.insert(note.path.clone(), Some(&note.title), &note.aliases);
+                if !resolver.contains(&note.path) {
+                    resolver.insert(note.path.clone(), Some(&note.title), &note.aliases);
+                }
             }
             let snapshot = Arc::new(Snapshot {
                 version,
@@ -148,6 +184,7 @@ impl Catalog {
                 resolver,
                 folders,
                 attachments,
+                relations: relations.into_values().collect(),
             });
             let mut state = self.state.lock().unwrap();
             if state.version != version {

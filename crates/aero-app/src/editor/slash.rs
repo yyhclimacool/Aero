@@ -14,6 +14,9 @@ pub enum SlashAction {
     InsertDate,
     /// 打开颜色菜单（7.7）
     OpenColors,
+    Emoji,
+    ChildDocument,
+    SyncReference,
     /// 直接给当前块上色：`color_menu` 的条目编号
     Color(usize),
 }
@@ -109,6 +112,45 @@ pub const ITEMS: &[SlashItem] = &[
         keywords: &["date", "today", "jtrq", "rq"],
         action: SlashAction::InsertDate,
     },
+    SlashItem {
+        label: "标题 4",
+        hint: "H4",
+        keywords: &["h4", "bt4"],
+        action: SlashAction::Convert(BlockType::Heading(4)),
+    },
+    SlashItem {
+        label: "标题 5",
+        hint: "H5",
+        keywords: &["h5", "bt5"],
+        action: SlashAction::Convert(BlockType::Heading(5)),
+    },
+    SlashItem {
+        label: "标题 6",
+        hint: "H6",
+        keywords: &["h6", "bt6"],
+        action: SlashAction::Convert(BlockType::Heading(6)),
+    },
+    SlashItem {
+        label: "高亮块",
+        hint: "容器",
+        keywords: &["highlight", "glk"],
+        action: SlashAction::Convert(BlockType::Highlight),
+    },
+    SlashItem {
+        label: "表情", hint: "系统字符面板", keywords: &["emoji", "bq"], action: SlashAction::Emoji
+    },
+    SlashItem {
+        label: "子文档",
+        hint: "创建并关联",
+        keywords: &["child", "document", "zwd"],
+        action: SlashAction::ChildDocument,
+    },
+    SlashItem {
+        label: "同步引用",
+        hint: "选择来源",
+        keywords: &["sync", "embed", "tbyy"],
+        action: SlashAction::SyncReference,
+    },
 ];
 
 /// 光标前的文本里是否有正在输入的 `/` 命令：`/` 在块首或空白之后，且 `/` 到光标之间没有空白。
@@ -142,7 +184,11 @@ pub fn filter(query: &str) -> Vec<Match> {
         .map(|(i, _)| Match::Item(i));
     let colors = match q.is_empty() {
         true => Vec::new(),
-        false => color_menu::filter(&q).into_iter().map(Match::Color).collect(),
+        false => color_menu::filter(&q)
+            .into_iter()
+            .filter(|&ix| color_menu::item(ix).slot != aero_core::colors::Slot::Border)
+            .map(Match::Color)
+            .collect(),
     };
     items.chain(colors).collect()
 }
@@ -182,7 +228,7 @@ mod tests {
         // "co" 同时是 code 与 color 的前缀
         assert_eq!(labels("co"), ["代码块", "颜色"]);
         assert_eq!(labels("dmk"), ["代码块"]);
-        assert_eq!(labels("标题").len(), 3);
+        assert_eq!(labels("标题").len(), 6);
         assert_eq!(labels("H2"), ["标题 2"]);
         assert!(filter("zzz").is_empty());
     }

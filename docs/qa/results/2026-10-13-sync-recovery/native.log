@@ -1,0 +1,30 @@
+sandbox_extension_issue_file_to_process failed for /tmp/aero-ui/Aero Native Test.app: 1 (Operation not permitted)
+[INFO aero_index::zvec_fts] zvec initialized, jieba dict: /Users/aero/code/Aero/vendor/zvec/lib/data/jieba_dict_trimmed
+[ WARN 2026-10-13 20:49:34 0x16fb27000 segment.cc:4060] ForwardBlock file[/tmp/aero-ui-sync-recovery/data/index/01M4TM38BA7ZH547HZD0XYVMPX/fts/0/scalar.9.ipc] already exists (possible crash residue); cleaning and overwriting.
+[INFO aero::search] index sync: 1 indexed, 106 unchanged, 0 removed, 0 errors
+[DEBUG aero::editor] focus 66..81 id=Some(BlockId(3))
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/.剪切来源.md.aero-tmp-64673-01M4TMZBJ401RJVQKQAXZGBA34", "/private/tmp/aero-ui-sync-recovery/vault/剪切来源.md"])
+[DEBUG aero::editor] focus 16..31 id=Some(BlockId(2))
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/粘贴目标.md"])
+[INFO aero::editor] reload 粘贴目标.md (changed on disk)
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/.剪切来源.md.aero-tmp-64673-01M4TMZGJ2VX5P8YS7BJ7T7BP1", "/private/tmp/aero-ui-sync-recovery/vault/剪切来源.md"])
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/粘贴目标.md"])
+[INFO aero::editor] reload 粘贴目标.md (changed on disk)
+[WARN aero::editor] 来源恢复.md: deleted on disk
+[DEBUG aero::watch] watch batch: 0 changed, 1 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/来源恢复.md"])
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/来源恢复.md"])
+[DEBUG aero::watch] watch batch: 0 changed, 1 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/来源恢复.md"])
+[WARN aero::editor] 来源恢复.md: deleted on disk
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/来源恢复.md"])
+[INFO aero::editor] reload 来源恢复.md (changed on disk)
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/来源恢复.md"])
+[INFO aero::editor] reload 来源恢复.md (changed on disk)
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/粘贴目标.md"])
+[DEBUG aero::editor] focus 66..81 id=Some(BlockId(5))
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/.剪切来源.md.aero-tmp-64673-01M4TNA70GQZQ6FX6DW42C382Z", "/private/tmp/aero-ui-sync-recovery/vault/剪切来源.md"])
+[DEBUG aero::editor] focus 16..31 id=Some(BlockId(2))
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/.剪切来源.md.aero-tmp-64673-01M4TNAB5R7JE37088C09SCK9Z", "/private/tmp/aero-ui-sync-recovery/vault/剪切来源.md"])
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/粘贴目标.md"])
+[DEBUG aero::editor] focus 66..81 id=Some(BlockId(6))
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/.剪切来源.md.aero-tmp-64673-01M4TNADSR2NG2062MQTEM7S5C", "/private/tmp/aero-ui-sync-recovery/vault/剪切来源.md"])
+[DEBUG aero::watch] watch batch: 1 changed, 0 removed, 0 attachments, rescan=false (["/private/tmp/aero-ui-sync-recovery/vault/.剪切来源.md.aero-tmp-64673-01M4TNAHP77MGNY9W6PGNTC6EZ", "/private/tmp/aero-ui-sync-recovery/vault/剪切来源.md"])

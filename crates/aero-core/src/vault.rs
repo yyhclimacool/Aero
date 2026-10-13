@@ -365,7 +365,7 @@ impl Vault {
         Ok(())
     }
 
-    pub(crate) fn validate_local_path(&self, path: &VaultPath) -> Result<(), VaultError> {
+    pub fn validate_local_path(&self, path: &VaultPath) -> Result<(), VaultError> {
         let mut current = self.root.clone();
         for part in path.as_str().split('/') {
             current.push(part);

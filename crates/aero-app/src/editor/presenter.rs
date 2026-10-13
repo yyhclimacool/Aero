@@ -100,6 +100,8 @@ impl Editor {
                 continue;
             }
             let text = self.doc.slice(unit.range.clone()).to_string();
+            let local =
+                aero_core::containers::local_source(&self.doc, unit.id).unwrap_or_else(|| text.clone());
             let key = Key::unit(unit.id);
             let range = unit.range.clone();
             match &unit.kind {
@@ -113,7 +115,7 @@ impl Editor {
                 BlockKind::BlockQuote if simple_quote(&text) => {
                     specs.push(spec(key, range, true, Extra::default()))
                 }
-                BlockKind::CodeFence { .. } if aero_core::rich_content::mermaid_source(&text).is_none() => {
+                BlockKind::CodeFence { .. } if aero_core::rich_content::mermaid_source(&local).is_none() => {
                     if let Some(inner) = fence_body(&text) {
                         let inner = unit.range.start + inner.start..unit.range.start + inner.end;
                         specs.push(spec(key, inner, true, Extra { code: true, ..Default::default() }));
@@ -212,7 +214,39 @@ impl Editor {
         }
         let is_focused =
             self.focused.as_ref().is_some_and(|f| f.textarea == self.presenters[&spec.key].textarea);
+        let alignment = self
+            .doc
+            .blocks()
+            .find(spec.key.id)
+            .map(|block| {
+                let attrs = self.preview_attrs(block.id, &block.attrs);
+                let attrs = if attrs.pairs.iter().any(|(key, _)| key == "align") {
+                    attrs
+                } else {
+                    aero_core::containers::ancestors(&self.doc, block.id)
+                        .last()
+                        .filter(|parent| matches!(parent.kind, BlockKind::ListItem { .. }))
+                        .map_or(attrs, |p| self.preview_attrs(p.id, &p.attrs))
+                };
+                aero_core::properties::Alignment::of(&attrs)
+            })
+            .unwrap_or_default();
         let p = self.presenters.get_mut(&spec.key).expect("inserted above");
+        p.textarea.update(cx, |ta, cx| ta.set_disabled(self.io.suspended, cx));
+        if spec.key.part == Part::Unit && !spec.extra.code {
+            p.textarea.update(cx, |ta, cx| {
+                use aero_core::properties::Alignment;
+                ta.set_text_align(
+                    match alignment {
+                        Alignment::Center => TextAlign::Center,
+                        Alignment::Right => TextAlign::Right,
+                        _ => TextAlign::Left,
+                    },
+                    cx,
+                );
+                ta.set_justify(alignment == Alignment::Justify, cx);
+            });
+        }
         p.range = spec.range;
         p.enter_newline = spec.enter_newline;
         if p.text != text || p.extra != spec.extra || p.styled.is_none() {
@@ -266,7 +300,9 @@ impl Editor {
         let link_styles = |links: &[(Range<usize>, String)]| -> Vec<LinkStyle> {
             links.iter().map(|(_, url)| self.preview_link_style(url, cx)).collect()
         };
-        if let Some(stamp) = &p.styled
+        let preview = self.inline_color_preview(&p.range);
+        if preview.is_none()
+            && let Some(stamp) = &p.styled
             && stamp.text == text
             && stamp.extra == p.extra
             && stamp.dark == dark
@@ -275,13 +311,34 @@ impl Editor {
         {
             return;
         }
-        let analysis = aero_core::markup::analyze_editing(&text, selection.clone());
+        let mut analysis = self.body_analysis(Some(key.id), &text, selection.clone());
+        if p.extra.code {
+            analysis = aero_core::markup::analyze("");
+            analysis.conceal = aero_core::containers::prefix_ranges(
+                &text,
+                &aero_core::containers::continuation(&self.doc, key.id),
+            );
+        }
         let links = analysis.links.clone();
-        let markup = self.presenter_markup(&text, &analysis, &p.extra, cx);
+        let mut markup = self.presenter_markup(&text, &analysis, &p.extra, cx);
+        let previewing = preview.is_some();
+        if let Some((range, slot, color)) = preview {
+            let color = crate::colors::token(slot, &color, dark);
+            markup.styles.push((
+                range,
+                HighlightStyle {
+                    color: (slot == aero_core::colors::Slot::Text).then_some(color).flatten(),
+                    background_color: (slot == aero_core::colors::Slot::Background)
+                        .then_some(color)
+                        .flatten(),
+                    ..Default::default()
+                },
+            ));
+        }
         let stamp = StyleStamp { text, extra: p.extra.clone(), dark, selection, links: link_styles(&links) };
         let p = self.presenters.get_mut(&key).expect("checked above");
         p.links = links;
-        p.styled = Some(stamp);
+        p.styled = (!previewing).then_some(stamp);
         p.textarea.update(cx, |ta, cx| ta.set_markup(markup, cx));
     }
 
@@ -295,7 +352,7 @@ impl Editor {
     ) -> Markup {
         use aero_core::colors::Slot;
         if extra.code {
-            return Markup::default();
+            return Markup { conceal: analysis.conceal.clone(), ..Default::default() };
         }
         let theme = cx.theme();
         let dark = theme.mode.is_dark();
@@ -375,6 +432,21 @@ impl Editor {
         }
     }
 
+    pub(super) fn body_analysis(
+        &self,
+        id: Option<BlockId>,
+        text: &str,
+        selection: Option<Range<usize>>,
+    ) -> Analysis {
+        let mut analysis = aero_core::markup::analyze_editing(text, selection);
+        if let Some(id) = id {
+            let prefix = aero_core::containers::continuation(&self.doc, id);
+            analysis.conceal.extend(aero_core::containers::prefix_ranges(text, &prefix));
+            analysis.conceal.sort_by_key(|r| (r.start, r.end));
+        }
+        analysis
+    }
+
     /// 正在编辑代码块里的代码：不配对括号、不弹链接和标签补全，控件里的文字已经没有围栏可供判断。
     pub(super) fn editing_code(&self) -> bool {
         let Some(f) = self.focused.as_ref() else { return false };
@@ -407,6 +479,7 @@ impl Editor {
         let (range, enter_newline) = (p.range.clone(), p.enter_newline);
         self.exit_edit(cx);
         self.selection = None;
+        self.selected_node = None;
         self.install_focus(range, Some(key.id), enter_newline, textarea.clone(), window, cx);
     }
 

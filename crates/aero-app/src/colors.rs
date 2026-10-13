@@ -28,8 +28,8 @@ const BG_DARK: [u32; 9] =
 fn value(slot: Slot, color: &str, dark: bool) -> Option<u32> {
     let ix = PALETTE.iter().position(|&c| c == color)?;
     Some(match (slot, dark) {
-        (Slot::Text, false) => TEXT_LIGHT[ix],
-        (Slot::Text, true) => TEXT_DARK[ix],
+        (Slot::Text | Slot::Border, false) => TEXT_LIGHT[ix],
+        (Slot::Text | Slot::Border, true) => TEXT_DARK[ix],
         (Slot::Background, false) => BG_LIGHT[ix],
         (Slot::Background, true) => BG_DARK[ix],
     })
@@ -37,11 +37,25 @@ fn value(slot: Slot, color: &str, dark: bool) -> Option<u32> {
 
 /// 调色板里某个颜色在这一组、这套主题下的色值。类名不在调色板里时返回 `None`（不渲染）。
 pub fn token(slot: Slot, color: &str, dark: bool) -> Option<Hsla> {
+    if let Some(c) = aero_core::colors::CustomColor::parse(color) {
+        return Some(
+            gpui_kit::Rgba {
+                r: c.red as f32 / 255.,
+                g: c.green as f32 / 255.,
+                b: c.blue as f32 / 255.,
+                a: c.alpha,
+            }
+            .into(),
+        );
+    }
     value(slot, color, dark).map(|v| rgb(v).into())
 }
 
 /// 同一个令牌的 CSS 写法，供富文本预览的 `<span style>` 用。
 fn hex(slot: Slot, color: &str, dark: bool) -> Option<String> {
+    if let Some(color) = aero_core::colors::normalize_custom(color) {
+        return Some(color);
+    }
     value(slot, color, dark).map(|v| format!("#{v:06x}"))
 }
 
@@ -69,29 +83,29 @@ pub fn of(attrs: &Attrs, cx: &App) -> Paint {
 
 /// 「上次使用的颜色」（7.7）：`⌘⇧H` 应用它，颜色菜单里作为第一行显示。
 /// 默认是黄色背景，也就是 `==` 那条路——没用过菜单时 `⌘⇧H` 与从前完全一样。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Last {
     pub slot: Slot,
     /// 调色板里的颜色名，始终是 [`PALETTE`] 中的一项
-    pub color: &'static str,
+    pub color: String,
 }
 
 impl Default for Last {
     fn default() -> Self {
-        Self { slot: Slot::Background, color: "yellow" }
+        Self { slot: Slot::Background, color: "yellow".into() }
     }
 }
 
 impl gpui_kit::Global for Last {}
 
 pub fn last(cx: &App) -> Last {
-    cx.try_global::<Last>().copied().unwrap_or_default()
+    cx.try_global::<Last>().cloned().unwrap_or_default()
 }
 
 /// 记住这次用的颜色。颜色菜单与工具条上色后调用；调色板外的颜色不记。
 pub fn remember(slot: Slot, color: &str, cx: &mut App) {
-    if let Some(&color) = PALETTE.iter().find(|&&c| c == color) {
-        cx.set_global(Last { slot, color });
+    if PALETTE.contains(&color) || aero_core::colors::CustomColor::parse(color).is_some() {
+        cx.set_global(Last { slot, color: color.into() });
     }
 }
 
@@ -119,6 +133,7 @@ pub fn paint_html(html: &str, dark: bool) -> String {
                 let property = match slot {
                     Slot::Text => "color",
                     Slot::Background => "background-color",
+                    Slot::Border => "border-color",
                 };
                 style.push_str(&format!("{property}:{hex};"));
             }

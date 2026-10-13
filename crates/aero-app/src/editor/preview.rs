@@ -62,12 +62,28 @@ pub(super) fn markdown_from(
     depth: u8,
     origin: Option<aero_core::VaultPath>,
 ) -> TextView {
+    markdown_chain(id, text, style, reveal, state, editor, block, depth, origin, Vec::new())
+}
+
+fn markdown_chain(
+    id: SharedString,
+    text: SharedString,
+    style: TextViewStyle,
+    reveal: u64,
+    state: Entity<PreviewState>,
+    editor: Entity<super::Editor>,
+    block: aero_core::BlockId,
+    depth: u8,
+    origin: Option<aero_core::VaultPath>,
+    chain: Vec<(aero_core::VaultPath, Option<String>)>,
+) -> TextView {
     let rich_editor = editor.clone();
     let rich_origin = origin.clone();
     let block_editor = editor.clone();
     let embed_editor = editor.clone();
     let embed_style = style.clone();
     let embed_id = id.clone();
+    let embed_origin = origin.clone();
     let highlight_editor = editor.clone();
     let highlight_style = style.clone();
     let highlight_id = id.clone();
@@ -151,7 +167,17 @@ pub(super) fn markdown_from(
         .markdown_block_renderer("note-embed", move |node, _, cx| {
             let (offset, embed) = node.data::<(usize, NoteEmbed)>().expect("note embed parser data");
             let id: SharedString = format!("{embed_id}-embed-{offset}").into();
-            render_note_embed(id, embed, &embed_style, &embed_editor, block, depth, cx)
+            render_note_embed(
+                id,
+                embed,
+                &embed_style,
+                &embed_editor,
+                block,
+                depth,
+                embed_origin.as_ref(),
+                &chain,
+                cx,
+            )
         })
         .markdown_block_parser(|node, cx| {
             if !matches!(node, markdown_ast::Node::Blockquote(_)) {
@@ -303,7 +329,7 @@ struct NoteEmbed {
 }
 
 /// 嵌入里还能再嵌入，但只渲染一层：再深就显示源码，免得互相嵌入转不出来。
-const EMBED_DEPTH: u8 = 1;
+const EMBED_DEPTH: u8 = 3;
 
 /// 整段只有一个笔记嵌入时才渲染内容；附件交给图片渲染器，PDF 暂时保持源码。
 fn note_embed(source: &str) -> Option<NoteEmbed> {
@@ -328,6 +354,8 @@ fn render_note_embed(
     editor: &Entity<super::Editor>,
     block: aero_core::BlockId,
     depth: u8,
+    origin: Option<&aero_core::VaultPath>,
+    chain: &[(aero_core::VaultPath, Option<String>)],
     cx: &mut App,
 ) -> AnyElement {
     use super::embeds_ui::EmbedView;
@@ -340,7 +368,17 @@ fn render_note_embed(
             None => format!("embed-{target}"),
         }
     };
-    let view = editor.read(cx).embed_view(&embed.target, embed.fragment.as_deref());
+    if depth >= EMBED_DEPTH {
+        return div()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child("同步引用已达到 3 跳展开上限")
+            .into_any_element();
+    }
+    let view = editor
+        .read(cx)
+        .live_embed(&embed.target, embed.fragment.as_deref(), origin, cx)
+        .unwrap_or_else(|| editor.read(cx).embed_view_from(&embed.target, embed.fragment.as_deref(), origin));
     let body: AnyElement = match view {
         EmbedView::Loading => {
             div().text_xs().text_color(theme.muted_foreground).child("正在载入…").into_any_element()
@@ -357,8 +395,13 @@ fn render_note_embed(
             )
             .into_any_element(),
         EmbedView::Ready { path, fragment, title, source } => {
+            if chain.contains(&(path.clone(), fragment.clone())) {
+                return div().text_xs().text_color(theme.danger).child("同步引用形成循环").into_any_element();
+            }
+            let mut chain = chain.to_vec();
+            chain.push((path.clone(), fragment.clone()));
             let click = {
-                let (editor, target, fragment) = (editor.clone(), embed.target.clone(), fragment.clone());
+                let (editor, target, fragment) = (editor.clone(), path.as_str().to_owned(), fragment.clone());
                 move |event: &ClickEvent, _: &mut Window, cx: &mut App| {
                     if event.is_right_click() {
                         return;
@@ -378,7 +421,7 @@ fn render_note_embed(
                 _ => title,
             };
             let content: AnyElement = if depth < EMBED_DEPTH {
-                markdown_from(
+                markdown_chain(
                     format!("{id}-body").into(),
                     aero_core::links::to_markdown(&source).into(),
                     style.clone(),
@@ -388,10 +431,15 @@ fn render_note_embed(
                     block,
                     depth + 1,
                     Some(path),
+                    chain,
                 )
                 .into_any_element()
             } else {
-                embed_source(format!("{id}-nested").into(), &source, cx).into_any_element()
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("同步引用已达到 3 跳展开上限")
+                    .into_any_element()
             };
             v_flex()
                 .id(id.clone())

@@ -1,4 +1,8 @@
-use std::{ops::Range, sync::Arc};
+use std::{
+    collections::VecDeque,
+    ops::Range,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use gpui::SharedString;
 use markdown::mdast::{self, Node};
@@ -15,9 +19,48 @@ use crate::text::{
 /// Parse Markdown into a tree of nodes.
 pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument, SharedString> {
     let options = cx.markdown_extensions.parse_options();
-    markdown::to_mdast(&source, &options)
-        .map(|n| ast_to_document(source, n, cx))
-        .map_err(|e| e.to_string().into())
+    let cell = {
+        static CACHE: OnceLock<Mutex<AstCache>> = OnceLock::new();
+        CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cell(source, cx.markdown_extensions.syntax_key())
+    };
+    // Pure syntax is shared across positions and windows. Extension conversion
+    // remains per view because offsets and custom parser callbacks can differ.
+    let ast = cell
+        .get_or_init(|| markdown::to_mdast(source, &options).map(Arc::new).map_err(|e| e.to_string().into()))
+        .clone()?;
+    Ok(ast_to_document(source, (*ast).clone(), cx))
+}
+
+type AstCell = Arc<OnceLock<Result<Arc<Node>, SharedString>>>;
+#[derive(Default)]
+struct AstCache {
+    entries: VecDeque<(String, (bool, bool), AstCell)>,
+    bytes: usize,
+}
+impl AstCache {
+    fn cell(&mut self, source: &str, syntax: (bool, bool)) -> AstCell {
+        const LIMIT: usize = 32 * 1024 * 1024;
+        if let Some(index) = self.entries.iter().position(|(text, key, _)| text == source && *key == syntax) {
+            let entry = self.entries.remove(index).unwrap();
+            let cell = entry.2.clone();
+            self.entries.push_back(entry);
+            return cell;
+        }
+        let cell = Arc::new(OnceLock::new());
+        if source.len() <= LIMIT {
+            while self.entries.len() >= 128 || self.bytes + source.len() > LIMIT {
+                let Some((old, _, _)) = self.entries.pop_front() else { break };
+                self.bytes -= old.len();
+            }
+            self.bytes += source.len();
+            self.entries.push_back((source.into(), syntax, cell.clone()));
+        }
+        cell
+    }
 }
 
 fn parse_table_row(table: &mut Table, node: &mdast::TableRow, cx: &mut NodeContext) {
@@ -451,6 +494,33 @@ fn ast_to_node(source: &str, value: mdast::Node, cx: &mut NodeContext) -> BlockN
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_syntax_cache_uses_options_and_evicts_oldest_entries() {
+        let mut cache = AstCache::default();
+        let first = cache.cell("same", (false, false));
+        assert!(Arc::ptr_eq(&first, &cache.cell("same", (false, false))));
+        assert!(!Arc::ptr_eq(&first, &cache.cell("same", (true, false))));
+        for i in 0..128 {
+            cache.cell(&format!("entry {i}"), (false, false));
+        }
+        assert_eq!(cache.entries.len(), 128);
+        assert!(!Arc::ptr_eq(&first, &cache.cell("same", (false, false))));
+        assert_eq!(cache.bytes, cache.entries.iter().map(|(s, _, _)| s.len()).sum::<usize>());
+        let full_source = "a".repeat(32 * 1024 * 1024);
+        let full = cache.cell(&full_source, (false, false));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, full_source.len());
+        assert!(Arc::ptr_eq(&full, &cache.cell(&full_source, (false, false))));
+        cache.cell("new", (false, false));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, 3);
+        let oversized = "b".repeat(32 * 1024 * 1024 + 1);
+        let first = cache.cell(&oversized, (false, false));
+        assert!(!Arc::ptr_eq(&first, &cache.cell(&oversized, (false, false))));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, 3);
+    }
     use gpui::ParentElement;
 
     use crate::text::{MarkdownExtensions, MarkdownNode, MarkdownPlugin};

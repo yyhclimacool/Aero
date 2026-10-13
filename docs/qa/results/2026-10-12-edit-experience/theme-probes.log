@@ -1,0 +1,58 @@
+== 点击 (480, 198) 前后
+相同
+   差异图：/tmp/aero-ui/shots/view/final-dark-outer.diff~169.png
+   编辑器：[DEBUG aero::editor] focus 49..78 id=Some(BlockId(3))
+== 退出编辑后与点击前
+相同
+== 点击 (430, 242) 前后
+相同
+   差异图：/tmp/aero-ui/shots/view/final-dark-quote.diff~173.png
+   编辑器：[DEBUG aero::editor] focus 82..112 id=Some(BlockId(5))
+== 退出编辑后与点击前
+相同
+== 点击 (430, 376) 前后
+相同
+   差异图：/tmp/aero-ui/shots/view/final-dark-list.diff~177.png
+   编辑器：[DEBUG aero::editor] focus 161..179 id=Some(BlockId(10))
+== 退出编辑后与点击前
+相同
+== 点击 (800, 454) 前后
+4 处差异（窗口点）：
+  x 332.5–482.5  y 641.0–669.5  (150.0×28.5pt，9983 像素)
+  x 488.5–491.0  y 641.0–669.5  (2.5×28.5pt，20 像素)
+  x 496.5–680.0  y 641.0–669.5  (183.5×28.5pt，3316 像素)
+  x 332.5–479.5  y 682.5–694.0  (147.0×11.5pt，3622 像素)
+   差异图：/tmp/aero-ui/shots/view/final-dark-inner.diff~181.png
+   编辑器：[DEBUG aero::editor] focus 227..248 id=Some(BlockId(15))
+== 退出编辑后与点击前
+相同
+== 点击 (480, 198) 前后
+相同
+   差异图：/tmp/aero-ui/shots/view/final-light-outer.diff~185.png
+   编辑器：[DEBUG aero::editor] focus 49..78 id=Some(BlockId(3))
+== 退出编辑后与点击前
+相同
+== 点击 (430, 242) 前后
+相同
+   差异图：/tmp/aero-ui/shots/view/final-light-quote.diff~189.png
+   编辑器：[DEBUG aero::editor] focus 82..112 id=Some(BlockId(5))
+== 退出编辑后与点击前
+相同
+== 点击 (430, 376) 前后
+相同
+   差异图：/tmp/aero-ui/shots/view/final-light-list.diff~193.png
+   编辑器：[DEBUG aero::editor] focus 161..179 id=Some(BlockId(10))
+== 退出编辑后与点击前
+相同
+== 点击 (800, 454) 前后
+4 处差异（窗口点）：
+  x 332.5–482.5  y 646.0–662.5  (150.0×16.5pt，5075 像素)
+  x 488.5–491.0  y 646.0–662.5  (2.5×16.5pt，16 像素)
+  x 496.5–680.0  y 646.0–662.5  (183.5×16.5pt，2941 像素)
+  x 332.5–479.5  y 682.5–694.0  (147.0×11.5pt，3453 像素)
+   差异图：/tmp/aero-ui/shots/view/final-light-inner.diff~197.png
+   编辑器：[DEBUG aero::editor] focus 227..248 id=Some(BlockId(15))
+== 退出编辑后与点击前
+2 处差异（窗口点）：
+  x 1179.0–1185.5  y 803.0–814.5  (6.5×11.5pt，101 像素)
+  x 1189.0–1224.0  y 803.0–814.5  (35.0×11.5pt，462 像素)

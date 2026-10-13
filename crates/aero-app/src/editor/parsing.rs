@@ -12,6 +12,7 @@ impl Editor {
             ..Default::default()
         };
         let edits = self.doc.take_edits();
+        self.shift_empty_slots(&edits);
         // Positional patches retain unit identities, indexes and viewport rows.
         // Container ranges follow the same left/right biases as document anchors.
         for edit in &edits {

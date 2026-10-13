@@ -1,0 +1,22 @@
+{
+  "window_points": {
+    "x": 116,
+    "y": 81,
+    "width": 1280,
+    "height": 820
+  },
+  "candidate_screen_points": {
+    "x": 636,
+    "y": 695,
+    "width": 510,
+    "height": 32
+  },
+  "candidate_window_points": {
+    "x": 520,
+    "y": 614
+  },
+  "input_method": "WeType 3.0.0",
+  "composition": "ni",
+  "os": "macOS 27.0.1 26A434",
+  "scale": 2
+}

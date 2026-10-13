@@ -257,7 +257,10 @@ fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(c, '\u{00C0}'..='\u{024F}' | '\u{0400}'..='\u{04FF}' | '\u{1E00}'..='\u{1EFF}')
         || matches!(c, '\u{0300}'..='\u{036F}' | '\u{0980}'..='\u{09FF}')
-        || matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';')
+        || matches!(
+            c,
+            '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';'
+        )
         || matches!(c, '!' | ')' | ']' | '}' | '"' | '”' | '»' | '…' | '⋯')
         || matches!(c, '\u{202F}' | '\u{00A0}' | '\u{2011}')
 }
@@ -520,7 +523,8 @@ impl TextWrapper {
             if conceal.iter().any(|range| range.contains(&abs)) {
                 continue;
             }
-            let font = measure.font(fonts.iter().filter(|(range, _)| range.contains(&abs)).map(|(_, font)| font));
+            let font =
+                measure.font(fonts.iter().filter(|(range, _)| range.contains(&abs)).map(|(_, font)| font));
             match runs.last_mut() {
                 Some(run) if run.font == font => run.len += ch.len_utf8(),
                 _ => runs.push(TextRun {
@@ -544,11 +548,8 @@ impl TextWrapper {
             layout.width,
             drawn.iter().map(|&(_, _, at)| at).chain(std::iter::once(display.len())),
         );
-        let chars: Vec<(usize, char, Pixels)> = drawn
-            .iter()
-            .zip(positions.windows(2))
-            .map(|(&(i, ch, _), xs)| (i, ch, xs[1] - xs[0]))
-            .collect();
+        let chars: Vec<(usize, char, Pixels)> =
+            drawn.iter().zip(positions.windows(2)).map(|(&(i, ch, _), xs)| (i, ch, xs[1] - xs[0])).collect();
         wrap_chars(&chars, measure.space(), wrap_width)
     }
 
@@ -613,7 +614,8 @@ impl TextWrapper {
             let mut hard_ends = Vec::new();
             let mut previous_end = line_start;
             for range in &self.hard_breaks {
-                if range.start >= previous_end && range.start < range.end
+                if range.start >= previous_end
+                    && range.start < range.end
                     && range.end <= line_start + line_str.len()
                     && line_str.is_char_boundary(range.start - line_start)
                     && line_str.is_char_boundary(range.end - line_start)
@@ -645,13 +647,15 @@ impl TextWrapper {
                         }
                         WrappingIndent::None => {
                             // Rewrap the continuation without reserving the first row's indent.
-                            if let Some(first_ix) = boundaries.iter().map(|b| b.ix)
-                                .find(|&ix| ix > 0 && ix < segment.len())
+                            if let Some(first_ix) =
+                                boundaries.iter().map(|b| b.ix).find(|&ix| ix > 0 && ix < segment.len())
                             {
                                 let first = segment_start + first_ix;
                                 wrapped_lines.push(prev_boundary_ix..first);
                                 prev_boundary_ix = first;
-                                for boundary in wrap_line(&segment[first_ix..], line_start + first, wrap_width) {
+                                for boundary in
+                                    wrap_line(&segment[first_ix..], line_start + first, wrap_width)
+                                {
                                     let ix = first + boundary.ix;
                                     if ix > prev_boundary_ix && ix < segment_end {
                                         wrapped_lines.push(prev_boundary_ix..ix);
@@ -669,7 +673,12 @@ impl TextWrapper {
                 segment_start = segment_end;
             }
 
-            new_lines.push(LineItem { len: line.len(), indent: indent_chars, indent_segments, wrapped_lines });
+            new_lines.push(LineItem {
+                len: line.len(),
+                indent: indent_chars,
+                indent_segments,
+                wrapped_lines,
+            });
         }
 
         if self.lines.is_empty() {
@@ -728,7 +737,8 @@ impl TextWrapper {
         let local_offset = offset.saturating_sub(start);
         // Unlike a soft wrap, a hard break has distinct before/after source positions.
         // Its end always belongs to the next row, even if the previous caret had affinity.
-        let line_end_affinity = line_end_affinity && !self.hard_breaks.iter().any(|range| range.end == offset);
+        let line_end_affinity =
+            line_end_affinity && !self.hard_breaks.iter().any(|range| range.end == offset);
         for (ix, range) in line.wrapped_lines.iter().enumerate() {
             let matches = range.contains(&local_offset) || (line_end_affinity && local_offset == range.end);
             if matches {
@@ -758,9 +768,12 @@ impl TextWrapper {
         let line_start = self.text.line_start_offset(row);
         let local_row = point.row.saturating_sub(wrapped_row);
         if let Some(range) = line.wrapped_lines.get(local_row) {
-            let end = self.hard_breaks.iter()
-                .find(|hard_break| hard_break.end == line_start + range.end
-                    && hard_break.start >= line_start + range.start)
+            let end = self
+                .hard_breaks
+                .iter()
+                .find(|hard_break| {
+                    hard_break.end == line_start + range.end && hard_break.start >= line_start + range.start
+                })
                 .map(|hard_break| hard_break.start - line_start)
                 .unwrap_or(range.end);
             line_start + range.start.saturating_add(point.column).min(end)
@@ -861,6 +874,74 @@ impl ConcealMap {
 }
 
 impl LineLayout {
+    pub(crate) fn justify(&mut self, width: Pixels) {
+        use unicode_segmentation::UnicodeSegmentation;
+        let cjk = |c: char| {
+            matches!(c as u32, 0x3400..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x323af
+            | 0x3040..=0x30ff | 0xac00..=0xd7af)
+        };
+        let opening = |c: char| "（《〈「『【〔［｛([{".contains(c);
+        let closing = |c: char| "，。！？；：、）》〉」』】〕］｝,.;:!?)]}".contains(c);
+        let count = self.wrapped_lines.len();
+        for i in 0..count.saturating_sub(1) {
+            if self.conceal.get(i).and_then(|m| m.as_ref()).is_some_and(|m| m.hard_break) {
+                continue;
+            }
+            let indent = self.line_indent(i);
+            let line = &mut self.wrapped_lines[i];
+            let available = width - indent;
+            let extra = available - line.width;
+            if extra <= px(0.) {
+                continue;
+            }
+            let clusters: Vec<_> = line.text.grapheme_indices(true).collect();
+            let mut gaps = Vec::new();
+            for pair in clusters.windows(2) {
+                let (at, left) = pair[0];
+                let (next, right) = pair[1];
+                let a = left.chars().last().unwrap();
+                let b = right.chars().next().unwrap();
+                if (left == " " && at > 0 && !right.chars().all(char::is_whitespace))
+                    || ((cjk(a) || cjk(b))
+                        && !opening(a)
+                        && !closing(b)
+                        && !a.is_whitespace()
+                        && !b.is_whitespace()
+                        && left.chars().count() == 1
+                        && right.chars().count() == 1)
+                {
+                    gaps.push(next);
+                }
+            }
+            if gaps.is_empty() {
+                continue;
+            }
+            let step = extra / gaps.len() as f32;
+            let mut runs = line.runs.clone();
+            for run in &mut runs {
+                for glyph in &mut run.glyphs {
+                    glyph.position.x += step * gaps.partition_point(|gap| *gap <= glyph.index) as f32;
+                }
+            }
+            let layout = gpui::LineLayout {
+                len: line.len,
+                font_size: line.font_size,
+                width: available,
+                ascent: line.ascent,
+                descent: line.descent,
+                runs,
+            };
+            *std::ops::DerefMut::deref_mut(line) = std::sync::Arc::new(layout);
+        }
+        self.longest_width = self.wrapped_lines.iter().map(|line| line.width).max().unwrap_or_default();
+        if self.whitespace_indicators.is_some() {
+            self.whitespace_chars.clear();
+            let indicators = self.whitespace_indicators.clone();
+            let current = std::mem::replace(self, Self::new());
+            *self = current.with_whitespaces(indicators);
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             len: 0,
@@ -937,7 +1018,9 @@ impl LineLayout {
     /// only soft continuations inherit the first row's indentation.
     #[inline]
     pub(crate) fn line_indent(&self, line_index: usize) -> Pixels {
-        self.wrap_indents.get(line_index).copied()
+        self.wrap_indents
+            .get(line_index)
+            .copied()
             .unwrap_or_else(|| if line_index == 0 { px(0.) } else { self.wrap_indent })
     }
 
@@ -998,12 +1081,11 @@ impl LineLayout {
         let mut acc_len = 0;
         let mut offset_y = px(0.);
 
-        let x_offset = last_layout.alignment_offset(self.longest_width);
-
         for (i, line) in self.wrapped_lines.iter().enumerate() {
             let is_last = i + 1 == self.wrapped_lines.len();
             let buf_len = self.segment_buffer_len(i);
-            let hard_break = self.conceal.get(i).and_then(|map| map.as_ref()).is_some_and(|map| map.hard_break);
+            let hard_break =
+                self.conceal.get(i).and_then(|map| map.as_ref()).is_some_and(|map| map.hard_break);
 
             let matches = if buf_len == 0 {
                 // Empty visual lines still own their boundary offset.
@@ -1019,7 +1101,9 @@ impl LineLayout {
             if matches {
                 let local = offset.saturating_sub(acc_len);
                 let display = self.display_index(i, local);
-                let x = line.x_for_index(display) + x_offset + self.line_indent(i);
+                let x = line.x_for_index(display)
+                    + last_layout.alignment_offset(line.width)
+                    + self.line_indent(i);
                 return Some(point(x, offset_y));
             }
 
@@ -1039,10 +1123,8 @@ impl LineLayout {
     /// reports the caret affinity that a wrap boundary needs.
     pub(crate) fn closest_index_for_x(&self, x: Pixels, last_layout: &LastLayout) -> usize {
         let mut acc_len = 0;
-        let x_offset = last_layout.alignment_offset(self.longest_width);
-        let x = x - x_offset;
-
         for (i, line) in self.wrapped_lines.iter().enumerate() {
+            let x = x - last_layout.alignment_offset(line.width);
             let line_indent = self.line_indent(i);
             if x <= line_indent + line.width {
                 let display = line.closest_index_for_x(x - line_indent);
@@ -1065,12 +1147,14 @@ impl LineLayout {
     ) -> Option<(usize, usize, Pixels)> {
         let mut offset = 0;
         let mut line_top = px(0.);
-        let x_offset = last_layout.alignment_offset(self.longest_width);
-
-        for (i, _line) in self.wrapped_lines.iter().enumerate() {
+        for (i, line) in self.wrapped_lines.iter().enumerate() {
             let line_bottom = line_top + last_layout.line_height;
             if pos.y >= line_top && pos.y < line_bottom {
-                return Some((i, offset, pos.x - x_offset - self.line_indent(i)));
+                return Some((
+                    i,
+                    offset,
+                    pos.x - last_layout.alignment_offset(line.width) - self.line_indent(i),
+                ));
             }
 
             offset += self.segment_buffer_len(i);
@@ -1230,15 +1314,22 @@ mod tests {
         gpui::LineLayout {
             len,
             width: px(width),
-            runs: runs.iter().enumerate().map(|(font, glyphs)| gpui::ShapedRun {
-                font_id: gpui::FontId(font),
-                glyphs: glyphs.iter().map(|&(index, x)| gpui::ShapedGlyph {
-                    id: gpui::GlyphId(0),
-                    index,
-                    position: point(px(x), px(0.)),
-                    is_emoji: false,
-                }).collect(),
-            }).collect(),
+            runs: runs
+                .iter()
+                .enumerate()
+                .map(|(font, glyphs)| gpui::ShapedRun {
+                    font_id: gpui::FontId(font),
+                    glyphs: glyphs
+                        .iter()
+                        .map(|&(index, x)| gpui::ShapedGlyph {
+                            id: gpui::GlyphId(0),
+                            index,
+                            position: point(px(x), px(0.)),
+                            is_emoji: false,
+                        })
+                        .collect(),
+                })
+                .collect(),
             ..Default::default()
         }
     }
@@ -1272,11 +1363,13 @@ mod tests {
         // Exhaustively cover repeats and arbitrary run/glyph order, not just sorted layouts.
         for glyph_count in 0..=6 {
             for mut encoding in 0..4usize.pow(glyph_count) {
-                let glyphs: Vec<_> = (0..glyph_count).map(|ordinal| {
-                    let index = encoding % 4;
-                    encoding /= 4;
-                    (index, 20. - ordinal as f32 * 3.)
-                }).collect();
+                let glyphs: Vec<_> = (0..glyph_count)
+                    .map(|ordinal| {
+                        let index = encoding % 4;
+                        encoding /= 4;
+                        (index, 20. - ordinal as f32 * 3.)
+                    })
+                    .collect();
                 let split = glyphs.len() / 2;
                 let layout = glyph_layout(&[&glyphs[..split], &[], &glyphs[split..]], 4, 31.);
                 let indices = [0, 1, 2, 3, 4, 5, 2, 0];
@@ -1295,14 +1388,21 @@ mod tests {
     fn batch_x_positions_visit_each_glyph_at_most_once() {
         for count in [256, 1024, 4096] {
             for unordered in [false, true] {
-                let glyphs: Vec<_> = (0..count).map(|ordinal| {
-                    let index = if unordered { ordinal ^ 1 } else { ordinal };
-                    (index, ordinal as f32)
-                }).collect();
-                let layout = glyph_layout(&[&glyphs[..count / 2], &[], &glyphs[count / 2..]], count, count as f32);
+                let glyphs: Vec<_> = (0..count)
+                    .map(|ordinal| {
+                        let index = if unordered { ordinal ^ 1 } else { ordinal };
+                        (index, ordinal as f32)
+                    })
+                    .collect();
+                let layout =
+                    glyph_layout(&[&glyphs[..count / 2], &[], &glyphs[count / 2..]], count, count as f32);
                 let visits = std::cell::Cell::new(0);
                 let actual = batch_x_for_indices(
-                    layout.runs.iter().flat_map(|run| run.glyphs.iter()).inspect(|_| visits.set(visits.get() + 1)),
+                    layout
+                        .runs
+                        .iter()
+                        .flat_map(|run| run.glyphs.iter())
+                        .inspect(|_| visits.set(visits.get() + 1)),
                     layout.width,
                     (0..=count).rev(),
                 );
@@ -1338,31 +1438,52 @@ mod tests {
             let runs: Vec<_> = [
                 (split, measure.font([&bold].into_iter())),
                 (display.len() - split, measure.font([&bold, &italic].into_iter())),
-            ].into_iter().map(|(len, font)| TextRun {
+            ]
+            .into_iter()
+            .map(|(len, font)| TextRun {
                 len,
                 font,
                 color: gpui::black(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
-            }).collect();
+            })
+            .collect();
             let layout = measure.text.layout_line(display, measure.font_size, &runs, None);
             let visible_source = source.char_indices().filter(|&(_, ch)| ch != '*' && ch != '~');
-            let chars: Vec<_> = display.char_indices().zip(visible_source).map(|((at, ch), (source_at, source_ch))| {
-                assert_eq!(ch, source_ch);
-                (source_at, ch, layout.x_for_index(at + ch.len_utf8()) - layout.x_for_index(at))
-            }).collect();
-            let conceal: Vec<_> = source.match_indices("**").chain(source.match_indices("~~"))
-                .map(|(at, marker)| line_start + at..line_start + at + marker.len()).collect();
+            let chars: Vec<_> = display
+                .char_indices()
+                .zip(visible_source)
+                .map(|((at, ch), (source_at, source_ch))| {
+                    assert_eq!(ch, source_ch);
+                    (source_at, ch, layout.x_for_index(at + ch.len_utf8()) - layout.x_for_index(at))
+                })
+                .collect();
+            let conceal: Vec<_> = source
+                .match_indices("**")
+                .chain(source.match_indices("~~"))
+                .map(|(at, marker)| line_start + at..line_start + at + marker.len())
+                .collect();
             for width in [px(1.), px(35.), px(75.), px(1000.)] {
                 let expected = wrap_chars(&chars, measure.space(), width);
-                let actual = TextWrapper::wrap_presented_line(&measure, source, line_start, &conceal, &fonts, width);
-                let boundaries = |items: Vec<Boundary>| items.into_iter().map(|b| (b.ix, b.next_indent)).collect::<Vec<_>>();
+                let actual =
+                    TextWrapper::wrap_presented_line(&measure, source, line_start, &conceal, &fonts, width);
+                let boundaries = |items: Vec<Boundary>| {
+                    items.into_iter().map(|b| (b.ix, b.next_indent)).collect::<Vec<_>>()
+                };
                 assert_eq!(boundaries(actual), boundaries(expected));
             }
-            assert!(TextWrapper::wrap_presented_line(
-                &measure, source, line_start, &[line_start..line_start + source.len()], &fonts, px(1.),
-            ).is_empty());
+            assert!(
+                TextWrapper::wrap_presented_line(
+                    &measure,
+                    source,
+                    line_start,
+                    &[line_start..line_start + source.len()],
+                    &fonts,
+                    px(1.),
+                )
+                .is_empty()
+            );
         });
     }
 
@@ -1574,7 +1695,10 @@ mod tests {
                                 WrapDisplayPoint::new(row, row, 0),
                             );
                         }
-                        assert_eq!(wrapper.display_point_to_offset(WrapDisplayPoint::new(row, 0, 0)), range.start);
+                        assert_eq!(
+                            wrapper.display_point_to_offset(WrapDisplayPoint::new(row, 0, 0)),
+                            range.start
+                        );
                     }
                 }
             }
@@ -1626,13 +1750,24 @@ mod tests {
                 for range in [0..18, 18..22, 22..40, 40..40] {
                     let mut part = TextWrapper::new(test_font(), px(14.), Some(px(25.)));
                     part.wrapping_indent = indent;
-                    part.conceal = breaks.iter().filter(|b| b.start >= range.start && b.end <= range.end)
-                        .map(|b| b.start - range.start..b.end - range.start).collect();
-                    part.fonts = fonts.iter().filter(|(r, _)| r.start >= range.start && r.end <= range.end)
-                        .map(|(r, f)| (r.start - range.start..r.end - range.start, f.clone())).collect();
+                    part.conceal = breaks
+                        .iter()
+                        .filter(|b| b.start >= range.start && b.end <= range.end)
+                        .map(|b| b.start - range.start..b.end - range.start)
+                        .collect();
+                    part.fonts = fonts
+                        .iter()
+                        .filter(|(r, _)| r.start >= range.start && r.end <= range.end)
+                        .map(|(r, f)| (r.start - range.start..r.end - range.start, f.clone()))
+                        .collect();
                     part.update_all(&Rope::from(text.slice(range.clone()).to_string()), cx);
-                    expected.extend(part.line(0).unwrap().wrapped_lines.iter()
-                        .map(|r| r.start + range.start..r.end + range.start));
+                    expected.extend(
+                        part.line(0)
+                            .unwrap()
+                            .wrapped_lines
+                            .iter()
+                            .map(|r| r.start + range.start..r.end + range.start),
+                    );
                 }
                 assert!(expected.len() > 4, "test must exercise soft wrapping");
                 assert_eq!(wrapper.line(0).unwrap().wrapped_lines.as_slice(), expected);
@@ -1676,7 +1811,8 @@ mod tests {
             wrapper._update(&text, &(0..text.len()), &text, &mut |line, _, _| {
                 let mut boundaries = vec![Boundary { ix: 0, next_indent: 0 }];
                 if line.starts_with("ab") {
-                    boundaries.extend([Boundary { ix: 1, next_indent: 0 }, Boundary { ix: 1, next_indent: 0 }]);
+                    boundaries
+                        .extend([Boundary { ix: 1, next_indent: 0 }, Boundary { ix: 1, next_indent: 0 }]);
                 }
                 boundaries.push(Boundary { ix: line.len(), next_indent: 0 });
                 boundaries
@@ -1736,9 +1872,24 @@ mod tests {
         wrapper.text = Rope::from("aa\nbbbb\nc");
         wrapper.lines = SumTree::from_iter(
             vec![
-                LineItem { len: 2, indent: 0, indent_segments: SmallVec::new(), wrapped_lines: smallvec::smallvec![0..2] },
-                LineItem { len: 4, indent: 0, indent_segments: SmallVec::new(), wrapped_lines: smallvec::smallvec![0..2, 2..4] },
-                LineItem { len: 1, indent: 0, indent_segments: SmallVec::new(), wrapped_lines: smallvec::smallvec![0..1] },
+                LineItem {
+                    len: 2,
+                    indent: 0,
+                    indent_segments: SmallVec::new(),
+                    wrapped_lines: smallvec::smallvec![0..2],
+                },
+                LineItem {
+                    len: 4,
+                    indent: 0,
+                    indent_segments: SmallVec::new(),
+                    wrapped_lines: smallvec::smallvec![0..2, 2..4],
+                },
+                LineItem {
+                    len: 1,
+                    indent: 0,
+                    indent_segments: SmallVec::new(),
+                    wrapped_lines: smallvec::smallvec![0..1],
+                },
             ],
             &(),
         );
@@ -1804,6 +1955,35 @@ mod tests {
         line_layout.set_wrapped_lines(wrapped_lines);
         assert_eq!(line_layout.len(), 150);
         assert_eq!(line_layout.wrapped_lines.len(), 2);
+    }
+
+    #[test]
+    fn justified_glyph_positions_drive_hit_testing_and_keep_final_row() {
+        fn row(text: &str) -> ShapedLine {
+            use unicode_segmentation::UnicodeSegmentation;
+            let glyphs: Vec<_> =
+                text.grapheme_indices(true).enumerate().map(|(i, (at, _))| (at, i as f32 * 10.)).collect();
+            let mut line = ShapedLine::default();
+            line.text = text.to_owned().into();
+            *std::ops::DerefMut::deref_mut(&mut line) =
+                std::sync::Arc::new(glyph_layout(&[&glyphs], text.len(), glyphs.len() as f32 * 10.));
+            line
+        }
+        let first = "中文 e\u{301} 👩‍💻 tail";
+        let mut layout = LineLayout::new();
+        layout.set_wrapped_lines(smallvec::smallvec![row(first), row("last")]);
+        let last = layout.wrapped_lines[1].clone();
+        layout.justify(px(300.));
+        assert_eq!(layout.wrapped_lines[0].width, px(300.));
+        assert_eq!(layout.wrapped_lines[1].width, last.width);
+        let mut context = test_last_layout(px(20.));
+        context.content_width = px(300.);
+        use unicode_segmentation::UnicodeSegmentation;
+        for (at, _) in first.grapheme_indices(true) {
+            let position = layout.position_for_index(at, &context, false).unwrap();
+            let hit = layout.closest_index_for_position(point(position.x, px(5.)), &context).unwrap().0;
+            assert_eq!(hit, at, "glyph at {at}");
+        }
     }
 
     /// A layout context whose only load-bearing field is the line height.

@@ -19,14 +19,20 @@ const NAMES: [&str; 9] = ["灰", "棕", "橙", "黄", "绿", "蓝", "紫", "粉"
 const PER_SLOT: usize = PALETTE.len() + 1;
 
 /// 条目总数（文字组 + 背景组）。
-pub const COUNT: usize = 2 * PER_SLOT;
+pub const COUNT: usize = 3 * PER_SLOT;
 
 /// 一行放几个样本（7.7 的排版：默认 + 4 色一行，其余 5 色一行）。
 pub const COLUMNS: usize = 5;
 
 /// 编号对应的条目。
 pub fn item(ix: usize) -> Item {
-    let slot = if ix < PER_SLOT { Slot::Text } else { Slot::Background };
+    let slot = if ix < PER_SLOT {
+        Slot::Text
+    } else if ix < 2 * PER_SLOT {
+        Slot::Background
+    } else {
+        Slot::Border
+    };
     let within = ix % PER_SLOT;
     Item { slot, color: within.checked_sub(1).map(|c| PALETTE[c]) }
 }
@@ -52,6 +58,7 @@ pub fn full_name(ix: usize) -> String {
             None => "默认颜色".to_owned(),
         },
         Slot::Background => format!("{color}背景"),
+        Slot::Border => format!("{color}边框"),
     }
 }
 
@@ -60,6 +67,7 @@ fn slot_names(slot: Slot) -> [&'static str; 3] {
     match slot {
         Slot::Text => ["文字", "text", "fg"],
         Slot::Background => ["背景", "bj", "bg"],
+        Slot::Border => ["边框", "bk", "border"],
     }
 }
 
@@ -87,7 +95,7 @@ pub fn filter(query: &str) -> Vec<usize> {
 /// 过滤结果的网格：两组各自按 [`COLUMNS`] 折行。格子里放的是 `matches` 里的位置，不是条目编号。
 pub fn rows(matches: &[usize]) -> Vec<Vec<usize>> {
     let mut rows: Vec<Vec<usize>> = Vec::new();
-    for slot in [Slot::Text, Slot::Background] {
+    for slot in [Slot::Text, Slot::Background, Slot::Border] {
         let group: Vec<usize> = (0..matches.len()).filter(|&at| item(matches[at]).slot == slot).collect();
         rows.extend(group.chunks(COLUMNS).map(<[usize]>::to_vec));
     }
@@ -121,7 +129,7 @@ mod tests {
 
     #[test]
     fn items_cover_both_slots_and_the_default_entry() {
-        assert_eq!(COUNT, 20);
+        assert_eq!(COUNT, 30);
         assert_eq!(item(0), Item { slot: Slot::Text, color: None });
         assert_eq!(item(1), Item { slot: Slot::Text, color: Some("gray") });
         assert_eq!(item(9), Item { slot: Slot::Text, color: Some("red") });
@@ -139,16 +147,16 @@ mod tests {
     fn filter_matches_chinese_english_class_names_and_whole_groups() {
         assert_eq!(filter("").len(), COUNT);
         // 中文：两组的蓝都命中
-        assert_eq!(filter("蓝"), [6, 16]);
+        assert_eq!(filter("蓝"), [6, 16, 26]);
         // 英文颜色名与类名
-        assert_eq!(filter("blue"), [6, 16]);
+        assert_eq!(filter("blue"), [6, 16, 26]);
         assert_eq!(filter("bg-blue"), [16]);
         // 组名整组命中，"bg" 是背景组的别名
         assert_eq!(filter("bg"), (10..20).collect::<Vec<_>>());
         assert_eq!(filter("文字"), (0..10).collect::<Vec<_>>());
         // 完整名
         assert_eq!(filter("蓝色背景"), [16]);
-        assert_eq!(filter("默认"), [0, 10]);
+        assert_eq!(filter("默认"), [0, 10, 20]);
         assert!(filter("chartreuse").is_empty());
     }
 
@@ -156,7 +164,7 @@ mod tests {
     fn keyboard_walks_the_grid_by_rows_and_wraps() {
         let all: Vec<usize> = (0..COUNT).collect();
         // 每组两行，每行 5 个
-        assert_eq!(rows(&all).len(), 4);
+        assert_eq!(rows(&all).len(), 6);
         assert_eq!(rows(&all)[0], [0, 1, 2, 3, 4]);
         assert_eq!(rows(&all)[3], [15, 16, 17, 18, 19]);
         // 左右在整个列表里走，两头回绕
@@ -166,11 +174,11 @@ mod tests {
         // 上下换行保持列号
         assert_eq!(step(&all, 2, 0, 1), 7);
         assert_eq!(step(&all, 7, 0, 1), 12);
-        assert_eq!(step(&all, 2, 0, -1), 17);
+        assert_eq!(step(&all, 2, 0, -1), 27);
         // 过滤后网格重排，列号超出的一行落到最后一个
         let filtered = filter("蓝");
-        assert_eq!(rows(&filtered), [[0], [1]]);
+        assert_eq!(rows(&filtered), [[0], [1], [2]]);
         assert_eq!(step(&filtered, 0, 0, 1), 1);
-        assert_eq!(step(&filtered, 1, 1, 0), 0);
+        assert_eq!(step(&filtered, 2, 1, 0), 0);
     }
 }

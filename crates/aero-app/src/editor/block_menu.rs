@@ -12,10 +12,12 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Submenu {
     Convert,
+    Layout,
 }
 
 pub(super) struct BlockMenu {
-    block: BlockId,
+    pub(super) block: BlockId,
+    revision: u64,
     origin: Point<Pixels>,
     submenu: Option<Submenu>,
 }
@@ -24,12 +26,14 @@ pub(super) struct BlockMenu {
 #[derive(Clone, Copy)]
 pub(super) struct BlockDrag {
     pub id: BlockId,
+    pub revision: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct BlockDropHint {
     before: usize,
     parent: Option<usize>,
+    node: Option<(BlockId, bool, bool)>,
     origin: Point<Pixels>,
     width: Pixels,
 }
@@ -59,6 +63,30 @@ impl Render for BlockDragGhost {
 }
 
 impl Editor {
+    pub(super) fn in_block_handle(&self, id: BlockId, cursor: Point<Pixels>) -> bool {
+        self.unit_bounds.iter().find(|(block, _)| *block == id).is_some_and(|(_, bounds)| {
+            let reach = self.gutter_reaches.get(&id).copied().unwrap_or(px(GUTTER));
+            let left = bounds.left() - reach;
+            let list = self.doc.blocks().find(id).is_some_and(|b| matches!(b.kind, BlockKind::List { .. }));
+            cursor.x >= left
+                && cursor.x < left + px(if list { 20. } else { GUTTER })
+                && cursor.y >= bounds.top() + px(4.)
+                && cursor.y < bounds.top() + px(if list { 48. } else { 24. })
+        })
+    }
+
+    pub(super) fn in_block_operation_area(&self, id: BlockId, cursor: Point<Pixels>) -> bool {
+        self.unit_bounds.iter().find(|(block, _)| *block == id).is_some_and(|(_, bounds)| {
+            let reach = self.gutter_reaches.get(&id).copied().unwrap_or(px(GUTTER));
+            let list = self.doc.blocks().find(id).is_some_and(|b| matches!(b.kind, BlockKind::List { .. }));
+            let bottom = if list { bounds.bottom().max(bounds.top() + px(48.)) } else { bounds.bottom() };
+            cursor.x >= bounds.left() - reach
+                && cursor.x <= bounds.right()
+                && cursor.y >= bounds.top()
+                && cursor.y <= bottom
+        })
+    }
+
     pub(super) fn open_block_menu_for_current(
         &mut self,
         window: &mut Window,
@@ -87,7 +115,8 @@ impl Editor {
     ) {
         let _ = self.close_color_menu(window, cx);
         self.slash = None;
-        self.block_menu = Some(BlockMenu { block, origin, submenu: None });
+        self.ensure_current_parse();
+        self.block_menu = Some(BlockMenu { block, revision: self.doc.version(), origin, submenu: None });
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -126,6 +155,51 @@ impl Editor {
     }
 
     fn block_drop_hint(&self, cursor: Point<Pixels>) -> Option<BlockDropHint> {
+        // Hit the deepest visible tree boundary at this x/y. A container's
+        // inner gutter means insert inside; its outer edge means a sibling.
+        let node = self
+            .unit_bounds
+            .iter()
+            .filter_map(|(id, bounds)| {
+                let block = self.doc.blocks().find(*id)?;
+                if cursor.y < bounds.top() || cursor.y > bounds.bottom() {
+                    return None;
+                }
+                let container = aero_core::containers::is_editable(&block.kind);
+                let structural = container
+                    || matches!(
+                        block.kind,
+                        aero_core::BlockKind::List { .. } | aero_core::BlockKind::ListItem { .. }
+                    );
+                if cursor.x < bounds.left() - px(if structural { 96. } else { 48. }) {
+                    return None;
+                }
+                Some((*id, *bounds, container, aero_core::containers::ancestors(&self.doc, *id).len()))
+            })
+            .max_by_key(|(_, _, _, depth)| *depth);
+        if let Some((id, bounds, container, _)) = node {
+            let into = container
+                && cursor.x >= bounds.left()
+                && cursor.y > bounds.top() + px(8.)
+                && cursor.y < bounds.bottom() - px(8.);
+            let after = cursor.y >= bounds.top() + bounds.size.height / 2.;
+            let ordinary = self.unit_index(id).is_some()
+                && !aero_core::containers::ancestors(&self.doc, id)
+                    .iter()
+                    .any(|b| aero_core::containers::is_editable(&b.kind));
+            if !ordinary {
+                return Some(BlockDropHint {
+                    before: 0,
+                    parent: None,
+                    node: Some((id, after, into)),
+                    origin: point(
+                        bounds.left() + if into { px(16.) } else { px(0.) },
+                        if after || into { bounds.bottom() } else { bounds.top() },
+                    ),
+                    width: (bounds.size.width - if into { px(16.) } else { px(0.) }).max(px(48.)),
+                });
+            }
+        }
         let mut hovered: Option<(usize, Bounds<Pixels>)> = None;
         let mut nearest: Option<(usize, Bounds<Pixels>, Pixels)> = None;
         for (ix, unit) in self.units.iter().enumerate() {
@@ -150,7 +224,13 @@ impl Editor {
         let parent = nest.then_some(ix);
         let y = if nest || before > ix { bounds.bottom() } else { bounds.top() };
         let x = if nest { bounds.left() + px(24.) } else { bounds.left() };
-        Some(BlockDropHint { before, parent, origin: point(x, y), width: (bounds.right() - x).max(px(48.)) })
+        Some(BlockDropHint {
+            before,
+            parent,
+            node: None,
+            origin: point(x, y),
+            width: (bounds.right() - x).max(px(48.)),
+        })
     }
 
     pub(super) fn finish_block_drag(
@@ -161,6 +241,11 @@ impl Editor {
     ) {
         self.ensure_current_parse();
         self.dragging_block = false;
+        if drag.revision != self.doc.version() {
+            self.block_drop = None;
+            cx.notify();
+            return;
+        }
         let cursor = window.mouse_position();
         let hint = self.block_drop_hint(cursor);
         self.block_drop = None;
@@ -168,16 +253,22 @@ impl Editor {
             cx.notify();
             return;
         };
-        let Some(from) = self.unit_index(drag.id) else {
-            cx.notify();
-            return;
+        let plan = if let Some((to, after, into)) = hint.node {
+            ops::move_node(&self.doc, drag.id, to, after, into)
+        } else if let Some(from) = self.unit_index(drag.id) {
+            ops::move_unit(
+                &self.doc,
+                &self.units,
+                from,
+                DropPlace { before: hint.before, parent: hint.parent },
+            )
+        } else {
+            let index = hint.before.min(self.units.len().saturating_sub(1));
+            self.units.get(index).and_then(|to| {
+                ops::move_node(&self.doc, drag.id, to.id, hint.before >= self.units.len(), false)
+            })
         };
-        let Some(plan) = ops::move_unit(
-            &self.doc,
-            &self.units,
-            from,
-            DropPlace { before: hint.before, parent: hint.parent },
-        ) else {
+        let Some(plan) = plan else {
             cx.notify();
             return;
         };
@@ -197,8 +288,8 @@ impl Editor {
     }
 
     pub(super) fn block_preview_text(&self, id: BlockId) -> SharedString {
-        let Some(ix) = self.unit_index(id) else { return "块".into() };
-        let text = self.doc.slice(self.units[ix].range.clone()).to_string();
+        let Some(block) = self.doc.blocks().find(id) else { return "块".into() };
+        let text = self.doc.slice(self.doc.content_range(block)).to_string();
         let line = text.lines().find(|line| !line.trim().is_empty()).unwrap_or("块");
         let line = line.trim();
         if line.chars().count() > 32 {
@@ -226,15 +317,25 @@ impl Editor {
     fn block_menu_convert(&mut self, target: BlockType, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = self.block_menu.as_ref() else { return };
         let id = menu.block;
-        let Some(block) = self.doc.blocks().find(id) else { return };
-        let offset = self.doc.content_range(block).start;
+        if menu.revision != self.doc.version() {
+            self.block_menu = None;
+            return;
+        }
+        let plan = ops::convert_node(&self.doc, id, target);
         self.block_menu = None;
-        self.convert_at(offset, target, false, window, cx);
+        match plan {
+            Ok(Some(plan)) => self.apply_plan(plan, window, cx),
+            Err(error) => {
+                window.push_notification(gpui_kit::component::notification::Notification::warning(error), cx)
+            }
+            _ => {}
+        }
     }
 
     fn block_menu_color(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.block_menu.as_ref().map(|m| m.block) else { return };
         self.block_menu = None;
-        self.open_color_menu(window, cx);
+        self.open_color_menu_for_blocks(vec![id], window, cx);
     }
 
     fn block_menu_copy_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -257,28 +358,79 @@ impl Editor {
         cx.notify();
     }
 
-    fn block_menu_duplicate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn block_menu_copy(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.block_menu.as_ref().map(|menu| menu.block) else { return };
         self.block_menu = None;
-        let Some(ix) = self.unit_index(id) else { return };
-        let range = self.units[ix].range.clone();
-        let text = self.doc.slice(range.clone()).to_string();
-        let at = range.end;
-        let insert = if text.ends_with('\n') { text } else { format!("\n{text}") };
-        if let Err(err) = self.doc.edit(aero_core::Edit::insert(at, insert)) {
-            log::warn!("复制块失败: {err}");
-            return;
-        }
-        self.after_doc_change(cx);
-        self.focus_at(at + 1, None, window, cx);
+        let Some(range) = aero_core::properties::owned_range(&self.doc, id) else { return };
+        let text = aero_core::containers::standalone(&self.doc, range);
+        self.copy_blocks(text, cx);
+        cx.notify();
     }
 
     fn block_menu_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.block_menu.as_ref().map(|menu| menu.block) else { return };
         self.block_menu = None;
-        if let Some(ix) = self.unit_index(id) {
-            self.select_blocks(ix, ix, window, cx);
-            self.delete_selected(window, cx);
+        let Some(range) = aero_core::properties::owned_range(&self.doc, id) else { return };
+        let at = range.start;
+        self.structural_edit(aero_core::Edit::delete(range), at, window, cx);
+    }
+
+    fn block_menu_cut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.block_menu.take() else { return };
+        if menu.revision != self.doc.version() {
+            return;
+        }
+        if let Some(range) = aero_core::properties::owned_range(&self.doc, menu.block) {
+            self.cut_blocks(range, window, cx);
+        }
+    }
+
+    fn block_menu_property(
+        &mut self,
+        key: &str,
+        value: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.block_menu.take() else { return };
+        if menu.revision != self.doc.version() {
+            return;
+        }
+        let Some(block) = self.doc.blocks().find(menu.block) else { return };
+        let mut attrs = block.attrs.clone();
+        if key == "indent-step" {
+            let current = aero_core::properties::indent(&attrs) as i32;
+            let next = (current + value.and_then(|v| v.parse::<i32>().ok()).unwrap_or(0)).clamp(0, 8);
+            aero_core::properties::set(&mut attrs, "indent", (next > 0).then(|| next.to_string()).as_deref());
+        } else {
+            aero_core::properties::set(&mut attrs, key, value);
+        }
+        if let Ok(Some(edit)) =
+            aero_core::properties::edit(&self.doc, menu.block, &attrs, block.persisted_id.as_deref())
+        {
+            let at = self.doc.content_range(block).start;
+            self.structural_edit(edit, at, window, cx);
+        }
+    }
+
+    fn block_menu_container(&mut self, unwrap: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.block_menu.take() else { return };
+        if menu.revision != self.doc.version() {
+            return;
+        }
+        let edit = if unwrap {
+            aero_core::containers::unwrap(&self.doc, menu.block)
+        } else {
+            aero_core::containers::wrap(&self.doc, menu.block, true)
+        };
+        match edit {
+            Ok(edit) => {
+                let at = edit.range.start;
+                self.structural_edit(edit, at, window, cx);
+            }
+            Err(error) => {
+                window.push_notification(gpui_kit::component::notification::Notification::error(error), cx)
+            }
         }
     }
 
@@ -313,6 +465,10 @@ impl Editor {
                     MouseButton::Left,
                     cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
+                        if this.block_menu.as_ref().is_some_and(|m| m.revision != this.doc.version()) {
+                            this.close_block_menu(cx);
+                            return;
+                        }
                         match action {
                             "convert" => {
                                 if let Some(menu) = &mut this.block_menu {
@@ -321,6 +477,15 @@ impl Editor {
                                 cx.notify();
                             }
                             "color" => this.block_menu_color(window, cx),
+                            "cut" => this.block_menu_cut(window, cx),
+                            "layout" => {
+                                if let Some(menu) = &mut this.block_menu {
+                                    menu.submenu = Some(Submenu::Layout);
+                                }
+                                cx.notify();
+                            }
+                            "highlight" => this.block_menu_container(false, window, cx),
+                            "unwrap" => this.block_menu_container(true, window, cx),
                             "source" => {
                                 let Some(id) = this.block_menu.as_ref().map(|menu| menu.block) else {
                                     return;
@@ -330,7 +495,28 @@ impl Editor {
                             }
                             "link" => this.block_menu_copy_link(window, cx),
                             "id" => this.block_menu_add_id(window, cx),
-                            "duplicate" => this.block_menu_duplicate(window, cx),
+                            "copy" => this.block_menu_copy(window, cx),
+                            "sync-copy" => {
+                                if let Some(id) = this.block_menu.as_ref().map(|m| m.block) {
+                                    this.copy_sync_for(id, window, cx);
+                                }
+                            }
+                            "sync-insert" | "sync-replace" => {
+                                if let Some(id) = this.block_menu.as_ref().map(|m| m.block)
+                                    && let Some(range) = aero_core::properties::owned_range(&this.doc, id)
+                                {
+                                    this.open_sync_picker(
+                                        if action == "sync-replace" {
+                                            range.clone()
+                                        } else {
+                                            range.end..range.end
+                                        },
+                                        action == "sync-replace",
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }
                             "delete" => this.block_menu_delete(window, cx),
                             _ => {}
                         }
@@ -345,13 +531,27 @@ impl Editor {
             let label = if self.block_shows_source(block) { "完成源码" } else { "编辑源码" };
             rows.push(row("block-menu-source", label.into(), "source"));
         }
+        rows.push(row("block-menu-layout", "对齐与缩进 ▸".into(), "layout"));
+        rows.push(row("block-menu-highlight", "包裹为高亮块".into(), "highlight"));
+        if self.doc.blocks().find(block).is_some_and(|b| aero_core::containers::is_editable(&b.kind)) {
+            rows.push(row("block-menu-unwrap", "解除容器".into(), "unwrap"));
+        }
         rows.extend([
             row("block-menu-link", "复制块链接".into(), "link"),
             row("block-menu-id", if has_id.is_some() { "复制 ^id".into() } else { "添加 ^id".into() }, "id"),
-            row("block-menu-duplicate", "复制块".into(), "duplicate"),
+            row("block-menu-copy", "复制块".into(), "copy"),
+            row("block-menu-cut", "剪切块".into(), "cut"),
+            row("block-menu-sync-copy", "复制同步引用".into(), "sync-copy"),
+            row("block-menu-sync-insert", "插入同步引用…".into(), "sync-insert"),
             row("block-menu-delete", "删除".into(), "delete"),
         ]);
         let convert = menu.submenu == Some(Submenu::Convert);
+        if self.doc.blocks().find(block).is_some_and(|b| {
+            preview::is_note_embed(self.doc.slice(self.doc.content_range(b)).to_string().trim())
+        }) {
+            rows.push(row("block-menu-sync-replace", "更换同步来源…".into(), "sync-replace"));
+        }
+        let layout = menu.submenu == Some(Submenu::Layout);
         Some(
             deferred(
                 anchored().position(menu.origin).snap_to_window_with_margin(px(8.)).child(
@@ -380,11 +580,63 @@ impl Editor {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .children(rows),
                         )
-                        .when(convert, |el| el.child(self.render_block_convert_menu(cx))),
+                        .when(convert, |el| el.child(self.render_block_convert_menu(cx)))
+                        .when(layout, |el| el.child(self.render_block_layout_menu(cx))),
                 ),
             )
             .into_any_element(),
         )
+    }
+
+    fn render_block_layout_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let supported =
+            self.block_menu.as_ref().and_then(|m| self.doc.blocks().find(m.block)).is_some_and(|b| {
+                matches!(
+                    b.kind,
+                    aero_core::BlockKind::Paragraph
+                        | aero_core::BlockKind::Heading { .. }
+                        | aero_core::BlockKind::ListItem { .. }
+                )
+            });
+        let rows = [
+            ("左对齐", "align", Some("left")),
+            ("居中", "align", Some("center")),
+            ("右对齐", "align", Some("right")),
+            ("两端对齐", "align", Some("justify")),
+            ("增加视觉缩进", "indent-step", Some("1")),
+            ("减少视觉缩进", "indent-step", Some("-1")),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (label, key, value))| {
+            div()
+                .id(("block-layout", i))
+                .px_2()
+                .py_1()
+                .text_sm()
+                .rounded(px(4.))
+                .opacity(if supported { 1. } else { 0.4 })
+                .child(label)
+                .when(supported, |el| {
+                    el.cursor_pointer().hover(|s| s.bg(cx.theme().list_hover)).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.block_menu_property(key, value, window, cx);
+                        }),
+                    )
+                })
+        });
+        v_flex()
+            .w(px(180.))
+            .p_1()
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(px(8.))
+            .shadow_lg()
+            .children(rows)
+            .into_any_element()
     }
 
     fn render_block_convert_menu(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -394,6 +646,8 @@ impl Editor {
         let rows = slash::ITEMS.iter().filter_map(|item| {
             let SlashAction::Convert(target) = item.action else { return None };
             let label = item.label.to_owned();
+            let reason =
+                self.block_menu.as_ref().and_then(|m| ops::conversion_reason(&self.doc, m.block, target));
             Some(
                 div()
                     .id(SharedString::from(format!("block-menu-type-{label}")))
@@ -404,11 +658,20 @@ impl Editor {
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover))
                     .text_sm()
+                    .opacity(if reason.is_some() { 0.4 } else { 1. })
+                    .when_some(reason, |el, reason| {
+                        el.tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(reason).build(window, cx)
+                        })
+                    })
                     .child(label)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
+                            if reason.is_some() {
+                                return;
+                            }
                             this.block_menu_convert(target, window, cx);
                         }),
                     ),

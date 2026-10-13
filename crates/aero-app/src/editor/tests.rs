@@ -24,6 +24,191 @@ fn focus_unit(editor: &Entity<Editor>, ix: usize, cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
+fn hover_block(id: aero_core::BlockId, cx: &mut VisualTestContext) {
+    let selector = Box::leak(format!("block-body-{}", id.0).into_boxed_str());
+    let row = cx.debug_bounds(selector).expect("block row");
+    cx.simulate_mouse_move(
+        row.origin + gpui_kit::point(gpui_kit::px(2.), gpui_kit::px(2.)),
+        None,
+        Default::default(),
+    );
+    settle(cx);
+}
+
+#[gpui_kit::test]
+fn enter_inside_formatted_heading_preserves_identity_and_saves_both_halves(cx: &mut TestAppContext) {
+    let id = aero_core::identity::new_block_id();
+    let source = format!("## **ab cd** {{.red}} ^{id}\n");
+    let (dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        editor.read(cx).focused.as_ref().unwrap().textarea.clone().update(cx, |ta, cx| {
+            let cursor = ta.value().find(" cd").unwrap();
+            ta.set_selected_range(cursor..cursor, cx);
+        })
+    });
+    cx.simulate_keystrokes("enter");
+    let split = format!("## **ab** {{.red}} ^{id}\n\n**cd** {{.red}}\n");
+    assert_eq!(text(&editor, cx), split);
+    cx.simulate_input("新");
+    assert_eq!(text(&editor, cx), split.replace("**cd**", "**新cd**"));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), split);
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+    cx.simulate_keystrokes("cmd-shift-z");
+    assert_eq!(text(&editor, cx), split);
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), split);
+}
+
+#[gpui_kit::test]
+fn different_styles_backspace_shows_a_warning_without_an_undo_entry(cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt as _;
+    let source = "one {.red}\n\ntwo {.blue}\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+    });
+    focus_unit(&editor, 1, cx);
+    cx.update(|_, cx| {
+        editor.read(cx).focused.as_ref().unwrap().textarea.clone().update(cx, |ta, cx| {
+            ta.set_selected_range(0..0, cx);
+        })
+    });
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text(&editor, cx), source);
+    cx.update(|window, cx| {
+        assert_eq!(window.notifications(cx).len(), 1);
+        let e = editor.read(cx);
+        assert_eq!(e.focused.as_ref().unwrap().id, Some(e.units[0].id));
+    });
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn empty_split_slot_materializes_explicit_style_with_first_input(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let id = aero_core::identity::new_block_id();
+    let alias = aero_core::identity::new_block_id();
+    let style = ".red align=center indent=2 custom=value";
+    let source = format!("one {{{style} aero-aliases={alias}}} ^{id}\n");
+    let (_dir, _vault, _path, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("enter");
+    let blank = format!("{source}\n\n");
+    assert_eq!(text(&editor, cx), blank);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let f = e.focused.as_ref().unwrap();
+        let attrs = f.empty_attrs.as_ref().expect("style belongs to the empty slot");
+        assert!(!attrs.pairs.iter().any(|(key, _)| key == "aero-aliases"));
+        assert_eq!(aero_core::properties::Alignment::of(attrs), aero_core::properties::Alignment::Center);
+    });
+    let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|window, cx| {
+        input.update(cx, |ta, cx| ta.replace_and_mark_text_in_range(None, "xin", None, window, cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), blank, "preedit cannot materialize text or attributes");
+    cx.update(|window, cx| input.update(cx, |ta, cx| ta.replace_text_in_range(None, "新", window, cx)));
+    cx.run_until_parked();
+    let filled = format!("{}\n\n新 {{{style}}}\n", source.trim_end());
+    assert_eq!(text(&editor, cx), filled);
+    cx.update(|_, cx| {
+        assert_eq!(
+            editor.read(cx).focused.as_ref().unwrap().textarea,
+            input,
+            "first commit retains the native input client"
+        )
+    });
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), blank);
+    cx.simulate_input("再");
+    assert_eq!(text(&editor, cx), filled.replace('新', "再"));
+    cx.simulate_keystrokes("cmd-z cmd-z");
+    assert_eq!(text(&editor, cx), source);
+    cx.update(|_, cx| {
+        assert!(editor.read(cx).empty_slots.iter().all(|slot| !editor.read(cx).available_empty_slot(slot)))
+    });
+    cx.simulate_keystrokes("cmd-shift-z");
+    assert_eq!(text(&editor, cx), blank);
+    cx.simulate_input("重");
+    assert_eq!(text(&editor, cx), filled.replace('新', "重"));
+}
+
+#[gpui_kit::test]
+fn empty_split_style_survives_blur_other_edits_and_multiline_input(cx: &mut TestAppContext) {
+    let source = "one {.red align=center indent=2 custom=value}\n\nlast\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("enter escape");
+    settle(cx);
+    let blank = text(&editor, cx);
+    let offset = cx.update(|_, cx| editor.read(cx).empty_slots[0].range.start);
+    let bounds = cx
+        .debug_bounds(Box::leak(format!("empty-paragraph-{offset}").into_boxed_str()))
+        .expect("a blurred empty paragraph remains clickable");
+    cx.simulate_click(bounds.center(), Default::default());
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(editor.read(cx).focused.as_ref().unwrap().empty_attrs.is_some()));
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input("before");
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    let shifted = cx.update(|_, cx| editor.read(cx).empty_slots[0].range.start);
+    assert_eq!(shifted, offset + "before".len(), "blank positions follow edits in other paragraphs");
+    let bounds = cx.debug_bounds(Box::leak(format!("empty-paragraph-{shifted}").into_boxed_str())).unwrap();
+    cx.simulate_click(bounds.center(), Default::default());
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "第一行\n第二行\n\n末段 {.blue align=right}".into(),
+        ))
+    });
+    cx.simulate_keystrokes("cmd-v");
+    let filled = text(&editor, cx);
+    assert!(filled.contains("第一行\n第二行 {.red align=center indent=2 custom=value}"), "{filled}");
+    assert!(filled.contains("末段 {.blue indent=2 custom=value align=right}"), "{filled}");
+    assert!(filled.ends_with("\n\nlast\n"), "{filled}");
+    cx.simulate_input("续");
+    assert!(text(&editor, cx).contains("末段续 {.blue"), "caret remains inside the final pasted body");
+    cx.simulate_keystrokes("cmd-z cmd-z");
+    assert_eq!(text(&editor, cx), blank.replace("one", "onebefore"));
+    cx.simulate_input("再");
+    assert!(text(&editor, cx).contains("再 {.red align=center indent=2 custom=value}"));
+}
+
+#[gpui_kit::test]
+fn multiple_empty_split_slots_keep_distinct_styles(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "red {.red}\n\nblue {.blue}\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for ix in [0, 1] {
+        focus_unit(&editor, ix, cx);
+        cx.simulate_keystrokes("enter escape");
+    }
+    settle(cx);
+    let offsets =
+        cx.update(|_, cx| editor.read(cx).empty_slots.iter().map(|s| s.range.start).collect::<Vec<_>>());
+    assert_eq!(offsets.len(), 2);
+    for (offset, value, color) in [(offsets[1], "乙", "blue"), (offsets[0], "甲", "red")] {
+        let bounds =
+            cx.debug_bounds(Box::leak(format!("empty-paragraph-{offset}").into_boxed_str())).unwrap();
+        cx.simulate_click(bounds.center(), Default::default());
+        cx.run_until_parked();
+        cx.simulate_input(value);
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        assert!(text(&editor, cx).contains(&format!("{value} {{.{color}}}")));
+    }
+}
+
 pub(super) fn open(
     cx: &mut TestAppContext,
     body: &str,
@@ -1087,6 +1272,7 @@ fn backlink_selection_notifies_when_the_caret_moves_between_nested_blocks(cx: &m
             observed.lock().unwrap().push(editor.read(cx).selected_reference(cx));
         })
     });
+    focus_unit(&editor, 1, cx);
     select_inline_text(&editor, "second", cx);
     cx.update(|_, cx| assert_eq!(editor.read(cx).selected_reference(cx).as_deref(), Some("two")));
     assert_eq!(observed.lock().unwrap().last().and_then(|id| id.as_deref()), Some("two"));
@@ -1254,11 +1440,7 @@ fn color_menu_open(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> bool 
 
 /// 打开颜色菜单：画一帧，让焦点真的落到菜单的过滤输入框上（键盘事件按上一帧的树派发）。
 fn open_color_menu(editor: &Entity<Editor>, cx: &mut VisualTestContext) {
-    cx.simulate_keystrokes("cmd-/");
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    cx.run_until_parked();
-    let color = cx.debug_bounds("block-menu-color").expect("⌘/ 应先打开块菜单");
-    cx.simulate_click(color.center(), gpui_kit::Modifiers::default());
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.open_color_menu(window, cx)));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.run_until_parked();
     assert!(color_menu_open(editor, cx), "颜色菜单没打开");
@@ -1400,15 +1582,15 @@ fn empty_document_has_no_navigation_marks(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn block_handle_click_selects_without_opening_menu(cx: &mut TestAppContext) {
+fn block_handle_click_opens_menu_for_the_captured_block(cx: &mut TestAppContext) {
     let source =
         "# 标题\n\n正文\n\n- 列表项\n\n> 引用\n\n```rust\nlet x = 1;\n```\n\n| 表头 |\n| --- |\n| 单元格 |\n";
     let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
     focus_unit(&editor, 0, cx);
     let ids: Vec<_> = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
-    for (ix, id) in ids.into_iter().enumerate() {
-        settle(cx);
+    for id in ids {
+        hover_block(id, cx);
         let selector = Box::leak(format!("gutter-handle-{}", id.0).into_boxed_str());
         let handle = cx.debug_bounds(selector).unwrap();
         cx.simulate_mouse_move(handle.center(), None, gpui_kit::Modifiers::default());
@@ -1416,12 +1598,11 @@ fn block_handle_click_selects_without_opening_menu(cx: &mut TestAppContext) {
         settle(cx);
         cx.update(|_, cx| {
             let e = editor.read(cx);
-            assert_eq!(e.selected_blocks(), Some(ix..ix + 1));
-            assert!(e.focused.is_none());
-            assert!(e.block_menu.is_none(), "left-clicking a handle must only select its block");
+            assert_eq!(e.block_menu.as_ref().map(|m| m.block), Some(id));
         });
-        assert!(cx.debug_bounds("block-menu").is_none());
+        assert!(cx.debug_bounds("block-menu").is_some());
         assert_eq!(text(&editor, cx), source);
+        cx.simulate_keystrokes("escape");
     }
 }
 
@@ -1503,10 +1684,11 @@ fn block_menu_right_click_retargets_and_outside_click_reaches_content(cx: &mut T
         assert!(cx.debug_bounds("block-menu").is_some());
         cx.update(|_, cx| assert_eq!(editor.read(cx).selected_blocks(), Some(ix..ix + 1)));
     }
-    let duplicate = cx.debug_bounds("block-menu-duplicate").unwrap();
-    cx.simulate_click(duplicate.center(), Modifiers::default());
+    let copy = cx.debug_bounds("block-menu-copy").unwrap();
+    cx.simulate_click(copy.center(), Modifiers::default());
     settle(cx);
-    assert_eq!(text(&editor, cx), "first\n\nsecond\nsecond\n");
+    assert_eq!(text(&editor, cx), source);
+    cx.update(|_, cx| assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("second")));
     assert!(cx.debug_bounds("block-menu").is_none());
     cx.simulate_keystrokes("escape");
     cx.simulate_keystrokes("cmd-z");
@@ -1555,6 +1737,7 @@ fn dragging_a_block_handle_reorders_it(cx: &mut TestAppContext) {
     draw(cx);
     let ids: Vec<aero_core::BlockId> =
         cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    hover_block(ids[2], cx);
     let handle = cx.debug_bounds(selector("gutter-handle", ids[2])).expect("第三块的拖动手柄");
     let target = cx.debug_bounds(selector("unit", ids[0])).expect("第一块");
     let drop_at = target.origin + gpui_kit::point(gpui_kit::px(24.), gpui_kit::px(4.));
@@ -1589,6 +1772,7 @@ fn dragging_onto_the_right_edge_nests_under_the_list_item(cx: &mut TestAppContex
     draw(cx);
     let ids: Vec<aero_core::BlockId> =
         cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    hover_block(ids[2], cx);
     let handle = cx.debug_bounds(selector("gutter-handle", ids[2])).unwrap();
     let item = cx.debug_bounds(selector("unit", ids[0])).unwrap();
     let drop_at = gpui_kit::point(item.right() - gpui_kit::px(8.), item.origin.y + gpui_kit::px(4.));
@@ -1616,6 +1800,7 @@ fn escape_cancels_a_block_drag(cx: &mut TestAppContext) {
     draw(cx);
     let ids: Vec<aero_core::BlockId> =
         cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
+    hover_block(ids[2], cx);
     let handle = cx.debug_bounds(selector("gutter-handle", ids[2])).unwrap();
     let target = cx.debug_bounds(selector("unit", ids[0])).unwrap();
     let drop_at = target.origin + gpui_kit::point(gpui_kit::px(24.), gpui_kit::px(4.));
@@ -1668,7 +1853,7 @@ fn color_menu_filters_and_applies_to_the_selection(cx: &mut TestAppContext) {
     // 记住了这次的选择：⌘⇧H 接着用它
     cx.update(|_, cx| {
         let last = crate::colors::last(cx);
-        assert_eq!((last.slot, last.color), (aero_core::colors::Slot::Text, "blue"));
+        assert_eq!((last.slot, last.color.as_str()), (aero_core::colors::Slot::Text, "blue"));
     });
     // 再打开：当前颜色带选中标记；Esc 关掉且不改文档
     open_color_menu(&editor, cx);
@@ -1808,7 +1993,8 @@ fn toolbar_more_menu_copies_a_block_link_and_adds_an_id(cx: &mut TestAppContext)
         let item = cx.read_from_clipboard().expect("clipboard");
         item.text().unwrap_or_default()
     });
-    assert_eq!(copied, format!("[[a#^{id}]]"));
+    let document = aero_core::identity::read(&aero_core::Document::from_text(&body)).unwrap().id.unwrap();
+    assert_eq!(copied, format!("[[id:{document}#^{id}]]"));
     assert_eq!(body.matches('^').count(), 1, "只写一个块 id：{body}");
 }
 
@@ -2776,8 +2962,8 @@ fn block_ref_current_note_assigns_and_inserts_as_one_undo_group(cx: &mut TestApp
     let span = aero_core::links::scan(&completed).remove(0);
     let fragment = span.fragment.unwrap();
     assert!(fragment.starts_with('^'));
-    assert_eq!(fragment.len(), 7);
-    assert_eq!(completed, format!("目标正文未保存 {fragment}\n\n引用 [[#{fragment}]]\n"));
+    assert!(aero_core::identity::is_block_id(&fragment[1..]));
+    assert!(completed.ends_with(&format!("目标正文未保存 {fragment}\n\n引用 [[#{fragment}]]\n")));
     cx.simulate_input("!");
     assert!(text(&editor, cx).contains(&format!("[[#{fragment}]]!")));
     cx.simulate_keystrokes("cmd-z");
@@ -3507,10 +3693,10 @@ fn command_availability_excludes_noop_and_unsupported_conversions(cx: &mut TestA
         assert!(editor.command_available(&crate::actions::ConvertBlock(2)));
         assert!(!editor.command_available(&crate::actions::DocUndo));
     });
-    for ix in [1, 2] {
-        focus_unit(&editor, ix, cx);
-        cx.update(|_, cx| assert!(!editor.read(cx).command_available(&crate::actions::ConvertBlock(2))));
-    }
+    focus_unit(&editor, 1, cx);
+    cx.update(|_, cx| assert!(editor.read(cx).command_available(&crate::actions::ConvertBlock(2))));
+    focus_unit(&editor, 2, cx);
+    cx.update(|_, cx| assert!(!editor.read(cx).command_available(&crate::actions::ConvertBlock(2))));
 }
 
 #[gpui_kit::test]
@@ -3876,7 +4062,7 @@ fn list_items_continue_and_exit(cx: &mut TestAppContext) {
     assert_eq!(text(&editor, cx), "- one\n- two\n\npara\n");
     // 段首 ⌫：并回上一行。上一行是列表项时，这段文字接到列表项末尾
     cx.simulate_keystrokes("home backspace");
-    assert_eq!(text(&editor, cx), "- one\n- twopara\n");
+    assert_eq!(text(&editor, cx), "- one\n- two\n\npara\n");
 }
 
 /// `/` 菜单（7.1）：块首输入 `/` 打开、继续输入过滤、↑↓ 选择、⏎ 确认 = 转换当前块并删掉命令；
@@ -3998,6 +4184,44 @@ fn convert_shortcuts(cx: &mut TestAppContext) {
     assert_eq!(text(&editor, cx), "a\n\nb2\n");
     cx.simulate_keystrokes("cmd-alt-7");
     assert_eq!(text(&editor, cx), "a\n\n> b2\n");
+}
+
+#[gpui_kit::test]
+fn conversion_shortcuts_and_slash_reject_lossy_items_and_keep_continuations(cx: &mut TestAppContext) {
+    let source = "- first\n\n  continuation\n\n  - nested ^kid\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| assert!(!editor.read(cx).command_available(&crate::actions::ConvertBlock(1))));
+    cx.simulate_keystrokes("cmd-alt-1");
+    assert_eq!(text(&editor, cx), source);
+    cx.simulate_keystrokes("end");
+    cx.simulate_input(" /h1");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), source.replacen("first", "first /h1", 1));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+    focus_unit(&editor, 1, cx);
+    cx.simulate_keystrokes("cmd-alt-2");
+    assert_eq!(text(&editor, cx), source.replace("  continuation", "  ## continuation"));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn slash_emoji_keeps_the_command_location_for_unicode_input(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "before\n\nafter\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_input(" /emoji");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), "before\n\nafter\n");
+    cx.simulate_input("👩‍👩‍👧‍👦");
+    assert_eq!(text(&editor, cx), "before👩‍👩‍👧‍👦\n\nafter\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "before\n\nafter\n");
 }
 
 /// 点击浏览态的块：画这一块的就是文本控件，按下的那一刻光标就落在点击处，不等下一帧。
@@ -4631,85 +4855,171 @@ fn block_selection_keyboard_flow(cx: &mut TestAppContext) {
     // ⌘X 剪切最后一块：前面多出的空行一起收掉，选区退到上一块
     cx.simulate_keystrokes("down down cmd-x");
     assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some("last".to_owned()));
-    assert_eq!(text(&editor, cx), "# Title\n\n- one!\n- two\n");
+    assert!(text(&editor, cx).ends_with("# Title\n\n- one!\n- two\n"));
     assert_eq!(selected(&editor, cx), Some(2..3));
 
     // 删到空文档：回浏览态，文件也随之为空
     cx.simulate_keystrokes("shift-up shift-up backspace");
-    assert_eq!(text(&editor, cx), "");
+    cx.update(|_, cx| assert!(editor.read(cx).units.is_empty()));
     assert_eq!(selected(&editor, cx), None);
     cx.executor().advance_clock(Duration::from_millis(600));
     cx.run_until_parked();
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text(&editor, cx));
 }
 
-/// 块 gutter（`ui_design.md` 5.3）：每个单位左侧有 `⠿` / `+`，各层级左对齐、不占正文宽度；
-/// `+` 在下方新开段落并打开 `/` 菜单，`⠿` 进入块选中态；点按钮不会顺带把块置为编辑态。
+/// Type labels and six-dot handles open the captured block menu without edits.
 #[gpui_kit::test]
-fn gutter_inserts_below_and_selects(cx: &mut TestAppContext) {
-    let (_dir, _vault, _path, editor) = open(cx, "intro\n\n- item\n\nend\n");
+fn gutter_type_and_handle_open_menu_without_geometry_or_document_changes(cx: &mut TestAppContext) {
+    let source = "intro\n\n- item\n\nend\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
-    let draw = |cx: &mut VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
     let selector = |name: &str, id: aero_core::BlockId| -> &'static str {
         Box::leak(format!("{name}-{}", id.0).into_boxed_str())
     };
-    let ids: Vec<aero_core::BlockId> =
-        cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
-    assert_eq!(ids.len(), 3);
-    draw(cx);
-
-    // 布局：gutter 在正文左侧、不同层级左对齐；正文列仍是 720 宽
+    let ids: Vec<_> = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
     let intro = cx.debug_bounds(selector("unit", ids[0])).unwrap();
-    let plus_intro = cx.debug_bounds(selector("gutter-plus", ids[0])).unwrap();
+    hover_block(ids[0], cx);
+    let type_intro = cx.debug_bounds(selector("gutter-plus", ids[0])).unwrap();
     let handle_intro = cx.debug_bounds(selector("gutter-handle", ids[0])).unwrap();
+    hover_block(ids[1], cx);
     let handle_item = cx.debug_bounds(selector("gutter-handle", ids[1])).unwrap();
-    assert!(
-        handle_intro.right() <= plus_intro.origin.x && plus_intro.right() <= intro.origin.x,
-        "gutter sits left of the block"
-    );
-    assert_eq!(handle_item.origin.x, handle_intro.origin.x, "list item gutter aligns with top-level gutter");
+    assert!(handle_intro.right() <= type_intro.origin.x && type_intro.right() <= intro.origin.x);
+    assert_eq!(handle_item.origin.x, handle_intro.origin.x);
     assert_eq!(intro.size.width, gpui_kit::px(720.));
+    for id in ids.iter().copied() {
+        for name in ["gutter-plus", "gutter-handle"] {
+            hover_block(id, cx);
+            let button = cx.debug_bounds(selector(name, id)).unwrap();
+            cx.simulate_click(button.center(), gpui_kit::Modifiers::default());
+            settle(cx);
+            cx.update(|_, cx| assert_eq!(editor.read(cx).block_menu.as_ref().map(|m| m.block), Some(id)));
+            assert_eq!(text(&editor, cx), source);
+            assert_eq!(cx.debug_bounds(selector("unit", ids[0])).unwrap(), intro);
+            cx.simulate_keystrokes("escape");
+            settle(cx);
+            cx.update(|_, cx| assert!(editor.read(cx).block_menu.is_none()));
+        }
+    }
+}
 
-    // `+`：下方多出 "/" 段落，菜单打开，焦点在 "/" 之后
-    cx.simulate_click(plus_intro.center(), gpui_kit::Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(text(&editor, cx), "intro\n\n/\n\n- item\n\nend\n");
+#[gpui_kit::test]
+fn list_operation_targets_remain_reachable_with_and_without_virtualization(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, point, px, size};
+    let source = "before\n\n- first\n\n  continuation\n\n  - nested\n- second\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(1000.), px(900.)));
+    for virtualized in [false, true] {
+        if virtualized {
+            let source = format!("{source}{}", "\n\nparagraph".repeat(80));
+            cx.update(|_, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.install_document(aero_core::Document::from_text(&source), editor.stamp, cx);
+                    cx.notify();
+                })
+            });
+        }
+        settle(cx);
+        let (list, item, paragraph) = cx.update(|_, cx| {
+            let list = editor
+                .read(cx)
+                .doc
+                .blocks()
+                .roots
+                .iter()
+                .find(|b| matches!(b.kind, aero_core::BlockKind::List { .. }))
+                .unwrap();
+            (list.id, list.children[0].id, list.children[0].children[0].id)
+        });
+        let selector = |name: &str, id: aero_core::BlockId| -> &'static str {
+            Box::leak(format!("{name}-{}", id.0).into_boxed_str())
+        };
+        let row = cx.debug_bounds(selector("row", item)).unwrap();
+        // Enter directly from outside the list, without first focusing any text.
+        cx.simulate_mouse_move(point(row.left() - px(66.), row.top() + px(12.)), None, Modifiers::default());
+        settle(cx);
+        cx.update(|_, cx| assert_eq!(editor.read(cx).hovered_block, Some(list), "virtualized={virtualized}"));
+        let list_handle = cx.debug_bounds(selector("gutter-handle", list)).unwrap();
+        cx.simulate_click(list_handle.center(), Modifiers::default());
+        settle(cx);
+        cx.update(|_, cx| assert_eq!(editor.read(cx).block_menu.as_ref().map(|m| m.block), Some(list)));
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        // The marker column belongs to the item, the text body to its paragraph.
+        cx.simulate_mouse_move(point(row.left() + px(12.), row.top() + px(12.)), None, Modifiers::default());
+        settle(cx);
+        cx.update(|_, cx| assert_eq!(editor.read(cx).hovered_block, Some(item)));
+        let item_handle = cx.debug_bounds(selector("gutter-handle", item)).unwrap();
+        assert!(list_handle.right() <= item_handle.left());
+        cx.simulate_click(item_handle.center(), Modifiers::default());
+        settle(cx);
+        cx.update(|_, cx| assert_eq!(editor.read(cx).block_menu.as_ref().map(|m| m.block), Some(item)));
+        cx.simulate_keystrokes("escape");
+        hover_block(paragraph, cx);
+        cx.update(|_, cx| assert_eq!(editor.read(cx).hovered_block, Some(paragraph)));
+        cx.simulate_mouse_move(point(row.left() + px(12.), row.top() + px(12.)), None, Modifiers::default());
+        settle(cx);
+        cx.update(|_, cx| assert_eq!(editor.read(cx).hovered_block, Some(item)));
+    }
+    // A one-line list is shorter than its vertical operation pair.
     cx.update(|_, cx| {
-        let e = editor.read(cx);
-        assert!(e.slash.is_some(), "slash menu opens");
-        let f = e.focused.as_ref().expect("new paragraph is being edited");
-        assert_eq!(f.textarea.read(cx).value(), "/");
-        assert_eq!(f.textarea.read(cx).cursor(), 1);
+        editor.update(cx, |editor, cx| {
+            editor.install_document(aero_core::Document::from_text("- only\n"), editor.stamp, cx);
+        })
     });
-    // 菜单里选标题 2：`/` 被删掉，新块变成 "## "
-    cx.simulate_input("h2");
-    cx.simulate_keystrokes("enter");
-    assert_eq!(text(&editor, cx), "intro\n\n## \n\n- item\n\nend\n");
-    cx.simulate_input("New");
-    assert_eq!(text(&editor, cx), "intro\n\n## New\n\n- item\n\nend\n");
+    settle(cx);
+    let list = cx.update(|_, cx| editor.read(cx).doc.blocks().roots[0].id);
+    let row = cx.debug_bounds(Box::leak(format!("row-{}", list.0).into_boxed_str())).unwrap();
+    cx.simulate_mouse_move(point(row.left() - px(66.), row.top() + px(38.)), None, Modifiers::default());
+    settle(cx);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).hovered_block, Some(list)));
+    let kind = cx.debug_bounds(Box::leak(format!("gutter-plus-{}", list.0).into_boxed_str())).unwrap();
+    cx.simulate_click(kind.center(), Modifiers::default());
+    settle(cx);
+    cx.update(|_, cx| assert_eq!(editor.read(cx).block_menu.as_ref().map(|m| m.block), Some(list)));
+}
 
-    // `⠿`：进入块选中态（而不是编辑态）
-    cx.simulate_keystrokes("escape escape");
-    draw(cx);
-    let ids: Vec<aero_core::BlockId> =
-        cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect());
-    let handle_end = cx.debug_bounds(selector("gutter-handle", ids[3])).unwrap();
-    cx.simulate_click(handle_end.center(), gpui_kit::Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(selected(&editor, cx), Some(3..4));
-    cx.update(|_, cx| assert!(editor.read(cx).focused.is_none()));
-
-    // 列表项的 `+`：段落落在项之后
-    draw(cx);
-    let plus_item = cx.debug_bounds(selector("gutter-plus", ids[2])).unwrap();
-    cx.simulate_click(plus_item.center(), gpui_kit::Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(text(&editor, cx), "intro\n\n## New\n\n- item\n\n/\n\nend\n");
-    assert_eq!(selected(&editor, cx), None);
-    // Esc 关菜单，`/` 留在文档里（与手敲一致）
-    cx.simulate_keystrokes("escape");
-    cx.update(|_, cx| assert!(editor.read(cx).slash.is_none() && editor.read(cx).focused.is_some()));
-    assert_eq!(text(&editor, cx), "intro\n\n## New\n\n- item\n\n/\n\nend\n");
+#[gpui_kit::test]
+fn container_handles_stay_in_the_editor_gutter_and_target_the_container(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, point, px, size};
+    let source = "before\n\n::::highlight\nouter\n\n> quote\n\n:::highlight\ninner\n:::\n::::\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(1000.), px(900.)));
+    settle(cx);
+    let ids = cx.update(|_, cx| {
+        editor
+            .read(cx)
+            .doc
+            .blocks()
+            .iter()
+            .filter(|(_, b)| aero_core::containers::is_editable(&b.kind))
+            .map(|(_, b)| b.id)
+            .collect::<Vec<_>>()
+    });
+    let outer = cx.debug_bounds(Box::leak(format!("row-{}", ids[0].0).into_boxed_str())).unwrap();
+    for id in ids {
+        hover_block(id, cx);
+        let selector =
+            |name: &str| -> &'static str { Box::leak(format!("{name}-{}", id.0).into_boxed_str()) };
+        let row = cx.debug_bounds(selector("row")).unwrap();
+        let handle = cx.debug_bounds(selector("gutter-handle")).unwrap();
+        let kind = cx.debug_bounds(selector("gutter-plus")).unwrap();
+        // A container does not consume an extra gutter width: both buttons
+        // must fit in the 48pt operation area immediately before its content.
+        assert_eq!(handle.left(), outer.left() - px(super::GUTTER), "{id:?}: {handle:?}, {row:?}");
+        assert!(kind.right() <= row.left());
+        cx.simulate_mouse_move(point(row.left() + px(2.), row.top() + px(2.)), None, Modifiers::default());
+        cx.simulate_mouse_move(handle.center(), None, Modifiers::default());
+        settle(cx);
+        cx.update(|_, cx| assert_eq!(editor.read(cx).hovered_block, Some(id)));
+        cx.simulate_click(handle.center(), Modifiers::default());
+        settle(cx);
+        cx.update(|_, cx| assert_eq!(editor.read(cx).block_menu.as_ref().map(|m| m.block), Some(id)));
+        assert_eq!(text(&editor, cx), source);
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+    }
 }
 
 /// 编辑态里 ⇧↑ / ⇧↓ 在首 / 末行升级为块选区；不在边上时仍是控件内的字符选区。

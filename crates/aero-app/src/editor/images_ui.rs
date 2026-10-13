@@ -182,6 +182,9 @@ impl super::Editor {
             cx.propagate();
             return;
         };
+        if self.paste_blocks(&item, window, cx) {
+            return;
+        }
         // 文字优先：从浏览器复制的图片往往同时带 HTML / 文字，用户要的是文字
         if item.entries().iter().any(|entry| matches!(entry, ClipboardEntry::String(_))) {
             cx.propagate();

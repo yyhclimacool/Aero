@@ -14,6 +14,7 @@
 //! - `key <按键>`：GPUI 的按键写法，如 `escape`、`cmd-z`、`shift-down`
 //! - `type <文字>`：逐字输入，可含中文与空格
 //! - `wait ms`：等待，期间照常出帧
+//! - `theme light|dark`：仅为当前测试应用切换主题，不修改系统设置
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -97,6 +98,17 @@ fn run(cmd: &str, rest: &[&str], pressed: &mut bool, window: &mut Window, cx: &m
         window.dispatch_event(PlatformInput::MouseUp(event), cx);
     };
     match cmd {
+        "theme" => {
+            let mode = match rest.first().copied() {
+                Some("light") => gpui_kit::component::ThemeMode::Light,
+                Some("dark") => gpui_kit::component::ThemeMode::Dark,
+                _ => {
+                    log::warn!("ui channel: bad theme {rest:?}");
+                    return;
+                }
+            };
+            gpui_kit::component::Theme::change(mode, Some(window), cx);
+        }
         "move" => {
             let event =
                 MouseMoveEvent { position: at(), pressed_button: pressed.then_some(button), modifiers };

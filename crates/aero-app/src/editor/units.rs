@@ -1,7 +1,7 @@
 //! 编辑单位（方案 7.1：光标永远位于某个 Leaf Block 内）。
 //!
-//! M1a 的取舍（方案 18 M1a）：引用 / callout / 脚注定义 / directive 整体作为一个单位、以源码编辑；
-//! 列表项的正文段落是单位，列表标记由容器绘制；没有子块的空列表项（`- `）自身是单位，编辑区间为空。
+//! 引用与高亮容器递归到正文叶块；callout、脚注定义和其他 directive 保留原子编辑路径。
+//! 列表项的正文段落是单位，列表标记由容器绘制；空项和空容器提供零长度输入占位。
 
 use std::ops::Range;
 
@@ -59,6 +59,9 @@ impl Unit {
 
 /// 是否把这个块当作一个整体单位（不再深入子块）。
 pub fn is_atomic(kind: &BlockKind) -> bool {
+    if aero_core::containers::is_editable(kind) {
+        return false;
+    }
     match kind {
         BlockKind::Marker | BlockKind::List { .. } | BlockKind::ListItem { .. } => false,
         k if !k.is_container() => true,
@@ -80,7 +83,7 @@ pub fn units(doc: &Document) -> Vec<Unit> {
 fn walk(doc: &Document, blocks: &[Block], list: Option<&ListCtx>, out: &mut Vec<Unit>) {
     for b in blocks {
         match &b.kind {
-            BlockKind::Marker => {}
+            BlockKind::Marker | BlockKind::FrontMatter => {}
             BlockKind::List { ordered, start } => {
                 let items: Vec<&Block> =
                     b.children.iter().filter(|c| matches!(c.kind, BlockKind::ListItem { .. })).collect();
@@ -125,7 +128,19 @@ fn walk(doc: &Document, blocks: &[Block], list: Option<&ListCtx>, out: &mut Vec<
                     list: list.cloned(),
                 });
             }
-            _ => walk(doc, &b.children, list, out),
+            _ => {
+                if aero_core::containers::is_editable(&b.kind) && b.children.is_empty() {
+                    let at = aero_core::containers::placeholder(doc, b);
+                    out.push(Unit {
+                        id: b.id,
+                        kind: BlockKind::Paragraph,
+                        range: at..at,
+                        list: list.cloned(),
+                    });
+                } else {
+                    walk(doc, &b.children, list, out);
+                }
+            }
         }
     }
 }
@@ -144,7 +159,7 @@ mod tests {
         let doc = Document::from_text("# T\n\n- a\n- \n\n> q\n> r\n\n```rs\nx\n```\n");
         let us = units(&doc);
         let kinds: Vec<&str> = us.iter().map(|u| u.kind.tag()).collect();
-        assert_eq!(kinds, ["heading", "paragraph", "list_item", "block_quote", "code_fence"]);
+        assert_eq!(kinds, ["heading", "paragraph", "list_item", "paragraph", "code_fence"]);
         // 空列表项：区间为空、有列表上下文
         let empty = &us[2];
         assert!(empty.range.is_empty());

@@ -1,0 +1,21 @@
+   Compiling aero-app v0.1.0 (/Users/aero/code/Aero/crates/aero-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 12s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/aero-1e75e5cb450dd4e9)
+
+running 1 test
+
+thread 'editor::embeds_ui::tests::deleted_live_source_invalidates_nested_references_and_recovers' (6236763) panicked at crates/aero-app/src/editor/embeds_ui.rs:439:17:
+deleted source cannot render retained editor text
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test editor::embeds_ui::tests::deleted_live_source_invalidates_nested_references_and_recovers ... FAILED
+
+failures:
+
+failures:
+    editor::embeds_ui::tests::deleted_live_source_invalidates_nested_references_and_recovers
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 628 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p aero-app --bin aero`

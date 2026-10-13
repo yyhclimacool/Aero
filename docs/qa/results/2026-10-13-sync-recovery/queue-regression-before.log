@@ -1,0 +1,34 @@
+   Compiling aero-app v0.1.0 (/Users/aero/code/Aero/crates/aero-app)
+warning: method `retire_transaction_source` is never used
+  --> crates/aero-app/src/editor/live_sources.rs:56:19
+   |
+53 | impl Editor {
+   | ----------- method in this implementation
+...
+56 |     pub(crate) fn retire_transaction_source(&self, cx: &mut Context<Self>) {
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aero-app` (bin "aero") generated 1 warning
+warning: `aero-app` (bin "aero" test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.98s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/aero-1e75e5cb450dd4e9)
+
+running 1 test
+
+thread 'workspace::tests::queued_file_operation_survives_undo_removing_an_open_document' (6250033) panicked at crates/aero-app/src/workspace.rs:2589:9:
+accepted operation must not be cancelled by an internally deleted editor awaiting tab closure
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test workspace::tests::queued_file_operation_survives_undo_removing_an_open_document ... FAILED
+
+failures:
+
+failures:
+    workspace::tests::queued_file_operation_survives_undo_removing_an_open_document
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 628 filtered out; finished in 2.00s
+
+error: test failed, to rerun pass `-p aero-app --bin aero`

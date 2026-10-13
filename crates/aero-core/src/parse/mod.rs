@@ -313,7 +313,11 @@ impl<'t> Cx<'t> {
                 // 与段落的块末属性一样记成 suffix：编辑和渲染都不再出现这一段源码。
                 let src = &self.text[range];
                 let t = markers::strip_trailing(src);
-                if !b.attrs.is_empty() && t.attrs.is_some() && t.id.is_none() {
+                if t.attrs.is_some() || t.id.is_some() {
+                    if let Some(attrs) = t.attrs {
+                        b.attrs = attrs;
+                    }
+                    b.persisted_id = t.id.map(Arc::from);
                     b.suffix_len = (src.len() - t.content_len) as u32;
                 }
                 b
@@ -368,16 +372,20 @@ impl<'t> Cx<'t> {
         range: Range<usize>,
         attrs: Attrs,
     ) -> ParsedBlock {
-        let children = self.convert_children(node, range.clone());
-        ParsedBlock {
-            hash: self.hash(&range),
-            kind,
-            range,
-            suffix_len: 0,
-            persisted_id: None,
-            attrs,
-            children,
+        let mut children = self.convert_children(node, range.clone());
+        let mut attrs = attrs;
+        let mut persisted_id = None;
+        if matches!(kind, BlockKind::ListItem { .. })
+            && children.first().is_some_and(|b| {
+                b.kind == BlockKind::Marker
+                    && b.attrs.pairs.iter().any(|(k, v)| k == "aero-owner" && v == "item")
+            })
+        {
+            let metadata = children.remove(0);
+            persisted_id = metadata.persisted_id;
+            attrs.merge(metadata.attrs);
         }
+        ParsedBlock { hash: self.hash(&range), kind, range, suffix_len: 0, persisted_id, attrs, children }
     }
 
     fn paragraph<'a>(&mut self, node: &'a AstNode<'a>, range: Range<usize>) -> ParsedBlock {

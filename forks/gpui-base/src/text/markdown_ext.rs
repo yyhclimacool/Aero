@@ -27,8 +27,7 @@ pub type MarkdownBlockParserFn =
     dyn for<'a> Fn(&mdast::Node, &MarkdownParseContext<'a>) -> Option<MarkdownNode> + Send + Sync;
 
 /// Type for a custom Markdown block renderer.
-pub type MarkdownBlockRenderFn =
-    dyn Fn(&MarkdownNode, &mut Window, &mut App) -> AnyElement + Send + Sync;
+pub type MarkdownBlockRenderFn = dyn Fn(&MarkdownNode, &mut Window, &mut App) -> AnyElement + Send + Sync;
 
 /// A reusable Markdown extension that parses and renders one custom node.
 pub trait MarkdownPlugin: Send + Sync + 'static {
@@ -144,11 +143,7 @@ impl MarkdownNode {
     }
 
     pub(crate) fn to_markdown(&self) -> String {
-        if self.markdown.is_empty() {
-            self.text.to_string()
-        } else {
-            self.markdown.to_string()
-        }
+        if self.markdown.is_empty() { self.text.to_string() } else { self.markdown.to_string() }
     }
 }
 
@@ -261,10 +256,7 @@ impl MarkdownExtensions {
             && self.enable_frontmatter == other.enable_frontmatter
             && self.block_parsers.len() == other.block_parsers.len()
             && self.block_renderers.len() == other.block_renderers.len()
-            && self
-                .block_renderers
-                .keys()
-                .all(|name| other.block_renderers.contains_key(name))
+            && self.block_renderers.keys().all(|name| other.block_renderers.contains_key(name))
     }
 
     pub(crate) fn push_block_parser<F>(&mut self, parser: F)
@@ -304,6 +296,10 @@ impl MarkdownExtensions {
         options
     }
 
+    pub(crate) fn syntax_key(&self) -> (bool, bool) {
+        (self.enable_frontmatter, self.enable_mdx)
+    }
+
     pub(crate) fn parse_block(
         &self,
         node: &mdast::Node,
@@ -323,9 +319,7 @@ impl MarkdownExtensions {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        self.block_renderers
-            .get(node.name())
-            .map(|render| render(node, window, cx))
+        self.block_renderers.get(node.name()).map(|render| render(node, window, cx))
     }
 
     fn bump_revision(&mut self) {

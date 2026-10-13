@@ -1,0 +1,108 @@
+{
+  "scale": 2,
+  "logical_region": [
+    260,
+    100,
+    740,
+    460
+  ],
+  "scope": "Complete editor text and containers; sidebar, backlinks, status bar excluded. No tolerance or in-region masks.",
+  "comparisons": [
+    {
+      "theme": "dark",
+      "kind": "outer",
+      "comparison": "0->1",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "dark",
+      "kind": "outer",
+      "comparison": "0->2",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "dark",
+      "kind": "quote",
+      "comparison": "0->1",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "dark",
+      "kind": "quote",
+      "comparison": "0->2",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "dark",
+      "kind": "list",
+      "comparison": "0->1",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "dark",
+      "kind": "list",
+      "comparison": "0->2",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "dark",
+      "kind": "inner",
+      "comparison": "0->1",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "dark",
+      "kind": "inner",
+      "comparison": "0->2",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "light",
+      "kind": "outer",
+      "comparison": "0->1",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "light",
+      "kind": "outer",
+      "comparison": "0->2",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "light",
+      "kind": "quote",
+      "comparison": "0->1",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "light",
+      "kind": "quote",
+      "comparison": "0->2",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "light",
+      "kind": "list",
+      "comparison": "0->1",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "light",
+      "kind": "list",
+      "comparison": "0->2",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "light",
+      "kind": "inner",
+      "comparison": "0->1",
+      "exact_changed_pixels": 0
+    },
+    {
+      "theme": "light",
+      "kind": "inner",
+      "comparison": "0->2",
+      "exact_changed_pixels": 0
+    }
+  ]
+}

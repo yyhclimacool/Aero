@@ -18,10 +18,7 @@ pub fn candidates(doc: &Document) -> Vec<Candidate> {
     doc.blocks()
         .iter()
         .filter_map(|(_, b)| {
-            if matches!(
-                b.kind,
-                BlockKind::FrontMatter | BlockKind::Marker | BlockKind::Raw | BlockKind::ListItem { .. }
-            ) {
+            if matches!(b.kind, BlockKind::FrontMatter | BlockKind::Marker | BlockKind::Raw) {
                 return None;
             }
             let source = doc.slice(doc.content_range(b)).to_string();
@@ -40,10 +37,12 @@ pub fn candidates(doc: &Document) -> Vec<Candidate> {
 
 /// Marker 节点也携带前一个块的 ID；不能将它误算成重复定义。
 pub fn resolve(doc: &Document, id: &str) -> Result<BlockId, String> {
-    let mut matches = doc
-        .blocks()
-        .iter()
-        .filter(|(_, b)| b.kind != BlockKind::Marker && b.persisted_id.as_deref() == Some(id));
+    let scoped =
+        crate::identity::read(doc).ok().and_then(|m| m.id).map(|document| format!("{document}#{id}"));
+    let mut matches = doc.blocks().iter().filter(|(_, b)| {
+        b.kind != BlockKind::Marker
+            && (owns_id(b, id) || scoped.as_ref().is_some_and(|id| aliases(b).any(|alias| alias == id)))
+    });
     let Some((_, first)) = matches.next() else { return Err(format!("找不到块 ID：^{id}")) };
     if matches.next().is_some() {
         return Err(format!("块 ID 重复：^{id}，请先消歧"));
@@ -51,9 +50,64 @@ pub fn resolve(doc: &Document, id: &str) -> Result<BlockId, String> {
     Ok(first.id)
 }
 
+pub fn aliases(block: &Block) -> impl Iterator<Item = &str> {
+    block
+        .attrs
+        .pairs
+        .iter()
+        .filter(|(key, _)| key == "aero-aliases")
+        .flat_map(|(_, value)| value.split_whitespace())
+}
+
+pub fn owns_id(block: &Block, id: &str) -> bool {
+    block.persisted_id.as_deref() == Some(id) || aliases(block).any(|alias| alias == id)
+}
+
 pub struct Assignment {
     pub id: String,
     pub edit: Option<Edit>,
+}
+
+pub struct PersistentAssignment {
+    pub document: String,
+    pub id: String,
+    pub edits: Vec<Edit>,
+}
+
+/// A portable reference upgrades a legacy short ID only at this explicit boundary.
+pub fn permanent(doc: &Document, block: BlockId) -> Result<PersistentAssignment, String> {
+    let (document, mut edits) = crate::identity::ensure(doc)?;
+    let b = doc.blocks().find(block).ok_or("目标块已不存在")?;
+    let id = match b.persisted_id.as_deref() {
+        Some(old) if crate::identity::is_block_id(old) => {
+            resolve(doc, old)?;
+            old.to_owned()
+        }
+        Some(old) => {
+            resolve(doc, old)?;
+            let id = crate::identity::new_block_id();
+            let mut attrs = b.attrs.clone();
+            let mut aliases: Vec<_> = aliases(b).map(str::to_owned).collect();
+            aliases.push(format!("{document}#{old}"));
+            aliases.sort();
+            aliases.dedup();
+            crate::properties::set(&mut attrs, "aero-aliases", Some(&aliases.join(" ")));
+            edits.extend(crate::properties::edit(doc, block, &attrs, Some(&id))?);
+            id
+        }
+        None if matches!(b.kind, BlockKind::ListItem { .. }) => {
+            let id = crate::identity::new_block_id();
+            edits.extend(crate::properties::edit(doc, block, &b.attrs, Some(&id))?);
+            id
+        }
+        None => {
+            let assignment = prepare(doc, block)?;
+            edits.extend(assignment.edit);
+            assignment.id
+        }
+    };
+    edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
+    Ok(PersistentAssignment { document, id, edits })
 }
 
 /// 仅准备一次插入，不修改文档。已有且唯一的 ID 原样复用。
@@ -70,8 +124,7 @@ pub fn prepare(doc: &Document, block: BlockId) -> Result<Assignment, String> {
     }
     let ids: HashSet<_> = doc.blocks().iter().filter_map(|(_, b)| b.persisted_id.as_deref()).collect();
     let id = loop {
-        let random = ulid::Ulid::generate().to_string();
-        let id = random[random.len() - 6..].to_ascii_lowercase();
+        let id = crate::identity::new_block_id();
         if !ids.contains(id.as_str()) {
             break id;
         }
@@ -207,8 +260,7 @@ mod tests {
         let mut doc = Document::from_text(source);
         let candidate = candidates(&doc).into_iter().find(|c| c.kind.tag() == kind).unwrap();
         let plan = prepare(&doc, candidate.block).unwrap_or_else(|e| panic!("{kind}: {source:?}: {e}"));
-        assert_eq!(plan.id.len(), 6);
-        assert!(plan.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+        assert!(crate::identity::is_block_id(&plan.id));
         doc.edit(plan.edit.unwrap()).unwrap();
         doc.reparse();
         let block = resolve(&doc, &plan.id).unwrap();

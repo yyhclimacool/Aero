@@ -44,6 +44,112 @@ fn parse_text(text: &str) -> ParseOutput {
     parse::parse(text)
 }
 
+/// Convert sequential inverse edits to disjoint spans in their initial text.
+/// Pieces retain original byte coordinates without a marker per character.
+fn restoration_spans(len: usize, edits: &[Edit]) -> Result<Vec<Edit>, String> {
+    #[derive(Clone)]
+    enum Piece {
+        Original(Range<usize>),
+        Inserted(String),
+    }
+    impl Piece {
+        fn len(&self) -> usize {
+            match self {
+                Self::Original(r) => r.len(),
+                Self::Inserted(s) => s.len(),
+            }
+        }
+        fn slice(&self, r: Range<usize>) -> Self {
+            match self {
+                Self::Original(old) => Self::Original(old.start + r.start..old.start + r.end),
+                Self::Inserted(s) => Self::Inserted(s[r].to_owned()),
+            }
+        }
+    }
+    let mut pieces = vec![Piece::Original(0..len)];
+    for edit in edits {
+        let mut next = Vec::new();
+        let mut at = 0;
+        let mut inserted = false;
+        for piece in pieces {
+            let end = at + piece.len();
+            if end <= edit.range.start {
+                next.push(piece);
+            } else if at >= edit.range.end {
+                if !inserted {
+                    next.push(Piece::Inserted(edit.text.clone()));
+                    inserted = true;
+                }
+                next.push(piece);
+            } else {
+                if at < edit.range.start {
+                    next.push(piece.slice(0..edit.range.start - at));
+                }
+                if !inserted {
+                    next.push(Piece::Inserted(edit.text.clone()));
+                    inserted = true;
+                }
+                if end > edit.range.end {
+                    next.push(piece.slice(edit.range.end - at..piece.len()));
+                }
+            }
+            at = end;
+        }
+        if !inserted {
+            if edit.range.start != at {
+                return Err("剪切恢复区间已失效".into());
+            }
+            next.push(Piece::Inserted(edit.text.clone()));
+        }
+        pieces = next;
+    }
+    let mut spans = Vec::new();
+    let mut at = 0;
+    let mut inserted = String::new();
+    for piece in pieces {
+        match piece {
+            Piece::Inserted(s) => inserted.push_str(&s),
+            Piece::Original(r) => {
+                if r.start != at || !inserted.is_empty() {
+                    spans.push(Edit::replace(at..r.start, std::mem::take(&mut inserted)));
+                }
+                at = r.end;
+            }
+        }
+    }
+    if at != len || !inserted.is_empty() {
+        spans.push(Edit::replace(at..len, inserted));
+    }
+    Ok(spans)
+}
+
+fn rebase_disjoint(edit: &Edit, anchors: &[Edit]) -> Result<Edit, String> {
+    for anchor in anchors {
+        let overlaps = edit.range.start < anchor.range.end && anchor.range.start < edit.range.end;
+        let cuts_anchor = anchor.range.is_empty()
+            && edit.range.start < anchor.range.start
+            && anchor.range.start < edit.range.end;
+        let inserts_inside = edit.range.is_empty()
+            && anchor.range.start <= edit.range.start
+            && edit.range.start < anchor.range.end;
+        if overlaps || cuts_anchor || inserts_inside {
+            return Err("后续编辑覆盖了剪切恢复位置，请先撤销该编辑".into());
+        }
+    }
+    let map = |p: usize, right: bool| {
+        let delta: isize = anchors
+            .iter()
+            .filter(|a| a.range.end < p || (a.range.end == p && (!a.range.is_empty() || right)))
+            .map(Edit::delta)
+            .sum();
+        (p as isize + delta) as usize
+    };
+    Ok(Edit::replace(
+        map(edit.range.start, true)..map(edit.range.end, edit.range.is_empty()),
+        edit.text.clone(),
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub struct Document {
     text: Rope,
@@ -63,6 +169,8 @@ pub struct Document {
     /// 逆编辑组；每组按顺序应用即可撤销一次操作
     undo: Vec<Vec<Edit>>,
     redo: Vec<Vec<Edit>>,
+    undo_transactions: Vec<Option<String>>,
+    redo_transactions: Vec<Option<String>>,
     pub bom: bool,
     pub line_ending: LineEnding,
     /// 最近一次解析的后处理统计
@@ -99,6 +207,8 @@ impl Document {
             next_id: 1,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_transactions: Vec::new(),
+            redo_transactions: Vec::new(),
             bom: src.bom,
             line_ending: src.line_ending,
             report: ParseReport::default(),
@@ -270,7 +380,9 @@ impl Document {
         if !inverses.is_empty() {
             inverses.reverse();
             self.undo.push(inverses);
+            self.undo_transactions.push(None);
             self.redo.clear();
+            self.redo_transactions.clear();
         }
         Ok(())
     }
@@ -282,10 +394,118 @@ impl Document {
         let inverse = self.apply_raw(&edit);
         match self.undo.last_mut() {
             // 组内逆编辑按顺序应用，新编辑的逆必须最先应用
-            Some(group) => group.insert(0, inverse),
-            None => self.undo.push(vec![inverse]),
+            Some(group) if self.undo_transactions.last() == Some(&None) => group.insert(0, inverse),
+            _ => {
+                self.undo.push(vec![inverse]);
+                self.undo_transactions.push(None);
+            }
         }
         self.redo.clear();
+        self.redo_transactions.clear();
+        Ok(())
+    }
+
+    /// One participant in a workspace transaction. An empty participant still
+    /// has a history boundary (for example a newly created child document).
+    pub fn edit_transaction(&mut self, edits: Vec<Edit>, token: &str) -> Result<(), EditError> {
+        let empty = edits.is_empty();
+        self.edit_group(edits)?;
+        if empty {
+            self.undo.push(Vec::new());
+            self.undo_transactions.push(None);
+        }
+        *self.undo_transactions.last_mut().unwrap() = Some(token.into());
+        self.redo.clear();
+        self.redo_transactions.clear();
+        Ok(())
+    }
+
+    pub fn history_transaction(&self, redo: bool) -> Option<&str> {
+        if redo { &self.redo_transactions } else { &self.undo_transactions }.last()?.as_deref()
+    }
+
+    pub fn discard_redo_transaction(&mut self, token: &str) {
+        if self.history_transaction(true) == Some(token) {
+            self.redo.pop();
+            self.redo_transactions.pop();
+        }
+    }
+
+    /// Remove an earlier pending cut while retaining later, disjoint edits and
+    /// their undo groups. Restoration spans are anchors carried through each
+    /// subsequent edit; overlaps are rejected instead of guessing a position.
+    pub fn without_transaction(&self, token: &str) -> Result<Self, String> {
+        let index = self
+            .undo_transactions
+            .iter()
+            .rposition(|t| t.as_deref() == Some(token))
+            .ok_or("剪切历史已不可用，无法可靠恢复原位置")?;
+        if self.undo_transactions[index + 1..].iter().any(Option::is_some) {
+            return Err("剪切后存在其他关联操作，请先撤销该操作".into());
+        }
+        let mut timeline = self.clone();
+        let mut later = Vec::new();
+        while timeline.undo.len() > index + 1 {
+            timeline.undo();
+            later.push(timeline.redo.last().unwrap().clone());
+        }
+        let mut anchors = restoration_spans(timeline.len(), &timeline.undo[index])?;
+        let mut restored = timeline.clone();
+        restored.undo();
+        restored.redo.clear();
+        restored.redo_transactions.clear();
+        for group in later.into_iter().rev() {
+            let mut inverses = Vec::new();
+            for edit in group {
+                let mapped = rebase_disjoint(&edit, &anchors)?;
+                text::check_edit(&restored.text, &mapped).map_err(|e| e.to_string())?;
+                inverses.push(restored.apply_raw(&mapped));
+                timeline.apply_raw(&edit);
+                for anchor in &mut anchors {
+                    // A concurrent insertion at the cut boundary follows the
+                    // restored subtree, so its restoration anchor stays left.
+                    let shift = |p| {
+                        crate::anchors::shift(
+                            p,
+                            crate::anchors::Bias::Left,
+                            edit.range.start,
+                            edit.range.end,
+                            edit.text.len(),
+                            edit.delta(),
+                        )
+                    };
+                    anchor.range = shift(anchor.range.start)..shift(anchor.range.end);
+                }
+            }
+            // Verify the commuting edits, including Unicode boundaries and
+            // multiple restoration spans, before accepting the new history.
+            let mut check = timeline.text.clone();
+            for anchor in anchors.iter().rev() {
+                text::apply_edit(&mut check, anchor);
+            }
+            if check != restored.text {
+                return Err("剪切恢复位置发生冲突，未修改文档".into());
+            }
+            inverses.reverse();
+            restored.undo.push(inverses);
+            restored.undo_transactions.push(None);
+        }
+        restored.reparse();
+        Ok(restored)
+    }
+
+    /// Append changes to an immediate cut without creating a second history
+    /// entry. Callers validate the whole workspace before changing any file.
+    pub fn amend_transaction(&mut self, edits: Vec<Edit>, token: &str) -> Result<(), EditError> {
+        assert_eq!(self.history_transaction(false), Some(token));
+        let mut probe = self.clone();
+        probe.edit_group(edits.clone())?;
+        for edit in edits {
+            let inverse = self.apply_raw(&edit);
+            self.undo.last_mut().unwrap().insert(0, inverse);
+        }
+        self.redo.clear();
+        self.redo_transactions.clear();
         Ok(())
     }
 
@@ -300,15 +520,19 @@ impl Document {
     /// 撤销一组编辑。返回新文本中受影响的区间（编辑器据此放光标）；没有可撤销的内容时为 `None`。
     pub fn undo(&mut self) -> Option<Range<usize>> {
         let group = self.undo.pop()?;
+        let token = self.undo_transactions.pop().unwrap();
         let (redo_group, affected) = self.apply_group(&group);
         self.redo.push(redo_group);
+        self.redo_transactions.push(token);
         Some(affected)
     }
 
     pub fn redo(&mut self) -> Option<Range<usize>> {
         let group = self.redo.pop()?;
+        let token = self.redo_transactions.pop().unwrap();
         let (undo_group, affected) = self.apply_group(&group);
         self.undo.push(undo_group);
+        self.undo_transactions.push(token);
         Some(affected)
     }
 
@@ -1389,6 +1613,56 @@ mod tests {
         assert!(d.redo().is_some());
         assert_eq!(d.to_string(), "Xbcd");
         assert!(d.redo().is_none());
+    }
+
+    #[test]
+    fn pending_cut_restores_anchors_across_disjoint_edits_and_rebases_history() {
+        let mut doc = Document::from_text("前面\n\n剪切\n\n后面\n");
+        doc.edit_transaction(vec![Edit::delete(8..16), Edit::insert(0, "metadata\n")], "cut").unwrap();
+        doc.edit(Edit::insert(doc.len(), "新增🦀\n")).unwrap();
+        doc.edit(Edit::insert(9, "开头\n")).unwrap();
+        let cut_text = doc.to_string();
+        let mut restored = doc.without_transaction("cut").unwrap();
+        assert_eq!(restored.to_string(), "开头\n前面\n\n剪切\n\n后面\n新增🦀\n");
+        assert_eq!(doc.to_string(), cut_text, "planning must not modify the original");
+        restored.undo();
+        assert_eq!(restored.to_string(), "前面\n\n剪切\n\n后面\n新增🦀\n");
+        restored.undo();
+        assert_eq!(restored.to_string(), "前面\n\n剪切\n\n后面\n");
+        assert!(!restored.can_undo());
+        restored.redo();
+        restored.redo();
+        assert_eq!(restored.to_string(), "开头\n前面\n\n剪切\n\n后面\n新增🦀\n");
+    }
+
+    #[test]
+    fn pending_cut_rejects_edits_covering_restoration_boundary() {
+        let mut doc = Document::from_text("beforeCUTafter");
+        doc.edit_transaction(vec![Edit::delete(6..9)], "cut").unwrap();
+        doc.edit(Edit::replace(5..8, "overlap")).unwrap();
+        assert!(doc.without_transaction("cut").is_err());
+        doc.undo();
+        doc.edit(Edit::insert(6, "new")).unwrap();
+        assert_eq!(doc.without_transaction("cut").unwrap().to_string(), "beforeCUTnewafter");
+    }
+
+    #[test]
+    fn transactions_amend_atomically_and_isolate_later_typing() {
+        let mut doc = Document::from_text("before");
+        doc.edit_transaction(vec![Edit::replace(0..6, "cut")], "move").unwrap();
+        doc.amend_transaction(vec![Edit::insert(3, " pasted")], "move").unwrap();
+        let snapshot = doc.to_string();
+        assert!(doc.amend_transaction(vec![Edit::insert(99, "bad")], "move").is_err());
+        assert_eq!(doc.to_string(), snapshot);
+        doc.edit_coalescing(Edit::insert(doc.len(), "!")).unwrap();
+        assert_eq!(doc.history_transaction(false), None);
+        doc.undo();
+        assert_eq!(doc.history_transaction(false), Some("move"));
+        doc.undo();
+        assert_eq!(doc.to_string(), "before");
+        assert_eq!(doc.history_transaction(true), Some("move"));
+        doc.redo();
+        assert_eq!(doc.to_string(), snapshot);
     }
 
     #[test]

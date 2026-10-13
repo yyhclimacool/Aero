@@ -184,12 +184,14 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
-        let assignment = aero_core::block_refs::prepare(&self.doc, block)?;
+        let assignment = aero_core::block_refs::permanent(&self.doc, block)?;
         let id = assignment.id.clone();
-        if let Some(edit) = assignment.edit {
-            let at = edit.range.start;
-            self.structural_edit(edit, at, window, cx);
+        if !assignment.edits.is_empty() {
+            self.doc.edit_group(assignment.edits).map_err(|e| e.to_string())?;
+            self.focused = None;
+            self.after_doc_change(cx);
         }
+        let _ = window;
         Ok(id)
     }
 
@@ -215,11 +217,8 @@ impl Editor {
                 return;
             }
         };
-        let bare = self.path.as_str().strip_suffix(".md").unwrap_or(self.path.as_str());
-        let Some(target) = aero_core::links::escape_target(bare) else {
-            return;
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(format!("[[{target}#^{id}]]")));
+        let Some(document) = aero_core::identity::read(&self.doc).ok().and_then(|m| m.id) else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(format!("[[id:{document}#^{id}]]")));
     }
 
     fn add_block_id(&mut self, window: &mut Window, cx: &mut Context<Self>) {

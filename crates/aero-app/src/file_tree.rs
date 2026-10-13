@@ -21,6 +21,12 @@ pub const ROW_HEIGHT: f32 = 28.;
 /// 每深一层缩进的宽度
 const INDENT: f32 = 14.;
 
+fn tree_view_file(vault: &Vault) -> std::path::PathBuf {
+    crate::paths::app_data_dir()
+        .join("views")
+        .join(format!("{:016x}.tree", aero_core::hash_bytes(vault.id().as_bytes())))
+}
+
 pub enum FileTreeEvent {
     Open(VaultPath),
     /// ⌘ 点击 / 中键 / 右键「在新标签页打开」
@@ -30,6 +36,11 @@ pub enum FileTreeEvent {
     Move {
         from: VaultPath,
         to: VaultPath,
+    },
+    Reparent {
+        path: VaultPath,
+        parent: Option<VaultPath>,
+        before: Option<VaultPath>,
     },
     Operation(crate::workspace::files::Operation),
 }
@@ -44,6 +55,10 @@ pub struct RenameEntry(pub String);
 #[action(namespace = file_tree, no_json)]
 pub struct TrashAttachment(pub String);
 
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = file_tree, no_json)]
+pub struct TopLevelDocument(pub String);
+
 struct RenameInput {
     path: VaultPath,
     directory: bool,
@@ -51,9 +66,49 @@ struct RenameInput {
     _subscription: Subscription,
 }
 
+#[derive(Clone)]
+struct DocumentLocation {
+    parent: Option<VaultPath>,
+    next: Option<VaultPath>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DocumentDropPosition {
+    Before,
+    After,
+    Inside,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DocumentDrop {
+    target: VaultPath,
+    parent: Option<VaultPath>,
+    before: Option<VaultPath>,
+    position: DocumentDropPosition,
+}
+
+fn document_locations(rows: &[aero_core::relations::Row]) -> BTreeMap<VaultPath, DocumentLocation> {
+    let mut locations = BTreeMap::new();
+    let mut ancestors = Vec::new();
+    for row in rows {
+        ancestors.truncate(row.depth);
+        locations
+            .insert(row.path.clone(), DocumentLocation { parent: ancestors.last().cloned(), next: None });
+        ancestors.push(row.path.clone());
+    }
+    let mut siblings = Vec::new();
+    for row in rows.iter().rev() {
+        siblings.truncate(row.depth + 1);
+        siblings.resize(row.depth + 1, None);
+        locations.get_mut(&row.path).unwrap().next = siblings[row.depth].replace(row.path.clone());
+    }
+    locations
+}
+
 /// 文件树里拖出来的一项。编辑区接受笔记（插入链接），树内接受移动。
 #[derive(Clone)]
 pub(crate) struct TreeDrag {
+    pub(crate) logical: bool,
     pub(crate) vault: String,
     pub(crate) path: VaultPath,
     pub(crate) directory: bool,
@@ -61,7 +116,8 @@ pub(crate) struct TreeDrag {
 
 impl TreeDrag {
     fn target(&self, vault: &str, directory: &str) -> Option<VaultPath> {
-        if self.vault != vault
+        if self.logical
+            || self.vault != vault
             || (self.directory
                 && (directory == self.path.as_str() || directory.starts_with(&format!("{}/", self.path))))
         {
@@ -84,6 +140,7 @@ impl Render for TreeDrag {
             .py_1()
             .rounded_md()
             .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
             .text_sm()
             .child(self.path.file_name().to_owned())
     }
@@ -155,6 +212,9 @@ impl Folder {
 struct Scan {
     tree: Result<(Folder, HashSet<VaultPath>), String>,
     attachments: BTreeMap<VaultPath, Vec<VaultPath>>,
+    relations: Vec<aero_core::relations::Note>,
+    relation_rows: Vec<aero_core::relations::Row>,
+    document_locations: BTreeMap<VaultPath, DocumentLocation>,
 }
 
 #[cfg(test)]
@@ -172,7 +232,9 @@ impl Scan {
 
     fn from_catalog(snapshot: Result<Arc<crate::catalog::Snapshot>, String>) -> Scan {
         let mut attachments: BTreeMap<VaultPath, Vec<VaultPath>> = BTreeMap::new();
+        let mut relations = Vec::new();
         let tree = snapshot.map(|snapshot| {
+            relations = snapshot.relations.clone();
             let notes = snapshot.notes.iter().map(|n| n.path.clone()).collect::<Vec<_>>();
             for entry in &snapshot.attachments.entries {
                 if let Some(note) = owner_note(&entry.path) {
@@ -181,12 +243,17 @@ impl Scan {
             }
             (Folder::build(&notes, &snapshot.folders), notes.into_iter().collect())
         });
-        Scan { tree, attachments }
+        let relation_rows = aero_core::relations::rows(&relations);
+        let document_locations = document_locations(&relation_rows);
+        Scan { tree, attachments, relations, relation_rows, document_locations }
     }
 }
 
 #[derive(Clone, Debug)]
 enum Row {
+    ProblemGroup {
+        label: String,
+    },
     /// 「收藏」分区标题，可折叠
     FavoritesHeader {
         expanded: bool,
@@ -222,6 +289,10 @@ enum Row {
 }
 
 pub struct FileTree {
+    documents: bool,
+    relations: Vec<aero_core::relations::Note>,
+    relation_rows: Vec<aero_core::relations::Row>,
+    document_locations: BTreeMap<VaultPath, DocumentLocation>,
     catalog: Arc<crate::catalog::Catalog>,
     vault: Arc<Vault>,
     root: Folder,
@@ -256,6 +327,9 @@ pub struct FileTree {
     focus_handle: FocusHandle,
     pub error: Option<String>,
     operation_error: Option<String>,
+    document_drop: Option<DocumentDrop>,
+    document_drop_bounds: Option<Bounds<Pixels>>,
+    relation_issues: BTreeMap<VaultPath, String>,
 }
 
 impl FileTree {
@@ -270,6 +344,10 @@ impl FileTree {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = FileTree {
+            documents: std::fs::read_to_string(tree_view_file(&vault)).map_or(true, |s| s != "files"),
+            relations: Vec::new(),
+            relation_rows: Vec::new(),
+            document_locations: BTreeMap::new(),
             catalog,
             vault,
             root: Folder::default(),
@@ -296,6 +374,9 @@ impl FileTree {
             focus_handle: cx.focus_handle(),
             error: None,
             operation_error: None,
+            document_drop: None,
+            document_drop_bounds: None,
+            relation_issues: BTreeMap::new(),
         };
         this.rebuild_rows();
         this.rescan_in_background(cx);
@@ -320,6 +401,11 @@ impl FileTree {
     pub(crate) fn set_operation_error(&mut self, error: Option<String>) {
         self.operation_error = error.clone();
         self.error = error;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn operation_error(&self) -> Option<&str> {
+        self.operation_error.as_deref()
     }
 
     #[cfg(test)]
@@ -381,6 +467,11 @@ impl FileTree {
             Err(e) => self.error = Some(e),
         }
         self.attachments = scan.attachments;
+        self.relations = scan.relations;
+        self.relation_rows = scan.relation_rows;
+        self.document_locations = scan.document_locations;
+        self.document_drop = None;
+        self.document_drop_bounds = None;
         self.rebuild_rows();
         // 普通刷新保留手动滚动位置；只补做初次加载或扫描期间请求的定位。
         if std::mem::take(&mut self.reveal_after_scan) {
@@ -439,6 +530,7 @@ impl FileTree {
 
     /// 面包屑点文件夹：展开到它、选中并滚到它那一行。
     pub fn reveal_folder(&mut self, dir: &str, cx: &mut Context<Self>) {
+        self.documents = false;
         self.vault_collapsed = false;
         let mut prefix = String::new();
         for seg in dir.split('/').filter(|s| !s.is_empty()) {
@@ -546,7 +638,45 @@ impl FileTree {
         rows.push(Row::VaultHeader { expanded: !self.vault_collapsed });
         if !self.vault_collapsed {
             let before = rows.len();
-            walk(&self.root, 0, &self.expanded, &self.attachments, &mut rows);
+            if self.documents {
+                let relations = self.relation_rows.clone();
+                self.relation_issues = relations
+                    .iter()
+                    .filter_map(|r| r.issue.as_ref().map(|s| (r.path.clone(), s.clone())))
+                    .collect();
+                let mut groups = std::collections::BTreeMap::<String, Vec<aero_core::relations::Row>>::new();
+                let mut issue = None;
+                let mut regular = Vec::new();
+                for row in relations {
+                    if row.depth == 0 {
+                        issue = row.issue.clone();
+                    }
+                    if let Some(issue) = &issue {
+                        groups.entry(issue.clone()).or_default().push(row);
+                    } else {
+                        regular.push(row);
+                    }
+                }
+                let ordered = regular.into_iter().map(|r| (None, Some(r))).chain(
+                    groups.into_iter().flat_map(|(label, rows)| {
+                        std::iter::once((Some(label), None)).chain(rows.into_iter().map(|r| (None, Some(r))))
+                    }),
+                );
+                for (label, row) in ordered {
+                    if let Some(label) = label {
+                        rows.push(Row::ProblemGroup { label });
+                    }
+                    let Some(row) = row else { continue };
+                    rows.push(Row::Note { path: row.path.clone(), depth: row.depth });
+                    if self.expanded.contains(row.path.as_str()) {
+                        for path in self.attachments.get(&row.path).into_iter().flatten() {
+                            rows.push(Row::Attachment { path: path.clone(), depth: row.depth + 1 });
+                        }
+                    }
+                }
+            } else {
+                walk(&self.root, 0, &self.expanded, &self.attachments, &mut rows);
+            }
             if rows.len() == before {
                 rows.push(if self.loading { Row::VaultLoading } else { Row::VaultEmpty });
             }
@@ -658,12 +788,25 @@ impl FileTree {
         cx.emit(FileTreeEvent::Operation(crate::workspace::files::Operation::Trash { path, note: false }));
     }
 
+    fn document_drop_at(&self, target: &VaultPath, y: Pixels) -> Option<DocumentDrop> {
+        let location = self.document_locations.get(target)?;
+        let (parent, before, position) = if y < px(8.) {
+            (location.parent.clone(), Some(target.clone()), DocumentDropPosition::Before)
+        } else if y > px(ROW_HEIGHT - 8.) {
+            (location.parent.clone(), location.next.clone(), DocumentDropPosition::After)
+        } else {
+            (Some(target.clone()), None, DocumentDropPosition::Inside)
+        };
+        Some(DocumentDrop { target: target.clone(), parent, before, position })
+    }
+
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let hover = theme.list_hover;
         let active = theme.list_active;
         let warning = theme.warning;
+        let accent = theme.primary;
         // 树行比 vault 标题深一层
         let indent = |depth: usize| px(8. + (depth + 1) as f32 * INDENT);
         let row_path = match &self.rows[ix] {
@@ -795,23 +938,61 @@ impl FileTree {
                     .font_weight(FontWeight::MEDIUM)
                     .child(chevron(expanded))
                     .child(div().flex_1().min_w_0().truncate().child(name))
+                    .child(
+                        div()
+                            .id("tree-view-toggle")
+                            .px_2()
+                            .text_xs()
+                            .child(if self.documents { "文档 ▾" } else { "文件 ▾" })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.documents = !this.documents;
+                                    let path = tree_view_file(&this.vault);
+                                    if let Some(parent) = path.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    if let Err(error) = std::fs::write(
+                                        path,
+                                        if this.documents { "documents" } else { "files" },
+                                    ) {
+                                        this.error = Some(format!("无法保存树视图偏好：{error}"));
+                                    }
+                                    this.rebuild_rows();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_section(false, cx)))
                     .can_drop({
                         let vault = self.vault.id().to_owned();
                         move |value, _, _| {
                             value.downcast_ref::<gpui_kit::ExternalPaths>().is_some()
-                                || value
-                                    .downcast_ref::<TreeDrag>()
-                                    .is_some_and(|d| d.target(&vault, "").is_some())
+                                || value.downcast_ref::<TreeDrag>().is_some_and(|d| {
+                                    (d.logical && d.vault == vault) || d.target(&vault, "").is_some()
+                                })
                         }
                     })
                     .drag_over::<TreeDrag>({
                         let vault = self.vault.id().to_owned();
                         move |style, drag, _, _| {
-                            if drag.target(&vault, "").is_some() { style.bg(active) } else { style }
+                            if (drag.logical && drag.vault == vault) || drag.target(&vault, "").is_some() {
+                                style.bg(active)
+                            } else {
+                                style
+                            }
                         }
                     })
                     .on_drop(cx.listener(|this, drag: &TreeDrag, _, cx| {
+                        if this.documents && drag.logical && drag.vault == this.vault.id() {
+                            cx.emit(FileTreeEvent::Reparent {
+                                path: drag.path.clone(),
+                                parent: None,
+                                before: None,
+                            });
+                            return;
+                        }
                         if let Some(to) = drag.target(this.vault.id(), "") {
                             cx.emit(FileTreeEvent::Move { from: drag.path.clone(), to });
                         }
@@ -822,6 +1003,13 @@ impl FileTree {
                     }))
                     .into_any_element()
             }
+            Row::ProblemGroup { label } => div()
+                .h(px(ROW_HEIGHT))
+                .px_3()
+                .text_xs()
+                .text_color(muted)
+                .child(label.clone())
+                .into_any_element(),
             Row::VaultEmpty | Row::VaultLoading => div()
                 .w_full()
                 .h(px(ROW_HEIGHT))
@@ -864,6 +1052,7 @@ impl FileTree {
                 .child(div().flex_1().truncate().child(name))
                 .on_drag(
                     TreeDrag {
+                        logical: false,
                         vault: self.vault.id().into(),
                         path: VaultPath::new(&path).expect("folder path"),
                         directory: true,
@@ -919,6 +1108,11 @@ impl FileTree {
                 let opened = self.opened.contains(&path);
                 let favorite = self.favorites.contains(&path);
                 let rel = path.as_str().to_owned();
+                let drop_position = self
+                    .document_drop
+                    .as_ref()
+                    .filter(|drop| drop.target == path && cx.has_active_drag())
+                    .map(|drop| drop.position);
                 h_flex()
                     .id(("note", ix))
                     .debug_selector({
@@ -928,6 +1122,7 @@ impl FileTree {
                     .group("tree-row")
                     .w_full()
                     .h(px(ROW_HEIGHT))
+                    .relative()
                     .pl(indent(depth))
                     .pr_2()
                     .gap_1()
@@ -955,7 +1150,21 @@ impl FileTree {
                     } else {
                         muted
                     }))
-                    .child(div().flex_1().truncate().child(path.stem().to_owned()))
+                    .child(div().flex_1().truncate().child(if self.documents {
+                        self.relations
+                            .iter()
+                            .find(|n| n.path == path)
+                            .map(|n| n.title.clone())
+                            .unwrap_or_else(|| path.stem().into())
+                    } else {
+                        path.stem().into()
+                    }))
+                    .when(self.documents, |el| {
+                        let issue = self.relation_issues.get(&path).cloned();
+                        el.when_some(issue, |el, issue| {
+                            el.child(div().text_xs().text_color(theme.warning).child(issue))
+                        })
+                    })
                     .child(self.star_button(ix, &path, favorite, cx))
                     // 📎 与附件数：点它展开 / 收起附件，不打开笔记（4.1）
                     .when_some(self.attachments.get(&path).map(Vec::len).filter(|n| *n > 0), |el, count| {
@@ -981,10 +1190,104 @@ impl FileTree {
                         )
                     })
                     .on_drag(
-                        TreeDrag { vault: self.vault.id().into(), path: path.clone(), directory: false },
-                        |drag, _, _, cx| cx.new(|_| drag.clone()),
+                        TreeDrag {
+                            logical: self.documents,
+                            vault: self.vault.id().into(),
+                            path: path.clone(),
+                            directory: false,
+                        },
+                        {
+                            let tree = cx.weak_entity();
+                            move |drag, _, window, cx| {
+                                let _ = tree.update(cx, |tree, cx| {
+                                    tree.document_drop = None;
+                                    tree.document_drop_bounds = None;
+                                    tree.focus_handle.focus(window, cx);
+                                    cx.notify();
+                                });
+                                cx.new(|_| drag.clone())
+                            }
+                        },
                     )
-                    .can_drop(|value, _, _| value.downcast_ref::<gpui_kit::ExternalPaths>().is_some())
+                    .can_drop({
+                        let vault = self.vault.id().to_owned();
+                        let target = path.clone();
+                        let logical = self.documents;
+                        move |value, _, _| {
+                            value.downcast_ref::<gpui_kit::ExternalPaths>().is_some()
+                                || (logical
+                                    && value
+                                        .downcast_ref::<TreeDrag>()
+                                        .is_some_and(|d| d.logical && d.vault == vault && d.path != target))
+                        }
+                    })
+                    .when_some(drop_position, |el, position| {
+                        el.child(
+                            div()
+                                .debug_selector(move || match position {
+                                    DocumentDropPosition::Before => "document-drop-before".into(),
+                                    DocumentDropPosition::After => "document-drop-after".into(),
+                                    DocumentDropPosition::Inside => "document-drop-inside".into(),
+                                })
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .map(|el| match position {
+                                    DocumentDropPosition::Before => el.top_0().h(px(2.)).bg(accent),
+                                    DocumentDropPosition::After => el.bottom_0().h(px(2.)).bg(accent),
+                                    DocumentDropPosition::Inside => {
+                                        el.top_0().bottom_0().border_1().border_color(accent)
+                                    }
+                                }),
+                        )
+                    })
+                    .on_drag_move(cx.listener({
+                        let target = path.clone();
+                        move |this, event: &DragMoveEvent<TreeDrag>, _, cx| {
+                            let drag = event.drag(cx);
+                            if !this.documents
+                                || !drag.logical
+                                || drag.vault != this.vault.id()
+                                || drag.path == target
+                                || !event.bounds.contains(&event.event.position)
+                            {
+                                return;
+                            }
+                            let y = event.event.position.y - event.bounds.top();
+                            this.document_drop_bounds = Some(event.bounds);
+                            let drop = this.document_drop_at(&target, y);
+                            if this.document_drop != drop {
+                                this.document_drop = drop;
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .on_drop(cx.listener({
+                        let target = path.clone();
+                        move |this, drag: &TreeDrag, _, cx| {
+                            if this.documents
+                                && drag.logical
+                                && drag.vault == this.vault.id()
+                                && drag.path != target
+                            {
+                                let drop = this
+                                    .document_drop
+                                    .take()
+                                    .filter(|d| d.target == target)
+                                    .or_else(|| this.document_drop_at(&target, px(ROW_HEIGHT / 2.)));
+                                this.document_drop = None;
+                                this.document_drop_bounds = None;
+                                if let Some(drop) = drop {
+                                    cx.emit(FileTreeEvent::Reparent {
+                                        path: drag.path.clone(),
+                                        parent: drop.parent,
+                                        before: drop.before,
+                                    });
+                                }
+                                cx.notify();
+                            }
+                        }
+                    }))
                     .drag_over::<gpui_kit::ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().list_active))
                     .on_drop(cx.listener({
                         let path = path.clone();
@@ -1006,6 +1309,7 @@ impl FileTree {
                             )
                             .separator()
                             .menu("重命名", Box::new(RenameEntry(rel.clone())))
+                            .menu("移至顶层", Box::new(TopLevelDocument(rel.clone())))
                             .menu("移到废纸篓", Box::new(TrashNote(rel.clone())))
                             .separator()
                             .menu("在 Finder 中显示", Box::new(RevealInFinder(rel.clone())))
@@ -1128,6 +1432,13 @@ impl Render for FileTree {
             .id("file-tree")
             .track_focus(&self.focus_handle)
             .key_context("FileTree")
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TreeDrag>, _, cx| {
+                if this.document_drop_bounds.is_some_and(|bounds| !bounds.contains(&event.event.position)) {
+                    this.document_drop = None;
+                    this.document_drop_bounds = None;
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &RenameSelection, window, cx| {
                 if let Some(path) = this.selected_folder.as_ref().or(this.selected.as_ref()).cloned() {
                     this.start_rename(path, window, cx);
@@ -1143,7 +1454,19 @@ impl Render for FileTree {
                     this.trash_attachment(path, cx);
                 }
             }))
+            .on_action(cx.listener(|_this, action: &TopLevelDocument, _, cx| {
+                if let Ok(path) = VaultPath::new(&action.0) {
+                    cx.emit(FileTreeEvent::Reparent { path, parent: None, before: None });
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && cx.stop_active_drag(window) {
+                    this.document_drop = None;
+                    this.document_drop_bounds = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 if event.keystroke.key == "escape" && this.rename_input.is_some() {
                     this.rename_input = None;
                     this.focus_handle.focus(window, cx);
@@ -1192,6 +1515,10 @@ mod tests {
         std::fs::write(dir.path().join("root.md"), "# Root\n").unwrap();
         let vault = Arc::new(Vault::open(dir.path()).unwrap());
         let (tree, _) = cx.add_window_view(|_, cx| FileTree::new(vault.clone(), cx));
+        tree.update(cx, |tree, _| {
+            tree.documents = false;
+            tree.rebuild_rows();
+        });
         cx.run_until_parked();
         // Standalone tree fixtures route requests through the same background worker.
         cx.update(|cx| {
@@ -1595,6 +1922,84 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn logical_tree_drop_previews_match_sibling_order_and_cancel_without_a_request(cx: &mut TestAppContext) {
+        use gpui_kit::{MouseButton, point, px};
+        use std::{cell::RefCell, rc::Rc};
+        let (dir, vault, tree) = setup(cx);
+        let parent_id = aero_core::identity::new_document_id();
+        let first_id = aero_core::identity::new_document_id();
+        for (name, id, parent, order) in [
+            ("p", parent_id.clone(), None, 0),
+            ("a", first_id.clone(), Some(parent_id.clone()), 1024),
+            ("a-child", aero_core::identity::new_document_id(), Some(first_id), 1024),
+            ("b", aero_core::identity::new_document_id(), Some(parent_id), 2048),
+            ("r", aero_core::identity::new_document_id(), None, 4096),
+        ] {
+            let parent = parent.map(|id| format!("  parent: {id}\n")).unwrap_or_default();
+            std::fs::write(
+                dir.path().join(format!("{name}.md")),
+                format!("---\naero:\n  id: {id}\n{parent}  order: {order}\n---\n# {name}\n"),
+            )
+            .unwrap();
+        }
+        tree.update(cx, |tree, _| {
+            tree.documents = true;
+            tree.apply(tree.scan_generation, super::Scan::read(&vault));
+        });
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|_, cx| {
+            let requests = requests.clone();
+            cx.subscribe(&tree, move |_, event, _| {
+                if let super::FileTreeEvent::Reparent { path, parent, before } = event {
+                    requests.borrow_mut().push((path.clone(), parent.clone(), before.clone()));
+                }
+            })
+            .detach();
+        });
+        let drag = |cx: &mut VisualTestContext, y: gpui_kit::Pixels| {
+            draw(cx);
+            let from = cx.debug_bounds("file-tree-note:r.md").unwrap().center();
+            let bounds = cx.debug_bounds("file-tree-note:a.md").unwrap();
+            let to = point(bounds.center().x, bounds.top() + y);
+            cx.simulate_mouse_move(from, None, Modifiers::default());
+            cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+            cx.simulate_mouse_move(from + point(px(10.), px(0.)), MouseButton::Left, Modifiers::default());
+            cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+            draw(cx);
+            assert_eq!(cx.debug_bounds("file-tree-note:a.md").unwrap(), bounds, "preview must not move rows");
+            to
+        };
+        let path = |s| aero_core::VaultPath::new(s).unwrap();
+        for (y, indicator, before) in [
+            (px(2.), "document-drop-before", Some(path("a.md"))),
+            (px(super::ROW_HEIGHT - 2.), "document-drop-after", Some(path("b.md"))),
+        ] {
+            let to = drag(cx, y);
+            assert!(cx.debug_bounds(indicator).is_some());
+            cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+            draw(cx);
+            assert_eq!(requests.borrow().last(), Some(&(path("r.md"), Some(path("p.md")), before)));
+            assert!(cx.debug_bounds(indicator).is_none());
+        }
+        let count = requests.borrow().len();
+        let to = drag(cx, px(super::ROW_HEIGHT / 2.));
+        assert!(cx.debug_bounds("document-drop-inside").is_some());
+        cx.simulate_keystrokes("escape");
+        draw(cx);
+        assert!(cx.debug_bounds("document-drop-inside").is_none());
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+        draw(cx);
+        assert_eq!(requests.borrow().len(), count);
+        let to = drag(cx, px(2.));
+        let blank = point(to.x, cx.debug_bounds("file-tree-note:r.md").unwrap().bottom() + px(120.));
+        cx.simulate_mouse_move(blank, MouseButton::Left, Modifiers::default());
+        draw(cx);
+        assert!(cx.debug_bounds("document-drop-before").is_none());
+        cx.simulate_keystrokes("escape");
+    }
+
+    #[gpui_kit::test]
     fn tree_drag_moves_files_and_directories_without_opening_them(cx: &mut TestAppContext) {
         use gpui_kit::{MouseButton, point, px};
         use std::{cell::RefCell, rc::Rc};
@@ -1612,7 +2017,9 @@ mod tests {
                 super::FileTreeEvent::Open(_) | super::FileTreeEvent::OpenInNewTab(_) => {
                     *opened.borrow_mut() += 1
                 }
-                super::FileTreeEvent::Operation(_) | super::FileTreeEvent::ToggleFavorite(_) => {}
+                super::FileTreeEvent::Operation(_)
+                | super::FileTreeEvent::ToggleFavorite(_)
+                | super::FileTreeEvent::Reparent { .. } => {}
             })
             .detach();
         });
@@ -1737,6 +2144,7 @@ mod tests {
     #[test]
     fn tree_drop_rejects_cross_vault_and_noop_targets() {
         let drag = super::TreeDrag {
+            logical: false,
             vault: "one".into(),
             path: aero_core::VaultPath::new("dir/n.md").unwrap(),
             directory: false,

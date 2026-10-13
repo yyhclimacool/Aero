@@ -1,0 +1,90 @@
+[
+  {
+    "target": "outer",
+    "state": "focused",
+    "image_size_px": [
+      2560,
+      1640
+    ],
+    "changed_pixels_exact": 0,
+    "max_channel_delta": 0,
+    "scale": 2
+  },
+  {
+    "target": "outer",
+    "state": "escape",
+    "image_size_px": [
+      2560,
+      1640
+    ],
+    "changed_pixels_exact": 0,
+    "max_channel_delta": 0,
+    "scale": 2
+  },
+  {
+    "target": "quote",
+    "state": "focused",
+    "image_size_px": [
+      2560,
+      1640
+    ],
+    "changed_pixels_exact": 0,
+    "max_channel_delta": 0,
+    "scale": 2
+  },
+  {
+    "target": "quote",
+    "state": "escape",
+    "image_size_px": [
+      2560,
+      1640
+    ],
+    "changed_pixels_exact": 0,
+    "max_channel_delta": 0,
+    "scale": 2
+  },
+  {
+    "target": "list-continuation",
+    "state": "focused",
+    "image_size_px": [
+      2560,
+      1640
+    ],
+    "changed_pixels_exact": 0,
+    "max_channel_delta": 0,
+    "scale": 2
+  },
+  {
+    "target": "list-continuation",
+    "state": "escape",
+    "image_size_px": [
+      2560,
+      1640
+    ],
+    "changed_pixels_exact": 0,
+    "max_channel_delta": 0,
+    "scale": 2
+  },
+  {
+    "target": "inner",
+    "state": "focused",
+    "image_size_px": [
+      2560,
+      1640
+    ],
+    "changed_pixels_exact": 0,
+    "max_channel_delta": 0,
+    "scale": 2
+  },
+  {
+    "target": "inner",
+    "state": "escape",
+    "image_size_px": [
+      2560,
+      1640
+    ],
+    "changed_pixels_exact": 0,
+    "max_channel_delta": 0,
+    "scale": 2
+  }
+]

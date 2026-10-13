@@ -58,7 +58,10 @@ scroll x y dy [dx]
 key <GPUI 按键>
 type <文字>
 wait <ms>
+theme light|dark
 ```
+
+`theme` 只切换当前测试应用的主题，便于双主题验收，不修改 macOS 外观设置。
 
 例：从一段拖到另一段中途停一下再松开
 

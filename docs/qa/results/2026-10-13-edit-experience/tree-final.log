@@ -1,0 +1,38 @@
+   Compiling aero-app v0.1.0 (/Users/aero/code/Aero/crates/aero-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.55s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/main.rs (target/debug/deps/aero-1e75e5cb450dd4e9)
+
+running 22 tests
+test file_tree::tests::initial_scan_honors_collapsed_sections_and_revealed_folder ... ok
+test file_tree::tests::changes_during_initial_scan_do_not_leave_the_tree_loading ... ok
+test file_tree::tests::file_tree_shows_empty_directories ... ok
+test file_tree::tests::file_tree_f2_opens_inline_rename ... ok
+test file_tree::tests::folder_selection_is_the_new_note_directory ... ok
+test file_tree::tests::tree_drop_rejects_cross_vault_and_noop_targets ... ok
+test file_tree::tests::background_refresh_updates_membership_without_rebuilding_for_queries ... ok
+test file_tree::tests::background_refresh_preserves_import_failure_feedback ... ok
+test file_tree::tests::favorites_opened_markers_and_star_buttons ... ok
+test file_tree::tests::naming_checks_only_candidates_and_preserves_files_missing_from_the_cached_tree ... ok
+test file_tree::tests::attachments_fold_under_their_note_and_mark_unreferenced_ones ... ok
+test file_tree::tests::startup_tree_loads_in_background_and_preserves_selection ... ok
+test file_tree::tests::logical_tree_drop_previews_match_sibling_order_and_cancel_without_a_request ... ok
+test file_tree::tests::stale_scan_cannot_overwrite_a_synchronous_refresh ... ok
+test file_tree::tests::queued_rescan_publishes_completed_snapshot_then_catches_up ... ok
+test file_tree::tests::dropping_finder_files_imports_notes_and_assets ... ok
+test file_tree::tests::tree_drag_moves_files_and_directories_without_opening_them ... ok
+test file_tree::tests::vault_header_uses_one_row_without_a_path_line ... ok
+test file_tree::tests::tree_rename_confirms_and_cancels_without_writing_files ... ok
+test file_tree::tests::initial_async_selection_reveals_note_after_scan ... ok
+test file_tree::tests::explicit_selection_during_pending_rescan_reveals_new_rows ... ok
+test file_tree::tests::background_rescan_preserves_manual_scroll_away_from_selection ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 605 filtered out; finished in 0.16s
+
+     Running tests/text_links.rs (target/debug/deps/text_links-a955f1effe4d0155)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+

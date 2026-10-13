@@ -414,7 +414,7 @@ fn relocated(path: &VaultPath, from: &VaultPath, to: &VaultPath, directory: bool
     path.clone()
 }
 
-fn file_catalog(vault: &Vault) -> Result<Vec<VaultPath>, RenameError> {
+pub(crate) fn file_catalog(vault: &Vault) -> Result<Vec<VaultPath>, RenameError> {
     let mut walk = ignore::WalkBuilder::new(vault.root());
     walk.hidden(true).git_ignore(true).require_git(false).follow_links(false);
     let ignore = vault.root().join(".aero/ignore");
@@ -604,7 +604,7 @@ fn resolve_note_path(target: &str, directory: &str, files: &[VaultPath]) -> Opti
     None
 }
 
-fn resolve_file(target: &str, directory: &str, files: &[VaultPath]) -> Option<VaultPath> {
+pub(crate) fn resolve_file(target: &str, directory: &str, files: &[VaultPath]) -> Option<VaultPath> {
     let mut parts: Vec<&str> = if target.starts_with('/') {
         Vec::new()
     } else {
@@ -626,7 +626,7 @@ fn resolve_file(target: &str, directory: &str, files: &[VaultPath]) -> Option<Va
     matches.next().is_none().then_some(found)
 }
 
-fn decode_path(path: &str) -> Option<String> {
+pub(crate) fn decode_path(path: &str) -> Option<String> {
     let mut out = Vec::new();
     let mut bytes = path.bytes();
     while let Some(byte) = bytes.next() {
@@ -641,7 +641,7 @@ fn decode_path(path: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn encode_path(path: &str) -> String {
+pub(crate) fn encode_path(path: &str) -> String {
     let mut encoded = String::new();
     for ch in path.chars() {
         if ch.is_ascii() && (!ch.is_ascii_alphanumeric() && !"/-._~".contains(ch)) {

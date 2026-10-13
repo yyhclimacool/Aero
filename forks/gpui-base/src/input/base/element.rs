@@ -1429,7 +1429,8 @@ impl<M: InputModeKind> TextElement<M> {
             cursor += n;
         }
 
-        let hard_break = markup.hard_breaks.iter().find(|range| range.start >= abs_start && range.end == abs_end);
+        let hard_break =
+            markup.hard_breaks.iter().find(|range| range.start >= abs_start && range.end == abs_end);
         if display.is_empty() {
             if let Some(range) = hard_break {
                 // An empty visual row still has its own editable source position,
@@ -1620,13 +1621,21 @@ impl<M: InputModeKind> TextElement<M> {
                         continue;
                     }
                     let start = line_item.wrapped_lines[first].start;
-                    let indent_bytes = line_text[start..].char_indices().nth(indent as usize)
-                        .map(|(ix, _)| ix).unwrap_or(line_text.len() - start);
-                    let display = conceal_maps[first].as_ref()
-                        .map(|map| map.to_display(indent_bytes)).unwrap_or(indent_bytes);
+                    let indent_bytes = line_text[start..]
+                        .char_indices()
+                        .nth(indent as usize)
+                        .map(|(ix, _)| ix)
+                        .unwrap_or(line_text.len() - start);
+                    let display = conceal_maps[first]
+                        .as_ref()
+                        .map(|map| map.to_display(indent_bytes))
+                        .unwrap_or(indent_bytes);
                     let width = wrapped_lines[first].x_for_index(display);
-                    let end = line_item.indent_segments.get(group + 1)
-                        .map(|&(row, _)| row).unwrap_or(wrapped_lines.len());
+                    let end = line_item
+                        .indent_segments
+                        .get(group + 1)
+                        .map(|&(row, _)| row)
+                        .unwrap_or(wrapped_lines.len());
                     wrap_indents[first + 1..end].fill(width);
                 }
             }
@@ -2083,7 +2092,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let whitespace_indicators =
             Self::layout_whitespace_indicators(&state, text_size, &text_style, window, cx);
 
-        let lines = Self::layout_lines(
+        let mut lines = Self::layout_lines(
             &state,
             &display_text,
             &last_layout,
@@ -2093,6 +2102,11 @@ impl<M: InputModeKind> Element for TextElement<M> {
             whitespace_indicators,
             window,
         );
+        if state.justify {
+            for line in &mut lines {
+                line.justify(last_layout.content_width);
+            }
+        }
 
         let mut longest_line_width = wrap_width.unwrap_or(px(0.));
         // 1. Single line
@@ -2451,7 +2465,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
             }
         }
 
-        self.paint_dashed_underlines(&prepaint.last_layout, origin, invisible_top_padding, scroll_offset, window, cx);
+        self.paint_dashed_underlines(
+            &prepaint.last_layout,
+            origin,
+            invisible_top_padding,
+            scroll_offset,
+            window,
+            cx,
+        );
 
         // Paint blinking cursors (shared blink state for all carets)
         if focused && show_cursor {

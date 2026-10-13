@@ -83,6 +83,9 @@ pub struct Resolver {
     by_name_stem: HashMap<String, Vec<VaultPath>>,
     /// Normalized path → deduplicated registered names, for targeted removal.
     names_of: HashMap<String, Vec<String>>,
+    by_document_id: HashMap<String, Vec<VaultPath>>,
+    by_block_id: HashMap<String, Vec<(VaultPath, String)>>,
+    identities_of: HashMap<VaultPath, (Option<String>, Vec<String>)>,
 }
 
 impl Resolver {
@@ -116,6 +119,7 @@ impl Resolver {
     }
 
     pub fn remove(&mut self, path: &VaultPath) {
+        self.remove_identity(path);
         let key = fold(path.as_str());
         let Some(registered) = self.by_path.remove(&key) else { return };
         remove_from_group(&mut self.by_stem, &fold(registered.stem()), &registered);
@@ -126,6 +130,73 @@ impl Resolver {
                     remove_from_group(&mut self.by_name_stem, &stem, &registered);
                 }
             }
+        }
+    }
+
+    fn remove_identity(&mut self, path: &VaultPath) {
+        if let Some((document, blocks)) = self.identities_of.remove(path) {
+            if let Some(id) = document {
+                remove_from_group(&mut self.by_document_id, &id, path);
+            }
+            for id in blocks {
+                if let Some(group) = self.by_block_id.get_mut(&id) {
+                    group.retain(|(p, _)| p != path);
+                    if group.is_empty() {
+                        self.by_block_id.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rebuildable identities read from Markdown, independent of filenames and titles.
+    pub fn register_identity(&mut self, path: &VaultPath, doc: &crate::Document) {
+        self.remove_identity(path);
+        let document = crate::identity::read(doc).ok().and_then(|meta| meta.id);
+        if let Some(id) = &document {
+            insert_sorted(self.by_document_id.entry(id.clone()).or_default(), path.clone());
+        }
+        let mut keys = Vec::new();
+        for (_, block) in doc.blocks().iter().filter(|(_, b)| b.kind != crate::BlockKind::Marker) {
+            let Some(primary) = block.persisted_id.as_deref() else { continue };
+            for id in std::iter::once(primary).chain(crate::block_refs::aliases(block)) {
+                let key = if crate::identity::is_block_id(id) || id.contains('#') {
+                    id.to_owned()
+                } else if let Some(document) = &document {
+                    format!("{document}#{id}")
+                } else {
+                    continue;
+                };
+                self.by_block_id.entry(key.clone()).or_default().push((path.clone(), primary.to_owned()));
+                keys.push(key);
+            }
+        }
+        self.identities_of.insert(path.clone(), (document, keys));
+    }
+
+    fn resolve_identity(&self, document: &str, fragment: Option<&str>) -> Resolution {
+        let docs = self.by_document_id.get(document).map(Vec::as_slice).unwrap_or(&[]);
+        if docs.len() > 1 {
+            return Resolution::Ambiguous { candidates: docs.to_vec() };
+        }
+        let Some(block) = fragment.and_then(|f| f.strip_prefix('^')) else {
+            return match docs {
+                [path] => Resolution::Resolved { path: path.clone(), fragment: fragment.map(str::to_owned) },
+                _ => Resolution::Unresolved,
+            };
+        };
+        let key = if crate::identity::is_block_id(block) {
+            block.to_owned()
+        } else {
+            format!("{document}#{block}")
+        };
+        let Some(entries) = self.by_block_id.get(&key) else { return Resolution::Unresolved };
+        // Duplicate definitions remain ambiguous, including two definitions in one file.
+        match entries.as_slice() {
+            [(path, primary)] => {
+                Resolution::Resolved { path: path.clone(), fragment: Some(format!("^{primary}")) }
+            }
+            many => Resolution::Ambiguous { candidates: many.iter().map(|(p, _)| p.clone()).collect() },
         }
     }
 
@@ -197,6 +268,9 @@ impl Resolver {
     /// Escaping paths are rejected before any name matching.
     pub fn resolve(&self, target: &str, fragment: Option<&str>, note_dir: &str) -> Resolution {
         let target = target.trim();
+        if let Some(id) = target.strip_prefix("id:").filter(|id| crate::identity::is_document_id(id)) {
+            return self.resolve_identity(id, fragment);
+        }
         if target.is_empty() || escapes(target) {
             return Resolution::Unresolved;
         }
@@ -437,6 +511,14 @@ pub fn target_range(src: &str, span: &LinkSpan) -> Range<usize> {
     let (target, _) = split_unescaped(head, '#');
     let start = span.range.start + 2 + target.len() - target.trim_start().len();
     start..start + target.trim().len()
+}
+
+/// Target and fragment together, excluding the display alias and surrounding whitespace.
+pub fn head_range(src: &str, span: &LinkSpan) -> Range<usize> {
+    let inner = &src[span.range.start + 2..span.range.end - 2];
+    let (head, _) = split_alias(inner);
+    let start = span.range.start + 2 + head.len() - head.trim_start().len();
+    start..start + head.trim().len()
 }
 
 /// 拆分 wikilink 的目标与片段（不含 `[[ ]]` / 别名），还原转义。

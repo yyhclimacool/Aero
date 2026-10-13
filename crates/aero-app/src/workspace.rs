@@ -6,6 +6,7 @@
 
 mod chrome;
 pub(crate) mod files;
+pub(crate) mod history;
 #[cfg(test)]
 mod layout_tests;
 mod tabs;
@@ -86,6 +87,7 @@ pub struct Workspace {
     session_closing: bool,
     io_task: Option<Task<()>>,
     file_guard: Option<files::Guard>,
+    file_control: Option<Arc<files::Control>>,
     sidebar_visible: bool,
     panel_visible: bool,
     /// 两侧拖出来的宽度；实际画多宽还看窗口宽度（`chrome::column_widths`）
@@ -199,6 +201,7 @@ impl Workspace {
             session_closing: false,
             io_task: None,
             file_guard: None,
+            file_control: None,
             sidebar_visible: state.sidebar_visible.unwrap_or(true),
             panel_visible: state.panel_visible.unwrap_or(true),
             sidebar_width: px(state.sidebar_width.unwrap_or(SIDEBAR_DEFAULT)),
@@ -252,6 +255,12 @@ impl Workspace {
         }
         match Vault::open(root) {
             Ok(vault) => {
+                let journal = self.data_dir.join("transactions").join(vault.id());
+                if let Err(error) = aero_core::transaction::recover(&vault, &journal) {
+                    window.push_notification(Notification::error(error).title("工作区事务需要恢复"), cx);
+                    operation.finish(crate::diagnostics::Outcome::Failed);
+                    return;
+                }
                 let vault = Arc::new(vault);
                 // Any previous session has already completed asynchronous shutdown.
                 let index_dir = self.data_dir.join("index");
@@ -535,6 +544,20 @@ impl Workspace {
             }
             FileTreeEvent::ToggleFavorite(path) => this.toggle_favorite(path.clone(), cx),
             FileTreeEvent::Move { from, to } => this.move_entry(from.clone(), to.clone(), window, cx),
+            FileTreeEvent::Reparent { path, parent, before } => {
+                if let Some(open) = &this.open {
+                    this.request_operation(
+                        PendingOperation::File(files::Operation::Reparent {
+                            path: path.clone(),
+                            parent: parent.clone(),
+                            before: before.clone(),
+                            journal: this.data_dir.join("transactions").join(open.vault.id()),
+                        }),
+                        window,
+                        cx,
+                    );
+                }
+            }
         })
     }
 
@@ -575,6 +598,21 @@ impl Workspace {
                 this.on_vault_link(path.clone(), fragment.clone(), window, cx)
             }
             EditorEvent::CloseRequested => this.close_editor(editor, window, cx),
+            EditorEvent::TransactionRemoved(parent) => {
+                let active = this.open.as_ref().is_some_and(|open| open.editor() == Some(editor));
+                this.close_editor(editor, window, cx);
+                if active && let Some(parent) = parent {
+                    this.open_note(parent.clone(), window, cx);
+                }
+            }
+            EditorEvent::HistoryRequested { token, redo } => this.request_history(token, *redo, window, cx),
+            EditorEvent::TransactionRequested(operation) => {
+                let mut operation = operation.clone();
+                if let Some(open) = &this.open {
+                    operation.set_journal(this.data_dir.join("transactions").join(open.vault.id()));
+                }
+                this.request_operation(PendingOperation::File(operation), window, cx);
+            }
             EditorEvent::LinkCompletionRequested(generation) => {
                 let Some(open) = this.open.as_ref() else { return };
                 let notes = open.search.read(cx).completion_notes(open.vault.clone(), cx);
@@ -1488,6 +1526,9 @@ impl Workspace {
             return;
         }
         if self.rename_pending || self.pending_operation.is_some() || self.session_busy() {
+            if let PendingOperation::File(operation) = &operation {
+                operation.cancel(cx);
+            }
             diagnostic.finish(crate::diagnostics::Outcome::Cancelled);
             window
                 .push_notification(Notification::warning("正在完成文件操作，请稍后再试。").title("Aero"), cx);
@@ -1499,19 +1540,46 @@ impl Workspace {
 
     /// Save completion drives this continuation; newer edits cause another save, never a discard.
     fn continue_operation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_guard.is_some() {
+            return;
+        }
         if self.pending_operation.is_none() {
             self.pending_operation = self.operation_queue.pop_front();
         }
         if self.pending_operation.is_none() || self.session_busy() {
             return;
         }
-        let editors: Vec<_> = self.open.iter().flat_map(|o| o.editors().cloned()).collect();
+        if self.open.as_ref().is_some_and(|o| files::busy(o.vault.id(), cx)) {
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                let _ = this.update_in(cx, |this, window, cx| this.continue_operation(window, cx));
+            })
+            .detach();
+            return;
+        }
+        let editors: Vec<_> = self.open.iter().flat_map(|o| Editor::live_editors(o.vault.id(), cx)).collect();
+        let is_history = self.pending_operation.as_ref().is_some_and(|q| {
+            matches!(
+                &q.operation,
+                PendingOperation::File(files::Operation::Transaction { direction: Some(_), .. })
+            )
+        });
         if editors.iter().any(|e| {
             let e = e.read(cx);
-            e.has_pending_export() || e.is_deleted() || matches!(e.save_state(), SaveState::Failed(_))
+            e.has_pending_export()
+                || (!is_history && e.is_deleted())
+                || matches!(e.save_state(), SaveState::Failed(_))
         }) {
-            self.pending_operation = None;
-            self.operation_queue.clear();
+            if let Some(op) = self.pending_operation.take()
+                && let PendingOperation::File(op) = op.operation
+            {
+                op.cancel(cx);
+            }
+            for op in self.operation_queue.drain(..) {
+                if let PendingOperation::File(op) = op.operation {
+                    op.cancel(cx);
+                }
+            }
             window.push_notification(
                 Notification::warning("笔记尚未安全保存，请处理保存错误或导出后重试。").title("Aero"),
                 cx,
@@ -1532,6 +1600,11 @@ impl Workspace {
         }
         if waiting {
             diagnostic.stage("waiting_for_save", Default::default());
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                let _ = this.update_in(cx, |this, window, cx| this.continue_operation(window, cx));
+            })
+            .detach();
             return;
         }
         let QueuedOperation { operation, diagnostic } = self.pending_operation.take().unwrap();
@@ -2074,7 +2147,15 @@ impl Render for Workspace {
                 // Keep the note and window chrome in place while cleanup runs.
                 // Editors are suspended and focus is on Workspace; block pointer
                 // and keyboard input so visible controls cannot start more work.
-                el.capture_key_down(|_, _, cx| cx.stop_propagation()).child(deferred(
+                el.capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape"
+                        && let Some(control) = &this.file_control
+                    {
+                        control.cancel();
+                    }
+                    cx.stop_propagation();
+                }))
+                .child(deferred(
                     div()
                         .id("workspace-busy")
                         .debug_selector(|| "workspace-busy".into())
@@ -2085,7 +2166,8 @@ impl Render for Workspace {
                         .items_center()
                         .justify_center()
                         .child(
-                            div()
+                            h_flex()
+                                .gap_2()
                                 .px_4()
                                 .py_2()
                                 .rounded_md()
@@ -2094,10 +2176,21 @@ impl Render for Workspace {
                                 .border_color(cx.theme().border)
                                 .shadow_md()
                                 .text_sm()
-                                .child(if self.rename_pending {
+                                .child(if self.rename_pending || self.file_guard.is_some() {
                                     "正在完成文件操作…"
                                 } else {
                                     "正在关闭笔记库…"
+                                })
+                                .when(self.file_control.is_some(), |el| {
+                                    el.child(
+                                        Button::new("cancel-file-operation").ghost().label("取消").on_click(
+                                            cx.listener(|this, _, _, _| {
+                                                if let Some(control) = &this.file_control {
+                                                    control.cancel();
+                                                }
+                                            }),
+                                        ),
+                                    )
                                 }),
                         ),
                 ))
@@ -2326,6 +2419,7 @@ mod tests {
                 session_closing: false,
                 io_task: None,
                 file_guard: None,
+                file_control: None,
                 sidebar_visible: true,
                 panel_visible: true,
                 sidebar_width: px(super::SIDEBAR_DEFAULT),
@@ -2368,7 +2462,333 @@ mod tests {
         (dir, data, workspace)
     }
 
-    /// 标签侧栏（4.3）：分级树带计数，点击切到搜索并执行 `tag:#…`，父标签含子标签。
+    #[gpui_kit::test]
+    fn undo_child_creation_closes_removed_tab_and_parent_can_redo(cx: &mut TestAppContext) {
+        let original = "before\n\n/子文档\n\nafter\n";
+        let (dir, _data, workspace) = open(cx, Some(original));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let parent = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        std::fs::write(dir.path().join("b.md"), "unrelated\n").unwrap();
+        workspace.update_in(cx, |w, window, cx| {
+            w.open_note(VaultPath::new("b.md").unwrap(), window, cx);
+            w.open_note(VaultPath::new("a.md").unwrap(), window, cx);
+        });
+        cx.run_until_parked();
+        let command = original.find("/子文档").unwrap();
+        workspace.update_in(cx, |w, window, cx| {
+            w.request_operation(
+                super::PendingOperation::File(super::files::Operation::CreateChild {
+                    parent: VaultPath::new("a.md").unwrap(),
+                    before: original.as_bytes().to_vec(),
+                    range: command..command + "/子文档".len(),
+                    journal: w.data_dir.join("transactions").join(w.open.as_ref().unwrap().vault.id()),
+                }),
+                window,
+                cx,
+            );
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let w = workspace.read(cx);
+                !w.session_busy()
+                    && w.open.as_ref().unwrap().editor().is_some_and(|e| e.read(cx).path().as_str() != "a.md")
+            })
+        });
+        let child = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        let child_path = child.read_with(cx, |e, _| e.path().clone());
+        let created_parent = std::fs::read(dir.path().join("a.md")).unwrap();
+        let created_child = std::fs::read(dir.path().join(child_path.as_str())).unwrap();
+        cx.update(|window, cx| {
+            child.update(cx, |e, cx| window.focus(&gpui_kit::Focusable::focus_handle(e, cx), cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-z");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).session_busy()));
+        assert!(!dir.path().join(child_path.as_str()).exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), original);
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            assert_eq!(open.tabs.len(), 2, "undo removes only the internally deleted child tab");
+            assert_eq!(open.editor(), Some(&parent));
+            assert!(!parent.read(cx).is_deleted());
+        });
+        // Deferred observers may still own the closed child entity. It must
+        // already be retired from active transaction participants.
+        cx.update(|window, cx| parent.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-z");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).session_busy()));
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), created_parent);
+        assert_eq!(std::fs::read(dir.path().join(child_path.as_str())).unwrap(), created_child);
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.md")).unwrap(), "unrelated\n");
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            assert_eq!(open.tree.read(cx).operation_error(), None);
+            open.search.read(cx).close_blocking();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn queued_file_operation_survives_undo_removing_an_open_document(cx: &mut TestAppContext) {
+        use super::{PendingOperation, files::Operation};
+        use aero_core::transaction::FileChange;
+        let (dir, _data, workspace) = open(cx, Some("parent\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let token = aero_core::identity::new_block_id();
+        let parent_id = aero_core::identity::new_document_id();
+        let child_id = aero_core::identity::new_document_id();
+        workspace.update_in(cx, |w, window, cx| {
+            w.request_operation(PendingOperation::File(Operation::Transaction {
+                token: token.clone(),
+                changes: vec![
+                    FileChange { path: VaultPath::new("a.md").unwrap(), before: Some(b"parent\n".to_vec()), after: Some(format!("---\naero:\n  id: {parent_id}\n---\n\nparent with child\n").into_bytes()) },
+                    FileChange { path: VaultPath::new("child.md").unwrap(), before: None, after: Some(format!("---\naero:\n  id: {child_id}\n  parent: {parent_id}\n  order: 1024\n---\n\n").into_bytes()) },
+                ],
+                history_changes: None, direction: None, open: Some(VaultPath::new("child.md").unwrap()),
+                journal: w.data_dir.join("transactions").join(w.open.as_ref().unwrap().vault.id()),
+            }), window, cx);
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let w = workspace.read(cx);
+                !w.session_busy()
+                    && w.open
+                        .as_ref()
+                        .unwrap()
+                        .editor()
+                        .is_some_and(|e| e.read(cx).path().as_str() == "child.md")
+            })
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            assert_eq!(
+                w.open.as_ref().unwrap().editor().unwrap().read(cx).history_transaction(false),
+                Some(token.as_str())
+            );
+            w.request_history(&token, false, window, cx);
+            w.request_operation(
+                PendingOperation::File(Operation::Create {
+                    directory: String::new(),
+                    base: "queued".into(),
+                    unique: true,
+                    text: "queued body\n".into(),
+                }),
+                window,
+                cx,
+            );
+            assert_eq!(w.operation_queue.len(), 1);
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let w = workspace.read(cx);
+                !w.session_busy() && w.pending_operation.is_none() && w.operation_queue.is_empty()
+            })
+        });
+        assert!(!dir.path().join("child.md").exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "parent\n");
+        assert!(
+            dir.path().join("queued.md").exists(),
+            "accepted operation must not be cancelled by an internally deleted editor awaiting tab closure"
+        );
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    /// Moving and repeated pasting share workspace history from either participant.
+    #[gpui_kit::test]
+    fn block_cut_paste_shares_history_and_second_paste_is_a_copy(cx: &mut TestAppContext) {
+        let document = aero_core::identity::new_document_id();
+        let block = aero_core::identity::new_block_id();
+        let original = format!("---\naero:\n  id: {document}\n---\n\nmove me ^{block}\n\nremaining\n");
+        let (dir, _data, workspace) = open(cx, Some(&original));
+        std::fs::write(dir.path().join("b.md"), "destination\n").unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let source = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape cmd-x");
+        assert!(
+            !source.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string()).contains("move me")
+        );
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-right");
+        cx.simulate_input(" modified");
+        let restored_source = original.replace("remaining", "remaining modified");
+        cx.update(|window, cx| {
+            workspace.update(cx, |w, cx| w.open_note(VaultPath::new("b.md").unwrap(), window, cx))
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .open
+                    .as_ref()
+                    .unwrap()
+                    .editor()
+                    .is_some_and(|e| e.read(cx).path().as_str() == "b.md")
+            })
+        });
+        let destination =
+            cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        let paste_count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _pastes = cx.update(|_, cx| {
+            let count = paste_count.clone();
+            cx.subscribe(&destination, move |_, event, _| {
+                if matches!(event, crate::editor::EditorEvent::TransactionRequested(_)) {
+                    count.set(count.get() + 1);
+                }
+            })
+        });
+        cx.update(|window, cx| destination.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-v");
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                !workspace.read(cx).session_busy() && workspace.read(cx).pending_operation.is_none()
+            })
+        });
+        let pasted = std::fs::read_to_string(dir.path().join("b.md")).unwrap();
+        assert!(pasted.contains(&format!("move me ^{block}")), "{pasted}");
+        cx.update(|window, cx| {
+            workspace.update(cx, |w, cx| w.open_note(VaultPath::new("a.md").unwrap(), window, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-z");
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                !workspace.read(cx).session_busy() && workspace.read(cx).pending_operation.is_none()
+            })
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), restored_source);
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.md")).unwrap(), "destination\n");
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-z");
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                !workspace.read(cx).session_busy() && workspace.read(cx).pending_operation.is_none()
+            })
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.md")).unwrap(), pasted);
+        cx.update(|window, cx| {
+            workspace.update(cx, |w, cx| w.open_note(VaultPath::new("b.md").unwrap(), window, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| destination.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-v");
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                !workspace.read(cx).session_busy() && workspace.read(cx).pending_operation.is_none()
+            })
+        });
+        let copied = std::fs::read_to_string(dir.path().join("b.md")).unwrap();
+        assert_eq!(paste_count.get(), 2, "both keyboard pastes reach the editor");
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            assert_eq!(open.tree.read(cx).operation_error(), None);
+        });
+        assert_eq!(copied.matches("move me").count(), 2, "{copied}");
+        assert_eq!(copied.matches(&block).count(), 1, "second paste gets a fresh ID");
+        for _ in 0..2 {
+            cx.update(|window, cx| destination.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+            cx.run_until_parked();
+            cx.simulate_keystrokes("cmd-z");
+            wait_until(cx, |cx| {
+                cx.update(|_, cx| {
+                    !workspace.read(cx).session_busy() && workspace.read(cx).pending_operation.is_none()
+                })
+            });
+        }
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), restored_source);
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.md")).unwrap(), "destination\n");
+        cx.update(|window, cx| {
+            workspace.update(cx, |w, cx| w.open_note(VaultPath::new("a.md").unwrap(), window, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(source.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string()), original);
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn failed_move_restores_cut_and_next_paste_gets_new_identity(cx: &mut TestAppContext) {
+        let block = aero_core::identity::new_block_id();
+        let original = format!(
+            "---\naero:\n  id: {}\n---\n\nmove me ^{block}\n\nremaining\n",
+            aero_core::identity::new_document_id()
+        );
+        let (dir, _data, workspace) = open(cx, Some(&original));
+        let target_path = dir.path().join("b.md");
+        std::fs::write(&target_path, "destination\n").unwrap();
+        let writable = std::fs::metadata(&target_path).unwrap().permissions();
+        let mut readonly = writable.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&target_path, readonly).unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let source = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape cmd-x");
+        cx.update(|window, cx| {
+            workspace.update(cx, |w, cx| w.open_note(VaultPath::new("b.md").unwrap(), window, cx))
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .open
+                    .as_ref()
+                    .unwrap()
+                    .editor()
+                    .is_some_and(|e| e.read(cx).path().as_str() == "b.md")
+            })
+        });
+        let target = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        cx.update(|window, cx| target.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-v");
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                !workspace.read(cx).session_busy() && workspace.read(cx).pending_operation.is_none()
+            })
+        });
+        assert_eq!(source.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string()), original);
+        cx.executor().advance_clock(std::time::Duration::from_millis(600));
+        cx.run_until_parked();
+        wait_until(cx, |_| std::fs::read_to_string(dir.path().join("a.md")).unwrap() == original);
+        assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "destination\n");
+        std::fs::set_permissions(&target_path, writable).unwrap();
+        cx.update(|window, cx| target.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-v");
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                !workspace.read(cx).session_busy() && workspace.read(cx).pending_operation.is_none()
+            })
+        });
+        let copied = std::fs::read_to_string(&target_path).unwrap();
+        assert!(copied.contains("move me"), "{copied}");
+        assert!(!copied.contains(&block), "invalidated token must paste as a copy");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), original);
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
     #[gpui_kit::test]
     fn tag_sidebar_nests_and_clicks_through_to_search(cx: &mut TestAppContext) {
         let (dir, _data, workspace) = open(cx, Some("hello #rust\n"));
@@ -3739,6 +4159,7 @@ mod tests {
                 .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
             let tree = workspace.read(cx).open.as_ref().unwrap().tree.clone();
             tree.update(cx, |t, cx| {
+                t.reveal_folder("", cx);
                 t.rescan();
                 cx.notify();
             });

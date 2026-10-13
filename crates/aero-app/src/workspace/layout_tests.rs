@@ -470,7 +470,10 @@ fn consecutive_creates_finish_before_queued_vault_close(cx: &mut TestAppContext)
     });
     wait_until(cx, |cx| cx.update(|_, cx| workspace.read(cx).open.is_none()));
     for name in ["未命名.md", "未命名 1.md", "未命名 2.md"] {
-        assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), b"");
+        let source = std::fs::read(dir.path().join(name)).unwrap();
+        let document = aero_core::Document::from_bytes(&source).unwrap();
+        assert!(aero_core::identity::read(&document).unwrap().id.is_some());
+        assert!(document.blocks().roots.iter().all(|b| b.kind == aero_core::BlockKind::FrontMatter));
     }
     assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), "# A\n");
 }

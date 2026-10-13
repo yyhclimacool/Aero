@@ -18,6 +18,7 @@ pub const PALETTE: [&str; 9] =
 pub enum Slot {
     Text,
     Background,
+    Border,
 }
 
 impl Slot {
@@ -26,6 +27,7 @@ impl Slot {
         match self {
             Slot::Text => color.to_owned(),
             Slot::Background => format!("bg-{color}"),
+            Slot::Border => format!("border-{color}"),
         }
     }
 
@@ -34,16 +36,107 @@ impl Slot {
         match self {
             Slot::Text => PALETTE.contains(&class),
             Slot::Background => class.strip_prefix("bg-").is_some_and(|c| PALETTE.contains(&c)),
+            Slot::Border => class.strip_prefix("border-").is_some_and(|c| PALETTE.contains(&c)),
         }
     }
 
     /// 当前属性列表里这一组的颜色。
     pub fn color_of(self, attrs: &Attrs) -> Option<&str> {
+        if let Some((_, value)) = attrs
+            .pairs
+            .iter()
+            .rev()
+            .find(|(key, value)| key == self.key() && CustomColor::parse(value).is_some())
+        {
+            return Some(value);
+        }
         attrs.classes.iter().find(|c| self.owns(c)).map(|class| match self {
             Slot::Text => class.as_str(),
             Slot::Background => class.strip_prefix("bg-").unwrap_or(class),
+            Slot::Border => class.strip_prefix("border-").unwrap_or(class),
         })
     }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Text => "color",
+            Self::Background => "background",
+            Self::Border => "border-color",
+        }
+    }
+
+    pub fn write(self, attrs: &mut Attrs, color: Option<&str>) {
+        attrs.classes.retain(|class| !self.owns(class));
+        attrs.pairs.retain(|(key, _)| key != self.key());
+        if let Some(color) = color {
+            if PALETTE.contains(&color) {
+                attrs.classes.push(self.class(color));
+            } else if let Some(color) = normalize_custom(color) {
+                attrs.pairs.push((self.key().into(), color));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CustomColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: f32,
+}
+
+impl CustomColor {
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if let Some(hex) = value.strip_prefix('#') {
+            if !matches!(hex.len(), 6 | 8) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let byte = |i| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+            return Some(Self {
+                red: byte(0)?,
+                green: byte(2)?,
+                blue: byte(4)?,
+                alpha: if hex.len() == 8 { byte(6)? as f32 / 255. } else { 1. },
+            });
+        }
+        let body = value.strip_prefix("rgba(")?.strip_suffix(')')?;
+        let parts: Vec<_> = body.split(',').map(str::trim).collect();
+        if parts.len() != 4
+            || parts.iter().take(3).any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+            || parts[3].is_empty()
+            || !parts[3].bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        {
+            return None;
+        }
+        let alpha = parts[3].parse::<f64>().ok()?;
+        if !(0. ..=1.).contains(&alpha) {
+            return None;
+        }
+        Some(Self {
+            red: parts[0].parse().ok()?,
+            green: parts[1].parse().ok()?,
+            blue: parts[2].parse().ok()?,
+            alpha: alpha as f32,
+        })
+    }
+}
+
+pub fn normalize_custom(value: &str) -> Option<String> {
+    CustomColor::parse(value)?;
+    let value = value.trim();
+    if value.starts_with('#') {
+        Some(value.to_ascii_uppercase())
+    } else {
+        let parts: Vec<_> = value[5..value.len() - 1].split(',').map(str::trim).collect();
+        // Keep the decimal alpha spelling; floating-point rendering is never serialized.
+        Some(format!("rgba({},{},{},{})", parts[0], parts[1], parts[2], parts[3]))
+    }
+}
+
+fn valid_color(color: &str) -> bool {
+    PALETTE.contains(&color) || CustomColor::parse(color).is_some()
 }
 
 /// `at` 处的属性列表：`{...}` 里全是合法 token 时返回属性与结束位置。`\{` 不算。
@@ -70,7 +163,7 @@ pub fn block_color(src: &str, block: Range<usize>, slot: Slot) -> Option<String>
 /// 已经是这个颜色时返回 `None`（无需编辑）。
 pub fn block_edit(src: &str, block: Range<usize>, slot: Slot, color: Option<&str>) -> Option<Edit> {
     if let Some(color) = color
-        && !PALETTE.contains(&color)
+        && !valid_color(color)
     {
         return None;
     }
@@ -88,13 +181,13 @@ fn trailing_block_edit(src: &str, block: Range<usize>, slot: Slot, color: Option
     let (body, tail) = (&text[..body_len], &text[body_len..]);
     let trailing = crate::parse::markers::strip_trailing(body);
     let mut attrs = trailing.attrs.clone().unwrap_or_default();
-    let had = slot.color_of(&attrs).map(str::to_owned);
-    if had.as_deref() == color {
+    if color.is_some() && slot.color_of(&attrs) == color {
         return None;
     }
-    attrs.classes.retain(|class| !slot.owns(class));
-    if let Some(color) = color {
-        attrs.classes.push(slot.class(color));
+    let before = attrs.clone();
+    slot.write(&mut attrs, color);
+    if before == attrs {
+        return None;
     }
     let mut out = String::with_capacity(body.len() + 16);
     out.push_str(&body[..trailing.content_len]);
@@ -114,13 +207,13 @@ fn trailing_block_edit(src: &str, block: Range<usize>, slot: Slot, color: Option
 /// 多行块的颜色写在块后面的独占行。已有 `{...}` / `^id` 行就改那一行。
 fn marker_line_edit(src: &str, at: usize, slot: Slot, color: Option<&str>) -> Option<Edit> {
     if let Some((range, mut attrs, id)) = marker_line_at(src, at) {
-        let had = slot.color_of(&attrs).map(str::to_owned);
-        if had.as_deref() == color {
+        if color.is_some() && slot.color_of(&attrs) == color {
             return None;
         }
-        attrs.classes.retain(|class| !slot.owns(class));
-        if let Some(color) = color {
-            attrs.classes.push(slot.class(color));
+        let before = attrs.clone();
+        slot.write(&mut attrs, color);
+        if before == attrs {
+            return None;
         }
         let mut line = String::new();
         if !attrs.is_empty() {
@@ -144,7 +237,7 @@ fn marker_line_edit(src: &str, at: usize, slot: Slot, color: Option<&str>) -> Op
     }
     let color = color?;
     let mut attrs = Attrs::default();
-    attrs.classes.push(slot.class(color));
+    slot.write(&mut attrs, Some(color));
     Some(Edit::insert(at, format!("\n\n{{{}}}\n", render(&attrs))))
 }
 
@@ -224,9 +317,11 @@ pub enum Inline {
 /// （范围逐渐扩大时以最大范围为准）。选区缩在某一段颜色里面时仍套一层，外层保持原色。
 /// 选区跨行、跨块或改完结构变了一律拒绝，不写坏文档。
 pub fn inline_edit(src: &str, selection: Range<usize>, slot: Slot, color: Option<&str>) -> Option<Inline> {
+    if slot == Slot::Border {
+        return None;
+    }
     if let Some(color) = color
-        && color != "yellow"
-        && !PALETTE.contains(&color)
+        && !valid_color(color)
     {
         return None;
     }
@@ -249,12 +344,13 @@ pub fn inline_edit(src: &str, selection: Range<usize>, slot: Slot, color: Option
     let brace = if bracketed { selection.end + 1 } else { selection.end };
     let existing = attrs_at(src, brace).map(|(attrs, end)| (attrs, brace..end));
     let mut attrs = existing.as_ref().map(|(attrs, _)| attrs.clone()).unwrap_or_default();
-    if slot.color_of(&attrs).map(str::to_owned).as_deref() == color {
+    if color.is_some() && slot.color_of(&attrs) == color {
         return None;
     }
-    attrs.classes.retain(|class| !slot.owns(class));
-    if let Some(color) = color {
-        attrs.classes.push(slot.class(color));
+    let before = attrs.clone();
+    slot.write(&mut attrs, color);
+    if before == attrs {
+        return None;
     }
     // 改写区间：有承载者就连着它一起重写，否则只包选区
     let range = match &existing {
@@ -351,17 +447,16 @@ fn flatten_covered(src: &str, selection: &Range<usize>, slot: Slot, color: Optio
         if slot == Slot::Background && color == Some("yellow") {
             format!("=={body}==")
         } else {
-            attrs.classes.retain(|class| !slot.owns(class));
-            if let Some(color) = color {
-                attrs.classes.push(slot.class(color));
-            }
+            slot.write(&mut attrs, color);
             if attrs.is_empty() { body } else { format!("[{body}]{{{}}}", render(&attrs)) }
         }
     } else if slot == Slot::Background && color == Some("yellow") {
         format!("=={body}==")
     } else if let Some(color) = color {
-        let class = slot.class(color);
-        if is_element(&body) { format!("{body}{{.{class}}}") } else { format!("[{body}]{{.{class}}}") }
+        let mut attrs = Attrs::default();
+        slot.write(&mut attrs, Some(color));
+        let attrs = render(&attrs);
+        if is_element(&body) { format!("{body}{{{attrs}}}") } else { format!("[{body}]{{{attrs}}}") }
     } else {
         body
     };
@@ -457,12 +552,15 @@ fn expands_over(selection: &Range<usize>, content: &Range<usize>) -> bool {
 }
 
 pub(crate) fn has_color(attrs: &Attrs) -> bool {
-    attrs.classes.iter().any(|class| Slot::Text.owns(class) || Slot::Background.owns(class))
+    [Slot::Text, Slot::Background].iter().any(|slot| slot.color_of(attrs).is_some())
 }
 
 fn only_colors(attrs: &Attrs) -> bool {
     attrs.id.is_none()
-        && attrs.pairs.is_empty()
+        && attrs
+            .pairs
+            .iter()
+            .all(|(k, v)| ["color", "background"].contains(&k.as_str()) && CustomColor::parse(v).is_some())
         && has_color(attrs)
         && attrs.classes.iter().all(|class| Slot::Text.owns(class) || Slot::Background.owns(class))
 }
@@ -541,13 +639,7 @@ fn is_element(selected: &str) -> bool {
 
 /// 属性列表内部的源码：`#id` 在前，其次类名，最后 `key=value`，与解析顺序一致。
 fn render(attrs: &Attrs) -> String {
-    let mut parts = Vec::new();
-    if let Some(id) = &attrs.id {
-        parts.push(format!("#{id}"));
-    }
-    parts.extend(attrs.classes.iter().map(|class| format!(".{class}")));
-    parts.extend(attrs.pairs.iter().map(|(k, v)| format!("{k}={v}")));
-    parts.join(" ")
+    crate::properties::render(attrs)
 }
 
 #[cfg(test)]

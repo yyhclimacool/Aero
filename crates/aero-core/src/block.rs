@@ -82,8 +82,12 @@ impl Attrs {
                 if k.is_empty() || !k.chars().all(is_attr_name_char) {
                     return None;
                 }
-                let v = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(v);
-                attrs.pairs.push((k.to_owned(), v.to_owned()));
+                let v = if let Some(v) = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+                    v.replace("\\\"", "\"").replace("\\\\", "\\")
+                } else {
+                    v.to_owned()
+                };
+                attrs.pairs.push((k.to_owned(), v));
             } else {
                 return None;
             }
@@ -110,7 +114,16 @@ fn tokenize_attrs(inner: &str) -> Option<Vec<&str>> {
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
     let mut in_quote = false;
+    let mut escaped = false;
     for (i, c) in inner.char_indices() {
+        if in_quote && c == '\\' && !escaped {
+            escaped = true;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match (c, in_quote) {
             ('"', _) => {
                 in_quote = !in_quote;

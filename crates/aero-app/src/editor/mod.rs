@@ -12,9 +12,12 @@
 mod backlinks_ui;
 mod block_menu;
 mod block_refs_ui;
+mod clipboard_ui;
+pub(crate) use sync_picker::insert_tree;
 mod color_menu;
 mod colors_ui;
 mod embeds_ui;
+mod empty_slots;
 mod highlight_ui;
 mod images_ui;
 mod inline_format_ui;
@@ -23,6 +26,7 @@ mod io;
 #[cfg(test)]
 mod layout_tests;
 mod link_preview;
+mod live_sources;
 mod math_ui;
 mod navigation;
 mod ops;
@@ -34,6 +38,8 @@ mod presenter;
 mod preview;
 mod rich_ui;
 mod slash;
+mod source_cache;
+mod sync_picker;
 mod table;
 mod tags;
 mod tags_ui;
@@ -132,8 +138,15 @@ pub enum EditorEvent {
         path: String,
         fragment: Option<String>,
     },
-    /// 横幅上的"关闭"：工作区丢掉这个编辑器
+    /// 横幅上的"关闭"：工作区丢掉这个编辑器。
     CloseRequested,
+    /// 已提交事务删除了本文件；若当前页被关闭，返回相关父文档。
+    TransactionRemoved(Option<VaultPath>),
+    HistoryRequested {
+        token: String,
+        redo: bool,
+    },
+    TransactionRequested(crate::workspace::files::Operation),
     /// 工作区提供本次菜单的笔记目录；返回时按 generation 丢弃旧请求。
     LinkCompletionRequested(u64),
     TagCompletionRequested(u64),
@@ -223,6 +236,9 @@ struct Focused {
     enter_newline: bool,
     /// 公式源码在弹窗里改，文档流里仍是渲染结果。
     math_popup: bool,
+    /// A newly split empty slot has no Markdown paragraph yet. Materialize
+    /// its inherited explicit style with the first committed text input.
+    empty_attrs: Option<aero_core::Attrs>,
     textarea: Entity<TextareaState>,
     pairs: pairs::State,
     highlight: highlight_ui::SourceHighlight,
@@ -240,11 +256,13 @@ pub struct Editor {
     units: Vec<Unit>,
     unit_indices: std::collections::HashMap<BlockId, usize>,
     unit_structure: Vec<(BlockId, BlockKind, aero_core::Attrs, usize)>,
+    gutter_reaches: std::collections::HashMap<BlockId, Pixels>,
     viewport: viewport::Viewport,
     parse_task: Option<Task<()>>,
     parse_window: Option<AnyWindowHandle>,
     preview: Entity<preview::PreviewState>,
     _preview_subscription: Subscription,
+    _live_subscription: Subscription,
     link_preview: link_preview::LinkPreview,
     backlinks: Option<Entity<crate::backlinks::BacklinksView>>,
     backlinks_subscription: Option<Subscription>,
@@ -261,8 +279,11 @@ pub struct Editor {
     /// 上一帧的 HiDPI 倍率：图片 / 公式按它算设备像素（渲染块时拿不到 `Window`）
     scale: f32,
     focused: Option<Focused>,
+    empty_slots: Vec<empty_slots::EmptySlot>,
     /// 块选中态；与 `focused` 互斥
     selection: Option<BlockSelection>,
+    selected_node: Option<BlockId>,
+    sync_picker: Option<sync_picker::SyncPicker>,
     /// 点在图片上：`(块, 这一段里的第几张)`。只给这张图画选中框，不给整块上底色
     selected_image: Option<(BlockId, usize)>,
     picker_open: bool,
@@ -271,6 +292,7 @@ pub struct Editor {
     color_menu: Option<colors_ui::ColorMenu>,
     /// 块菜单（5.3）
     block_menu: Option<block_menu::BlockMenu>,
+    hovered_block: Option<BlockId>,
     /// 拖拽块时的插入线
     block_drop: Option<block_menu::BlockDropHint>,
     dragging_block: bool,
@@ -356,11 +378,19 @@ impl Editor {
         stamp: FileStamp,
         cx: &mut Context<Self>,
     ) -> Self {
+        crate::workspace::history::attach(vault.id(), &path, &mut doc, cx);
         doc.track_edits();
         let units = units::units(&doc);
         let unit_structure = viewport::structure(&doc);
+        let gutter_reaches = viewport::gutter_reaches(&doc);
         let preview = cx.new(|_| preview::PreviewState::default());
         let preview_subscription = cx.observe(&preview, |_, _, cx| cx.notify());
+        live_sources::publish(&vault, &path, &doc, cx.weak_entity(), cx);
+        let live_subscription = cx.observe_global::<live_sources::LiveSources>(|this, cx| {
+            this.embeds.revision = None;
+            this.refresh_embeds(cx);
+            cx.notify();
+        });
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(EXTERNAL_POLL).await;
@@ -376,12 +406,14 @@ impl Editor {
             stamp,
             unit_indices: units.iter().enumerate().map(|(ix, unit)| (unit.id, ix)).collect(),
             unit_structure,
+            gutter_reaches,
             viewport: viewport::Viewport::default(),
             parse_task: None,
             parse_window: None,
             units,
             preview,
             _preview_subscription: preview_subscription,
+            _live_subscription: live_subscription,
             link_preview: link_preview::LinkPreview::default(),
             backlinks: None,
             backlinks_subscription: None,
@@ -394,12 +426,16 @@ impl Editor {
             viewer: None,
             scale: 1.,
             focused: None,
+            empty_slots: Vec::new(),
             selection: None,
+            selected_node: None,
+            sync_picker: None,
             selected_image: None,
             picker_open: false,
             slash: None,
             color_menu: None,
             block_menu: None,
+            hovered_block: None,
             block_drop: None,
             dragging_block: false,
             unit_bounds: Vec::new(),
@@ -445,6 +481,70 @@ impl Editor {
         &self.path
     }
 
+    pub(crate) fn history_transaction(&self, redo: bool) -> Option<&str> {
+        self.doc.history_transaction(redo)
+    }
+
+    pub(crate) fn finish_transaction(
+        &mut self,
+        token: &str,
+        change: &aero_core::transaction::FileChange,
+        direction: Option<bool>,
+        stamp: Option<FileStamp>,
+        cx: &mut Context<Self>,
+    ) {
+        self.focused = None;
+        self.selection = None;
+        match direction {
+            Some(true) => {
+                self.doc.redo();
+            }
+            Some(false) => {
+                self.doc.undo();
+            }
+            None => {
+                let after = change
+                    .after
+                    .as_deref()
+                    .and_then(|b| Document::from_bytes(b).ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let edits = vec![Edit::replace(0..self.doc.len(), after)];
+                if self.doc.history_transaction(false) == Some(token) {
+                    let _ = self.doc.amend_transaction(edits, token);
+                } else {
+                    if let Ok(restored) = self.doc.without_transaction(token) {
+                        self.doc = restored;
+                    }
+                    let _ = self.doc.edit_transaction(
+                        vec![Edit::replace(
+                            0..self.doc.len(),
+                            change
+                                .after
+                                .as_deref()
+                                .and_then(|b| Document::from_bytes(b).ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        )],
+                        token,
+                    );
+                }
+            }
+        }
+        self.after_doc_change(cx);
+        self.save_task = None;
+        self.dirty = false;
+        self.save_state = SaveState::Clean;
+        if let Some(stamp) = stamp {
+            self.stamp = stamp;
+            self.set_banner(None, cx);
+        } else {
+            self.mark_deleted(cx);
+        }
+        self.resume_io(cx);
+        cx.notify();
+    }
+
     pub fn set_picker_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.picker_open = open;
         if open {
@@ -481,10 +581,8 @@ impl Editor {
         } else if let Some(action) = action.as_any().downcast_ref::<ConvertBlock>() {
             let Some(focused) = &self.focused else { return false };
             let Some(target) = BlockType::from_shortcut(action.0) else { return false };
-            unit_at(&self.units, focused.range.start).is_none_or(|ix| {
-                ops::block_type(&self.units[ix])
-                    .is_some_and(|current| current != BlockType::Quote && current != target)
-            })
+            unit_at(&self.units, focused.range.start)
+                .is_none_or(|ix| ops::conversion_available(&self.doc, &self.units[ix], target))
         } else {
             false
         }
@@ -705,6 +803,12 @@ impl Editor {
     /// 新建笔记后直接进入编辑态（光标在文末的空段落）。
     pub fn start_writing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.append_paragraph(window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_focus_unit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        assert!(!self.io.suspended, "transaction must release input");
+        self.focus_unit(index, self.units[index].range.len(), window, cx);
     }
 
     /// 大纲点击：把该块置为编辑态（光标在块尾），并滚到可见位置。
@@ -952,11 +1056,26 @@ impl Editor {
         let offset = offset.min(self.doc.len());
         // 正好落在某个单位上；否则若 offset 与下一个单位之间只有同一行的空白（段首空格被 Markdown 忽略），
         // 也算落在那个单位上
-        let hit = unit_at(&self.units, offset).or_else(|| {
-            let ix = self.units.iter().position(|u| u.range.start >= offset)?;
-            let gap = self.doc.slice(offset..self.units[ix].range.start).to_string();
-            gap.chars().all(|c| c == ' ' || c == '\t').then_some(ix)
-        });
+        let hit = unit_at(&self.units, offset)
+            .or_else(|| {
+                // History operations can end at a hidden attribute / ID
+                // suffix. That position still belongs to the original body.
+                self.units.iter().rposition(|u| {
+                    u.range.end < offset
+                        && self
+                            .doc
+                            .blocks()
+                            .find(u.id)
+                            .is_some_and(|block| !block.attrs.is_empty() || block.persisted_id.is_some())
+                        && aero_core::properties::owned_range(&self.doc, u.id)
+                            .is_some_and(|owned| offset <= owned.end)
+                })
+            })
+            .or_else(|| {
+                let ix = self.units.iter().position(|u| u.range.start >= offset)?;
+                let gap = self.doc.slice(offset..self.units[ix].range.start).to_string();
+                gap.chars().all(|c| c == ' ' || c == '\t').then_some(ix)
+            });
         match hit {
             Some(ix) => {
                 let cursor = cursor.unwrap_or(offset.saturating_sub(self.units[ix].range.start));
@@ -1101,6 +1220,7 @@ impl Editor {
             id,
             enter_newline,
             math_popup: false,
+            empty_attrs: None,
             textarea,
             pairs: Default::default(),
             highlight: Default::default(),
@@ -1108,6 +1228,12 @@ impl Editor {
             _subscription: subscription,
             _cursor_subscription: cursor_subscription,
         });
+        let empty_attrs = self
+            .empty_slots
+            .iter()
+            .find(|slot| self.focused.as_ref().is_some_and(|f| f.range == slot.range))
+            .map(|slot| slot.attrs.clone());
+        self.inherit_empty_style(empty_attrs, cx);
         self.sync_diagram_preview(true, cx);
         self.refresh_markup(cx);
         cx.notify();
@@ -1208,7 +1334,7 @@ impl Editor {
         }
         let text = ta.value().to_string();
         let caret = selection.start;
-        let analysis = aero_core::markup::analyze_editing(&text, Some(selection));
+        let analysis = self.body_analysis(self.focused.as_ref().and_then(|f| f.id), &text, Some(selection));
         let conceal: Vec<_> =
             analysis.conceal.iter().filter(|range| !analysis.hard_breaks.contains(range)).cloned().collect();
         let target = analysis
@@ -1309,6 +1435,10 @@ impl Editor {
     /// 编辑态里的 Esc（文本控件的 `Escape` 冒泡到这里）：先关菜单 / 标题编辑；否则退出编辑并选中刚才的块
     /// （`ui_design.md` 6："Esc 两段式退出"）。光标在没有块的空位上时直接回浏览态。
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_node.take().is_some() {
+            cx.notify();
+            return;
+        }
         self.clear_navigation(cx);
         self.cancel_link_preview(cx);
         if self.close_image_viewer(window, cx) {
@@ -1350,6 +1480,9 @@ impl Editor {
 
     /// 块选中态里的 Esc（或程序化的 `BlurEditor`）：回浏览态。没什么可退的就 propagate。
     fn on_blur_editor(&mut self, _: &BlurEditor, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_block_menu(cx) {
+            return;
+        }
         self.cancel_link_preview(cx);
         if self.close_image_viewer(window, cx) {
             return;
@@ -1401,6 +1534,7 @@ impl Editor {
 
     /// 选中 `anchor..=head` 这些单位：退出编辑态（落盘），焦点回容器，`head` 那块滚到可见处。
     fn select_blocks(&mut self, anchor: usize, head: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_node = None;
         if self.units.is_empty() {
             self.blur_to_browse(window, cx);
             return;
@@ -1479,14 +1613,25 @@ impl Editor {
 
     /// 选中块的 Markdown 源码（整行，列表项含标记与嵌套子项）。
     fn selected_source(&self) -> Option<String> {
+        if let Some(id) = self.selected_node {
+            return aero_core::properties::owned_range(&self.doc, id)
+                .map(|r| aero_core::containers::standalone(&self.doc, r));
+        }
         let sel = self.selection?;
         let span = ops::units_span(&self.doc, &self.units, sel.first(), sel.last());
-        Some(self.doc.slice(span).to_string())
+        Some(aero_core::containers::standalone(&self.doc, span))
     }
 
     /// ⌫ / ⌦：删掉选中的块，一个撤销组；选区落到原位置上的下一块（没有就上一块；文档空了回浏览态）。
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_current_parse();
+        if let Some(id) = self.selected_node.take() {
+            if let Some(range) = aero_core::properties::owned_range(&self.doc, id) {
+                let at = range.start;
+                self.structural_edit(Edit::delete(range), at, window, cx);
+            }
+            return;
+        }
         let Some(sel) = self.selection else { return };
         let edit = ops::delete_units(&self.doc, &self.units, sel.first(), sel.last());
         if let Err(err) = self.doc.edit(edit) {
@@ -1512,7 +1657,7 @@ impl Editor {
         {
             self.selection = Some(BlockSelection { anchor: ix, head: ix });
         }
-        if self.selection.is_some() {
+        if self.selection.is_some() || self.selected_node.is_some() {
             self.delete_selected(window, cx);
         } else {
             cx.propagate();
@@ -1551,32 +1696,24 @@ impl Editor {
         }
     }
 
-    /// gutter 的 `+`：在块下方新开段落并打开 `/` 菜单。
-    fn insert_block_below(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
-        self.ensure_current_parse();
-        self.block_menu = None;
-        let Some(ix) = self.unit_index(id) else { return };
-        let plan = ops::insert_slash_below(&self.doc, &self.units, ix);
-        self.apply_plan(plan, window, cx);
-        self.update_slash(cx);
-    }
-
     fn on_copy_selected(&mut self, _: &CopySelectedBlocks, _: &mut Window, cx: &mut Context<Self>) {
         self.ensure_current_parse();
         match self.selected_source() {
-            Some(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+            Some(text) => self.copy_blocks(text, cx),
             None => cx.propagate(),
         }
     }
 
     fn on_cut_selected(&mut self, _: &CutSelectedBlocks, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_current_parse();
-        match self.selected_source() {
-            Some(text) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                self.delete_selected(window, cx);
-            }
-            None => cx.propagate(),
+        let range = self
+            .selected_node
+            .and_then(|id| aero_core::properties::owned_range(&self.doc, id))
+            .or_else(|| self.selection.map(|s| ops::units_span(&self.doc, &self.units, s.first(), s.last())));
+        if let Some(range) = range {
+            self.cut_blocks(range, window, cx);
+        } else {
+            cx.propagate();
         }
     }
 
@@ -1618,16 +1755,85 @@ impl Editor {
         self.parse_window = Some(window.window_handle());
         self.sanitize_cell(window, cx);
         let paired = self.complete_pairs(window, cx);
+        if self.hides_markers(cx)
+            && !self.note_source
+            && !self.input_composing(window, cx)
+            && let Some(f) = &self.focused
+            && let Some(id) = f.id
+            && !self.source_blocks.contains(&id)
+        {
+            let prefix = aero_core::containers::continuation(&self.doc, id);
+            let old = self.doc.slice(f.range.clone()).to_string();
+            let textarea = f.textarea.clone();
+            let current = textarea.read(cx).value();
+            let selection = textarea.read(cx).selected_range();
+            let (text, selection) = aero_core::containers::repair_prefixes(
+                &current,
+                &prefix,
+                old.starts_with(&prefix),
+                selection,
+            );
+            if text != current.as_ref() {
+                textarea.update(cx, |ta, cx| {
+                    ta.set_value(text, window, cx);
+                    ta.set_selected_range(selection, cx);
+                });
+            }
+        }
         let Some(f) = self.focused.as_mut() else { return };
         let new_text = f.textarea.read(cx).value();
         let old_text = self.doc.slice(f.range.clone()).to_string();
-        let Some(edit) = minimal_edit(f.range.start, &old_text, &new_text) else { return };
+        let Some(mut edit) = minimal_edit(f.range.start, &old_text, &new_text) else { return };
 
         let now = Instant::now();
         let small = !edit.text.contains('\n') && edit.text.len() <= 8 && edit.range.len() <= 8;
         let coalesce =
             !paired && small && self.last_edit_at.is_some_and(|t| now.duration_since(t) < COALESCE_WINDOW);
         let delta = edit.delta();
+        let materialized_style =
+            old_text.trim().is_empty() && !new_text.trim().is_empty() && f.empty_attrs.is_some();
+        if materialized_style {
+            let cursor = f.textarea.read(cx).cursor();
+            let start = f.range.start;
+            let (styled, cursor) =
+                match empty_slots::styled_input(&new_text, cursor, f.empty_attrs.as_ref().unwrap()) {
+                    Ok(styled) => styled,
+                    Err(err) => {
+                        log::error!("empty paragraph style rejected: {err}");
+                        return;
+                    }
+                };
+            let keeps_body = !new_text.contains(['\n', '\r']) && styled.starts_with(new_text.as_ref());
+            edit = Edit::replace(f.range.clone(), styled);
+            if let Err(err) = self.doc.edit(edit) {
+                log::error!("edit rejected: {err}");
+                return;
+            }
+            if keeps_body {
+                // Retain the input client on an ordinary first commit. Large
+                // documents can keep their normal background parse path, and
+                // subsequent letters coalesce with this input and its style.
+                f.range.end = start + new_text.len();
+                self.last_edit_at = (!paired).then_some(now);
+                self.after_doc_change(cx);
+                self.update_wiki(window, cx);
+                self.update_tags(cx);
+                self.update_slash(cx);
+                self.refresh_markup(cx);
+                self.settle_image_embed(window, cx);
+                return;
+            }
+            self.focused = None;
+            self.last_edit_at = None;
+            self.after_doc_change(cx);
+            self.ensure_current_parse();
+            self.focus_at(start + cursor, None, window, cx);
+            self.update_wiki(window, cx);
+            self.update_tags(cx);
+            self.update_slash(cx);
+            self.settle_image_embed(window, cx);
+            return;
+        }
         let result = if coalesce { self.doc.edit_coalescing(edit) } else { self.doc.edit(edit) };
         if let Err(err) = result {
             log::error!("edit rejected: {err}");
@@ -1711,7 +1917,35 @@ impl Editor {
         let before = self.doc.slice(menu.block_start..menu.anchor).to_string();
         let start = menu.anchor - (before.len() - before.trim_end_matches(' ').len());
         let command = start..menu.anchor + 1 + menu.query.len();
+        if let SlashAction::Convert(target) = action {
+            if let Some(reason) = unit_at(&self.units, menu.block_start).and_then(|ix| {
+                ops::conversion_reason(&self.doc, ops::conversion_target(&self.doc, &self.units[ix]), target)
+            }) {
+                use gpui_kit::component::WindowExt as _;
+                window
+                    .push_notification(gpui_kit::component::notification::Notification::warning(reason), cx);
+                return;
+            }
+        }
         match action {
+            SlashAction::SyncReference => self.open_sync_picker(command, false, window, cx),
+            SlashAction::ChildDocument => {
+                cx.emit(EditorEvent::TransactionRequested(crate::workspace::files::Operation::CreateChild {
+                    parent: self.path.clone(),
+                    before: self.doc.to_bytes(),
+                    range: command,
+                    journal: crate::paths::app_data_dir().join("transactions").join(self.vault.id()),
+                }));
+            }
+            SlashAction::Emoji => {
+                self.structural_edit(Edit::delete(command.clone()), command.start, window, cx);
+                // Frame callbacks run before paint. Wait through one complete
+                // paint so the replacement textarea installs its native input
+                // handler before the system asks for the insertion point.
+                cx.on_next_frame(window, |_, window, _| {
+                    window.on_next_frame(|window, _| window.show_character_palette());
+                });
+            }
             SlashAction::InsertDate => {
                 let date = chrono::Local::now().format("%Y-%m-%d").to_string();
                 let end = command.start + date.len();
@@ -1766,7 +2000,22 @@ impl Editor {
             gap.chars().all(|c| c == ' ' || c == '\t').then_some(ix)
         });
         let plan = match hit {
-            Some(ix) => ops::convert(&self.doc, &self.units, ix, target),
+            Some(ix) => {
+                if let Some(reason) = ops::conversion_reason(
+                    &self.doc,
+                    ops::conversion_target(&self.doc, &self.units[ix]),
+                    target,
+                ) {
+                    use gpui_kit::component::WindowExt as _;
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::warning(reason),
+                        cx,
+                    );
+                    operation.finish(crate::diagnostics::Outcome::Noop);
+                    return;
+                }
+                ops::convert(&self.doc, &self.units, ix, target)
+            }
             None => Some(ops::insert_block(offset, target)),
         };
         let Some(plan) = plan else {
@@ -1825,6 +2074,7 @@ impl Editor {
     fn after_doc_change(&mut self, cx: &mut Context<Self>) {
         self.cancel_link_preview(cx);
         self.refresh_parse(cx);
+        self.publish_live(cx);
         self.refresh_embeds(cx);
         if let Some(f) = self.focused.as_mut() {
             // 单元格、callout 标题与正文从块中间开始：仍属于原来那一块，否则控件会在别处再画一份
@@ -1938,8 +2188,53 @@ impl Editor {
         }
         let range = f.range.clone();
         let unit = self.focused_unit().map(|ix| self.units[ix].clone());
+        let mut empty_attrs = f.empty_attrs.clone().or_else(|| {
+            unit.as_ref()
+                .filter(|u| u.is_text())
+                .and_then(|u| self.doc.blocks().find(u.id))
+                .map(|b| b.attrs.clone())
+        });
+        if let Some(attrs) = &mut empty_attrs {
+            aero_core::properties::set(attrs, "aero-aliases", None);
+            aero_core::properties::set(attrs, "aero-owner", None);
+        }
+        empty_attrs = empty_attrs.filter(|attrs| !attrs.is_empty());
         let plan = ops::split(&self.doc, unit.as_ref(), &range, cursor);
         self.apply_plan(plan, window, cx);
+        self.inherit_empty_style(empty_attrs, cx);
+    }
+
+    fn inherit_empty_style(&mut self, attrs: Option<aero_core::Attrs>, cx: &mut Context<Self>) {
+        if let Some(f) = &mut self.focused
+            && f.range.is_empty()
+            && let Some(mut attrs) = attrs
+        {
+            aero_core::properties::set(&mut attrs, "aero-aliases", None);
+            aero_core::properties::set(&mut attrs, "aero-owner", None);
+            attrs.id = None;
+            if attrs.is_empty() {
+                return;
+            }
+            let alignment = aero_core::properties::Alignment::of(&attrs);
+            f.textarea.update(cx, |ta, cx| {
+                use aero_core::properties::Alignment;
+                ta.set_text_align(
+                    match alignment {
+                        Alignment::Center => TextAlign::Center,
+                        Alignment::Right => TextAlign::Right,
+                        _ => TextAlign::Left,
+                    },
+                    cx,
+                );
+                ta.set_justify(alignment == Alignment::Justify, cx);
+            });
+            f.empty_attrs = Some(attrs.clone());
+            if let Some(slot) = self.empty_slots.iter_mut().find(|slot| slot.range == f.range) {
+                slot.attrs = attrs;
+            } else {
+                self.empty_slots.push(empty_slots::EmptySlot { range: f.range.clone(), attrs });
+            }
+        }
     }
 
     /// 引用 / callout 正文里的 ⏎：新起一行并带上 `> `（界面上看不见）。空的最后一行再按 ⏎ 离开引用。
@@ -2011,7 +2306,7 @@ impl Editor {
             return;
         }
         let text = ta.value().to_string();
-        let analysis = aero_core::markup::analyze_editing(&text, Some(selection.clone()));
+        let analysis = self.body_analysis(f.id, &text, Some(selection.clone()));
         let spans: Vec<Range<usize>> = analysis.spans().cloned().collect();
         let hidden_between = |start: usize, end: usize| {
             text[start..end].char_indices().all(|(offset, _)| analysis.conceals(start + offset))
@@ -2076,8 +2371,20 @@ impl Editor {
             }
         };
         match outcome {
+            ops::Backspace::SelectContainer(id) => {
+                self.focused = None;
+                self.selection = None;
+                self.selected_node = Some(id);
+                self.focus_handle.focus(window, cx);
+                cx.notify();
+            }
             ops::Backspace::Edit(plan) => self.apply_plan(plan, window, cx),
             ops::Backspace::MoveTo { unit, cursor } => self.focus_unit(unit, cursor, window, cx),
+            ops::Backspace::StyleMismatch { unit, cursor } => {
+                self.focus_unit(unit, cursor, window, cx);
+                use gpui_kit::component::{WindowExt as _, notification::Notification};
+                window.push_notification(Notification::warning("块样式不同，未合并"), cx);
+            }
             ops::Backspace::Nothing => {}
         }
     }
@@ -2293,6 +2600,14 @@ impl Editor {
     // ---- 撤销 / 重做 ----
 
     fn on_undo(&mut self, _: &DocUndo, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(token) = self
+            .doc
+            .history_transaction(false)
+            .filter(|token| crate::workspace::history::contains(self.vault.id(), token, cx))
+        {
+            cx.emit(EditorEvent::HistoryRequested { token: token.into(), redo: false });
+            return;
+        }
         let operation = crate::diagnostics::Operation::new(
             "undo",
             crate::diagnostics::Facts {
@@ -2302,6 +2617,9 @@ impl Editor {
             },
         );
         if let Some(affected) = self.doc.undo() {
+            if let Some(token) = self.doc.history_transaction(true).map(str::to_owned) {
+                Self::complete_cut(&token, true, cx);
+            }
             operation.scope(|| self.after_history(affected, window, cx));
             operation.finish(crate::diagnostics::Outcome::Ok);
         } else {
@@ -2310,6 +2628,14 @@ impl Editor {
     }
 
     fn on_redo(&mut self, _: &DocRedo, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(token) = self
+            .doc
+            .history_transaction(true)
+            .filter(|token| crate::workspace::history::contains(self.vault.id(), token, cx))
+        {
+            cx.emit(EditorEvent::HistoryRequested { token: token.into(), redo: true });
+            return;
+        }
         let operation = crate::diagnostics::Operation::new(
             "redo",
             crate::diagnostics::Facts {
@@ -2332,11 +2658,30 @@ impl Editor {
         self.wiki = None;
         self.tag_menu = None;
         self.last_edit_at = None;
+        let empty_attrs = self
+            .focused
+            .as_ref()
+            .filter(|f| {
+                let end =
+                    f.id.and_then(|id| aero_core::properties::owned_range(&self.doc, id))
+                        .map_or(f.range.end, |range| range.end);
+                f.range.start <= affected.start && affected.start <= end
+            })
+            .and_then(|f| {
+                f.empty_attrs.clone().or_else(|| {
+                    f.id.and_then(|id| self.doc.blocks().find(id))
+                        .filter(|b| matches!(b.kind, BlockKind::Paragraph | BlockKind::Heading { .. }))
+                        .map(|b| b.attrs.clone())
+                })
+            });
         let was_editing = self.focused.take().is_some();
         let was_selecting = self.selection.is_some();
         self.after_doc_change(cx);
         if was_editing {
             self.focus_at(affected.end, None, window, cx);
+            if self.focused.as_ref().is_some_and(|f| f.empty_attrs.is_none()) {
+                self.inherit_empty_style(empty_attrs, cx);
+            }
         } else if was_selecting {
             let ix = unit_at(&self.units, affected.start)
                 .or_else(|| self.units.iter().position(|u| u.range.start >= affected.start))
@@ -2482,11 +2827,17 @@ impl Editor {
         self.io.checking = None;
         self.io.check_generation += 1;
         self.io.suspended = true;
+        for presenter in self.presenters.values() {
+            presenter.textarea.update(_cx, |s, cx| s.set_disabled(true, cx));
+        }
         true
     }
 
     pub(crate) fn resume_io(&mut self, cx: &mut Context<Self>) {
         self.io.suspended = false;
+        for presenter in self.presenters.values() {
+            presenter.textarea.update(cx, |s, cx| s.set_disabled(false, cx));
+        }
         self.check_external(cx);
         if self.dirty {
             self.schedule_save(cx);
@@ -2688,9 +3039,11 @@ impl Editor {
         self.cancel_link_preview(cx);
         self.focused = None;
         // 块 id 随新文档重排，旧的定位高亮会落到别的块上
+        self.empty_slots.clear();
         self.highlight = None;
         self.highlight_task = None;
         self.doc = doc;
+        crate::workspace::history::attach(self.vault.id(), &self.path, &mut self.doc, cx);
         self.doc.track_edits();
         self.embeds.clear_content();
         self.update_local_link_names();
@@ -2704,6 +3057,7 @@ impl Editor {
         self.save_task = None;
         self.last_edit_at = None;
         self.save_state = SaveState::Clean;
+        self.publish_live(cx);
         cx.emit(EditorEvent::Reloaded);
         cx.emit(EditorEvent::Changed);
         cx.notify();
@@ -2722,6 +3076,7 @@ impl Editor {
     }
 
     fn set_banner(&mut self, banner: Option<Banner>, cx: &mut Context<Self>) {
+        let was_deleted = self.is_deleted();
         self.banner_task = None;
         if banner == Some(Banner::Reloaded) {
             self.banner_task = Some(cx.spawn(async move |this, cx| {
@@ -2735,6 +3090,10 @@ impl Editor {
             }));
         }
         self.banner = banner;
+        if was_deleted != self.is_deleted() {
+            source_cache::invalidate(self.vault.id(), std::slice::from_ref(&self.path));
+            self.publish_live(cx);
+        }
         cx.notify();
     }
 
@@ -3076,6 +3435,12 @@ impl Editor {
             }
             _ => {}
         }
+        if let Some(attrs) = &f.empty_attrs {
+            el = Self::painted(el, crate::colors::of(attrs, cx));
+            let width = f32::from(self.scroll.bounds().size.width).min(COLUMN_WIDTH);
+            let indent = (f32::from(aero_core::properties::indent(attrs)) * 24.).min((width - 160.).max(0.));
+            el = el.pl(px(indent));
+        }
         if self.slash.is_some() {
             el = el.child(self.render_slash_menu(cx));
         }
@@ -3120,6 +3485,21 @@ impl Editor {
                     ),
                 };
                 let active = i == menu.selected;
+                let reason = match hit {
+                    slash::Match::Item(ix) => match slash::ITEMS[ix].action {
+                        SlashAction::Convert(target) => {
+                            unit_at(&self.units, menu.block_start).and_then(|ix| {
+                                ops::conversion_reason(
+                                    &self.doc,
+                                    ops::conversion_target(&self.doc, &self.units[ix]),
+                                    target,
+                                )
+                            })
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 h_flex()
                     .id(("slash-item", i))
                     .w_full()
@@ -3128,6 +3508,12 @@ impl Editor {
                     .gap_2()
                     .rounded(px(4.))
                     .items_center()
+                    .opacity(if reason.is_some() { 0.4 } else { 1. })
+                    .when_some(reason, |el, reason| {
+                        el.tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(reason).build(window, cx)
+                        })
+                    })
                     .when(active, |el| el.bg(theme.list_active))
                     .hover(|el| el.bg(theme.list_hover))
                     .on_mouse_down(
@@ -3179,8 +3565,9 @@ impl Editor {
         inherited: Option<Hsla>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let paint = crate::colors::of(&b.attrs, cx).inherit(inherited);
-        match &b.kind {
+        let attrs = self.preview_attrs(b.id, &b.attrs);
+        let paint = crate::colors::of(&attrs, cx).inherit(inherited);
+        let rendered = match &b.kind {
             BlockKind::Marker => None,
             BlockKind::List { ordered, start } => {
                 let items: Vec<&Block> =
@@ -3190,20 +3577,71 @@ impl Editor {
                     .enumerate()
                     .map(|(i, item)| {
                         let number = ordered.then_some(*start + i as u32);
-                        self.render_list_item(item, number, depth, paint.text, cx)
+                        self.render_list_item(item, number, depth, None, cx)
                     })
                     .collect();
-                Some(Self::painted(v_flex().w_full().gap(px(4.)).children(els), paint).into_any_element())
+                let body =
+                    Self::painted(v_flex().w_full().gap(px(4.)).children(els), paint).into_any_element();
+                Some(self.with_gutter(b.id, depth, body, cx))
             }
             // 列表项自己的颜色由 `render_list_item` 画：它要把标记列也包进背景里
             BlockKind::ListItem { .. } => Some(self.render_list_item(b, None, depth, inherited, cx)),
+            kind if aero_core::containers::is_editable(kind) => {
+                let mut els: Vec<AnyElement> = b
+                    .children
+                    .iter()
+                    .filter_map(|child| self.render_block(child, depth + 1, None, cx))
+                    .collect();
+                if els.is_empty() {
+                    let key = presenter::Key::unit(b.id);
+                    if let Some(text) = self.render_presenter(key, cx) {
+                        els.push(text);
+                    }
+                }
+                let border = aero_core::colors::Slot::Border
+                    .color_of(&attrs)
+                    .and_then(|value| {
+                        crate::colors::token(
+                            aero_core::colors::Slot::Border,
+                            value,
+                            cx.theme().mode.is_dark(),
+                        )
+                    })
+                    .unwrap_or(cx.theme().border);
+                let background = paint.background.unwrap_or_else(|| {
+                    if matches!(kind, BlockKind::Directive { .. }) {
+                        cx.theme().muted
+                    } else {
+                        gpui_kit::transparent_black()
+                    }
+                });
+                let body = v_flex()
+                    .w_full()
+                    .gap(px(8.))
+                    .px(px(16.))
+                    .py(px(8.))
+                    .border_1()
+                    .border_color(border)
+                    .rounded(px(6.))
+                    .bg(background)
+                    .when(self.selected_node == Some(b.id), |el| el.bg(cx.theme().selection))
+                    .children(els)
+                    .into_any_element();
+                Some(self.with_gutter(b.id, depth, body, cx))
+            }
             k if units::is_atomic(k) => self.render_unit(b, depth, paint, cx),
             _ => {
                 let els: Vec<AnyElement> =
-                    b.children.iter().filter_map(|c| self.render_block(c, depth, paint.text, cx)).collect();
+                    b.children.iter().filter_map(|c| self.render_block(c, depth, None, cx)).collect();
                 Some(Self::painted(v_flex().w_full().gap(px(8.)).children(els), paint).into_any_element())
             }
-        }
+        };
+        let indent = f32::from(aero_core::properties::indent(&attrs)) * 24.;
+        let width = f32::from(self.scroll.bounds().size.width).min(COLUMN_WIDTH);
+        let indent = indent.min((width - 160.).max(0.));
+        rendered.map(|body| {
+            if indent > 0. { div().w_full().pl(px(indent)).child(body).into_any_element() } else { body }
+        })
     }
 
     /// 块颜色的画法（7.7）：背景铺满块矩形、左右各多 8 px；子块继承同一段文字色。
@@ -3225,7 +3663,7 @@ impl Editor {
         inherited: Option<Hsla>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let paint = crate::colors::of(&item.attrs, cx).inherit(inherited);
+        let paint = crate::colors::of(&self.preview_attrs(item.id, &item.attrs), cx).inherit(inherited);
         let (muted, selection) = (cx.theme().muted_foreground, cx.theme().selection);
         let content: Vec<&Block> = item.children.iter().filter(|c| c.kind != BlockKind::Marker).collect();
         let task = match item.kind {
@@ -3274,14 +3712,25 @@ impl Editor {
                     )
                     .into_any_element()
             };
-            self.with_gutter(id, depth + 1, body, cx)
+            body
         } else {
-            let els: Vec<AnyElement> =
-                content.iter().filter_map(|c| self.render_block(c, depth + 1, paint.text, cx)).collect();
+            let els: Vec<AnyElement> = content
+                .iter()
+                .filter_map(|c| {
+                    self.render_block(
+                        c,
+                        depth + 1,
+                        matches!(c.kind, BlockKind::Paragraph | BlockKind::Heading { .. })
+                            .then_some(paint.text)
+                            .flatten(),
+                        cx,
+                    )
+                })
+                .collect();
             v_flex().w_full().gap(px(4.)).children(els).into_any_element()
         };
 
-        Self::painted(h_flex().w_full().items_start().gap(px(4.)), paint)
+        let body = Self::painted(h_flex().w_full().items_start().gap(px(4.)), paint)
             .child(
                 div()
                     .flex_none()
@@ -3293,7 +3742,8 @@ impl Editor {
                     .child(marker),
             )
             .child(div().flex_1().min_w_0().child(body))
-            .into_any_element()
+            .into_any_element();
+        self.with_gutter(item.id, depth, body, cx)
     }
 
     /// 任务的方框：点一下在 `[ ]` 和 `[x]` 之间切换，不进编辑态，也不挪动任何文字。
@@ -3343,13 +3793,14 @@ impl Editor {
         self.after_doc_change(cx);
     }
 
-    /// 悬停出现的块 gutter（5.3）：`⠿` 进入块选中态，`+` 在下方插入块并打开 `/` 菜单。
+    /// Stable operation space is shared by the type label and six-dot handle.
     /// 行向左伸出 gutter 的宽度（嵌套列表再加上标记列），按钮画在伸出去的那段里：
-    /// 鼠标从块移到按钮上仍在同一个悬停组内，按钮不会在半路消失；各层级的按钮左对齐。
+    /// 鼠标从块移到按钮上仍在同一个悬停组内；列表整体另外占用外侧一列。
     fn with_gutter(&self, id: BlockId, depth: usize, content: AnyElement, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let reach = px(GUTTER + LIST_INDENT * depth as f32);
+        let reach = self.gutter_reaches.get(&id).copied().unwrap_or(px(GUTTER + LIST_INDENT * depth as f32));
         let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+        let active = self.block_menu.as_ref().map(|menu| menu.block).or(self.hovered_block) == Some(id);
         let button = |name: &'static str, glyph: &'static str, title: &'static str| {
             div()
                 .id((name, id.0))
@@ -3364,49 +3815,57 @@ impl Editor {
                 .text_color(muted)
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover))
+                .when(!active, |el| el.invisible())
                 .tooltip(move |window, cx| {
                     gpui_kit::component::tooltip::Tooltip::new(title).build(window, cx)
                 })
                 .child(glyph)
         };
         let editor = cx.entity();
-        let handle = button("gutter-handle", "⠿", "点击选中块，拖动重排；右键打开菜单")
-            .on_drag(block_menu::BlockDrag { id }, move |drag, _, window, cx| {
-                let cursor = window.mouse_position();
-                editor.update(cx, |this, _| this.preview_block_drag(cursor));
-                let text = editor.read(cx).block_preview_text(drag.id);
-                cx.new(|_| block_menu::BlockDragGhost::new(text))
-            })
+        let outer = self.doc.blocks().find(id).is_some_and(|b| {
+            matches!(b.kind, BlockKind::List { .. } | BlockKind::ListItem { .. })
+                || aero_core::containers::is_editable(&b.kind)
+        });
+        let list = self.doc.blocks().find(id).is_some_and(|b| matches!(b.kind, BlockKind::List { .. }));
+        let handle = button("gutter-handle", "⠿", "点击打开块菜单，拖动重排")
+            .on_drag(
+                block_menu::BlockDrag { id, revision: self.doc.version() },
+                move |drag, _, window, cx| {
+                    let cursor = window.mouse_position();
+                    editor.update(cx, |this, _| this.preview_block_drag(cursor));
+                    let text = editor.read(cx).block_preview_text(drag.id);
+                    cx.new(|_| block_menu::BlockDragGhost::new(text))
+                },
+            )
             .on_click(cx.listener(move |this, _, window, cx| {
                 if cx.has_active_drag() || this.dragging_block {
                     return;
                 }
                 cx.stop_propagation();
-                this.select_block_by_id(id, window, cx);
+                this.open_block_menu(id, window.mouse_position(), window, cx);
             }));
-        let plus = button("gutter-plus", "+", "在下方插入块").on_mouse_down(
+        let kind = self
+            .doc
+            .blocks()
+            .find(id)
+            .map(|b| match &b.kind {
+                BlockKind::Heading { level } => format!("H{level}"),
+                BlockKind::Paragraph => "T".into(),
+                BlockKind::List { .. } | BlockKind::ListItem { .. } => "≡".into(),
+                BlockKind::BlockQuote => "❯".into(),
+                BlockKind::CodeFence { .. } => "{}".into(),
+                BlockKind::Directive { .. } => "▣".into(),
+                _ => "◇".into(),
+            })
+            .unwrap_or_else(|| "T".into());
+        let plus = button("gutter-plus", "", "块类型；点击打开块菜单").child(kind).on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.insert_block_below(id, window, cx);
+                this.open_block_menu(id, window.mouse_position(), window, cx);
             }),
         );
         h_flex()
-            .debug_selector(move || format!("row-{}", id.0))
-            .w_full()
-            .items_start()
-            .relative()
-            .group("unit")
-            .ml(-reach)
-            .pl(reach)
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.select_block_by_id(id, window, cx);
-                    this.open_block_menu(id, event.position, window, cx);
-                }),
-            )
             .on_children_prepainted({
                 let this = cx.weak_entity();
                 move |bounds, _, cx| {
@@ -3415,19 +3874,90 @@ impl Editor {
                     }
                 }
             })
+            .id(("block-row", id.0))
+            .debug_selector(move || format!("row-{}", id.0))
+            .w_full()
+            .items_start()
+            .relative()
+            .when(active, |el| el.bg(hover.opacity(0.3)))
+            .when(!outer, |el| el.ml(-reach).pl(reach))
+            .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                // Nested rows extend into the same gutter. Crossing from an
+                // ancestor's body to its handle must keep that ancestor active.
+                if this
+                    .hovered_block
+                    .is_some_and(|active| active != id && this.in_block_handle(active, event.position))
+                {
+                    cx.stop_propagation();
+                    return;
+                }
+                // Negative margins only bridge an active target to its handle.
+                // They must not claim a parent's border or list marker column.
+                if !this
+                    .unit_bounds
+                    .iter()
+                    .any(|(block, bounds)| *block == id && bounds.contains(&event.position))
+                {
+                    return;
+                }
+                cx.stop_propagation();
+                if this.hovered_block != Some(id) && this.block_menu.is_none() {
+                    this.hovered_block = Some(id);
+                    cx.notify();
+                }
+            }))
+            .on_hover(cx.listener(move |this, hovered, window, cx| {
+                if !hovered
+                    && this.hovered_block == Some(id)
+                    && !this.in_block_operation_area(id, window.mouse_position())
+                {
+                    this.hovered_block = None;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.select_block_by_id(id, window, cx);
+                    this.open_block_menu(id, event.position, window, cx);
+                }),
+            )
             .child(
                 h_flex()
                     .absolute()
-                    .left_0()
+                    .left(if outer { -reach } else { px(0.) })
                     .top(px(4.))
-                    .w(px(GUTTER))
+                    // The extra 24pt already reserved at the editor edge fits
+                    // a vertical pair for the whole list, beside the item rail.
+                    .w(px(if list { 20. } else { GUTTER }))
+                    .when(list, |el| el.flex_col())
                     .gap(px(4.))
-                    .opacity(0.)
-                    .group_hover("unit", |s| s.opacity(1.))
+                    .opacity(if active { 1. } else { 0. })
+                    // The transparent rail itself remains a hover target;
+                    // hidden buttons cannot intercept clicks or start drags.
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                        cx.stop_propagation();
+                        if this.hovered_block.is_some_and(|active| {
+                            active != id && this.in_block_handle(active, event.position)
+                        }) {
+                            return;
+                        }
+                        if this.hovered_block != Some(id) && this.block_menu.is_none() {
+                            this.hovered_block = Some(id);
+                            cx.notify();
+                        }
+                    }))
                     .child(handle)
                     .child(plus),
             )
-            .child(div().flex_1().min_w_0().child(content))
+            .child(
+                div()
+                    .debug_selector(move || format!("block-body-{}", id.0))
+                    .flex_1()
+                    .min_w_0()
+                    .child(content),
+            )
             .into_any_element()
     }
 
@@ -3661,7 +4191,9 @@ impl Editor {
         }
         let theme = cx.theme().clone();
         let base = range.start;
-        let text: SharedString = self.doc.slice(range).to_string().into();
+        let text: SharedString = aero_core::containers::local_source(&self.doc, b.id)
+            .unwrap_or_else(|| self.doc.slice(range).to_string())
+            .into();
         let id = b.id;
         // 用 click 而不是 mouse down 进编辑态：预览里的链接在 mouse up 时才触发并 stop_propagation，
         // 若 mouse down 就把块换成文本框，链接的 mouse up 落不到 TextView 上，点 wikilink 只会进编辑态。
@@ -3685,7 +4217,7 @@ impl Editor {
 
         let body: AnyElement = match &b.kind {
             BlockKind::CodeFence { .. } if aero_core::rich_content::mermaid_source(&text).is_some() => {
-                self.render_diagram(&text, id, true, cx)
+                self.render_diagram(&text, id, aero_core::containers::ancestors(&self.doc, id).is_empty(), cx)
             }
             BlockKind::Paragraph if aero_core::rich_content::pdf_embed(&text).is_some() => {
                 self.render_pdf(&text, id, Some(&self.path), true, cx)
@@ -3926,12 +4458,30 @@ impl Render for Editor {
         self.scale = window.scale_factor();
         let (foreground, muted) = (cx.theme().foreground, cx.theme().muted_foreground);
         let blocks = self.render_blocks(cx);
-        let empty = self.doc.blocks().is_empty() && self.focused.is_none();
+        let empty = self.units.is_empty() && self.focused.is_none();
 
         let body = div()
             .id("editor")
             .debug_selector(|| "editor".into())
             .key_context("Editor")
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if let Some(id) = this.hovered_block
+                    && !this.in_block_operation_area(id, event.position)
+                {
+                    this.hovered_block = None;
+                    cx.notify();
+                }
+            }))
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                if !hovered && this.hovered_block.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .capture_key_down(cx.listener(|this, _, _, cx| {
+                if this.io.suspended {
+                    cx.stop_propagation();
+                }
+            }))
             .track_focus(&self.focus_handle)
             // 菜单面板由 occlude 排除；在正文链接吞掉捕获事件前关闭菜单。
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
@@ -4063,6 +4613,7 @@ impl Render for Editor {
             .children(self.render_link_preview(window, cx))
             .children(self.render_toolbar(cx))
             .children(self.render_block_menu(cx))
+            .children(self.render_sync_picker(cx))
             .children(self.render_block_drop_line(cx))
             .children(self.render_math_editor(cx))
             // 颜色菜单画在编辑器根上：块选中态没有控件可挂，位置由 `color_menu_position` 给
