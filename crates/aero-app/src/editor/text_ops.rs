@@ -3,6 +3,7 @@
 use std::ops::Range;
 
 use aero_core::Edit;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// 把"块的旧文本 → 控件里的新文本"收缩成一次最小编辑（公共前后缀之外的部分），
 /// 坐标换算到文档绝对偏移。两者相同时返回 `None`。
@@ -169,16 +170,18 @@ pub fn plan_backspace(
     let hidden = |i: usize| conceal.iter().any(|range| range.contains(&i));
     let mut end = caret.min(text.len());
     let start = loop {
-        let Some((prev, _)) = text[..end].char_indices().next_back() else { return Deletion::AtStart };
+        let Some((prev, _)) = text[..end].grapheme_indices(true).next_back() else {
+            return Deletion::AtStart;
+        };
         if hidden(prev) {
             end = prev;
         } else {
             break prev;
         }
     };
-    let range = if &text[start..end] == "\n" { start..caret } else { start..end };
+    let range = if matches!(&text[start..end], "\n" | "\r\n") { start..caret } else { start..end };
     let range = widen_emptied_span(range, conceal, spans);
-    if range.end == caret && end == caret && text[range.clone()].chars().count() == 1 {
+    if range.start == start && range.end == caret && end == caret {
         return Deletion::Native;
     }
     Deletion::Range { caret: range.start, range }
@@ -187,7 +190,7 @@ pub fn plan_backspace(
 /// ⌦：删光标后一个看得见的字。删到行尾的换行时，下一行藏起来的 `> ` 跟着删。
 pub fn plan_delete(text: &str, conceal: &[Range<usize>], spans: &[Range<usize>], caret: usize) -> Deletion {
     let hidden = |i: usize| conceal.iter().any(|range| range.contains(&i));
-    let next = |i: usize| text[i..].chars().next().map_or(i, |c| i + c.len_utf8());
+    let next = |i: usize| text[i..].graphemes(true).next().map_or(i, |grapheme| i + grapheme.len());
     let mut start = caret.min(text.len());
     while start < text.len() && hidden(start) {
         start = next(start);
@@ -196,7 +199,7 @@ pub fn plan_delete(text: &str, conceal: &[Range<usize>], spans: &[Range<usize>],
         return if caret >= text.len() { Deletion::Native } else { Deletion::Nothing };
     }
     let mut end = next(start);
-    if &text[start..end] == "\n" {
+    if matches!(&text[start..end], "\n" | "\r\n") {
         while end < text.len() && hidden(end) && text.as_bytes()[end] != b'\n' {
             end = next(end);
         }
@@ -259,6 +262,22 @@ mod tests {
         assert_eq!(run("abc", 1, false), "Native");
         // 后面只剩隐藏标记
         assert_eq!(run("**b**", 3, false), "Nothing");
+    }
+
+    #[test]
+    fn emoji_deletion_keeps_hidden_markers_and_graphemes_intact() {
+        assert_eq!(run("a\r\n> b", "a\r\n> ".len(), true), "ab");
+        assert_eq!(run("a\r\n> b", 1, false), "ab");
+        for emoji in [
+            "\u{1F44D}\u{1F3FD}",
+            "\u{1F469}\u{200D}\u{1F4BB}",
+            "\u{1F1E8}\u{1F1F3}",
+        ] {
+            let source = format!("a **{emoji}** z");
+            let end = source.find(" z").unwrap();
+            assert_eq!(run(&source, end, true), "a  z");
+            assert_eq!(run(&source, 2, false), "a  z");
+        }
     }
 
     #[test]

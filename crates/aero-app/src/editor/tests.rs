@@ -4217,11 +4217,89 @@ fn slash_emoji_keeps_the_command_location_for_unicode_input(cx: &mut TestAppCont
     cx.simulate_input(" /emoji");
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
-    assert_eq!(text(&editor, cx), "before\n\nafter\n");
+    assert_eq!(text(&editor, cx), "before \n\nafter\n");
     cx.simulate_input("👩‍👩‍👧‍👦");
-    assert_eq!(text(&editor, cx), "before👩‍👩‍👧‍👦\n\nafter\n");
+    assert_eq!(text(&editor, cx), "before 👩‍👩‍👧‍👦\n\nafter\n");
     cx.simulate_keystrokes("cmd-z");
-    assert_eq!(text(&editor, cx), "before\n\nafter\n");
+    assert_eq!(text(&editor, cx), "before \n\nafter\n");
+}
+
+#[gpui_kit::test]
+fn slash_emoji_preserves_surrounding_text_and_spaces(cx: &mut TestAppContext) {
+    let source = "before  after\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        editor.read(cx).focused.as_ref().unwrap().textarea.clone().update(cx, |ta, cx| {
+            ta.set_selected_range(8..8, cx);
+        });
+    });
+    cx.simulate_input("/emoji");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(text(&editor, cx), source);
+    cx.simulate_input("\u{1F44D}\u{1F3FD}");
+    assert_eq!(text(&editor, cx), "before  \u{1F44D}\u{1F3FD}after\n");
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[cfg(target_os = "macos")]
+#[gpui_kit::test]
+fn emoji_command_preserves_selection_and_does_not_edit_until_input(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+
+    let source = "before after\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let command = crate::actions::commands()
+        .into_iter()
+        .find(|command| command.id == "emoji")
+        .expect("system emoji command must be discoverable");
+    cx.update(|_, cx| assert!(!editor.read(cx).command_available(command.action.as_ref())));
+    focus_unit(&editor, 0, cx);
+    let textarea = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.clone());
+    cx.update(|window, cx| {
+        textarea.update(cx, |ta, cx| ta.set_selected_range(7..12, cx));
+        assert!(editor.read(cx).command_available(command.action.as_ref()));
+        window.dispatch_action(command.action.boxed_clone(), cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(text(&editor, cx), source);
+    cx.update(|window, cx| {
+        assert_eq!(editor.read(cx).focused.as_ref().unwrap().textarea, textarea);
+        assert_eq!(textarea.read(cx).selected_range(), 7..12);
+        assert!(textarea.focus_handle(cx).is_focused(window));
+        assert!(!editor.read(cx).doc.can_undo());
+    });
+    cx.simulate_input("\u{1F600}");
+    assert_eq!(text(&editor, cx), "before \u{1F600}\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn slash_emoji_does_not_open_for_a_different_input_after_refocus(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "/emoji\n\nafter\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.update_slash(cx)));
+    cx.simulate_keystrokes("enter");
+    cx.update(|window, cx| {
+        window.simulate_next_frame(cx);
+        window.draw(cx).clear(cx);
+        editor.update(cx, |e, cx| {
+            let id = e.units.last().unwrap().id;
+            e.focus_block(id, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.simulate_next_frame(cx);
+        window.draw(cx).clear(cx);
+    });
+    cx.simulate_input("!");
+    assert!(text(&editor, cx).ends_with("after!\n"));
 }
 
 /// 点击浏览态的块：画这一块的就是文本控件，按下的那一刻光标就落在点击处，不等下一帧。

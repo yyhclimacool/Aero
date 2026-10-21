@@ -32,7 +32,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             let Some(range) = TextSelector::word_range(&self.text, offset) else {
                 return;
             };
-            range
+            self.cursor_boundary(range.start, Bias::Left)..self.cursor_boundary(range.end, Bias::Right)
         };
 
         self.undo_manager.break_transaction_coalescing();

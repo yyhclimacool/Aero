@@ -20,6 +20,7 @@ gpui-kit.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
+unicode-segmentation = "1.12.0"
 # 命令行（方案 13.1）。图形界面仍是无参数或直接给库路径时启动
 clap = { version = "4", features = ["derive"] }
 # 兼容旧日志；本地诊断使用结构化事件，后台写入和容量管理在 diagnostics 中。

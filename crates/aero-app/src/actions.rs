@@ -140,6 +140,7 @@ actions!(
         LinkAlias,
         /// ⌘K：选区变为行内链接，已有链接选中地址，无选区打开笔记补全。
         EditLink,
+        OpenCharacterPalette,
         /// 块选中态（`ui_design.md` 6）：↑↓ 移动选中
         SelectBlockUp,
         SelectBlockDown,
@@ -290,6 +291,8 @@ pub fn commands() -> Vec<Command> {
         Command::new("undo", "撤销", "undo cx", Editor, DocUndo),
         Command::new("redo", "重做", "redo cz", Editor, DocRedo),
         Command::new("edit-link", "插入或编辑链接", "link url insert edit lj", Editor, EditLink),
+        #[cfg(target_os = "macos")]
+        Command::new("emoji", "表情与符号…", "emoji character symbols bq", Editor, OpenCharacterPalette),
         Command::new("color-last", "应用上次使用的颜色", "color last ysyd", Editor, ApplyLastColor),
         Command::new("color-menu", "颜色…", "color palette ys tsb", Editor, OpenColorMenu),
         Command::new("note-source", "查看源码", "source markdown ckym", Note, ToggleNoteSource),
@@ -373,6 +376,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("tab", MenuConfirm, Some("Input")),
         KeyBinding::new("shift-enter", LinkAlias, Some("Input")),
         KeyBinding::new("cmd-k", EditLink, Some("Editor > Input")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("ctrl-cmd-space", OpenCharacterPalette, Some("Editor > Input")),
         KeyBinding::new("cmd-b", FormatInline(Format::Bold), Some("Editor > Input")),
         KeyBinding::new("cmd-i", FormatInline(Format::Italic), Some("Editor > Input")),
         KeyBinding::new("cmd-e", FormatInline(Format::Code), Some("Editor > Input")),
@@ -509,6 +514,10 @@ pub fn sync_menus(state: MenuState, cx: &mut App) {
             MenuItem::action("黄色高亮", FormatInline(Format::Highlight)),
             MenuItem::action("颜色…", OpenColorMenu),
             MenuItem::action("上次使用的颜色", ApplyLastColor),
+            #[cfg(target_os = "macos")]
+            MenuItem::separator(),
+            #[cfg(target_os = "macos")]
+            MenuItem::action("表情与符号…", OpenCharacterPalette),
         ]),
         Menu::new("视图").items(vec![
             MenuItem::action("文件", OpenFiles),
@@ -540,6 +549,18 @@ pub fn sync_menus(state: MenuState, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn emoji_command_is_scoped_to_the_editor() {
+        let command = super::commands()
+            .into_iter()
+            .find(|command| command.id == "emoji")
+            .expect("system emoji command must be discoverable");
+        assert_eq!(command.label, "表情与符号…");
+        assert!(matches!(command.scope, super::CommandScope::Editor));
+        assert!(command.keywords.contains("emoji"));
+    }
+
     #[test]
     fn search_privacy_command_is_available_in_vault() {
         let command = super::commands()

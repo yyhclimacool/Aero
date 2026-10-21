@@ -20,6 +20,12 @@ WeType 3.0.0 在 macOS 27.0.1（26A434）、Retina 2× 的实际 Aero debug 窗�
 
 该结果仅覆盖第三方中文输入法的列出场景；系统简体拼音、日文与下方完整矩阵仍未关闭。
 
+## 最新代码状态（2026-10-21）
+
+当前 `0baae89` 加暂存修改已经增加系统字符面板命令、菜单、快捷键及 Unicode 字素边界处理。相关入口见 [`actions.rs`](../../crates/aero-app/src/actions.rs)、[`editor/mod.rs`](../../crates/aero-app/src/editor/mod.rs)、[`selection.rs`](../../forks/gpui-base/src/input/base/selection.rs) 和 [`state.rs`](../../forks/gpui-base/src/input/base/state.rs)。
+
+这些改动只能记录为“代码已接入／自动覆盖增强”。本轮没有完成系统简体拼音、日文输入法的真实候选窗矩阵，也没有完成系统字符面板内的真实点选；因此不能勾选下方人工清单，也不能关闭 [A19](../edit_experience/edit_experience_request.md#15-验收标准)。当前实现差距和证据边界见 [2026-10-21 代码审查](edit-experience-gap-review-2026-10-21.md)。
+
 ## 原生输入法完整人工验收（尚未完成，不能计为全部通过）
 
 M0 的独立控件记录在 `docs/decisions/0001-ui-toolkit.md`，不能替代本表。下列项目需要原生 macOS 候选窗和真实输入源；自动调用 IME 协议不覆盖候选窗、输入法快捷键或系统切换行为。

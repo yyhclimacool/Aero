@@ -2988,17 +2988,33 @@ impl<M: InputModeKind> InputBaseState<M> {
         offset
     }
 
-    /// Clip a cursor/selection offset without splitting a CRLF newline. This does
-    /// not alter the rope or its byte/UTF-16 conversion used for exact source APIs.
     pub(super) fn cursor_boundary(&self, offset: usize, bias: Bias) -> usize {
         let offset = self.text.clip_offset(offset, bias);
-        if offset > 0
-            && self.text.char_at(offset - 1) == Some('\r')
-            && self.text.char_at(offset) == Some('\n')
-        {
-            if bias == Bias::Left { offset - 1 } else { offset + 1 }
-        } else {
-            offset
+        let mut cursor = GraphemeCursor::new(offset, self.text.len(), true);
+        let (mut chunk, mut start) = self.text.chunk(offset);
+        let mut seeking = false;
+        loop {
+            let boundary = if seeking {
+                match bias {
+                    Bias::Left => cursor.prev_boundary(chunk, start),
+                    Bias::Right => cursor.next_boundary(chunk, start),
+                }
+            } else {
+                cursor.is_boundary(chunk, start).map(|boundary| boundary.then_some(offset))
+            };
+            match boundary {
+                Ok(Some(boundary)) => return boundary,
+                Ok(None) => seeking = true,
+                Err(GraphemeIncomplete::PreContext(end)) => {
+                    let (context, context_start) = self.text.chunk(end - 1);
+                    cursor.provide_context(&context[..end - context_start], context_start);
+                }
+                Err(GraphemeIncomplete::PrevChunk) => (chunk, start) = self.text.chunk(start - 1),
+                Err(GraphemeIncomplete::NextChunk) => {
+                    (chunk, start) = self.text.chunk(start + chunk.len());
+                }
+                Err(GraphemeIncomplete::InvalidOffset) => unreachable!("cursor outside rope chunk"),
+            }
         }
     }
 
@@ -5077,6 +5093,71 @@ mod tests {
                 assert_eq!(state.value(), "ab");
                 state.undo(&Undo, window, cx);
                 assert_eq!(state.value(), "");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_emoji_cursor_boundaries_and_deletion(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            input_view.input.update(cx, |state, cx| {
+                for symbol in [
+                    "\u{1F44D}\u{1F3FD}",
+                    "\u{1F469}\u{200D}\u{1F4BB}",
+                    "\u{1F1E8}\u{1F1F3}",
+                    "e\u{301}",
+                ] {
+                    let text = format!("a{symbol}z");
+                    let end = 1 + symbol.len();
+                    state.set_value(text.clone(), window, cx);
+                    if symbol != "e\u{301}" {
+                        state.select_word(1, window, cx);
+                        assert_eq!(state.selected_range(), 1..end, "double-click {symbol:?}");
+                    }
+                    state.set_selected_range(end..end, cx);
+                    state.select_left(&SelectLeft, window, cx);
+                    assert_eq!(state.selected_range(), 1..end, "{symbol:?}");
+                    state.set_selected_range(end..end, cx);
+                    state.backspace(&Backspace, window, cx);
+                    assert_eq!(state.value(), "az", "{symbol:?}");
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), text);
+                    state.set_selected_range(1..1, cx);
+                    state.select_right(&SelectRight, window, cx);
+                    assert_eq!(state.selected_range(), 1..end, "{symbol:?}");
+                    state.set_selected_range(1..1, cx);
+                    state.delete(&Delete, window, cx);
+                    assert_eq!(state.value(), "az", "{symbol:?}");
+                }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_emoji_cursor_boundaries_across_rope_chunks(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            input_view.input.update(cx, |state, cx| {
+                let text = format!(
+                    "{}a{}{}{}\r\nz",
+                    "x".repeat(1000),
+                    "\u{301}".repeat(700),
+                    "\u{1F1E8}\u{1F1F3}".repeat(160),
+                    "\u{1F469}\u{1F3FD}\u{200D}".repeat(160),
+                );
+                state.set_value(text.clone(), window, cx);
+                assert!(state.text.chunks().count() > 1);
+                let boundaries: Vec<_> =
+                    text.grapheme_indices(true).map(|(at, _)| at).chain([text.len()]).collect();
+                for offset in 0..=text.len() {
+                    let left = *boundaries.iter().rev().find(|&&at| at <= offset).unwrap();
+                    let right = *boundaries.iter().find(|&&at| at >= offset).unwrap();
+                    assert_eq!(state.cursor_boundary(offset, Bias::Left), left, "left at {offset}");
+                    assert_eq!(state.cursor_boundary(offset, Bias::Right), right, "right at {offset}");
+                }
             });
         });
     }

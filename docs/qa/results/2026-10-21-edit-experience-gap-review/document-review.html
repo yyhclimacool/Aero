@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>块交互体验文档审阅报告（2026-10-21）</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #5f6b7a;
+      --line: #d8dee8;
+      --accent: #2457c5;
+      --ok: #19704a;
+      --warn: #9a5b00;
+      --high: #9f2f2f;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #101319;
+        --panel: #171c24;
+        --text: #edf2f7;
+        --muted: #a9b3c2;
+        --line: #303846;
+        --accent: #8db4ff;
+        --ok: #69c99a;
+        --warn: #f2bd68;
+        --high: #ff9696;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1120px; margin: 0 auto; padding: 40px 24px 64px; }
+    header, section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      margin-bottom: 18px;
+      padding: 24px;
+    }
+    h1, h2, h3 { line-height: 1.25; margin-top: 0; }
+    h1 { font-size: 28px; margin-bottom: 8px; }
+    h2 { font-size: 20px; margin-bottom: 14px; }
+    h3 { font-size: 16px; margin-bottom: 8px; }
+    p { margin: 8px 0 14px; }
+    a { color: var(--accent); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .meta, .note { color: var(--muted); }
+    .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+    .badge { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-size: 13px; }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .high { color: var(--high); }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { border: 1px solid var(--line); padding: 10px 12px; text-align: left; vertical-align: top; }
+    th { background: color-mix(in srgb, var(--panel) 78%, var(--line)); }
+    ul, ol { padding-left: 22px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .card { border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>块交互体验文档审阅报告</h1>
+    <p class="meta">审阅日期：2026-10-21 · 模式：author + maintenance · 主要类型：reference</p>
+    <p>本次将最新代码差距审查写入项目文档，同时保持需求基线、历史验收和当前代码状态三者分离。</p>
+    <div class="badges">
+      <span class="badge ok">整体：通过</span>
+      <span class="badge">5 份 Markdown 文档</span>
+      <span class="badge">1 份新增主记录</span>
+      <span class="badge">11 类实现差距</span>
+      <span class="badge warn">完整界面与性能门槛未关闭</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>1. 概览</h2>
+    <table>
+      <thead><tr><th>文件</th><th>角色</th><th>结果</th></tr></thead>
+      <tbody>
+        <tr><td><a href="../../edit-experience-gap-review-2026-10-21.md">edit-experience-gap-review-2026-10-21.md</a></td><td>实现差距与代码证据的主记录</td><td>新增；覆盖 11 类问题、3 类未关闭验收及修复顺序</td></tr>
+        <tr><td><a href="../../../edit_experience/edit_experience_request.md">edit_experience_request.md</a></td><td>A01–A37、P1–P3 需求基线</td><td>仅增加反向链接，不混入实现状态</td></tr>
+        <tr><td><a href="../../../project_plan.md">project_plan.md</a></td><td>阶段计划与总体状态</td><td>增加 §23.9 摘要与未关闭门槛</td></tr>
+        <tr><td><a href="../../edit-experience-2026-10-12.md">edit-experience-2026-10-12.md</a></td><td>历史自动回归与真实窗口证据</td><td>增加后续代码审查说明；A32 表情编号修正为 A19</td></tr>
+        <tr><td><a href="../../ime.md">ime.md</a></td><td>原生输入法人工验收清单</td><td>增加当前代码状态，保留人工矩阵未完成结论</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>2. 单页诊断</h2>
+    <div class="grid">
+      <div class="card"><h3>新差距审查</h3><p><strong>类型：</strong>参考</p><p><strong>评分：</strong><span class="ok">通过</span></p><p>开头直接定义证据边界；状态、问题、验收门槛和行动顺序分层清楚。</p></div>
+      <div class="card"><h3>需求基线</h3><p><strong>类型：</strong>参考</p><p><strong>评分：</strong><span class="ok">通过</span></p><p>保持单一职责，没有把当前缺口改写成需求正文。</p></div>
+      <div class="card"><h3>历史 QA</h3><p><strong>类型：</strong>参考</p><p><strong>评分：</strong><span class="ok">通过</span></p><p>历史执行结果与 2026-10-21 代码阅读结论明确分开。</p></div>
+      <div class="card"><h3>IME 清单</h3><p><strong>类型：</strong>任务</p><p><strong>评分：</strong><span class="ok">通过</span></p><p>代码入口增强没有被错误用于勾选真实输入法人工项目。</p></div>
+    </div>
+    <p class="note">未命中需要重写的结构反模式。页面目标明确，交叉引用代替了重复复制。</p>
+  </section>
+
+  <section>
+    <h2>3. 编辑摘要</h2>
+    <table>
+      <thead><tr><th>位置</th><th>变更</th><th>理由</th></tr></thead>
+      <tbody>
+        <tr><td><code>docs/qa/edit-experience-gap-review-2026-10-21.md:5–52</code></td><td>新增范围、状态定义、11 类问题、未关闭验收、修复顺序和结论</td><td>建立当前代码状态的单一事实源，避免污染历史 QA</td></tr>
+        <tr><td><code>docs/edit_experience/edit_experience_request.md:460</code></td><td>增加实现差距反向链接</td><td>让需求读者能定位当前状态，同时声明不改变需求基线</td></tr>
+        <tr><td><code>docs/project_plan.md:1460</code></td><td>增加 §23.9</td><td>在总体计划中呈现最新状态和未关闭门槛</td></tr>
+        <tr><td><code>docs/qa/edit-experience-2026-10-12.md:57, 59–64</code></td><td>修正 A19 编号并增加后续代码审查</td><td>消除 A19/A32 混淆，保留历史测试计数不变</td></tr>
+        <tr><td><code>docs/qa/ime.md:23–29</code></td><td>增加最新代码状态</td><td>区分代码已接入与真实候选窗、字符面板点选尚未验收</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. 一致性校验结果</h2>
+    <table>
+      <thead><tr><th>维度</th><th>结果</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>术语与状态</td><td class="ok">通过</td><td>统一使用“代码已接入，待验证”“部分实现，待修正”“尚未实现”，并单列验收证据缺口。</td></tr>
+        <tr><td>A19/A32 编号</td><td class="ok">通过</td><td>当前 Markdown 文档统一为 A19＝系统字符面板、A32＝子文档事务。两份历史 JSON 的旧编号作为原始证据保留，并在新审查中注明。</td></tr>
+        <tr><td>本地链接</td><td class="ok">通过</td><td>脚本检查 5 份 Markdown，所有本地目标存在。</td></tr>
+        <tr><td>Markdown 空白</td><td class="ok">通过</td><td><code>git diff --check</code> 通过；无尾随空白，文件均有末尾换行。</td></tr>
+        <tr><td>证据边界</td><td class="ok">通过</td><td>没有声称 2026-10-21 复跑自动测试、完成完整界面矩阵或完成 P1–P3。</td></tr>
+        <tr><td>内容重复</td><td class="ok">通过</td><td>11 类详细问题只保存在新审查，其他页面只提供摘要或链接。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. 修复建议清单</h2>
+    <ol>
+      <li><strong class="high">高：</strong>先处理无损写回、子块操作范围、同步身份和事务准备期保护。</li>
+      <li><strong class="warn">中：</strong>再处理颜色往返与恢复默认、列表层级、同步异常反馈和子文档导入入口。</li>
+      <li><strong>验证：</strong>每次修复补最小自动回归，并对发生变化的历史指纹路径重新留证。</li>
+      <li><strong>交付：</strong>代码稳定后执行 A01–A37 完整真实界面矩阵、原生 IME／字符面板和 P1–P3。</li>
+    </ol>
+  </section>
+</main>
+</body>
+</html>

@@ -90,7 +90,7 @@ pub fn set_focus_shows_source(on: bool, cx: &mut App) {
 use crate::actions::{
     BlockDown, BlockUp, BlurEditor, ConvertBlock, CopySelectedBlocks, CutSelectedBlocks,
     DeleteSelectedBlocks, DocRedo, DocUndo, EditLink, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp,
-    FormatInline, LinkAlias, MenuConfirm, SelectBlockDown, SelectBlockUp, SplitBlock,
+    FormatInline, LinkAlias, MenuConfirm, OpenCharacterPalette, SelectBlockDown, SelectBlockUp, SplitBlock,
 };
 use crate::colors::Paint;
 use ops::{BlockType, Plan};
@@ -576,7 +576,10 @@ impl Editor {
             self.doc.can_undo()
         } else if action.as_any().is::<DocRedo>() {
             self.doc.can_redo()
-        } else if action.as_any().is::<EditLink>() || action.as_any().is::<FormatInline>() {
+        } else if action.as_any().is::<EditLink>()
+            || action.as_any().is::<FormatInline>()
+            || action.as_any().is::<OpenCharacterPalette>()
+        {
             self.focused.is_some()
         } else if let Some(action) = action.as_any().downcast_ref::<ConvertBlock>() {
             let Some(focused) = &self.focused else { return false };
@@ -1864,6 +1867,40 @@ impl Editor {
         self.hides_markers(cx) && !self.block_shows_source(id) && self.unit_is_image_embed(id)
     }
 
+    fn on_open_character_palette(
+        &mut self,
+        _: &OpenCharacterPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focused) = &self.focused else {
+            cx.propagate();
+            return;
+        };
+        let textarea = focused.textarea.clone();
+        if !textarea.focus_handle(cx).is_focused(window) || !textarea.read(cx).is_editable() {
+            cx.propagate();
+            return;
+        }
+        let selection = textarea.read(cx).selected_range();
+        self.slash = None;
+        self.hide_toolbar(cx);
+        self.last_edit_at = None;
+        // Next-frame callbacks precede paint; the native input handler needs one complete paint first.
+        cx.on_next_frame(window, move |_, window, cx| {
+            cx.on_next_frame(window, move |this, window, cx| {
+                if this.focused.as_ref().is_some_and(|focused| focused.textarea == textarea)
+                    && textarea.focus_handle(cx).is_focused(window)
+                    && textarea.read(cx).is_editable()
+                    && textarea.read(cx).selected_range() == selection
+                {
+                    window.show_character_palette();
+                }
+            });
+        });
+        cx.notify();
+    }
+
     // ---- `/` 菜单（7.1） ----
 
     /// 每次控件文本变化后：光标前有 `/query` 就开着菜单并实时过滤，否则关掉。
@@ -1938,13 +1975,8 @@ impl Editor {
                 }));
             }
             SlashAction::Emoji => {
-                self.structural_edit(Edit::delete(command.clone()), command.start, window, cx);
-                // Frame callbacks run before paint. Wait through one complete
-                // paint so the replacement textarea installs its native input
-                // handler before the system asks for the insertion point.
-                cx.on_next_frame(window, |_, window, _| {
-                    window.on_next_frame(|window, _| window.show_character_palette());
-                });
+                self.structural_edit(Edit::delete(menu.anchor..command.end), menu.anchor, window, cx);
+                self.on_open_character_palette(&OpenCharacterPalette, window, cx);
             }
             SlashAction::InsertDate => {
                 let date = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -4504,6 +4536,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_menu_confirm))
             .on_action(cx.listener(Self::on_link_alias))
             .on_action(cx.listener(Self::on_edit_link))
+            .on_action(cx.listener(Self::on_open_character_palette))
             .on_action(cx.listener(Self::on_format_inline))
             .on_action(cx.listener(Self::on_apply_last_color))
             .on_action(cx.listener(Self::on_open_color_menu))
