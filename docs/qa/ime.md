@@ -20,11 +20,13 @@ WeType 3.0.0 在 macOS 27.0.1（26A434）、Retina 2× 的实际 Aero debug 窗�
 
 该结果仅覆盖第三方中文输入法的列出场景；系统简体拼音、日文与下方完整矩阵仍未关闭。
 
-## 最新代码状态（2026-10-21）
+## 最新代码与验证状态（2026-10-23 更新）
 
-当前 `0baae89` 加暂存修改已经增加系统字符面板命令、菜单、快捷键及 Unicode 字素边界处理。相关入口见 [`actions.rs`](../../crates/aero-app/src/actions.rs)、[`editor/mod.rs`](../../crates/aero-app/src/editor/mod.rs)、[`selection.rs`](../../forks/gpui-base/src/input/base/selection.rs) 和 [`state.rs`](../../forks/gpui-base/src/input/base/state.rs)。
+系统字符面板命令、编辑菜单、快捷键以及 Unicode 字素级光标、选区、双击和删除修复已随 `e9d6172` 提交。相关入口见 [`actions.rs`](../../crates/aero-app/src/actions.rs)、[`editor/mod.rs`](../../crates/aero-app/src/editor/mod.rs)、[`selection.rs`](../../forks/gpui-base/src/input/base/selection.rs) 和 [`state.rs`](../../forks/gpui-base/src/input/base/state.rs)。
 
-这些改动只能记录为“代码已接入／自动覆盖增强”。本轮没有完成系统简体拼音、日文输入法的真实候选窗矩阵，也没有完成系统字符面板内的真实点选；因此不能勾选下方人工清单，也不能关闭 [A19](../edit_experience/edit_experience_request.md#15-验收标准)。当前实现差距和证据边界见 [2026-10-21 代码审查](edit-experience-gap-review-2026-10-21.md)。
+上一轮实际验证已观察到 macOS“表情与符号”窗口弹出；打开面板没有修改测试文档。自动回归覆盖插入位置、选区恢复、Unicode 编辑和撤销，但系统拒绝辅助访问，尚未通过原生面板点选完成插入／取消／删除／撤销的端到端检查，A19 保持部分验收。验证范围见 [系统表情补充记录](edit-experience-2026-10-12.md#系统表情补充记录2026-10-23)。
+
+字素级移动和删除不等于字素级自动换行、全部对齐选区或原生 IME 几何路径均已完成；这些实现差距列在 [G10](edit-experience-gap-review-2026-10-21.md#需要继续开发或修正)。系统简体拼音、日文及下方候选窗完整矩阵仍未完成，不据表情入口或自动测试通过勾选人工清单；本次文档更新未重新执行原生验收。
 
 ## 原生输入法完整人工验收（尚未完成，不能计为全部通过）
 
