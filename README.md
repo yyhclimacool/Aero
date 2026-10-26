@@ -88,6 +88,8 @@ scripts/release-macos.sh --notarize  # 或改用 AERO_NOTARY_APPLE_ID / AERO_NOT
 
 凭据只从环境变量读取，脚本不保存任何秘密。当前没有配置自动更新源：「检查更新」只显示本地说明，发布仍是上传 `.dmg`。
 
+DMG 使用固定的 Finder 图标布局，浅色背景中的六个彩色箭头从四周指向 Applications，提示将 Aero 拖进去安装。背景由 `scripts/dmg-background.swift` 绘制，包含普通与 Retina 分辨率；窗口和图标位置由 `scripts/dmg-layout.applescript` 保存。打包时需要在已登录的 macOS 桌面会话中运行，并允许终端控制 Finder（系统首次提示时授权）。
+
 ### 本地语义搜索
 
 打开 vault 后，在 `⌘,` →「搜索与隐私」（或搜索栏「设置」）中开启「允许模型下载」，点击「下载模型」，再开启「启用本地语义搜索」。固定的 multilingual-e5-small int8 模型约 135 MB，使用 CPU 在本地计算；笔记和查询不上传，下载和语义搜索默认均关闭。模型就绪后可离线使用。
