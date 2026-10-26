@@ -25,10 +25,22 @@ pub fn split(doc: &Document, unit: Option<&Unit>, range: &Range<usize>, cursor: 
     if text.is_empty() {
         let container = unit.and_then(|u| doc.blocks().find(u.id)).or_else(|| doc.block_at(range.start));
         if let Some(container) = container.filter(|b| aero_core::containers::is_editable(&b.kind)) {
-            let at = aero_core::properties::owned_range(doc, container.id).unwrap().end;
-            let prefix = aero_core::containers::continuation(doc, container.id);
+            let at_end = container
+                .children
+                .iter()
+                .filter(|b| b.kind != BlockKind::Marker)
+                .all(|b| doc.range_of(b).end <= doc_cursor);
+            let (at, prefix) = if at_end {
+                (
+                    aero_core::properties::owned_range(doc, container.id).unwrap().end,
+                    aero_core::containers::continuation(doc, container.id),
+                )
+            } else {
+                (doc_cursor, aero_core::containers::content_continuation(doc, container.id))
+            };
             let separator = format!("\n{prefix}\n{prefix}");
-            return Plan { focus_offset: at + separator.len(), edit: Edit::insert(at, separator) };
+            let focus_offset = at + if at_end { separator.len() } else { 1 + prefix.len() };
+            return Plan { focus_offset, edit: Edit::insert(at, separator) };
         }
     }
     // 光标两侧的空格一并吃掉：Markdown 会忽略段首空白，留着会让新块的起点与焦点错位
@@ -157,10 +169,142 @@ pub fn split(doc: &Document, unit: Option<&Unit>, range: &Range<usize>, cursor: 
     Plan { focus_offset: cut.start + separator.len(), edit: Edit::replace(cut, separator) }
 }
 
+pub fn list_item_for(doc: &Document, id: BlockId) -> Option<BlockId> {
+    let block = doc.blocks().find(id)?;
+    if matches!(block.kind, BlockKind::ListItem { .. }) {
+        return Some(id);
+    }
+    aero_core::containers::ancestors(doc, id).into_iter().rev()
+        .find(|b| matches!(b.kind, BlockKind::ListItem { .. })).map(|b| b.id)
+}
+
+pub fn list_indent(doc: &Document, id: BlockId) -> Option<Plan> {
+    let item = list_item_for(doc, id)?;
+    let path = aero_core::containers::ancestors(doc, item);
+    let list = path.last()?;
+    let siblings: Vec<_> = list.children.iter().filter(|b| matches!(b.kind, BlockKind::ListItem { .. })).collect();
+    let index = siblings.iter().position(|b| b.id == item)?;
+    list_focus_plan(doc, move_node(doc, item, siblings.get(index.checked_sub(1)?)?.id, false, true)?)
+}
+
+fn list_focus_plan(doc: &Document, mut plan: Plan) -> Option<Plan> {
+    let mut probe = doc.clone();
+    probe.edit(plan.edit.clone()).ok()?;
+    probe.reparse();
+    if let Some(unit) = super::units::units(&probe).iter().find(|u| u.range.start >= plan.focus_offset) {
+        plan.focus_offset = unit.range.start;
+    }
+    Some(plan)
+}
+
+pub fn list_outdent(doc: &Document, id: BlockId) -> Option<Plan> {
+    let item = list_item_for(doc, id)?;
+    let path = aero_core::containers::ancestors(doc, item);
+    if let Some(parent) = path.iter().rev().nth(1)
+        .filter(|b| matches!(b.kind, BlockKind::ListItem { .. }))
+    {
+        return list_focus_plan(doc, outdent_nested_item(doc, item, parent.id)?);
+    }
+    None
+}
+
+fn outdent_nested_item(doc: &Document, item: BlockId, parent: BlockId) -> Option<Plan> {
+    let range = aero_core::properties::owned_range(doc, item)?;
+    let piece = aero_core::containers::standalone(doc, range);
+    let inserted = Document::from_text(&piece);
+    let shapes = tree_shapes(&inserted);
+    let expected = changed_tree(doc, &doc.blocks().roots, &[item], parent, TreeInsertion::After, &shapes);
+    let at = aero_core::properties::owned_range(doc, parent)?.end;
+    let prefix = aero_core::containers::continuation(doc, parent);
+    let mut edits = SelectionPlan::nodes(doc, &[item]).deletions(doc);
+    if edits.is_empty() || edits.iter().any(|e| e.range.start < at && at < e.range.end) { return None; }
+    let shift: isize = edits.iter().filter(|e| e.range.end <= at)
+        .map(|e| e.text.len() as isize - e.range.len() as isize).sum();
+    let insertion = format!("\n{prefix}\n{prefix}{}", piece.trim_end_matches('\n').replace('\n', &format!("\n{prefix}")));
+    let focus_offset = (at as isize + shift) as usize + 2 * (1 + prefix.len());
+    edits.push(Edit::insert(at, insertion));
+    edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
+    let mut probe = doc.clone();
+    probe.edit_group(edits).ok()?;
+    probe.reparse();
+    if tree_shapes(&probe) != expected { return None; }
+    Some(Plan { edit: Edit::replace(0..doc.len(), probe.to_string()), focus_offset })
+}
+
+fn exit_list_item(doc: &Document, id: BlockId) -> Option<Plan> {
+    let item = doc.blocks().find(id)?;
+    let path = aero_core::containers::ancestors(doc, id);
+    let list = path.last()?;
+    let range = aero_core::properties::owned_range(doc, id)?;
+    let children: Vec<_> = item.children.iter().filter(|b| b.kind != BlockKind::Marker).collect();
+    let mut attrs = item.attrs.clone();
+    aero_core::properties::set(&mut attrs, "aero-owner", None);
+    if !attrs.is_empty() || item.persisted_id.is_some() {
+        return None;
+    }
+    let body = children.iter().map(|child| {
+        aero_core::containers::standalone(doc, aero_core::properties::owned_range(doc, child.id).unwrap())
+    }).collect::<Vec<_>>().join("\n\n");
+    let replacement_shapes: Vec<_> = children.iter().map(|child| TreeShape::read(doc, child)).collect();
+    let expected = list_exit_shapes(doc, &doc.blocks().roots, list.id, id, &replacement_shapes);
+    let prefix = aero_core::containers::continuation(doc, id);
+    let before = list.children.iter().filter(|b| b.kind != BlockKind::Marker).next()?.id != id;
+    let after = list.children.iter().filter(|b| b.kind != BlockKind::Marker).last()?.id != id;
+    let replacement = format!("{}{}{}",
+        if before { format!("\n{prefix}") } else { String::new() },
+        body.replace('\n', &format!("\n{prefix}")),
+        if after { format!("\n{prefix}") } else { String::new() });
+    let mut edits = recipient_fence_edits(doc, id, false, &Document::from_text(&body))?;
+    let shift: isize = edits.iter().filter(|e| e.range.end <= range.start)
+        .map(|e| e.text.len() as isize - e.range.len() as isize).sum();
+    let focus_offset = (range.start as isize + shift) as usize + if before { 1 + prefix.len() } else { 0 };
+    edits.push(Edit::replace(range, replacement));
+    edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
+    let mut probe = doc.clone();
+    probe.edit_group(edits.clone()).ok()?;
+    probe.reparse();
+    if tree_shapes(&probe) != expected { return None; }
+    let edit = if edits.len() == 1 { edits.remove(0) } else { Edit::replace(0..doc.len(), probe.to_string()) };
+    Some(Plan { edit, focus_offset })
+}
+
+fn list_exit_shapes(doc: &Document, blocks: &[aero_core::Block], list: BlockId, item: BlockId, inserted: &[TreeShape]) -> Vec<TreeShape> {
+    let mut result = Vec::new();
+    for block in blocks.iter().filter(|b| b.kind != BlockKind::Marker) {
+        if block.id != list {
+            let mut shape = TreeShape::read(doc, block);
+            shape.children = list_exit_shapes(doc, &block.children, list, item, inserted);
+            result.push(shape);
+            continue;
+        }
+        let children: Vec<_> = block.children.iter().filter(|b| b.kind != BlockKind::Marker).collect();
+        let index = children.iter().position(|b| b.id == item).unwrap();
+        for (part, slice) in [&children[..index], &children[index + 1..]].into_iter().enumerate() {
+            if part == 1 { result.extend_from_slice(inserted); }
+            if slice.is_empty() { continue; }
+            let mut shape = TreeShape::read(doc, block);
+            shape.children = slice.iter().map(|b| TreeShape::read(doc, b)).collect();
+            shape.content = shape.children.first().and_then(|b| b.content.clone());
+            if part == 0 && index + 1 < children.len() {
+                shape.attrs = Default::default();
+                shape.identity = None;
+            }
+            if let BlockKind::List { ordered: true, ref mut start } = shape.kind
+                && let Some(marker) = &shape.content
+            {
+                *start = marker.trim_end_matches(['.', ')']).parse().unwrap_or(*start);
+            }
+            result.push(shape);
+        }
+    }
+    merge_anonymous_lists(result)
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Backspace {
     SelectContainer(aero_core::BlockId),
     Edit(Plan),
+    Blocked(&'static str),
     /// 不改文档，只把焦点移到某个单位的某个偏移
     MoveTo {
         unit: usize,
@@ -179,6 +323,18 @@ pub enum Backspace {
 pub fn backspace_at_start(doc: &Document, units: &[Unit], ix: usize) -> Backspace {
     let unit = &units[ix];
     let doc_text = doc.to_string();
+    if let Some(item) = list_item_for(doc, unit.id)
+        && doc.blocks().find(item).is_some_and(|item| {
+            item.id == unit.id || item.children.iter().find(|b| b.kind != BlockKind::Marker)
+                .is_some_and(|b| b.id == unit.id)
+        })
+    {
+        let nested = aero_core::containers::ancestors(doc, item).iter().rev().nth(1)
+            .is_some_and(|b| matches!(b.kind, BlockKind::ListItem { .. }));
+        let plan = if nested { list_outdent(doc, item) }
+            else { exit_list_item(doc, item).and_then(|plan| list_focus_plan(doc, plan)) };
+        return plan.map_or(Backspace::Blocked("无法无损退出此列表项，请保留其样式、身份和子块"), Backspace::Edit);
+    }
     if let Some(block) = doc.blocks().find(unit.id).filter(|b| aero_core::containers::is_editable(&b.kind)) {
         return Backspace::SelectContainer(block.id);
     }
@@ -188,19 +344,11 @@ pub fn backspace_at_start(doc: &Document, units: &[Unit], ix: usize) -> Backspac
         .find(|b| aero_core::containers::is_editable(&b.kind))
         && !units[..ix].iter().any(|u| u.range.start >= doc.range_of(container).start)
     {
-        return Backspace::SelectContainer(container.id);
-    }
-
-    if let Some(ctx) = &unit.list {
-        let between = &doc_text[ctx.item_range.start..unit.range.start];
-        if is_list_marker(between) {
-            let ls = line_start(&doc_text, ctx.item_range.start);
-            let replacement = if ctx.item_index > 0 || ctx.parent.is_some() { "\n" } else { "" };
-            return Backspace::Edit(Plan {
-                focus_offset: ls + replacement.len(),
-                edit: Edit::replace(ls..unit.range.start, replacement),
-            });
-        }
+        return if unit.range.is_empty() {
+            Backspace::SelectContainer(container.id)
+        } else {
+            Backspace::MoveTo { unit: ix, cursor: 0 }
+        };
     }
 
     if ix == 0 {
@@ -336,44 +484,250 @@ pub fn down_target(
     Some((ix, col.min(first_len)))
 }
 
-/// 连续几个单位（下标闭区间 `first..=last`）在源码里占的整行区间：首个单位所在行的行首到最后一个单位
-/// 末行的行尾（不含那个换行）。列表项按整项算（含嵌套子项）；`^id` 等尾标记与正文同行，自然包含。
-/// 这就是块选中态里 ⌘C 复制、⌫ 删除的对象（`ui_design.md` 6）。
-pub fn units_span(doc: &Document, units: &[Unit], first: usize, last: usize) -> Range<usize> {
-    let text = doc.to_string();
-    let mut start = usize::MAX;
-    let mut end = 0;
-    for unit in &units[first..=last] {
-        let (s, e) = match &unit.list {
-            Some(ctx) => (ctx.item_range.start, ctx.item_range.end),
-            None => (unit.range.start, unit.range.end),
-        };
-        // 区间末尾若已含换行，退回到行内再找行尾，免得跑到下一行
-        let e = if e > s && text[..e].ends_with('\n') { e - 1 } else { e };
-        start = start.min(s);
-        end = end.max(e);
-    }
-    let start = line_start(&text, start.min(text.len()));
-    let end = text[end.min(text.len())..].find('\n').map_or(text.len(), |i| end + i);
-    start..end
+#[derive(Clone, Debug)]
+pub(crate) struct SelectionPlan {
+    targets: Vec<SelectionTarget>,
+    deletions: Vec<Edit>,
+    replacement_deletions: Vec<Edit>,
 }
 
-/// 删除连续几个单位：整行删掉，连同它们之后的空行；删到文末时也收掉前面多出来的空行，
-/// 文档结尾仍是单个换行。
-pub fn delete_units(doc: &Document, units: &[Unit], first: usize, last: usize) -> Edit {
-    let text = doc.to_string();
-    let Range { mut start, mut end } = units_span(doc, units, first, last);
-    while end < text.len() && text.as_bytes()[end] == b'\n' {
-        end += 1;
+#[derive(Clone, Debug)]
+struct SelectionTarget {
+    id: BlockId,
+    kind: BlockKind,
+    range: Range<usize>,
+    parent: Option<BlockId>,
+    nested: bool,
+    prefix: String,
+}
+
+impl SelectionPlan {
+    pub(crate) fn nodes(doc: &Document, ids: &[BlockId]) -> Self {
+        let ids: std::collections::HashSet<_> = ids.iter().copied().collect();
+        let source = doc.to_string();
+        let mut targets: Vec<_> = doc
+            .blocks()
+            .iter()
+            .filter_map(|(_, block)| {
+                if !ids.contains(&block.id) {
+                    return None;
+                }
+                let ancestors = aero_core::containers::ancestors(doc, block.id);
+                if ancestors.iter().any(|b| ids.contains(&b.id)) {
+                    return None;
+                }
+                let mut range = aero_core::properties::owned_range(doc, block.id)?;
+                while range.end > range.start && source.as_bytes()[range.end - 1] == b'\n' {
+                    range.end -= 1;
+                }
+                Some(SelectionTarget {
+                    id: block.id,
+                    kind: block.kind.clone(),
+                    range,
+                    parent: ancestors.last().map(|b| b.id),
+                    nested: ancestors.iter().any(|b| !matches!(b.kind, BlockKind::List { .. })),
+                    prefix: aero_core::containers::opening_continuation(doc, block.id),
+                })
+            })
+            .collect();
+        targets.sort_by_key(|t| t.range.start);
+        let deletions = Self::plan_deletions(doc, &targets);
+        let replacement_deletions = Self::plan_deletions(doc, targets.get(1..).unwrap_or_default());
+        Self { targets, deletions, replacement_deletions }
     }
-    if end == text.len() {
-        // 按前缀判断而不是 `text[start - 2..start]`：`start` 是字符边界，但它前面两个字节
-        // 可能落在一个多字节字符（如 `。`）中间，直接切片会 panic。
-        while start >= 2 && text[..start].ends_with("\n\n") {
-            start -= 1;
+
+    pub(crate) fn units(doc: &Document, units: &[Unit], first: usize, last: usize) -> Self {
+        let ids: Vec<_> = units[first..=last]
+            .iter()
+            .map(|unit| {
+                // Keyboard selection keeps first-item semantics without promoting continuation leaves.
+                aero_core::containers::ancestors(doc, unit.id)
+                    .last()
+                    .filter(|item| {
+                        matches!(item.kind, BlockKind::ListItem { .. })
+                            && item
+                                .children
+                                .iter()
+                                .find(|b| b.kind != BlockKind::Marker)
+                                .is_some_and(|b| b.id == unit.id)
+                    })
+                    .map_or(unit.id, |item| item.id)
+            })
+            .collect();
+        Self::nodes(doc, &ids)
+    }
+
+    pub(crate) fn source(&self, doc: &Document) -> String {
+        let source = doc.to_string();
+        let mut result = String::new();
+        for (i, target) in self.targets.iter().enumerate() {
+            if i > 0 {
+                let previous = &self.targets[i - 1];
+                let gap = &source[previous.range.end..target.range.start];
+                if previous.parent == target.parent && !gap.is_empty() && gap.chars().all(char::is_whitespace)
+                {
+                    result.push_str(gap.trim_end_matches([' ', '\t']));
+                } else {
+                    result.push_str("\n\n");
+                }
+            }
+            result.push_str(&aero_core::containers::standalone(doc, target.range.clone()));
         }
+        result
     }
-    Edit::delete(start..end)
+
+    pub(crate) fn start(&self) -> Option<usize> {
+        self.targets.first().map(|t| t.range.start)
+    }
+
+    pub(crate) fn deletions(&self, _doc: &Document) -> Vec<Edit> {
+        self.deletions.clone()
+    }
+
+    pub(crate) fn replace(&self, doc: &Document, source: &str) -> Result<Document, String> {
+        let first = self.targets.first().ok_or("选中的块已不存在")?;
+        let original = doc.to_string();
+        // Workspace reparsing preserves snapshot offsets, not session-local BlockIds.
+        let ids = self
+            .targets
+            .iter()
+            .map(|target| {
+                doc.blocks()
+                    .iter()
+                    .find_map(|(_, block)| {
+                        if block.kind != target.kind {
+                            return None;
+                        }
+                        let mut range = aero_core::properties::owned_range(doc, block.id)?;
+                        while range.end > range.start && original.as_bytes()[range.end - 1] == b'\n' {
+                            range.end -= 1;
+                        }
+                        (range == target.range).then_some(block.id)
+                    })
+                    .ok_or("选中的块已变化")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let inserted = Document::from_text(source);
+        let expected = changed_tree(
+            doc,
+            &doc.blocks().roots,
+            &ids,
+            ids[0],
+            TreeInsertion::Before,
+            &tree_shapes(&inserted),
+        );
+        let mut edits = self.replacement_deletions.clone();
+        edits.extend(recipient_fence_edits(doc, ids[0], false, &inserted).ok_or("目标容器围栏不完整")?);
+        edits.push(Edit::replace(
+            first.range.clone(),
+            source.trim_end_matches('\n').replace('\n', &format!("\n{}", first.prefix)),
+        ));
+        edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
+        let mut result = doc.clone();
+        result.edit_group(edits).map_err(|e| e.to_string())?;
+        result.reparse();
+        if tree_shapes(&result) != expected {
+            return Err("粘贴会改变未选中块的层级或内容".into());
+        }
+        Ok(result)
+    }
+
+    fn plan_deletions(doc: &Document, targets: &[SelectionTarget]) -> Vec<Edit> {
+        let source = doc.to_string();
+        let mut edits: Vec<Edit> = Vec::new();
+        let mut preserves_list = false;
+        for target in targets {
+            let mut range = target.range.clone();
+            let parent_list = target.parent.and_then(|id| doc.blocks().find(id)).filter(|list| {
+                matches!(list.kind, BlockKind::List { .. })
+                    && (list.persisted_id.is_some() || !list.attrs.is_empty())
+            });
+            preserves_list |= parent_list.is_some();
+            if let Some(list) = parent_list.filter(|list| {
+                list.children.iter().find(|b| b.kind != BlockKind::Marker).is_some_and(|b| b.id == target.id)
+                    && list
+                        .children
+                        .iter()
+                        .filter(|b| b.kind != BlockKind::Marker)
+                        .all(|b| targets.iter().any(|t| t.id == b.id))
+            }) {
+                // A legal empty item keeps unselected list metadata off the preceding block.
+                let marker = source[doc.range_of(list)].split_whitespace().next().unwrap_or("-");
+                edits.push(Edit::replace(range, format!("{marker} ")));
+                continue;
+            }
+            if let Some(item) = target
+                .parent
+                .and_then(|id| doc.blocks().find(id))
+                .filter(|b| matches!(b.kind, BlockKind::ListItem { .. }))
+                && item
+                    .children
+                    .iter()
+                    .find(|b| b.kind != BlockKind::Marker)
+                    .is_some_and(|b| b.id == target.id)
+                && let Some(next) = item
+                    .children
+                    .iter()
+                    .find(|b| b.kind != BlockKind::Marker && !targets.iter().any(|t| t.id == b.id))
+            {
+                let end = line_start(&source, doc.range_of(next).start);
+                let prefix = aero_core::containers::continuation(doc, target.id);
+                if end > range.end
+                    && source[range.end..end]
+                        .lines()
+                        .all(|line| line.trim().is_empty() || line.trim() == prefix.trim())
+                {
+                    // An empty item cannot retain children across a blank separator.
+                    range.end = end - 1;
+                }
+            }
+            if !target.nested && parent_list.is_none() {
+                while range.end < source.len() && source.as_bytes()[range.end] == b'\n' {
+                    range.end += 1;
+                }
+                if range.end == source.len() {
+                    while range.start >= 2 && source[..range.start].ends_with("\n\n") {
+                        range.start -= 1;
+                    }
+                }
+            }
+            if let Some(previous) =
+                edits.last_mut().filter(|e| e.text.is_empty() && e.range.end >= range.start)
+            {
+                previous.range.end = previous.range.end.max(range.end);
+            } else {
+                edits.push(Edit::delete(range));
+            }
+        }
+        edits.reverse();
+        if preserves_list {
+            let removed: Vec<_> = targets.iter().map(|t| t.id).collect();
+            let expected =
+                changed_tree(doc, &doc.blocks().roots, &removed, removed[0], TreeInsertion::Before, &[]);
+            let mut probe = doc.clone();
+            if probe.edit_group(edits.clone()).is_err() {
+                return Vec::new();
+            }
+            probe.reparse();
+            if tree_shapes(&probe) != expected {
+                return Vec::new();
+            }
+        }
+        edits
+    }
+}
+
+pub fn units_span(doc: &Document, units: &[Unit], first: usize, last: usize) -> Range<usize> {
+    let plan = SelectionPlan::units(doc, units, first, last);
+    let text = doc.to_string();
+    let start = plan.start().unwrap_or(doc.len());
+    let end = plan.targets.last().map_or(start, |t| t.range.end);
+    line_start(&text, start)..end
+}
+
+#[cfg(test)]
+pub fn delete_units(doc: &Document, units: &[Unit], first: usize, last: usize) -> Vec<Edit> {
+    SelectionPlan::units(doc, units, first, last).deletions(doc)
 }
 
 /// 在文末新建空段落：需要补的换行与新段落的偏移；不需要编辑时 `edit` 为 `None`。
@@ -481,6 +835,182 @@ fn contains_unit(units: &[Unit], ancestor: usize, index: usize) -> bool {
     unit.range.start >= span.start && unit.range.end <= span.end && span.start != span.end
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TreeShape {
+    kind: BlockKind,
+    attrs: aero_core::Attrs,
+    identity: Option<String>,
+    content: Option<String>,
+    children: Vec<TreeShape>,
+}
+
+impl TreeShape {
+    fn read(doc: &Document, block: &aero_core::Block) -> Self {
+        Self {
+            kind: block.kind.clone(),
+            attrs: block.attrs.clone(),
+            identity: block.persisted_id.as_deref().map(str::to_owned),
+            content: if matches!(block.kind, BlockKind::List { .. } | BlockKind::ListItem { .. }) {
+                aero_core::containers::local_source(doc, block.id)
+                    .and_then(|source| source.split_whitespace().next().map(str::to_owned))
+            } else if !block.kind.is_container() {
+                aero_core::containers::local_source(doc, block.id)
+                    .map(|source| source.trim_end_matches('\n').to_owned())
+            } else {
+                None
+            },
+            children: block
+                .children
+                .iter()
+                .filter(|b| b.kind != BlockKind::Marker)
+                .map(|b| Self::read(doc, b))
+                .collect(),
+        }
+    }
+}
+
+fn tree_shapes(doc: &Document) -> Vec<TreeShape> {
+    doc.blocks()
+        .roots
+        .iter()
+        .filter(|b| b.kind != BlockKind::Marker)
+        .map(|b| TreeShape::read(doc, b))
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum TreeInsertion {
+    Before,
+    After,
+    Into,
+}
+
+fn changed_tree(
+    doc: &Document,
+    blocks: &[aero_core::Block],
+    removed: &[BlockId],
+    target: BlockId,
+    insertion: TreeInsertion,
+    inserted: &[TreeShape],
+) -> Vec<TreeShape> {
+    let mut result = Vec::new();
+    for block in blocks.iter().filter(|b| b.kind != BlockKind::Marker) {
+        let here = block.id == target;
+        let in_list = aero_core::containers::ancestors(doc, block.id)
+            .last()
+            .is_some_and(|b| matches!(b.kind, BlockKind::List { .. }));
+        let siblings = || {
+            inserted.iter().flat_map(|b| {
+                if in_list && matches!(b.kind, BlockKind::List { .. }) {
+                    b.children.clone()
+                } else {
+                    vec![b.clone()]
+                }
+            })
+        };
+        if here && matches!(insertion, TreeInsertion::Before) {
+            result.extend(siblings());
+        }
+        if !removed.contains(&block.id) {
+            let mut shape = TreeShape::read(doc, block);
+            shape.children = changed_tree(doc, &block.children, removed, target, insertion, inserted);
+            if here && matches!(insertion, TreeInsertion::Into) {
+                shape.children.extend_from_slice(inserted);
+                shape.children = merge_anonymous_lists(shape.children);
+            }
+            if let BlockKind::List { ordered, ref mut start } = shape.kind {
+                if shape.children.is_empty() && (shape.identity.is_some() || !shape.attrs.is_empty()) {
+                    shape.children.push(TreeShape {
+                        kind: BlockKind::ListItem { task: None },
+                        attrs: aero_core::Attrs::default(),
+                        identity: None,
+                        content: shape.content.clone(),
+                        children: Vec::new(),
+                    });
+                }
+                shape.content = shape.children.first().and_then(|child| child.content.clone());
+                if ordered && let Some(marker) = &shape.content {
+                    *start = marker.trim_end_matches(['.', ')']).parse().unwrap_or(*start);
+                }
+            }
+            if !matches!(shape.kind, BlockKind::List { .. })
+                || !shape.children.is_empty()
+                || shape.identity.is_some()
+                || !shape.attrs.is_empty()
+            {
+                result.push(shape);
+            }
+        }
+        if here && matches!(insertion, TreeInsertion::After) {
+            result.extend(siblings());
+        }
+    }
+    merge_anonymous_lists(result)
+}
+
+fn merge_anonymous_lists(shapes: Vec<TreeShape>) -> Vec<TreeShape> {
+    let mut result: Vec<TreeShape> = Vec::new();
+    for shape in shapes {
+        if let Some(previous) = result.last_mut().filter(|previous| {
+            matches!(shape.kind, BlockKind::List { .. })
+                && previous.kind == shape.kind
+                && previous.content == shape.content
+                && previous.identity.is_none()
+                && shape.identity.is_none()
+                && previous.attrs.is_empty()
+                && shape.attrs.is_empty()
+        }) {
+            previous.children.extend(shape.children);
+        } else {
+            result.push(shape);
+        }
+    }
+    result
+}
+
+fn recipient_fence_edits(
+    doc: &Document,
+    target: BlockId,
+    into: bool,
+    inserted: &Document,
+) -> Option<Vec<Edit>> {
+    let original = doc.to_string();
+    let mut edits = Vec::new();
+    // Comrak checks pure colon closers before visiting literal code children.
+    let mut required = inserted.to_string().lines().map(directive_closing_width).max().unwrap_or(0);
+    for (_, block) in inserted.blocks().iter().filter(|(_, b)| matches!(b.kind, BlockKind::Directive { .. }))
+    {
+        let local = aero_core::containers::local_source(inserted, block.id)?;
+        let opening = local.bytes().take_while(|b| *b == b':').count();
+        required = required.max(opening).max(local.lines().last().map(directive_closing_width).unwrap_or(0));
+    }
+    let mut ancestors = aero_core::containers::ancestors(doc, target);
+    if into {
+        ancestors.push(doc.blocks().find(target)?);
+    }
+    for ancestor in ancestors.into_iter().rev().filter(|b| matches!(b.kind, BlockKind::Directive { .. })) {
+        let span = doc.range_of(ancestor);
+        let opening = &original[span.clone()];
+        let count = opening.bytes().take_while(|b| *b == b':').count();
+        let local = aero_core::containers::standalone(doc, span.clone());
+        let length = local.lines().last().map(directive_closing_width).unwrap_or(0);
+        if count > required {
+            required = count.max(length);
+            continue;
+        }
+        let closing = span.start + opening.rfind('\n')? + 1;
+        let start = closing + original[closing..span.end].find(':')?;
+        if count < 3 || length < count || !original[start + length..span.end].trim().is_empty() {
+            return None;
+        }
+        required = (required + 1).max(length);
+        let fence = ":".repeat(required);
+        edits.push(Edit::replace(span.start..span.start + count, fence.clone()));
+        edits.push(Edit::replace(start..start + length, fence));
+    }
+    Some(edits)
+}
+
 pub fn move_node(
     doc: &Document,
     source: aero_core::BlockId,
@@ -488,7 +1018,6 @@ pub fn move_node(
     after: bool,
     into: bool,
 ) -> Option<Plan> {
-    let from = doc.blocks().find(source)?;
     let to = doc.blocks().find(target)?;
     if source == target || aero_core::containers::ancestors(doc, target).iter().any(|b| b.id == source) {
         return None;
@@ -496,20 +1025,14 @@ pub fn move_node(
     let range = aero_core::properties::owned_range(doc, source)?;
     let target_range = aero_core::properties::owned_range(doc, target)?;
     let original = doc.to_string();
-    let external = aero_core::containers::continuation(doc, source);
-    let piece = original[range.clone()]
-        .split('\n')
-        .enumerate()
-        .map(|(i, line)| if i == 0 { line } else { line.strip_prefix(external.as_str()).unwrap_or(line) })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let piece = aero_core::containers::standalone(doc, range.clone());
     let (at, prefix) = if into {
-        if !aero_core::containers::is_editable(&to.kind) {
+        if !aero_core::containers::is_editable(&to.kind) && !matches!(to.kind, BlockKind::ListItem { .. }) {
             return None;
         }
-        let prefix = aero_core::containers::continuation(doc, target);
+        let prefix = aero_core::containers::content_continuation(doc, target);
         match to.kind {
-            BlockKind::BlockQuote => (doc.range_of(to).end, format!("{prefix}> ")),
+            BlockKind::BlockQuote | BlockKind::ListItem { .. } => (doc.range_of(to).end, prefix),
             _ => {
                 let span = doc.range_of(to);
                 let offset = original[span.clone()].rfind('\n')? + span.start;
@@ -519,40 +1042,86 @@ pub fn move_node(
     } else {
         (
             if after { target_range.end } else { target_range.start },
-            aero_core::containers::continuation(doc, target),
+            if after {
+                aero_core::containers::continuation(doc, target)
+            } else {
+                aero_core::containers::opening_continuation(doc, target)
+            },
         )
     };
     if range.start <= at && at <= range.end {
         return None;
     }
-    let piece = piece.replace('\n', &format!("\n{prefix}"));
-    let insertion = if into || after {
-        format!("\n{prefix}\n{prefix}{}", piece.trim_end_matches('\n'))
+    let inserted = Document::from_text(&piece);
+    let moved = TreeShape::read(doc, doc.blocks().find(source)?);
+    let shapes = tree_shapes(&inserted);
+    let exported = if matches!(moved.kind, BlockKind::ListItem { .. }) {
+        if shapes.len() != 1 {
+            return None;
+        }
+        &shapes.first().filter(|b| matches!(b.kind, BlockKind::List { .. }))?.children
     } else {
-        format!("{}\n{prefix}\n{prefix}", piece.trim_end_matches('\n'))
+        &shapes
     };
-    let mut edits = vec![Edit::delete(range.clone()), Edit::insert(at, insertion)];
+    if exported.as_slice() != [moved] {
+        return None;
+    }
+    let position = if into {
+        TreeInsertion::Into
+    } else if after {
+        TreeInsertion::After
+    } else {
+        TreeInsertion::Before
+    };
+    let expected = changed_tree(doc, &doc.blocks().roots, &[source], target, position, &shapes);
+    if expected == tree_shapes(doc) && prefix == aero_core::containers::opening_continuation(doc, source) {
+        return None;
+    }
+    let piece = piece.trim_end_matches('\n').replace('\n', &format!("\n{prefix}"));
+    let insertion = if into || after {
+        format!("\n{prefix}\n{prefix}{piece}")
+    } else {
+        format!("{piece}\n{prefix}\n{prefix}")
+    };
+    let selection = SelectionPlan::nodes(doc, &[source]);
+    let mut edits = selection.deletions(doc);
+    if !selection.targets.first()?.nested {
+        // Moving a root leaves unrelated separator trivia in its original slot.
+        for edit in edits.iter_mut().filter(|edit| edit.text.is_empty()) {
+            edit.text = format!(
+                "{}{}",
+                &original[edit.range.start..range.start],
+                &original[range.end..edit.range.end],
+            );
+        }
+    }
+    edits.extend(recipient_fence_edits(doc, target, into, &inserted)?);
+    if edits.iter().any(|e| e.range.start < at && at < e.range.end) {
+        return None;
+    }
+    let shift = edits
+        .iter()
+        .filter(|e| e.range.end <= at)
+        .map(|e| e.text.len() as isize - e.range.len() as isize)
+        .sum::<isize>();
+    let focus_offset =
+        (at as isize + shift) as usize + if into || after { 2 * (1 + prefix.len()) } else { 0 };
+    edits.push(Edit::insert(at, insertion));
     edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
     let mut probe = doc.clone();
     probe.edit_group(edits).ok()?;
     probe.reparse();
-    // Reindentation must never hide, duplicate, or detach a persistent identity.
-    let identities = |doc: &Document| {
-        let mut ids: Vec<_> = doc
-            .blocks()
-            .iter()
-            .filter(|(_, b)| b.kind != BlockKind::Marker)
-            .filter_map(|(_, b)| b.persisted_id.as_deref().map(str::to_owned))
-            .collect();
-        ids.sort();
-        ids
-    };
-    if identities(doc) != identities(&probe) {
+    if tree_shapes(&probe) != expected || probe.to_string() == original {
         return None;
     }
-    let focus_offset = if at > range.end { at - range.len() } else { at };
-    let _ = from;
     Some(Plan { edit: Edit::replace(0..doc.len(), probe.to_string()), focus_offset })
+}
+
+fn directive_closing_width(line: &str) -> usize {
+    // Ancestor indentation can expose colon closers before the parser visits code children.
+    let rest = line.trim_start_matches([' ', '\t']);
+    let count = rest.bytes().take_while(|b| *b == b':').count();
+    if count >= 3 && rest[count..].bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r')) { count } else { 0 }
 }
 
 fn adapt_moved_block(raw: &str, source: &Unit, units: &[Unit], place: DropPlace, text: &str) -> String {
@@ -676,33 +1245,14 @@ fn assemble_move(text: &str, cut: Range<usize>, insert_at: usize, piece: &str) -
         push_piece(&mut out, gap, &piece);
         out.push_str(&text[at..]);
     }
-    squash_blank_lines(&out, text.ends_with('\n'))
+    // Only normalize boundary separators; interior blank lines may be literal code data.
+    out
 }
 
 fn is_list_piece(piece: &str) -> bool {
     let line = piece.trim_start_matches('\n').lines().next().unwrap_or("");
     let indent = line.chars().take_while(|c| *c == ' ' || *c == '\t').map(char::len_utf8).sum();
     list_marker_len(&line[indent..]).is_some()
-}
-
-fn squash_blank_lines(text: &str, trailing_newline: bool) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut newlines = 0u8;
-    for ch in text.chars() {
-        if ch == '\n' {
-            newlines = newlines.saturating_add(1);
-            if newlines <= 2 {
-                out.push('\n');
-            }
-        } else {
-            newlines = 0;
-            out.push(ch);
-        }
-    }
-    if trailing_newline && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
 }
 
 /// 段首刚打完的列表标记。光标还没走出这段标记时不认。标题和引用的标记留在单位源码里，不在这里。
@@ -875,13 +1425,21 @@ fn convert_leaf(doc: &Document, units: &[Unit], ix: usize, target: BlockType) ->
     if current == target {
         return None;
     }
-    let doc_text = doc.to_string();
-    // 替换区间的起点：列表项是标记所在行的行首（吃掉缩进与标记），其余是单位起点
-    let start = match &unit.list {
-        Some(ctx) => line_start(&doc_text, ctx.item_range.start),
-        None => unit.range.start,
+    let (start, external) = if let Some(ctx) = &unit.list {
+        let item =
+            doc.blocks().iter().map(|(_, b)| b).find(|b| {
+                matches!(b.kind, BlockKind::ListItem { .. }) && doc.range_of(b) == ctx.item_range
+            })?;
+        (ctx.item_range.start, aero_core::containers::continuation(doc, item.id))
+    } else {
+        (unit.range.start, aero_core::containers::continuation(doc, unit.id))
     };
-    let src = &doc_text[unit.range.clone()];
+    let local = if unit.range.is_empty() {
+        String::new()
+    } else {
+        aero_core::containers::local_source(doc, unit.id)?
+    };
+    let src = local.as_str();
     let content: String = match current {
         BlockType::Heading(_) => src[heading_prefix_len(src)..].to_owned(),
         BlockType::Quote | BlockType::Highlight => return None,
@@ -948,6 +1506,8 @@ fn convert_leaf(doc: &Document, units: &[Unit], ix: usize, target: BlockType) ->
         }
     }
     let end = aero_core::properties::owned_range(doc, unit.id)?.end;
+    let cursor = cursor + text[..cursor].bytes().filter(|b| *b == b'\n').count() * external.len();
+    let text = text.replace('\n', &format!("\n{external}"));
     Some(Plan { focus_offset: start + cursor, edit: Edit::replace(start..end, text) })
 }
 
@@ -1112,6 +1672,7 @@ pub fn toggle_task(item_src: &str, base: usize) -> Option<Edit> {
 
 /// 上一行还能接着写字：段落、标题、列表项正文、引用和 callout。
 /// `- `、`3) `、`- [x] `（可带缩进）是否只是列表标记。
+#[cfg(test)]
 fn is_list_marker(s: &str) -> bool {
     let s = s.trim_start_matches([' ', '\t']);
     let rest = if let Some(r) = s.strip_prefix(['-', '*', '+']) {
@@ -1144,6 +1705,92 @@ mod tests {
             .filter(|&ix| us[ix].range.start <= plan.focus_offset)
             .map(|ix| doc.slice(us[ix].range.clone()).to_string());
         (doc.to_string(), focused)
+    }
+
+    #[test]
+    fn phase2_list_levels_preserve_quoted_task_subtree_and_sibling_metadata() {
+        let source = "> - parent\n> - [x] {aero-owner=item .red custom=keep} ^item\n>\n>   body ^body\n>\n>   continuation ^cont\n>\n>   - nested ^nested\n> - {aero-owner=item .blue} ^sibling\n>\n>   other\n";
+        let mut doc = Document::from_text(source);
+        let item = aero_core::block_refs::resolve(&doc, "item").unwrap();
+        let old = TreeShape::read(&doc, doc.blocks().find(item).unwrap());
+        let sibling = TreeShape::read(&doc, doc.blocks().find(aero_core::block_refs::resolve(&doc, "sibling").unwrap()).unwrap());
+        let plan = list_indent(&doc, item).expect("preceding item receives the whole subtree");
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let indented = doc.to_string();
+        let item = aero_core::block_refs::resolve(&doc, "item").unwrap();
+        assert_eq!(TreeShape::read(&doc, doc.blocks().find(item).unwrap()), old);
+        assert_eq!(aero_core::containers::ancestors(&doc, item).iter().filter(|b| matches!(b.kind, BlockKind::ListItem { .. })).count(), 1);
+        assert_eq!(TreeShape::read(&doc, doc.blocks().find(aero_core::block_refs::resolve(&doc, "sibling").unwrap()).unwrap()), sibling);
+        let plan = list_outdent(&doc, item).unwrap();
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let item = aero_core::block_refs::resolve(&doc, "item").unwrap();
+        assert_eq!(TreeShape::read(&doc, doc.blocks().find(item).unwrap()), old);
+        assert_eq!(aero_core::containers::ancestors(&doc, item).iter().filter(|b| matches!(b.kind, BlockKind::ListItem { .. })).count(), 0);
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), indented);
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn phase2_root_task_exit_keeps_continuations_and_nested_children() {
+        for source in [
+            "> - [x] first ^first\n>\n>   second ^second\n>\n>   - child ^child\n> - after ^after\n",
+            "- {aero-owner=item .red} ^item\n\n  first ^first\n\n  second ^second\n\n  - child ^child\n- after ^after\n",
+            ":::highlight\n- {aero-owner=item .red} ^item\n\n  first ^first\n\n  second ^second\n\n  - child ^child\n- after ^after\n:::\n",
+        ] {
+            let mut doc = Document::from_text(source);
+            let us = units(&doc);
+            if source.contains("^item") {
+                assert!(matches!(backspace_at_start(&doc, &us, 0), Backspace::Blocked(_)));
+                assert_eq!(doc.to_string(), source);
+                continue;
+            }
+            let Backspace::Edit(plan) = backspace_at_start(&doc, &us, 0) else { panic!("root exit {source}") };
+            doc.edit(plan.edit).unwrap();
+            doc.reparse();
+            for id in ["first", "second", "child", "after"] { assert!(aero_core::block_refs::resolve(&doc, id).is_ok(), "{id}: {}", doc.to_string()); }
+            if source.contains("^item") { assert!(aero_core::block_refs::resolve(&doc, "item").is_ok()); }
+            doc.undo().unwrap();
+            assert_eq!(doc.to_string(), source);
+        }
+    }
+
+    #[test]
+    fn phase2_numbered_task_levels_keep_marker_width_and_literal_code() {
+        let source = "> 9) parent\n> 10) [x] body ^body\n>\n>     ```text\n>      leading\n>         four\n>     ```\n>\n>     continuation ^cont\n> 11) sibling ^sibling\n";
+        let mut doc = Document::from_text(source);
+        let item = list_item_for(&doc, aero_core::block_refs::resolve(&doc, "body").unwrap()).unwrap();
+        let old = TreeShape::read(&doc, doc.blocks().find(item).unwrap());
+        let plan = list_indent(&doc, item).unwrap();
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let item = list_item_for(&doc, aero_core::block_refs::resolve(&doc, "body").unwrap()).unwrap();
+        assert_eq!(TreeShape::read(&doc, doc.blocks().find(item).unwrap()), old);
+        let plan = list_outdent(&doc, item).unwrap();
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let item = list_item_for(&doc, aero_core::block_refs::resolve(&doc, "body").unwrap()).unwrap();
+        assert_eq!(TreeShape::read(&doc, doc.blocks().find(item).unwrap()), old);
+        assert!(doc.to_string().contains("10) [x] body"));
+    }
+
+    #[test]
+    fn phase2_first_list_item_cannot_indent_and_empty_nested_item_outdents() {
+        let quoted = Document::from_text("- parent\n\n  > quoted ^body\n");
+        assert_eq!(list_item_for(&quoted, aero_core::block_refs::resolve(&quoted, "body").unwrap()), Some(quoted.blocks().roots[0].children[0].id));
+        let mut doc = Document::from_text("- parent\n  - child\n  - \n");
+        let first = doc.blocks().roots[0].children[0].id;
+        assert!(list_indent(&doc, first).is_none());
+        assert!(list_outdent(&doc, first).is_none());
+        let us = units(&doc);
+        let Backspace::Edit(plan) = backspace_at_start(&doc, &us, 2) else { panic!("outdent empty item") };
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        assert_eq!(units(&doc).last().unwrap().list.as_ref().unwrap().parent, None);
+        assert_eq!(units(&doc).len(), 3);
     }
 
     #[test]
@@ -1281,6 +1928,465 @@ mod tests {
         let plan = convert(&doc, &us, 1, BlockType::Heading(2)).unwrap();
         apply(&mut doc, plan);
         assert_eq!(doc.to_string(), source.replace("  continuation", "  ## continuation"));
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    fn check_nested_code_conversion(source: &str, expected: &str) {
+        let mut doc = Document::from_text(source);
+        let id = aero_core::block_refs::resolve(&doc, "body").unwrap();
+        let attrs = doc.blocks().find(id).unwrap().attrs.clone();
+        let ancestor_kinds: Vec<_> = aero_core::containers::ancestors(&doc, id)
+            .iter()
+            .map(|b| (b.kind.clone(), b.attrs.clone(), b.persisted_id.clone()))
+            .collect();
+        let plan = convert_node(&doc, id, BlockType::Code).unwrap().unwrap();
+        assert_eq!(&source[..plan.edit.range.start], &expected[..plan.edit.range.start]);
+        let focus = plan.focus_offset;
+        apply(&mut doc, plan);
+        assert_eq!(doc.to_string(), expected);
+        assert!(doc.to_string()[..focus].ends_with("beta"));
+        let id = aero_core::block_refs::resolve(&doc, "body").unwrap();
+        let code = doc.blocks().find(id).unwrap();
+        assert_eq!(code.kind, BlockKind::CodeFence { info: String::new() });
+        assert_eq!(code.attrs, attrs);
+        assert_eq!(aero_core::containers::local_source(&doc, id).unwrap(), "```\nalpha\nbeta\n```");
+        assert_eq!(
+            aero_core::containers::ancestors(&doc, id)
+                .iter()
+                .map(|b| (b.kind.clone(), b.attrs.clone(), b.persisted_id.clone()))
+                .collect::<Vec<_>>(),
+            ancestor_kinds
+        );
+        let sibling = aero_core::block_refs::resolve(&doc, "sib").unwrap();
+        assert_eq!(aero_core::containers::local_source(&doc, sibling).as_deref(), Some("sibling"));
+        assert_eq!(doc.blocks().find(sibling).unwrap().attrs.classes, ["blue"]);
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+        doc.redo().unwrap();
+        doc.reparse();
+        let id = aero_core::block_refs::resolve(&doc, "body").unwrap();
+        let plan = convert_node(&doc, id, BlockType::Text).unwrap().unwrap();
+        apply(&mut doc, plan);
+        assert_eq!(doc.to_string(), source);
+        let id = aero_core::block_refs::resolve(&doc, "body").unwrap();
+        assert_eq!(doc.blocks().find(id).unwrap().attrs, attrs);
+    }
+
+    #[test]
+    fn quote_child_code_conversion_keeps_body_metadata_and_following_siblings() {
+        check_nested_code_conversion(
+            "> alpha\n> beta {.red align=center} ^body\n>\n> sibling {.blue} ^sib\n\noutside\n",
+            "> ```\n> alpha\n> beta\n> ```\n> \n> {.red align=center} ^body\n>\n> sibling {.blue} ^sib\n\noutside\n",
+        );
+    }
+
+    #[test]
+    fn list_child_code_conversion_keeps_body_metadata_and_following_siblings() {
+        check_nested_code_conversion(
+            "- {aero-owner=item .item} ^item\n\n  alpha\n  beta {.red align=center} ^body\n\n  sibling {.blue} ^sib\n- next ^next\n\noutside\n",
+            "- {aero-owner=item .item} ^item\n\n  ```\n  alpha\n  beta\n  ```\n  \n  {.red align=center} ^body\n\n  sibling {.blue} ^sib\n- next ^next\n\noutside\n",
+        );
+    }
+
+    #[test]
+    fn quoted_list_first_child_conversion_retains_item_marker() {
+        check_nested_code_conversion(
+            "> - alpha\n>   beta {.red align=center} ^body\n>\n>   sibling {.blue} ^sib\n> - next ^next\n\noutside\n",
+            "> - ```\n>   alpha\n>   beta\n>   ```\n>   \n>   {.red align=center} ^body\n>\n>   sibling {.blue} ^sib\n> - next ^next\n\noutside\n",
+        );
+    }
+
+    #[test]
+    fn quoted_simple_item_conversion_keeps_external_quote() {
+        let source = "> - alpha\n>   beta {.red} ^body\n>\n> sibling ^sib\n\noutside\n";
+        let mut doc = Document::from_text(source);
+        let us = units(&doc);
+        let plan = convert(&doc, &us, 0, BlockType::Code).unwrap();
+        apply(&mut doc, plan);
+        assert_eq!(
+            doc.to_string(),
+            "> ```\n> alpha\n> beta\n> ```\n> \n> {.red} ^body\n>\n> sibling ^sib\n\noutside\n"
+        );
+        let id = aero_core::block_refs::resolve(&doc, "body").unwrap();
+        assert_eq!(aero_core::containers::local_source(&doc, id).as_deref(), Some("```\nalpha\nbeta\n```"));
+        assert_eq!(doc.blocks().find(id).unwrap().attrs.classes, ["red"]);
+        assert_eq!(aero_core::containers::ancestors(&doc, id).len(), 1);
+        assert!(aero_core::block_refs::resolve(&doc, "sib").is_ok());
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn code_conversion_uses_each_lines_quote_and_task_prefix() {
+        for (source, expected, roundtrip, leaf) in [
+            (
+                "> alpha\n>beta {.red} ^body\n>\n> sibling ^sib\n",
+                "> ```\n> alpha\n> beta\n> ```\n> \n> {.red} ^body\n>\n> sibling ^sib\n",
+                "> alpha\n> beta {.red} ^body\n>\n> sibling ^sib\n",
+                true,
+            ),
+            (
+                "- [ ] alpha\n  beta {.red} ^body\n\nsibling ^sib\n",
+                "```\nalpha\nbeta\n```\n\n{.red} ^body\n\nsibling ^sib\n",
+                "alpha\nbeta {.red} ^body\n\nsibling ^sib\n",
+                false,
+            ),
+            (
+                "> - [x] alpha\n>   beta {.red} ^body\n>\n> sibling ^sib\n",
+                "> ```\n> alpha\n> beta\n> ```\n> \n> {.red} ^body\n>\n> sibling ^sib\n",
+                "> alpha\n> beta {.red} ^body\n>\n> sibling ^sib\n",
+                false,
+            ),
+            (
+                "- [ ] parent\n\n  > alpha\n  >beta {.red} ^body\n\n  sibling ^sib\n",
+                "- [ ] parent\n\n  > ```\n  > alpha\n  > beta\n  > ```\n  > \n  > {.red} ^body\n\n  sibling ^sib\n",
+                "- [ ] parent\n\n  > alpha\n  > beta {.red} ^body\n\n  sibling ^sib\n",
+                true,
+            ),
+        ] {
+            let mut doc = Document::from_text(source);
+            let id = aero_core::block_refs::resolve(&doc, "body").unwrap();
+            let attrs = doc.blocks().find(id).unwrap().attrs.clone();
+            let plan = if leaf {
+                convert_node(&doc, id, BlockType::Code).unwrap().unwrap()
+            } else {
+                let us = units(&doc);
+                let ix = us.iter().position(|u| u.id == id).unwrap();
+                convert(&doc, &us, ix, BlockType::Code).unwrap()
+            };
+            apply(&mut doc, plan);
+            assert_eq!(doc.to_string(), expected);
+            let id = aero_core::block_refs::resolve(&doc, "body").unwrap();
+            let code = doc.blocks().find(id).unwrap();
+            assert_eq!(code.kind, BlockKind::CodeFence { info: String::new() });
+            assert_eq!(code.attrs, attrs);
+            assert_eq!(
+                aero_core::containers::local_source(&doc, id).as_deref(),
+                Some("```\nalpha\nbeta\n```")
+            );
+            let sibling = aero_core::block_refs::resolve(&doc, "sib").unwrap();
+            assert_eq!(aero_core::containers::local_source(&doc, sibling).as_deref(), Some("sibling"));
+            doc.undo().unwrap();
+            assert_eq!(doc.to_string(), source);
+            doc.redo().unwrap();
+            doc.reparse();
+            let id = aero_core::block_refs::resolve(&doc, "body").unwrap();
+            let plan = convert_node(&doc, id, BlockType::Text).unwrap().unwrap();
+            apply(&mut doc, plan);
+            assert_eq!(doc.to_string(), roundtrip);
+            let id = aero_core::block_refs::resolve(&doc, "body").unwrap();
+            assert_eq!(doc.blocks().find(id).unwrap().attrs, attrs);
+        }
+    }
+
+    #[test]
+    fn nested_move_grows_only_recipient_fences_and_preserves_subtree() {
+        let moving = ":::highlight {.red}\nchild {.blue} ^kid\n\n```text\n::::::::literal\n\n\n\nend\n```\n:::\n\n^moving";
+        let recipient = "> :::highlight {.green}\n> resident ^resident\n> :::\n>\n> ^recipient";
+        let source = format!("{moving}\n\n{recipient}\n\ntail\n");
+        let mut doc = Document::from_text(&source);
+        let from = aero_core::block_refs::resolve(&doc, "moving").unwrap();
+        let to = aero_core::block_refs::resolve(&doc, "recipient").unwrap();
+        let kid = aero_core::block_refs::resolve(&doc, "kid").unwrap();
+        assert!(move_node(&doc, from, kid, false, true).is_none());
+        assert!(move_node(&doc, from, from, false, true).is_none());
+        let plan = move_node(&doc, from, to, false, true).expect("equal fences must allow nesting");
+        apply(&mut doc, plan);
+        let expected = format!(
+            "\n\n> ::::highlight {{.green}}\n> resident ^resident\n> \n> {}\n> ::::\n>\n> ^recipient\n\ntail\n",
+            moving.replace('\n', "\n> ")
+        );
+        assert_eq!(doc.to_string(), expected);
+        let from = aero_core::block_refs::resolve(&doc, "moving").unwrap();
+        let to = aero_core::block_refs::resolve(&doc, "recipient").unwrap();
+        let kid = aero_core::block_refs::resolve(&doc, "kid").unwrap();
+        let parent = doc.blocks().find(to).unwrap();
+        assert_eq!(parent.attrs.classes, ["green"]);
+        assert!(parent.children.iter().any(|b| b.id == from));
+        let moved = doc.blocks().find(from).unwrap();
+        assert_eq!(moved.attrs.classes, ["red"]);
+        assert!(moved.children.iter().any(|b| b.id == kid));
+        assert_eq!(doc.blocks().find(kid).unwrap().attrs.classes, ["blue"]);
+        assert_eq!(aero_core::containers::local_source(&doc, kid).as_deref(), Some("child"));
+        let code = moved.children.iter().find(|b| matches!(b.kind, BlockKind::CodeFence { .. })).unwrap();
+        assert_eq!(
+            aero_core::containers::local_source(&doc, code.id).as_deref(),
+            Some("```text\n::::::::literal\n\n\n\nend\n```")
+        );
+        let resident = aero_core::block_refs::resolve(&doc, "resident").unwrap();
+        assert!(parent.children.iter().any(|b| b.id == resident));
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn nested_move_without_ids_grows_all_recipient_ancestors_for_sibling_drops() {
+        for after in [false, true] {
+            let moving = ":::highlight {.red}\nmoving body\n:::";
+            let source = format!(
+                "{moving}\n\n::::highlight {{.outer}}\n> :::highlight {{.inner}}\n> resident ^resident\n> :::\n::::\n\n^outer\n\noutside\n"
+            );
+            let mut doc = Document::from_text(&source);
+            let from = doc.blocks().roots[0].id;
+            let to = aero_core::block_refs::resolve(&doc, "resident").unwrap();
+            let plan = move_node(&doc, from, to, after, false).expect("nested sibling drop must be valid");
+            apply(&mut doc, plan);
+            let piece = moving.replace('\n', "\n> ");
+            let middle = if after {
+                format!("resident ^resident\n> \n> {piece}")
+            } else {
+                format!("{piece}\n> \n> resident ^resident")
+            };
+            assert_eq!(
+                doc.to_string(),
+                format!(
+                    "\n\n:::::highlight {{.outer}}\n> ::::highlight {{.inner}}\n> {middle}\n> ::::\n:::::\n\n^outer\n\noutside\n"
+                )
+            );
+            let outer = aero_core::block_refs::resolve(&doc, "outer").unwrap();
+            let outer = doc.blocks().find(outer).unwrap();
+            assert_eq!(outer.attrs.classes, ["outer"]);
+            let inner = &outer.children[0].children[0];
+            assert_eq!(inner.attrs.classes, ["inner"]);
+            let moved = &inner.children[usize::from(after)];
+            assert_eq!(moved.attrs.classes, ["red"]);
+            assert_eq!(moved.children.len(), 1);
+            assert_eq!(
+                aero_core::containers::local_source(&doc, moved.children[0].id).as_deref(),
+                Some("moving body")
+            );
+            doc.undo().unwrap();
+            assert_eq!(doc.to_string(), source);
+        }
+    }
+
+    #[test]
+    fn moving_code_colon_closers_without_ids_grows_recipient_fences() {
+        for (literal, fence) in [
+            (":::", "::::"),
+            ("   :::: \t", ":::::"),
+            ("::::::::literal", ":::"),
+            (":::::::: literal", ":::"),
+            ("    :::::", "::::::"),
+            ("\t:::::", "::::::"),
+            (":::::\u{a0}", ":::"),
+        ] {
+            let moving = format!("```text\n{literal}\n```");
+            let source = format!("{moving}\n\n:::highlight\ny\n:::\n\nsibling\n");
+            let mut doc = Document::from_text(&source);
+            let from = doc.blocks().roots[0].id;
+            let to = doc.blocks().roots[1].id;
+            let plan = move_node(&doc, from, to, false, true).unwrap();
+            apply(&mut doc, plan);
+            assert_eq!(doc.blocks().roots.len(), 2, "{doc}");
+            let recipient = &doc.blocks().roots[0];
+            assert_eq!(recipient.kind, BlockKind::Directive { name: "highlight".into() });
+            assert_eq!(recipient.children.len(), 2, "{doc}");
+            assert_eq!(
+                aero_core::containers::local_source(&doc, recipient.children[0].id).as_deref(),
+                Some("y")
+            );
+            let code = &recipient.children[1];
+            assert_eq!(code.kind, BlockKind::CodeFence { info: "text".into() });
+            assert_eq!(aero_core::containers::local_source(&doc, code.id).as_deref(), Some(moving.as_str()));
+            assert_eq!(
+                aero_core::containers::local_source(&doc, doc.blocks().roots[1].id).as_deref(),
+                Some("sibling")
+            );
+            assert_eq!(doc.to_string(), format!("\n\n{fence}highlight\ny\n\n{moving}\n{fence}\n\nsibling\n"));
+            doc.undo().unwrap();
+            assert_eq!(doc.to_string(), source);
+        }
+    }
+
+    #[test]
+    fn moving_code_into_indented_directives_preserves_literal_and_tree() {
+        let source = "~~~text\n    :::\n~~~\n\n  ::::highlight\n  :::highlight\ny\n  :::\n  ::::\n";
+        let mut doc = Document::from_text(source);
+        let from = doc.blocks().roots[0].id;
+        let to = doc.blocks().roots[1].children[0].id;
+        let plan = move_node(&doc, from, to, false, true).unwrap();
+        apply(&mut doc, plan);
+        assert_eq!(doc.blocks().roots.len(), 1, "{doc}");
+        let outer = &doc.blocks().roots[0];
+        assert_eq!(outer.kind, BlockKind::Directive { name: "highlight".into() });
+        assert_eq!(outer.children.len(), 1, "{doc}");
+        let inner = &outer.children[0];
+        assert_eq!(inner.kind, BlockKind::Directive { name: "highlight".into() });
+        assert_eq!(inner.children.len(), 2, "{doc}");
+        assert_eq!(inner.children[0].kind, BlockKind::Paragraph);
+        assert_eq!(doc.slice(doc.range_of(&inner.children[0])).to_string(), "y");
+        let code = &inner.children[1];
+        assert_eq!(code.kind, BlockKind::CodeFence { info: "text".into() });
+        assert_eq!(doc.slice(doc.range_of(code)).to_string(), "~~~text\n      :::\n  ~~~");
+        assert_eq!(
+            aero_core::containers::local_source(&doc, code.id).as_deref(),
+            Some("~~~text\n    :::\n~~~")
+        );
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn moving_tabbed_colon_code_keeps_literal_under_directive_columns() {
+        let source = "~~~text\n\t:::\n~~~\n\n  ::::highlight\n  :::highlight\ny\n  :::\n  ::::\n";
+        let mut doc = Document::from_text(source);
+        let from = doc.blocks().roots[0].id;
+        let to = doc.blocks().roots[1].children[0].id;
+        let plan = move_node(&doc, from, to, false, true).unwrap();
+        apply(&mut doc, plan);
+        assert_eq!(doc.blocks().roots.len(), 1, "{doc}");
+        let outer = &doc.blocks().roots[0];
+        assert_eq!(outer.children.len(), 1, "{doc}");
+        let inner = &outer.children[0];
+        assert_eq!(inner.children.len(), 2, "{doc}");
+        let code = &inner.children[1];
+        assert_eq!(code.kind, BlockKind::CodeFence { info: "text".into() });
+        assert_eq!(doc.slice(doc.range_of(code)).to_string(), "~~~text\n  \t:::\n  ~~~");
+        assert_eq!(
+            aero_core::containers::local_source(&doc, code.id).as_deref(),
+            Some("~~~text\n\t:::\n~~~")
+        );
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn moving_indented_code_before_paragraph_preserves_literal_and_undo() {
+        let source = "tail\n\n  ~~~text\n    keep\n  ~~~\n";
+        let mut doc = Document::from_text(source);
+        let from = doc.blocks().roots[1].id;
+        let to = doc.blocks().roots[0].id;
+        let plan = move_node(&doc, from, to, false, false).unwrap();
+        apply(&mut doc, plan);
+        assert_eq!(doc.blocks().roots.len(), 2, "{doc}");
+        let code = &doc.blocks().roots[0];
+        assert_eq!(code.kind, BlockKind::CodeFence { info: "text".into() });
+        assert_eq!(doc.slice(doc.range_of(code)).to_string(), "~~~text\n  keep\n~~~");
+        let tail = &doc.blocks().roots[1];
+        assert_eq!(tail.kind, BlockKind::Paragraph);
+        assert_eq!(doc.slice(doc.range_of(tail)).to_string(), "tail");
+        assert!(doc.to_string().ends_with("tail\n\n  \n"), "{doc}");
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn moving_code_between_nested_prefixes_keeps_body_and_destination() {
+        for (container, prefix) in [
+            ("  :::highlight\ny\n  :::", "  "),
+            ("  ::::highlight\n    :::highlight\ny\n    :::\n  ::::", "    "),
+            ("> - item\n>\n>     :::highlight\n>     y\n>     :::", ">     "),
+            ("  ::::highlight\n  > - item\n  >\n  >   :::highlight\n  >   y\n  >   :::\n  ::::", "  >   "),
+            ("-\t:::highlight\n\ty\n\t:::", "    "),
+        ] {
+            let moving = "  ~~~text\n    keep\n  \tmore\n  ~~~";
+            let source = format!("{moving}\n\n{container}\n\ntail\n");
+            let mut doc = Document::from_text(&source);
+            let from = doc.blocks().roots[0].id;
+            let to = doc
+                .blocks()
+                .iter()
+                .filter(|(_, b)| matches!(b.kind, BlockKind::Directive { .. }))
+                .last()
+                .unwrap()
+                .1
+                .id;
+            let recipient = doc.blocks().find(to).unwrap();
+            let resident = recipient.children.last().unwrap();
+            assert_eq!(aero_core::containers::local_source(&doc, resident.id).as_deref(), Some("y"));
+            assert!(
+                doc.slice(doc.range_of(recipient)).to_string().trim_end().ends_with(":::"),
+                "recipient range {:?}: {:?}; parse: {:?}; source: {source}",
+                doc.range_of(recipient),
+                doc.slice(doc.range_of(recipient)).to_string(),
+                aero_core::parse(&source)
+            );
+            let plan = move_node(&doc, from, to, false, true).unwrap();
+            apply(&mut doc, plan);
+            let recipient = doc
+                .blocks()
+                .iter()
+                .filter(|(_, b)| matches!(b.kind, BlockKind::Directive { .. }))
+                .last()
+                .unwrap()
+                .1;
+            assert_eq!(recipient.children.len(), 2, "{doc}");
+            let code = &recipient.children[1];
+            assert_eq!(code.kind, BlockKind::CodeFence { info: "text".into() }, "{doc}");
+            assert_eq!(
+                doc.slice(doc.range_of(code)).to_string(),
+                format!("~~~text\n{prefix}  keep\n{prefix}\tmore\n{prefix}~~~")
+            );
+            assert_eq!(
+                aero_core::containers::local_source(&doc, code.id).as_deref(),
+                Some("~~~text\n  keep\n\tmore\n~~~")
+            );
+            assert_eq!(
+                aero_core::containers::local_source(&doc, recipient.children[0].id).as_deref(),
+                Some("y")
+            );
+            assert!(doc.to_string().ends_with("\n\ntail\n"));
+            doc.undo().unwrap();
+            assert_eq!(doc.to_string(), source);
+        }
+    }
+
+    #[test]
+    fn moving_before_indented_code_preserves_both_fence_offsets() {
+        let source = "~~~text\n  moving\n~~~\n\n  ~~~text\n    resident\n  ~~~\n";
+        let mut doc = Document::from_text(source);
+        let from = doc.blocks().roots[0].id;
+        let to = doc.blocks().roots[1].id;
+        let plan = move_node(&doc, from, to, false, false).unwrap();
+        apply(&mut doc, plan);
+        assert_eq!(doc.blocks().roots.len(), 2, "{doc}");
+        for (code, expected) in doc.blocks().roots.iter().zip(["  moving", "  resident"]) {
+            assert_eq!(code.kind, BlockKind::CodeFence { info: "text".into() });
+            assert_eq!(
+                aero_core::containers::local_source(&doc, code.id).unwrap(),
+                format!("~~~text\n{expected}\n~~~")
+            );
+        }
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn moving_longer_directive_closer_without_ids_grows_all_ancestors() {
+        let moving = ":::highlight\nchild\n::::";
+        let source =
+            format!("{moving}\n\n::::highlight\n:::highlight\ny\n:::\n\nresident\n::::\n\nsibling\n");
+        let mut doc = Document::from_text(&source);
+        let from = doc.blocks().roots[0].id;
+        let to = doc.blocks().roots[1].children[0].id;
+        let plan = move_node(&doc, from, to, false, true).unwrap();
+        apply(&mut doc, plan);
+        assert_eq!(doc.blocks().roots.len(), 2, "{doc}");
+        let outer = &doc.blocks().roots[0];
+        assert_eq!(outer.children.len(), 2, "{doc}");
+        let inner = &outer.children[0];
+        assert_eq!(inner.children.len(), 2, "{doc}");
+        assert_eq!(aero_core::containers::local_source(&doc, inner.children[0].id).as_deref(), Some("y"));
+        let moved = &inner.children[1];
+        assert_eq!(moved.children.len(), 1);
+        assert_eq!(aero_core::containers::local_source(&doc, moved.id).as_deref(), Some(moving));
+        assert_eq!(aero_core::containers::local_source(&doc, moved.children[0].id).as_deref(), Some("child"));
+        assert_eq!(
+            aero_core::containers::local_source(&doc, outer.children[1].id).as_deref(),
+            Some("resident")
+        );
+        assert_eq!(
+            aero_core::containers::local_source(&doc, doc.blocks().roots[1].id).as_deref(),
+            Some("sibling")
+        );
+        assert_eq!(
+            doc.to_string(),
+            format!(
+                "\n\n::::::highlight\n:::::highlight\ny\n\n{moving}\n:::::\n\nresident\n::::::\n\nsibling\n"
+            )
+        );
         doc.undo().unwrap();
         assert_eq!(doc.to_string(), source);
     }
@@ -1578,6 +2684,41 @@ mod tests {
     }
 
     #[test]
+    fn g02_paste_replaces_disjoint_children_not_their_containers() {
+        let source = ":::highlight {.red custom=one}\nfirst ^first\n:::\n\n^left\n\n:::highlight {.blue custom=two}\nsecond ^second\n:::\n\n^right\n\n<!-- opaque  bytes -->\n";
+        let doc = Document::from_text(source);
+        let us = units(&doc);
+        let mut result = SelectionPlan::units(&doc, &us, 0, 1).replace(&doc, "new ^new").unwrap();
+        assert_eq!(
+            result.to_string(),
+            source.replace("first ^first", "new ^new").replace("second ^second", "")
+        );
+        result.undo().unwrap();
+        assert_eq!(result.to_string(), source);
+    }
+
+    #[test]
+    fn g02_paste_keeps_list_and_quote_ancestor_prefixes() {
+        for (source, first, last, expected) in [
+            (
+                "- first\n\n  continuation\n\n  - nested\n\noutside\n",
+                1,
+                1,
+                "- first\n\n  new\n  \n  other\n\n  - nested\n\noutside\n",
+            ),
+            ("> first\n>\n> second\n\noutside\n", 0, 1, "> new\n> \n> other\n>\n> \n\noutside\n"),
+        ] {
+            let doc = Document::from_text(source);
+            let us = units(&doc);
+            let mut result =
+                SelectionPlan::units(&doc, &us, first, last).replace(&doc, "new\n\nother").unwrap();
+            assert_eq!(result.to_string(), expected);
+            result.undo().unwrap();
+            assert_eq!(result.to_string(), source);
+        }
+    }
+
+    #[test]
     fn unit_spans_cover_whole_lines_and_list_items() {
         let doc = Document::from_text("# T\n\n- a\n  - b\n- c\n\n```rs\nx\n```\n\npara ^p1\n");
         let us = units(&doc);
@@ -1599,38 +2740,38 @@ mod tests {
     fn delete_units_removes_lines_and_surrounding_blank_lines() {
         let mut doc = Document::from_text("aaa\n\nbbb\n\nccc\n");
         let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+        doc.edit_group(delete_units(&doc, &us, 1, 1)).unwrap();
         assert_eq!(doc.to_string(), "aaa\n\nccc\n");
         // 删最后一块：前面的空行也收掉
         doc.reparse();
         let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+        doc.edit_group(delete_units(&doc, &us, 1, 1)).unwrap();
         assert_eq!(doc.to_string(), "aaa\n");
         // 删第一块
         let mut doc = Document::from_text("aaa\n\nbbb\n");
         let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 0, 0)).unwrap();
+        doc.edit_group(delete_units(&doc, &us, 0, 0)).unwrap();
         assert_eq!(doc.to_string(), "bbb\n");
         // 全删：空文档
         let mut doc = Document::from_text("aaa\n\nbbb\n");
         let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 0, 1)).unwrap();
+        doc.edit_group(delete_units(&doc, &us, 0, 1)).unwrap();
         assert_eq!(doc.to_string(), "");
         // 列表项：整行；紧邻的项不需要空行
         let mut doc = Document::from_text("- a\n- b\n- c\n");
         let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+        doc.edit_group(delete_units(&doc, &us, 1, 1)).unwrap();
         assert_eq!(doc.to_string(), "- a\n- c\n");
         // 标题与紧跟的段落之间没有空行
         let mut doc = Document::from_text("# T\npara\n");
         let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 0, 0)).unwrap();
+        doc.edit_group(delete_units(&doc, &us, 0, 0)).unwrap();
         assert_eq!(doc.to_string(), "para\n");
         // 删最后一块、且前一行以多字节字符结尾：收空行不能按字节切片（曾 panic 在 `。` 中间）
         for before in ["中文。", "图 🎨", "ascii"] {
             let mut doc = Document::from_text(&format!("{before}\n\n![[x.png]]\n"));
             let us = units(&doc);
-            doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+            doc.edit_group(delete_units(&doc, &us, 1, 1)).unwrap();
             assert_eq!(doc.to_string(), format!("{before}\n"), "{before}");
         }
     }
@@ -1641,6 +2782,29 @@ mod tests {
         assert_eq!(append_paragraph(&Document::from_text("a")), (Some(Edit::insert(1, "\n\n")), 3));
         assert_eq!(append_paragraph(&Document::from_text("a\n")), (Some(Edit::insert(2, "\n")), 3));
         assert_eq!(append_paragraph(&Document::from_text("a\n\n")), (None, 3));
+    }
+
+    #[test]
+    fn move_unit_preserves_unrelated_fenced_code_bytes_and_undo() {
+        let untouched = "```text\nkeep\n\n\n\nspaces  \n```\n\n{.blue} ^code\n\n\n\n";
+        for (source, from, before, expected) in [
+            (format!("{untouched}aaa\n\nbbb\n\nccc\n"), 3, 1, format!("{untouched}ccc\n\naaa\n\nbbb\n")),
+            (format!("aaa\n\nbbb\n\n{untouched}ccc\n"), 0, 3, format!("bbb\n\n{untouched}aaa\n\nccc\n")),
+        ] {
+            let mut doc = Document::from_text(&source);
+            let us = units(&doc);
+            let plan = move_unit(&doc, &us, from, DropPlace { before, parent: None }).unwrap();
+            apply(&mut doc, plan);
+            assert_eq!(doc.to_string(), expected);
+            let code = aero_core::block_refs::resolve(&doc, "code").unwrap();
+            assert_eq!(doc.blocks().find(code).unwrap().attrs.classes, ["blue"]);
+            assert_eq!(
+                aero_core::containers::local_source(&doc, code).as_deref(),
+                Some("```text\nkeep\n\n\n\nspaces  \n```")
+            );
+            doc.undo().unwrap();
+            assert_eq!(doc.to_string(), source);
+        }
     }
 
     #[test]

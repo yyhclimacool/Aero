@@ -34,6 +34,7 @@ struct Row {
 pub(super) struct Viewport {
     dirty: bool,
     pending: Vec<usize>,
+    container_pending: HashMap<BlockId, Vec<usize>>,
     rows: Vec<Row>,
     prefix: Vec<Pixels>,
     unit_rows: Vec<usize>,
@@ -48,6 +49,7 @@ impl Default for Viewport {
         Self {
             dirty: true,
             pending: Vec::new(),
+            container_pending: HashMap::new(),
             rows: Vec::new(),
             prefix: vec![px(0.)],
             unit_rows: Vec::new(),
@@ -259,16 +261,20 @@ impl Editor {
         self.unit_structure = structure;
     }
 
+    pub(super) fn container_empty_slots(&self, id: BlockId) -> &[usize] {
+        self.viewport.container_pending.get(&id).map_or(&[], Vec::as_slice)
+    }
+
     pub(super) fn prepare_viewport(&mut self, window: &Window) {
-        let mut pending: Vec<_> = self
-            .empty_slots
-            .iter()
-            .filter(|slot| self.available_empty_slot(slot))
-            .map(|slot| slot.range.start)
-            .collect();
-        pending.extend(self.focused.as_ref().filter(|f| f.id.is_none()).map(|f| f.range.start));
-        pending.sort_unstable();
-        pending.dedup();
+        let mut pending = Vec::new();
+        self.viewport.container_pending.clear();
+        for offset in self.pending_empty_slots() {
+            if let Some(container) = self.empty_slot_container(offset) {
+                self.viewport.container_pending.entry(container).or_default().push(offset);
+            } else {
+                pending.push(offset);
+            }
+        }
         if self.viewport.dirty || self.viewport.pending != pending {
             let offset = self.scroll.offset();
             let top = -offset.y - self.viewport.origin;
@@ -297,6 +303,24 @@ impl Editor {
                 });
             if let Some(row) = row {
                 pinned.push(row);
+            }
+        }
+        if let Some(focused) = self.focused.as_ref().filter(|f| f.id.is_none()) {
+            for (index, row) in self.viewport.rows.iter().enumerate() {
+                let contains = match row.content {
+                    RowContent::Root(root) => {
+                        let range = self.doc.range_of(&self.doc.blocks().roots[root]);
+                        range.start <= focused.range.start && focused.range.start <= range.end
+                    }
+                    RowContent::ListItem { root, item, .. } => {
+                        let range = self.doc.range_of(&self.doc.blocks().roots[root].children[item]);
+                        range.start <= focused.range.start && focused.range.start <= range.end
+                    }
+                    RowContent::Pending(offset) => offset == focused.range.start,
+                };
+                if contains {
+                    pinned.push(index);
+                }
             }
         }
         let height = if self.scroll.bounds().size.height > px(0.) {

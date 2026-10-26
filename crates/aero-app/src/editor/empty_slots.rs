@@ -70,6 +70,33 @@ pub(super) fn styled_input(
 }
 
 impl Editor {
+    pub(super) fn pending_empty_slots(&self) -> Vec<usize> {
+        let mut pending: Vec<_> = self
+            .empty_slots
+            .iter()
+            .filter(|slot| self.available_empty_slot(slot))
+            .map(|slot| slot.range.start)
+            .collect();
+        pending.extend(self.focused.as_ref().filter(|f| f.id.is_none()).map(|f| f.range.start));
+        pending.sort_unstable();
+        pending.dedup();
+        pending
+    }
+
+    pub(super) fn empty_slot_container(&self, offset: usize) -> Option<BlockId> {
+        self.doc
+            .blocks()
+            .iter()
+            .filter(|(_, block)| {
+                let range = self.doc.content_range(block);
+                aero_core::containers::is_editable(&block.kind)
+                    && (range.contains(&offset)
+                        || (block.kind == BlockKind::BlockQuote && range.end == offset))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, block)| block.id)
+    }
+
     pub(super) fn available_empty_slot(&self, slot: &EmptySlot) -> bool {
         if !slot.range.is_empty() || unit_at(&self.units, slot.range.start).is_some() {
             return false;
@@ -79,6 +106,15 @@ impl Editor {
         // paragraph. Only an actual reserved blank line gets a viewport row.
         let before = self.doc.slice(0..at);
         let mut chars = before.chars_at(before.len()).reversed();
+        if self.empty_slot_container(at).is_some() {
+            return chars.take_while(|c| *c != '\n').all(|c| matches!(c, ' ' | '\t' | '>'))
+                && self
+                    .doc
+                    .slice(at..self.doc.len())
+                    .chars()
+                    .take_while(|c| *c != '\n')
+                    .all(|c| matches!(c, ' ' | '\t' | '\r'));
+        }
         let blank_before = at == 0 || (chars.next() == Some('\n') && chars.next() == Some('\n'));
         blank_before && self.doc.slice(at..self.doc.len()).chars().next().is_none_or(|c| c == '\n')
     }

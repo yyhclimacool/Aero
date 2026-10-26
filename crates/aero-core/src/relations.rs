@@ -146,6 +146,7 @@ pub fn child_at(
     let mut parent = parent.clone();
     let mut order = 0i64;
     let mut observed = Vec::new();
+    let mut unordered = Vec::new();
     let mut ids = HashSet::new();
     for path in vault.notes().map_err(|e| e.to_string())? {
         let (bytes, _) = vault.read_bytes(&path).map_err(|e| e.to_string())?;
@@ -158,10 +159,23 @@ pub fn child_at(
         }
         if meta.parent.as_deref() == Some(&parent_id) {
             order = order.max(meta.order.unwrap_or(0));
+            if meta.order.is_none() && &path != parent_path {
+                unordered.push((observed.len(), natural(&doc.title_or(path.stem())), path.clone(), doc));
+            }
         }
         if &path != parent_path {
             observed.push(FileChange { path, before: Some(bytes.clone()), after: Some(bytes) });
         }
+    }
+    unordered.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+    for (index, _, _, doc) in unordered {
+        order = order.checked_add(1024).ok_or("同级顺序超出范围")?;
+        let edits = identity::prepare(&doc, &Patch { order: Some(order), ..Default::default() })?;
+        let mut bytes = observed[index].before.clone().unwrap();
+        for edit in edits {
+            bytes = crate::block_refs::edit_bytes(&bytes, &edit)?;
+        }
+        observed[index].after = Some(bytes);
     }
     let path = (0..)
         .map(|i| {
@@ -370,6 +384,54 @@ mod tests {
         .unwrap();
         assert_eq!(vault.read_bytes(&parent_path).unwrap().0, original.as_bytes());
         assert!(!vault.exists(&path));
+    }
+
+    #[test]
+    fn new_child_is_appended_after_existing_unordered_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let parent_id = identity::new_document_id();
+        let parent = VaultPath::new("parent.md").unwrap();
+        let source = format!("---\naero: {{id: {parent_id}}}\n---\nparent\n");
+        vault.create_bytes(&parent, source.as_bytes()).unwrap();
+        for (name, order) in [("ordered", Some(1024)), ("legacy10", None), ("legacy2", None)] {
+            let extra = order.map_or(String::new(), |order| format!(", order: {order}"));
+            vault.create_bytes(&VaultPath::new(&format!("{name}.md")).unwrap(), format!(
+                "---\naero: {{id: {}, parent: {parent_id}{extra}}}\n---\n{name}\n", identity::new_document_id()
+            ).as_bytes()).unwrap();
+        }
+        let (new_path, changes) = child(&vault, &parent, &Document::from_text(&source)).unwrap();
+        let notes: Vec<_> = changes.iter().map(|change| {
+            let doc = Document::from_bytes(change.after.as_ref().unwrap()).unwrap();
+            Note { path: change.path.clone(), title: change.path.stem().into(), metadata: identity::read(&doc) }
+        }).collect();
+        let ordered = rows(&notes).into_iter().filter(|row| row.depth == 1).map(|row| row.path.stem().to_owned()).collect::<Vec<_>>();
+        assert_eq!(ordered, ["ordered", "legacy2", "legacy10", new_path.stem()]);
+        for change in changes.iter().filter(|c| c.path.stem().starts_with("legacy")) {
+            let doc = Document::from_bytes(change.after.as_ref().unwrap()).unwrap();
+            assert!(identity::read(&doc).unwrap().order.is_some());
+            assert!(doc.to_string().ends_with(&format!("{}\n", change.path.stem())));
+        }
+    }
+
+    #[test]
+    fn assigning_missing_sibling_order_preserves_yaml_comments_and_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let parent_id = identity::new_document_id();
+        let parent = VaultPath::new("parent.md").unwrap();
+        let source = format!("---\naero: {{id: {parent_id}}}\n---\nparent\n");
+        vault.create_bytes(&parent, source.as_bytes()).unwrap();
+        let sibling = VaultPath::new("sibling.md").unwrap();
+        let raw = format!("---\r\n# comment\naero:\r\n  id: {}\r\n  parent: {parent_id}\n  custom: 'keep'\r\n---\r\nunchanged\n", identity::new_document_id());
+        vault.create_bytes(&sibling, raw.as_bytes()).unwrap();
+        let (_, changes) = child(&vault, &parent, &Document::from_text(&source)).unwrap();
+        let change = changes.iter().find(|c| c.path == sibling).unwrap();
+        assert_eq!(change.before.as_deref(), Some(raw.as_bytes()));
+        let text = String::from_utf8(change.after.clone().unwrap()).unwrap();
+        assert!(text.contains("# comment\naero:\r\n"));
+        assert!(text.contains("  custom: 'keep'\r\n"));
+        assert!(text.ends_with("unchanged\n"));
     }
 
     #[test]

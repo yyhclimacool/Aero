@@ -84,7 +84,7 @@ pub struct Resolver {
     /// Normalized path → deduplicated registered names, for targeted removal.
     names_of: HashMap<String, Vec<String>>,
     by_document_id: HashMap<String, Vec<VaultPath>>,
-    by_block_id: HashMap<String, Vec<(VaultPath, String)>>,
+    by_block_id: HashMap<String, Vec<(VaultPath, Option<String>)>>,
     identities_of: HashMap<VaultPath, (Option<String>, Vec<String>)>,
 }
 
@@ -158,8 +158,8 @@ impl Resolver {
         }
         let mut keys = Vec::new();
         for (_, block) in doc.blocks().iter().filter(|(_, b)| b.kind != crate::BlockKind::Marker) {
-            let Some(primary) = block.persisted_id.as_deref() else { continue };
-            for id in std::iter::once(primary).chain(crate::block_refs::aliases(block)) {
+            let primary = block.persisted_id.as_deref();
+            for id in primary.into_iter().chain(crate::block_refs::aliases(block)) {
                 let key = if crate::identity::is_block_id(id) || id.contains('#') {
                     id.to_owned()
                 } else if let Some(document) = &document {
@@ -167,7 +167,10 @@ impl Resolver {
                 } else {
                     continue;
                 };
-                self.by_block_id.entry(key.clone()).or_default().push((path.clone(), primary.to_owned()));
+                self.by_block_id
+                    .entry(key.clone())
+                    .or_default()
+                    .push((path.clone(), primary.map(str::to_owned)));
                 keys.push(key);
             }
         }
@@ -193,9 +196,10 @@ impl Resolver {
         let Some(entries) = self.by_block_id.get(&key) else { return Resolution::Unresolved };
         // Duplicate definitions remain ambiguous, including two definitions in one file.
         match entries.as_slice() {
-            [(path, primary)] => {
+            [(path, Some(primary))] => {
                 Resolution::Resolved { path: path.clone(), fragment: Some(format!("^{primary}")) }
             }
+            [(_, None)] => Resolution::Unresolved,
             many => Resolution::Ambiguous { candidates: many.iter().map(|(p, _)| p.clone()).collect() },
         }
     }
@@ -435,7 +439,7 @@ pub(crate) fn scan_tree<'a>(root: &'a comrak::nodes::AstNode<'a>, src: &str) -> 
 }
 
 /// 重命名时也扫描笔记嵌入；普通索引与预览仍由 [`scan`] 排除嵌入。
-pub(crate) fn scan_for_rename(src: &str) -> Vec<LinkSpan> {
+pub fn scan_for_rename(src: &str) -> Vec<LinkSpan> {
     if !src.contains("[[") {
         return Vec::new();
     }
@@ -535,6 +539,19 @@ pub fn escape_target(target: &str) -> Option<String> {
         return None;
     }
     Some(target.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]").replace('#', "\\#"))
+}
+
+pub fn readable_alias(title: &str) -> String {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = if title.is_empty() { "未命名" } else { &title };
+    let mut out = String::new();
+    for c in title.chars().filter(|c| !c.is_control()) {
+        if c.is_ascii_punctuation() {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// 未解析目标要创建的文件路径：相对链接所在笔记目录，`[[foo.md]]` 与 `[[foo]]` 都建 `<dir>/foo.md`。
@@ -814,6 +831,24 @@ fn escape_link_text(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn g08_readable_alias_roundtrips_punctuation_without_changing_identity() {
+        let title = "开发 [记录] | C:\\notes **x**";
+        let document = crate::identity::new_document_id();
+        let block = crate::identity::new_block_id();
+        let label = readable_alias(title);
+        let text = format!("[[id:{document}#^{block}|{label}]]");
+        let links = scan(&text);
+        assert_eq!(links.len(), 1, "{text}");
+        assert_eq!(links[0].target, format!("id:{document}"));
+        assert_eq!(links[0].fragment, Some(format!("^{block}")));
+        assert_eq!(links[0].alias.as_deref(), Some(title));
+        assert!(text.contains("\\[记录\\]"));
+        assert_eq!(scan_embeds(&format!("!{text}"))[0].parameter.as_deref(), Some(title));
+        assert!(!readable_alias("multi\nline\tname").contains(['\n', '\t']));
+        assert!(!readable_alias(" \n ").is_empty());
+    }
+
     fn note(s: &str) -> VaultPath {
         VaultPath::new(s).unwrap()
     }
@@ -830,6 +865,39 @@ mod tests {
         let spans = scan(src);
         assert_eq!(spans.len(), 1, "{src:?}");
         spans.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn alias_only_identity_owners_conflict_but_never_resolve_without_a_primary() {
+        let document = crate::identity::new_document_id();
+        let other_document = crate::identity::new_document_id();
+        let block = crate::identity::new_block_id();
+        let target = format!("id:{document}");
+        let fragment = format!("^{block}");
+        let mut resolver = Resolver::new();
+        resolver.register_identity(
+            &note("alias.md"),
+            &crate::Document::from_text(&format!(
+                "---\naero:\n  id: {other_document}\n---\n\nalias {{aero-aliases=\"{block} old\"}}\n"
+            )),
+        );
+        assert_eq!(resolver.resolve(&target, Some(&fragment), ""), Resolution::Unresolved);
+        resolver.register_identity(
+            &note("source.md"),
+            &crate::Document::from_text(&format!(
+                "---\naero:\n  id: {document}\n---\n\nsource ^{block}\n\nlegacy ^old\n"
+            )),
+        );
+        assert!(matches!(resolver.resolve(&target, Some(&fragment), ""), Resolution::Ambiguous { .. }));
+        assert_eq!(
+            resolver.resolve(&target, Some("^old"), ""),
+            Resolution::Resolved { path: note("source.md"), fragment: Some("^old".into()) }
+        );
+        resolver.remove(&note("alias.md"));
+        assert_eq!(
+            resolver.resolve(&target, Some(&fragment), ""),
+            Resolution::Resolved { path: note("source.md"), fragment: Some(fragment) }
+        );
     }
 
     #[test]

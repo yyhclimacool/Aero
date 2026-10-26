@@ -14,8 +14,9 @@ use gpui_kit::*;
 /// 嵌入内容缓存。键是源码里的写法（目标 + 片段），因为解析本身也可能还没就绪。
 #[derive(Default)]
 pub(super) struct Embeds {
-    resolved: HashMap<(VaultPath, Option<String>), Result<(String, String), String>>,
+    resolved: HashMap<(VaultPath, Option<String>), Result<SourceSnapshot, String>>,
     pub(super) resolver: Option<aero_core::links::Resolver>,
+    pub(super) resolver_sources: u64,
     entries: HashMap<(String, Option<String>), Entry>,
     targets: HashSet<(String, Option<String>)>,
     pub(super) revision: Option<Revision>,
@@ -39,6 +40,7 @@ impl Embeds {
         self.resolved.clear();
         self.targets.clear();
         self.revision = None;
+        self.scan = None;
     }
 }
 
@@ -51,8 +53,7 @@ enum Entry {
     },
     Ready {
         path: VaultPath,
-        title: String,
-        source: String,
+        snapshot: SourceSnapshot,
     },
     Failed {
         path: VaultPath,
@@ -63,11 +64,99 @@ enum Entry {
 /// 块元素拿到的嵌入状态。
 pub(super) enum EmbedView {
     Loading,
-    Ready { path: VaultPath, fragment: Option<String>, title: String, source: String },
+    Ready {
+        path: VaultPath,
+        fragment: Option<String>,
+        title: SharedString,
+        source: SharedString,
+        excerpt: SharedString,
+        conflict: Option<VaultPath>,
+    },
     Failed(SharedString),
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static SNAPSHOT_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone)]
+pub(super) struct SourceSnapshot {
+    title: SharedString,
+    source: SharedString,
+    excerpt: SharedString,
+    fragment: Option<String>,
+    conflict: Option<VaultPath>,
+}
+
+impl SourceSnapshot {
+    pub(super) fn new(
+        doc: &Document,
+        path: &VaultPath,
+        fragment: Option<&str>,
+        conflict: Option<VaultPath>,
+    ) -> Result<Self, String> {
+        #[cfg(test)]
+        SNAPSHOT_ANALYSES.with(|count| count.set(count.get() + 1));
+        let source = slice(doc, fragment)?;
+        let fragment = match fragment.and_then(|f| f.strip_prefix('^')) {
+            Some(id) => {
+                let block = aero_core::block_refs::resolve(doc, id)?;
+                doc.blocks().iter().find(|(_, b)| b.id == block)
+                    .and_then(|(_, b)| b.persisted_id.as_ref()).map(|id| format!("^{id}"))
+                    .or_else(|| fragment.map(str::to_owned))
+            }
+            None => fragment.filter(|f| !f.is_empty()).map(str::to_owned),
+        };
+        let plain = aero_core::index::plain_text(&source, &aero_core::BlockKind::Paragraph);
+        let flat = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut excerpt: String = flat.chars().take(180).collect();
+        if flat.chars().count() > 180 { excerpt.push('…'); }
+        Ok(Self { title: doc.title_or(path.stem()).into(), source: source.into(), excerpt: excerpt.into(), fragment, conflict })
+    }
+
+    pub(super) fn view(&self, path: VaultPath) -> EmbedView {
+        EmbedView::Ready {
+            path,
+            fragment: self.fragment.clone(),
+            title: self.title.clone(),
+            source: self.source.clone(),
+            excerpt: self.excerpt.clone(),
+            conflict: self.conflict.clone(),
+        }
+    }
+}
+
+fn source_targets(source: &str) -> Vec<(String, Option<String>, bool)> {
+    let mut targets: Vec<_> = aero_core::links::scan_embeds(source).into_iter()
+        .filter(|span| aero_core::attachments::Kind::for_path(&span.target).is_none())
+        .map(|span| (span.target, span.fragment, true)).collect();
+    targets.extend(aero_core::links::scan(source).into_iter()
+        .filter(|span| span.fragment.as_deref().is_some_and(|f| f.starts_with('^')))
+        .map(|span| (span.target, span.fragment, false)));
+    targets
+}
+
 impl super::Editor {
+    pub(super) fn cached_source(&self, path: &VaultPath, fragment: Option<&str>) -> EmbedView {
+        if !self.embeds.revision.as_ref().is_some_and(|revision|
+            revision.epoch == self.io.epoch && revision.version == self.doc.version() && revision.path == self.path)
+        {
+            return EmbedView::Loading;
+        }
+        match self.embeds.resolved.get(&(path.clone(), fragment.map(str::to_owned))) {
+            Some(Ok(snapshot)) => snapshot.view(path.clone()),
+            Some(Err(error)) => EmbedView::Failed(error.clone().into()),
+            None if self.embeds.resolved.len() >= 128 => EmbedView::Failed("来源预览超过缓存上限，请前往原文".into()),
+            None => EmbedView::Loading,
+        }
+    }
+
+    pub(super) fn embeds_current(&self, cx: &App) -> bool {
+        self.embeds.resolver_sources == super::live_sources::generation(self.vault.id(), cx)
+            && self.embeds.revision.as_ref() == Some(&self.embed_revision(cx))
+    }
+
     pub(super) fn embed_view_from(
         &self,
         target: &str,
@@ -83,27 +172,9 @@ impl super::Editor {
         };
         if let Some(Resolution::Resolved { path, fragment }) = &resolution {
             if path == &self.path {
-                return match slice(&self.doc, fragment.as_deref()) {
-                    Ok(source) => EmbedView::Ready {
-                        path: path.clone(),
-                        fragment: fragment.clone(),
-                        title: self.title(),
-                        source,
-                    },
-                    Err(error) => EmbedView::Failed(error.into()),
-                };
+                return self.local_source_view(fragment.as_deref());
             }
-            if let Some(result) = self.embeds.resolved.get(&(path.clone(), fragment.clone())) {
-                return match result {
-                    Ok((title, source)) => EmbedView::Ready {
-                        path: path.clone(),
-                        fragment: fragment.clone(),
-                        title: title.clone(),
-                        source: source.clone(),
-                    },
-                    Err(error) => EmbedView::Failed(error.clone().into()),
-                };
-            }
+            return self.cached_source(path, fragment.as_deref());
         }
         match resolution {
             Some(Resolution::Unresolved) => EmbedView::Failed(format!("找不到同步来源：{target}").into()),
@@ -128,18 +199,10 @@ impl super::Editor {
         };
         // 同篇嵌入用未保存的文档，改一处两处一起变
         if path == self.path {
-            return match slice(&self.doc, fragment.as_deref()) {
-                Ok(source) => EmbedView::Ready { path, fragment, title: self.title(), source },
-                Err(error) => EmbedView::Failed(error.into()),
-            };
+            return self.local_source_view(fragment.as_deref());
         }
         match self.embeds.entries.get(&(target.to_owned(), fragment.clone())) {
-            Some(Entry::Ready { path, title, source }) => EmbedView::Ready {
-                path: path.clone(),
-                fragment,
-                title: title.clone(),
-                source: source.clone(),
-            },
+            Some(Entry::Ready { path, snapshot }) => snapshot.view(path.clone()),
             Some(Entry::Failed { error, .. }) => EmbedView::Failed(error.clone()),
             // 还没预取到（刚打开 / 刚改完 / 解析器刚就绪）：占位，不是错误
             None | Some(Entry::Loading { .. }) => EmbedView::Loading,
@@ -153,6 +216,7 @@ impl super::Editor {
             self.prefetch_embeds(cx);
             return;
         }
+        self.refresh_reference_hover(false, cx);
         if self.embeds.scan.is_some() {
             return;
         }
@@ -171,11 +235,11 @@ impl super::Editor {
                     .filter(|editor| editor.entity_id() != cx.entity_id())
                     .filter_map(|editor| {
                         let editor = editor.read(cx);
-                        (!editor.is_deleted()).then(|| (editor.path.clone(), editor.doc.clone()))
+                        (!editor.is_deleted()).then(|| (editor.path.clone(), (editor.doc.clone(), editor.source_conflict())))
                     })
                     .collect();
                 if !this.is_deleted() {
-                    overlays.insert(this.path.clone(), this.doc.clone());
+                    overlays.insert(this.path.clone(), (this.doc.clone(), this.source_conflict()));
                 }
                 (
                     this.embed_revision(cx),
@@ -191,16 +255,12 @@ impl super::Editor {
             let (targets, resolver, resolved) = cx
                 .background_spawn(async move {
                     let source = snapshot.text().to_string();
-                    let targets = aero_core::links::scan_embeds(&source)
-                        .into_iter()
-                        .filter(|embed| aero_core::attachments::Kind::for_path(&embed.target).is_none())
-                        .map(|embed| (embed.target, embed.fragment))
-                        .collect();
+                    let targets = source_targets(&source).into_iter().map(|(target, fragment, _)| (target, fragment)).collect();
                     let mut resolver =
                         directory.and_then(|d| d.snapshot().ok()).map(|s| s.resolver.clone()).unwrap_or_else(
                             || aero_core::links::Resolver::from_notes(vault.notes().unwrap_or_default()),
                         );
-                    for (path, doc) in &overlays {
+                    for (path, (doc, _)) in &overlays {
                         resolver.insert(
                             path.clone(),
                             Some(&doc.title_or(path.stem())),
@@ -209,41 +269,44 @@ impl super::Editor {
                         resolver.register_identity(path, doc);
                     }
                     let mut resolved = HashMap::new();
-                    let mut queue = std::collections::VecDeque::from([(origin, source, 0u8)]);
+                    let mut expanded = HashSet::new();
+                    let mut bytes = 0usize;
+                    let mut queue = std::collections::VecDeque::from([(origin, SharedString::from(source), 0u8)]);
                     while let Some((origin, source, depth)) = queue.pop_front() {
-                        if depth == 3 {
-                            continue;
-                        }
-                        for embed in aero_core::links::scan_embeds(&source) {
-                            if aero_core::attachments::Kind::for_path(&embed.target).is_some() {
-                                continue;
-                            }
-                            let resolution = if embed.target.is_empty() {
-                                Resolution::Resolved { path: origin.clone(), fragment: embed.fragment }
+                        for (target, fragment, expand) in source_targets(&source) {
+                            let resolution = if target.is_empty() {
+                                Resolution::Resolved { path: origin.clone(), fragment }
                             } else {
-                                resolver.resolve(&embed.target, embed.fragment.as_deref(), origin.parent())
+                                resolver.resolve(&target, fragment.as_deref(), origin.parent())
                             };
-                            let Resolution::Resolved { path, fragment } = resolution else {
-                                continue;
-                            };
+                            let Resolution::Resolved { path, fragment } = resolution else { continue };
                             let key = (path.clone(), fragment.clone());
-                            if resolved.contains_key(&key) {
-                                continue;
+                            if !resolved.contains_key(&key) {
+                                if resolved.len() >= 128 { continue; }
+                                let result = if bytes >= 32 * 1024 * 1024 {
+                                    Err("来源预览超过缓存上限，请前往原文".into())
+                                } else {
+                                    let doc = overlays.get(&path).cloned()
+                                        .map(|(doc, conflict)| (std::sync::Arc::new(doc), conflict))
+                                        .map(Ok)
+                                        .unwrap_or_else(|| super::source_cache::read(&vault, &path)
+                                            .map(|doc| (doc, None))
+                                            .map_err(|error| format!("无法读取笔记：{error}")));
+                                    doc.and_then(|(doc, conflict)| SourceSnapshot::new(&doc, &path, fragment.as_deref(), conflict))
+                                        .and_then(|snapshot| {
+                                            if snapshot.source.len() > 32 * 1024 * 1024 - bytes {
+                                                Err("来源预览超过缓存上限，请前往原文".into())
+                                            } else { Ok(snapshot) }
+                                        })
+                                };
+                                if let Ok(snapshot) = &result { bytes += snapshot.source.len(); }
+                                resolved.insert(key.clone(), result);
                             }
-                            let doc = overlays
-                                .get(&path)
-                                .cloned()
-                                .map(std::sync::Arc::new)
-                                .map(Ok)
-                                .unwrap_or_else(|| super::source_cache::read(&vault, &path));
-                            let result = doc.and_then(|doc| {
-                                slice(&doc, fragment.as_deref())
-                                    .map(|source| (doc.title_or(path.stem()), source))
-                            });
-                            if let Ok((_, source)) = &result {
-                                queue.push_back((path, source.clone(), depth + 1));
+                            if expand && depth < 3 && expanded.insert(key.clone()) {
+                                if let Some(Ok(snapshot)) = resolved.get(&key) {
+                                    queue.push_back((path, snapshot.source.clone(), depth + 1));
+                                }
                             }
-                            resolved.insert(key, result);
                         }
                     }
                     (targets, resolver, resolved)
@@ -252,6 +315,7 @@ impl super::Editor {
             let _ = this.update(cx, |this, cx| {
                 if this.embed_revision(cx) == revision {
                     this.embeds.resolver = Some(resolver);
+                    this.embeds.resolver_sources = revision.sources;
                     this.embeds.resolved = resolved;
                 }
                 this.receive_embed_scan(revision, targets, cx);
@@ -282,6 +346,7 @@ impl super::Editor {
         self.embeds.revision = Some(revision);
         self.embeds.targets = targets;
         self.prefetch_embeds(cx);
+        self.refresh_reference_hover(true, cx);
         cx.notify();
     }
 
@@ -291,6 +356,7 @@ impl super::Editor {
         self.embeds.entries.retain(|key, _| wanted.contains(key));
         for (target, fragment) in self.embeds.targets.clone() {
             let key = (target.clone(), fragment.clone());
+            if self.embeds.entries.len() >= 128 && !self.embeds.entries.contains_key(&key) { continue; }
             // 同篇嵌入与解析不出的目标都在渲染时即时算，不进缓存
             let Some(Resolution::Resolved { path, fragment }) =
                 self.resolve_link_target(&target, fragment.as_deref())
@@ -304,9 +370,7 @@ impl super::Editor {
             }
             if let Some(result) = self.embeds.resolved.get(&(path.clone(), fragment.clone())) {
                 let entry = match result {
-                    Ok((title, source)) => {
-                        Entry::Ready { path, title: title.clone(), source: source.clone() }
-                    }
+                    Ok(snapshot) => Entry::Ready { path, snapshot: snapshot.clone() },
                     Err(error) => Entry::Failed { path, error: error.clone().into() },
                 };
                 self.embeds.entries.insert(key, entry);
@@ -341,9 +405,7 @@ impl super::Editor {
             let read = cx
                 .background_spawn(async move {
                     let doc = super::source_cache::read(&vault, &read_path).map_err(|e| format!("无法读取笔记：{e}"))?;
-                    let source = slice(&doc, fragment.as_deref())?;
-                    let title = doc.title_or(read_path.stem());
-                    Ok::<_, String>((title, source))
+                    SourceSnapshot::new(&doc, &read_path, fragment.as_deref(), None)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -356,7 +418,7 @@ impl super::Editor {
                 this.embeds.entries.insert(
                     key,
                     match read {
-                        Ok((title, source)) => Entry::Ready { path, title, source },
+                        Ok(snapshot) => Entry::Ready { path, snapshot },
                         Err(error) => Entry::Failed { path, error: error.into() },
                     },
                 );
@@ -368,25 +430,13 @@ impl super::Editor {
     /// 别的笔记动了（保存、外部改动、改名、删除）：丢掉它的嵌入缓存与所有失败项，下一帧重读。
     pub fn invalidate_embeds(&mut self, paths: &[VaultPath], cx: &mut Context<Self>) {
         super::source_cache::invalidate(self.vault.id(), paths);
-        // An external source event can arrive while the old source is being
-        // read. Dropping the owner prevents that result from being applied.
-        self.embeds.scan = None;
-        self.embeds.revision = None;
-        if self.embeds.resolved.keys().any(|(path, _)| paths.contains(path)) {
-            self.embeds.resolved.retain(|(path, _), _| !paths.contains(path));
-            self.embeds.revision = None;
-            self.refresh_embeds(cx);
+        if let Some(catalog) = &self.link_preview.catalog {
+            catalog.touch(paths.iter().cloned());
         }
-        let before = self.embeds.entries.len();
-        self.embeds.entries.retain(|_, entry| match entry {
-            Entry::Ready { path, .. } => !paths.contains(path),
-            Entry::Failed { .. } => false,
-            Entry::Loading { path, .. } => !paths.contains(path),
-        });
-        if self.embeds.entries.len() != before {
-            self.refresh_embeds(cx);
-            cx.notify();
-        }
+        // An identity change can invalidate references to other paths too.
+        self.embeds.clear_content();
+        self.refresh_embeds(cx);
+        cx.notify();
     }
 }
 
@@ -416,6 +466,198 @@ mod tests {
     use aero_core::{Document, Edit, VaultPath};
     use gpui_kit::{TestAppContext, VisualTestContext};
     use std::time::Duration;
+
+    #[test]
+    fn g08_source_snapshot_views_share_prepared_text() {
+        let path = VaultPath::new("source.md").unwrap();
+        let snapshot = super::SourceSnapshot::new(&Document::from_text("---\ntitle: A source title longer than inline string storage\n---\n\nA source body longer than inline string storage ^p\n"), &path, Some("^p"), None).unwrap();
+        let super::EmbedView::Ready { source: first, title: first_title, .. } = snapshot.view(path.clone()) else { panic!() };
+        let super::EmbedView::Ready { source: second, title: second_title, .. } = snapshot.view(path) else { panic!() };
+        assert_eq!(first.as_ptr(), second.as_ptr(), "views must share prepared source rather than copy it per cell");
+        assert_eq!(first_title.as_ptr(), second_title.as_ptr(), "views must share prepared titles");
+    }
+
+    #[gpui_kit::test]
+    fn g08_reference_refreshes_closed_title_excerpt_without_writing_alias(cx: &mut TestAppContext) {
+        let original = "[[source#^p|copied title]]\n";
+        let (_dir, vault, destination, editor) = super::super::tests::open(cx, original);
+        let path = VaultPath::new("source.md").unwrap();
+        for (title, body) in [("First", "old excerpt"), ("Second", "new excerpt")] {
+            vault.write_bytes(&path, format!("---\ntitle: {title}\n---\n\n{body} ^p\n").as_bytes()).unwrap();
+            editor.update(cx, |e, cx| e.invalidate_embeds(std::slice::from_ref(&path), cx));
+            cx.run_until_parked();
+            editor.read_with(cx, |e, _| {
+                let super::EmbedView::Ready { title: actual, source, .. } = e.embed_view_from("source", Some("^p"), None) else {
+                    panic!("ordinary block references must prefetch their source");
+                };
+                assert_eq!(actual, title);
+                assert_eq!(source, format!("{body} ^p"));
+                assert_eq!(e.doc.to_string(), original);
+                assert_eq!(e.doc.version(), 0);
+            });
+            assert_eq!(vault.read_bytes(&destination).unwrap().0, original.as_bytes());
+        }
+    }
+
+    #[gpui_kit::test]
+    fn g08_reference_failures_evict_success_and_distinguish_missing_duplicate_read(cx: &mut TestAppContext) {
+        let (_dir, vault, _, editor) = super::super::tests::open(cx, "[[source#^p|hint]]\n");
+        let path = VaultPath::new("source.md").unwrap();
+        let mut errors = Vec::new();
+        for bytes in [b"body ^p\n".as_slice(), b"no anchor\n", b"one ^p\n\ntwo ^p\n", &[0xff]] {
+            vault.write_bytes(&path, bytes).unwrap();
+            editor.update(cx, |e, cx| e.invalidate_embeds(std::slice::from_ref(&path), cx));
+            cx.run_until_parked();
+            editor.read_with(cx, |e, _| match e.embed_view_from("source", Some("^p"), None) {
+                super::EmbedView::Ready { source, .. } if bytes == b"body ^p\n" => assert_eq!(source, "body ^p"),
+                super::EmbedView::Failed(error) if bytes != b"body ^p\n" => errors.push(error.to_string()),
+                _ => panic!("must resolve to current content or its current error"),
+            });
+        }
+        assert_eq!(errors.len(), 3);
+        assert_ne!(errors[0], errors[1]);
+        assert_ne!(errors[1], errors[2]);
+    }
+
+    #[gpui_kit::test]
+    fn g08_full_path_candidate_beats_ambiguous_live_aliases(cx: &mut TestAppContext) {
+        use super::super::Editor;
+        use gpui_kit::AppContext as _;
+        let (_dir, vault, _, editor) = super::super::tests::open(cx, "[[Source#^p]]\n");
+        let path = VaultPath::new("Source.md").unwrap();
+        vault.write_bytes(&path, b"correct unopened body ^p\n").unwrap();
+        let mut aliases = Vec::new();
+        for name in ["alias-one.md", "alias-two.md"] {
+            let path = VaultPath::new(name).unwrap();
+            vault.write_bytes(&path, b"---\naliases: [Source]\n---\n\nwrong body ^p\n").unwrap();
+            let (doc, stamp) = vault.read(&path).unwrap();
+            aliases.push(cx.new(|cx| Editor::new(vault.clone(), path, doc, stamp, cx)));
+        }
+        editor.update(cx, |e, cx| e.refresh_embeds(cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, cx| {
+            let view = e.live_embed("Source", Some("^p"), None, cx)
+                .unwrap_or_else(|| e.embed_view_from("Source", Some("^p"), None));
+            assert!(matches!(view, super::EmbedView::Ready { path: actual, source, .. }
+                if actual == path && source == "correct unopened body ^p"), "full catalog paths outrank partial live aliases");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn g08_live_source_redraw_reuses_text_and_refreshes_once_per_version(cx: &mut TestAppContext) {
+        use super::super::Editor;
+        use gpui_kit::AppContext as _;
+        let (_dir, vault, _, editor) = super::super::tests::open(cx, "[[source#^p]]\n\n[[source#^p]]\n");
+        let path = VaultPath::new("source.md").unwrap();
+        vault.write_bytes(&path, b"A source body longer than inline string storage ^p\n").unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let source = cx.new(|cx| Editor::new(vault.clone(), path.clone(), doc, stamp, cx));
+        cx.run_until_parked();
+        let view_text = |cx: &mut TestAppContext| editor.read_with(cx, |e, cx| {
+            let super::EmbedView::Ready { source, .. } = e.live_embed("source", Some("^p"), None, cx).unwrap() else { panic!("prepared live source") };
+            source
+        });
+        let first = view_text(cx);
+        let analyses = super::SNAPSHOT_ANALYSES.get();
+        for _ in 0..4 {
+            let again = view_text(cx);
+            assert_eq!(first.as_ptr(), again.as_ptr(), "live views must share the prepared version");
+        }
+        assert_eq!(super::SNAPSHOT_ANALYSES.get(), analyses, "live lookups must not analyze on paint");
+        let scans = editor.read_with(cx, |e, _| e.embeds.scan_count);
+        source.update(cx, |e, cx| {
+            e.doc.edit(Edit::replace(0..e.doc.len(), "A refreshed body longer than inline string storage ^p\n")).unwrap();
+            e.doc.reparse();
+            e.publish_live(cx);
+        });
+        cx.run_until_parked();
+        let second = view_text(cx);
+        assert_eq!(second, "A refreshed body longer than inline string storage ^p");
+        assert_ne!(first.as_ptr(), second.as_ptr());
+        let again = view_text(cx);
+        assert_eq!(second.as_ptr(), again.as_ptr());
+        assert_eq!(editor.read_with(cx, |e, _| e.embeds.scan_count), scans + 1);
+    }
+
+    #[gpui_kit::test]
+    fn g08_stale_complete_cache_waits_even_when_live_resolution_agrees(cx: &mut TestAppContext) {
+        use super::super::Editor;
+        use gpui_kit::AppContext as _;
+        let (_dir, vault, _, editor) = super::super::tests::open(cx, "[[source#^p]]\n");
+        let path = VaultPath::new("source.md").unwrap();
+        vault.write_bytes(&path, b"old body ^p\n").unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let source = cx.new(|cx| Editor::new(vault.clone(), path.clone(), doc, stamp, cx));
+        cx.run_until_parked();
+        source.update(cx, |e, cx| {
+            e.doc.edit(Edit::replace(0..e.doc.len(), "one ^p\n\ntwo ^p\n")).unwrap();
+            e.doc.reparse();
+            e.publish_live(cx);
+        });
+        editor.read_with(cx, |e, cx| assert!(matches!(e.live_embed("source", Some("^p"), None, cx), Some(super::EmbedView::Loading)), "unvalidated complete snapshots must wait for the latest generation"));
+    }
+
+    #[gpui_kit::test]
+    fn g08_live_duplicate_identity_never_reuses_success_while_scan_is_pending(cx: &mut TestAppContext) {
+        use super::super::Editor;
+        use gpui_kit::AppContext as _;
+        let document = aero_core::identity::new_document_id();
+        let block = aero_core::identity::new_block_id();
+        let address = format!("id:{document}");
+        let fragment = format!("^{block}");
+        let (_dir, vault, _, editor) = super::super::tests::open(cx, &format!("[[{address}#{fragment}|hint]]\n"));
+        let path = VaultPath::new("source.md").unwrap();
+        let text = format!("---\naero:\n  id: {document}\n---\n\nbody ^{block}\n");
+        vault.write_bytes(&path, text.as_bytes()).unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let _source = cx.new(|cx| Editor::new(vault.clone(), path.clone(), doc, stamp, cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, cx| assert!(matches!(e.live_embed(&address, Some(&fragment), None, cx), Some(super::EmbedView::Ready { .. }))));
+        let duplicate_path = VaultPath::new("duplicate.md").unwrap();
+        vault.write_bytes(&duplicate_path, text.as_bytes()).unwrap();
+        let (doc, stamp) = vault.read(&duplicate_path).unwrap();
+        cx.update(|cx| {
+            let _duplicate = cx.new(|cx| Editor::new(vault.clone(), duplicate_path.clone(), doc, stamp, cx));
+            let view = editor.read(cx).live_embed(&address, Some(&fragment), None, cx);
+            assert!(!matches!(view, Some(super::EmbedView::Ready { .. })), "identity changes must not display a previously unique body");
+        });
+        cx.run_until_parked();
+        std::fs::remove_file(vault.fs_path(&duplicate_path)).unwrap();
+        editor.update(cx, |e, cx| e.invalidate_embeds(std::slice::from_ref(&duplicate_path), cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, cx| assert!(matches!(e.live_embed(&address, Some(&fragment), None, cx), Some(super::EmbedView::Ready { .. })), "released live identities must not cause phantom conflicts"));
+    }
+
+    #[gpui_kit::test]
+    fn g08_closed_identity_invalidation_rebuilds_catalog_before_reusing_body(cx: &mut TestAppContext) {
+        let document = aero_core::identity::new_document_id();
+        let block = aero_core::identity::new_block_id();
+        let address = format!("id:{document}");
+        let fragment = format!("^{block}");
+        let (_dir, vault, _, editor) = super::super::tests::open(cx, &format!("[[{address}#{fragment}|hint]]\n"));
+        let path = VaultPath::new("source.md").unwrap();
+        let duplicate = VaultPath::new("duplicate.md").unwrap();
+        let text = format!("---\naero:\n  id: {document}\n---\n\nbody ^{block}\n");
+        vault.write_bytes(&path, text.as_bytes()).unwrap();
+        let catalog = crate::catalog::Catalog::new(vault.clone());
+        editor.update(cx, |e, cx| {
+            e.link_preview.catalog = Some(catalog);
+            e.invalidate_embeds(std::slice::from_ref(&path), cx);
+        });
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert!(matches!(e.embed_view_from(&address, Some(&fragment), None), super::EmbedView::Ready { .. })));
+        vault.write_bytes(&duplicate, text.as_bytes()).unwrap();
+        editor.update(cx, |e, cx| {
+            e.invalidate_embeds(std::slice::from_ref(&duplicate), cx);
+            assert!(!matches!(e.embed_view_from(&address, Some(&fragment), None), super::EmbedView::Ready { .. }));
+        });
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert!(matches!(e.embed_view_from(&address, Some(&fragment), None), super::EmbedView::Failed(error) if error.contains("歧义"))));
+        std::fs::remove_file(vault.fs_path(&duplicate)).unwrap();
+        editor.update(cx, |e, cx| e.invalidate_embeds(std::slice::from_ref(&duplicate), cx));
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| assert!(matches!(e.embed_view_from(&address, Some(&fragment), None), super::EmbedView::Ready { .. })));
+    }
 
     #[gpui_kit::test]
     fn deleted_live_source_invalidates_nested_references_and_recovers(cx: &mut TestAppContext) {

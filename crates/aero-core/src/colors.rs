@@ -289,11 +289,24 @@ pub fn inline_color(src: &str, selection: Range<usize>, slot: Slot) -> Option<St
     if selected.is_empty() {
         return None;
     }
-    if slot == Slot::Background
-        && src[..selection.start].ends_with("==")
-        && src[selection.end..].starts_with("==")
-    {
-        return Some("yellow".to_owned());
+    let analysis = crate::markup::analyze(src);
+    for (range, mark) in analysis.styles.iter().rev() {
+        if range.start <= selection.start && selection.end <= range.end {
+            let value = match (mark, slot) {
+                (crate::markup::Mark::Palette(values), Slot::Text) => values[0].as_deref(),
+                (crate::markup::Mark::Palette(values), Slot::Background) => values[1].as_deref(),
+                (crate::markup::Mark::Highlight, Slot::Background) => Some("yellow"),
+                _ => None,
+            };
+            if let Some(value) = value {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    if analysis.styles.iter().any(|(range, mark)| {
+        *mark == crate::markup::Mark::Code && range.start <= selection.start && selection.end <= range.end
+    }) {
+        return None;
     }
     let bracketed = src[..selection.start].ends_with('[') && src[selection.end..].starts_with("]{");
     let brace = if bracketed { selection.end + 1 } else { selection.end };
@@ -332,6 +345,35 @@ pub fn inline_edit(src: &str, selection: Range<usize>, slot: Slot, color: Option
     }
     if selected.trim().is_empty() || selected.contains(['\n', '\r']) {
         return None;
+    }
+    let analysis = crate::markup::analyze(src);
+    if slot == Slot::Background && color.is_none()
+        && let Some((content, _)) = analysis.styles.iter().find(|(range, mark)| {
+            *mark == crate::markup::Mark::Highlight
+                && range.start <= selection.start && selection.end <= range.end
+                && (range.start..selection.start).chain(selection.end..range.end).all(|at| analysis.conceals(at))
+        })
+    {
+        let mut range = content.start - 2..content.end + 2;
+        let body = splice_edits(src, content, &covered_color_edits(src, content, slot));
+        let marker = attrs_at(src, range.end).map(|(_, end)| {
+            let marker = color_marker(&src[range.end..end], slot, None);
+            range.end = end;
+            marker
+        }).unwrap_or_default();
+        let text = if marker.is_empty() {
+            body
+        } else if is_element(&body) {
+            format!("{body}{marker}")
+        } else {
+            format!("[{body}]{marker}")
+        };
+        let mut after = src.to_owned();
+        after.replace_range(range.clone(), &text);
+        if !crate::inline_links::same_structure(&crate::parse::parse(src).blocks, &crate::parse::parse(&after).blocks) {
+            return None;
+        }
+        return Some(Inline::Edit(Edit::replace(range, text)));
     }
     if let Some(edit) = flatten_covered(src, &selection, slot, color) {
         return Some(edit);
@@ -382,9 +424,11 @@ pub fn inline_edit(src: &str, selection: Range<usize>, slot: Slot, color: Option
         if wrap {
             out.push(']');
         }
-        out.push('{');
-        out.push_str(&render(&attrs));
-        out.push('}');
+        let marker = existing.as_ref().map_or_else(
+            || format!("{{{}}}", render(&attrs)),
+            |(_, range)| color_marker(&src[range.clone()], slot, color),
+        );
+        out.push_str(&marker);
     }
     let mut after = src.to_owned();
     after.replace_range(range.clone(), &out);
@@ -423,16 +467,16 @@ pub fn painted_content(replacement: &str) -> Range<usize> {
 /// 选区盖住了更小的颜色范围：收掉那些标记，再按这次的颜色写整段。
 /// 没有被盖住的颜色时返回 `None`，调用方走原来的就地修改 / 套一层。
 fn flatten_covered(src: &str, selection: &Range<usize>, slot: Slot, color: Option<&str>) -> Option<Inline> {
-    let holes = covered_markup(src, selection);
-    if holes.is_empty() {
+    let edits = covered_color_edits(src, selection, slot);
+    if edits.is_empty() {
         return None;
     }
     let mut range = selection.clone();
-    for hole in &holes {
-        range.start = range.start.min(hole.start);
-        range.end = range.end.max(hole.end);
+    for edit in &edits {
+        range.start = range.start.min(edit.range.start);
+        range.end = range.end.max(edit.range.end);
     }
-    let body = splice_out(src, &range, &holes);
+    let body = splice_edits(src, &range, &edits);
     if body.trim().is_empty() || body.contains(['\n', '\r']) {
         return None;
     }
@@ -441,15 +485,13 @@ fn flatten_covered(src: &str, selection: &Range<usize>, slot: Slot, color: Optio
         && src[selection.end..].starts_with("]{")
         && bracket_start(src, selection.end, line_start(src, selection.end)) == Some(selection.start - 1)
     {
-        let (mut attrs, end) = attrs_at(src, selection.end + 1)?;
+        let (_, end) = attrs_at(src, selection.end + 1)?;
         range.start = selection.start - 1;
         range.end = end;
-        if slot == Slot::Background && color == Some("yellow") {
-            format!("=={body}==")
-        } else {
-            slot.write(&mut attrs, color);
-            if attrs.is_empty() { body } else { format!("[{body}]{{{}}}", render(&attrs)) }
-        }
+        let yellow = slot == Slot::Background && color == Some("yellow");
+        let marker = color_marker(&src[selection.end + 1..end], slot, if yellow { None } else { color });
+        let body = if yellow { format!("=={body}==") } else { body };
+        if marker.is_empty() { body } else { format!("[{body}]{marker}") }
     } else if slot == Slot::Background && color == Some("yellow") {
         format!("=={body}==")
     } else if let Some(color) = color {
@@ -469,9 +511,51 @@ fn flatten_covered(src: &str, selection: &Range<usize>, slot: Slot, color: Optio
     Some(Inline::Edit(Edit::replace(range, out)))
 }
 
-/// 被选区整段盖住、并且选区还伸出这段颜色之外的标记。这些标记要删掉。
-fn covered_markup(src: &str, selection: &Range<usize>) -> Vec<Range<usize>> {
-    let mut holes = Vec::new();
+fn color_marker(marker: &str, slot: Slot, color: Option<&str>) -> String {
+    let inner = &marker[1..marker.len() - 1];
+    let mut removed = Vec::new();
+    for token in crate::block::tokenize_attrs(inner).expect("validated attributes") {
+        let owned = token.strip_prefix('.').is_some_and(|class| slot.owns(class))
+            || token.split_once('=').is_some_and(|(key, _)| key == slot.key());
+        if owned {
+            let from = token.as_ptr() as usize - inner.as_ptr() as usize;
+            let at = from + token.len();
+            let end = inner[at..]
+                .char_indices()
+                .find(|(_, ch)| !ch.is_whitespace())
+                .map_or(inner.len(), |(n, _)| at + n);
+            let from = if end == inner.len() { inner[..from].trim_end().len() } else { from };
+            removed.push(from..end);
+        }
+    }
+    let mut result = String::new();
+    let mut at = 0;
+    for range in removed {
+        if range.end > at {
+            result.push_str(&inner[at..range.start.max(at)]);
+            at = range.end;
+        }
+    }
+    result.push_str(&inner[at..]);
+    if let Some(color) = color {
+        let mut attrs = Attrs::default();
+        slot.write(&mut attrs, Some(color));
+        let token = render(&attrs);
+        let end = result.trim_end().len();
+        result.insert_str(end, &if end == 0 { token } else { format!(" {token}") });
+    }
+    if result.trim().is_empty() { String::new() } else { format!("{{{result}}}") }
+}
+
+fn covered_color_edits(src: &str, selection: &Range<usize>, slot: Slot) -> Vec<Edit> {
+    let code: Vec<_> = crate::markup::analyze(src)
+        .styles
+        .into_iter()
+        .filter_map(|(range, mark)| (mark == crate::markup::Mark::Code).then_some(range))
+        .collect();
+    let in_code = |offset| code.iter().any(|range| range.contains(&offset));
+    let overlaps_code = |range: Range<usize>| code.iter().any(|r| r.start < range.end && range.start < r.end);
+    let mut edits = Vec::new();
     let mut search = 0;
     while let Some(rel) = src[search..].find("]{") {
         let close = search + rel;
@@ -484,9 +568,19 @@ fn covered_markup(src: &str, selection: &Range<usize>) -> Vec<Range<usize>> {
             continue;
         };
         let content = open + 1..close;
-        if expands_over(selection, &content) && has_color(&attrs) && only_colors(&attrs) {
-            holes.push(open..open + 1);
-            holes.push(close..end);
+        let mut remaining = attrs.clone();
+        slot.write(&mut remaining, None);
+        if expands_over(selection, &content)
+            && remaining != attrs
+            && !in_code(open)
+            && !overlaps_code(close..end)
+        {
+            if remaining.is_empty() {
+                edits.push(Edit::delete(open..open + 1));
+                edits.push(Edit::delete(close..end));
+            } else {
+                edits.push(Edit::replace(close + 1..end, color_marker(&src[close + 1..end], slot, None)));
+            }
         }
         search = end;
     }
@@ -505,17 +599,21 @@ fn covered_markup(src: &str, selection: &Range<usize>) -> Vec<Range<usize>> {
             search = end;
             continue;
         };
+        let mut remaining = attrs.clone();
+        slot.write(&mut remaining, None);
         if expands_over(selection, &element)
-            && has_color(&attrs)
-            && only_colors(&attrs)
+            && remaining != attrs
             && end <= selection.end
+            && !overlaps_code(brace..end)
         {
-            holes.push(brace..end);
+            edits.push(Edit::replace(brace..end, color_marker(&src[brace..end], slot, None)));
         }
         search = end;
     }
     search = selection.start;
-    while let Some(rel) = src[search..selection.end].find("==") {
+    while slot == Slot::Background
+        && let Some(rel) = src[search..selection.end].find("==")
+    {
         let start = search + rel;
         if escaped(src, start) {
             search = start + 2;
@@ -530,17 +628,21 @@ fn covered_markup(src: &str, selection: &Range<usize>) -> Vec<Range<usize>> {
         let content = start + 2..end - 2;
         if expands_over(selection, &content)
             && !content.is_empty()
+            && !in_code(start)
             && !src[content.clone()].contains('\n')
-            && !holes.iter().any(|hole| hole.start < end && start < hole.end)
+            && !overlaps_code(end - 2..end)
+            && !edits.iter().any(|edit| {
+                (edit.range.start < start + 2 && start < edit.range.end)
+                    || (edit.range.start < end && end - 2 < edit.range.end)
+            })
         {
-            holes.push(start..start + 2);
-            holes.push(end - 2..end);
+            edits.push(Edit::delete(start..start + 2));
+            edits.push(Edit::delete(end - 2..end));
         }
         search = end;
     }
-    holes.retain(|hole| !hole.is_empty());
-    holes.sort_by_key(|hole| hole.start);
-    holes
+    edits.sort_by_key(|edit| edit.range.start);
+    edits
 }
 
 /// 选区盖住 `content`，并且至少有一侧伸到这段颜色外面。正好重合是就地改色，不算扩大。
@@ -553,16 +655,6 @@ fn expands_over(selection: &Range<usize>, content: &Range<usize>) -> bool {
 
 pub(crate) fn has_color(attrs: &Attrs) -> bool {
     [Slot::Text, Slot::Background].iter().any(|slot| slot.color_of(attrs).is_some())
-}
-
-fn only_colors(attrs: &Attrs) -> bool {
-    attrs.id.is_none()
-        && attrs
-            .pairs
-            .iter()
-            .all(|(k, v)| ["color", "background"].contains(&k.as_str()) && CustomColor::parse(v).is_some())
-        && has_color(attrs)
-        && attrs.classes.iter().all(|class| Slot::Text.owns(class) || Slot::Background.owns(class))
 }
 
 fn element_before(src: &str, brace: usize) -> Option<Range<usize>> {
@@ -583,20 +675,16 @@ fn element_before(src: &str, brace: usize) -> Option<Range<usize>> {
     None
 }
 
-fn splice_out(src: &str, range: &Range<usize>, holes: &[Range<usize>]) -> String {
+fn splice_edits(src: &str, range: &Range<usize>, edits: &[Edit]) -> String {
     let mut out = String::with_capacity(range.len());
     let mut at = range.start;
-    for hole in holes {
-        if hole.end <= at || hole.start >= range.end {
+    for edit in edits {
+        if edit.range.start < at || edit.range.end > range.end {
             continue;
         }
-        let start = hole.start.max(range.start);
-        let end = hole.end.min(range.end);
-        if start < at {
-            continue;
-        }
-        out.push_str(&src[at..start]);
-        at = end;
+        out.push_str(&src[at..edit.range.start]);
+        out.push_str(&edit.text);
+        at = edit.range.end;
     }
     out.push_str(&src[at..range.end]);
     out
@@ -658,6 +746,61 @@ mod tests {
             }
             None => source.to_owned(),
         }
+    }
+
+    #[test]
+    fn default_background_clears_selected_highlight_contents_only() {
+        for (source, selected, expected) in [
+            ("before ==word== after", "word", "before word after"),
+            ("==**word**==", "**word**", "**word**"),
+            ("==**word**==", "word", "**word**"),
+            ("==[word]{.red custom='raw'}==", "[word]{.red custom='raw'}", "[word]{.red custom='raw'}"),
+            ("==[word]{.red custom='raw'}==", "word", "[word]{.red custom='raw'}"),
+            ("==word=={.red background=\"#123456\" custom='raw'}", "word", "[word]{.red custom='raw'}"),
+        ] {
+            let start = source.find(selected).unwrap();
+            let Some(Inline::Edit(edit)) = inline_edit(source, start..start + selected.len(), Slot::Background, None) else {
+                panic!("expected highlight removal: {source}");
+            };
+            let mut doc = Document::from_text(source);
+            doc.edit(edit).unwrap();
+            assert_eq!(doc.to_string(), expected);
+            doc.undo();
+            assert_eq!(doc.to_string(), source);
+        }
+        for source in ["`==word==`", "\\==word=="] {
+            let start = source.find("word").unwrap();
+            assert!(inline_edit(source, start..start + 4, Slot::Background, None).is_none());
+        }
+    }
+
+    #[test]
+    fn default_highlight_removal_does_not_change_block_structure() {
+        let source = "==# heading==";
+        assert!(inline_edit(source, 2..source.len() - 2, Slot::Background, None).is_none());
+    }
+
+    #[test]
+    fn inline_menu_reads_effective_attached_and_nested_colors() {
+        for (source, text, background) in [
+            ("**word**{.red color=\"#123456\" .bg-blue}", "#123456", "blue"),
+            ("[word](url){color=\"#123456\" .bg-blue}", "#123456", "blue"),
+            ("[[word]{.green}]{.red .bg-blue}", "green", "blue"),
+            ("[==word==]{.red background=\"#123456\"}", "red", "yellow"),
+        ] {
+            let start = source.find("word").unwrap();
+            assert_eq!(inline_color(source, start..start + 4, Slot::Text).as_deref(), Some(text), "{source}");
+            assert_eq!(inline_color(source, start..start + 4, Slot::Background).as_deref(), Some(background), "{source}");
+        }
+    }
+
+    #[test]
+    fn exact_inline_color_edit_preserves_other_attribute_bytes() {
+        let source = "[word]{.red custom='raw' background=\"rgba(1,2,3,0.375000001)\"}";
+        let Some(Inline::Edit(edit)) = inline_edit(source, 1..5, Slot::Text, Some("blue")) else { panic!("edit"); };
+        let mut doc = Document::from_text(source);
+        doc.edit(edit).unwrap();
+        assert_eq!(doc.to_string(), "[word]{custom='raw' background=\"rgba(1,2,3,0.375000001)\" .blue}");
     }
 
     #[test]
@@ -780,7 +923,7 @@ mod tests {
             "[也[可以通过[「文件 → 关闭 Vault」回到库选择页，再从最近列]{.blue}表]{.pink}切换。]{.bg-blue}";
         assert_eq!(
             edit(&format!("{nested}\n"), nested, Slot::Background, Some("green")),
-            "[也可以通过「文件 → 关闭 Vault」回到库选择页，再从最近列表切换。]{.bg-green}\n"
+            "[也[可以通过[「文件 → 关闭 Vault」回到库选择页，再从最近列]{.blue}表]{.pink}切换。]{.bg-green}\n"
         );
         // 选区正好是外层正文：收掉里面的颜色，外层换成本次的颜色
         let outer = "也[可以通过[「文件」]{.blue}表]{.pink}切换。";
@@ -794,6 +937,78 @@ mod tests {
             edit(wide, "「文件」", Slot::Text, Some("blue")),
             "[也可以通过[「文件」]{.blue}表切换。]{.bg-blue}\n"
         );
+    }
+
+    #[test]
+    fn expanding_color_only_replaces_the_requested_channel() {
+        let cases = [
+            ("前 [字]{.red .bg-blue} 后", Slot::Text, Some("pink"), "[前 [字]{.bg-blue} 后]{.pink}"),
+            ("前 [字]{.red .bg-blue} 后", Slot::Background, Some("green"), "[前 [字]{.red} 后]{.bg-green}"),
+            ("前 ==底== 与 [字]{.red} 后", Slot::Text, Some("pink"), "[前 ==底== 与 字 后]{.pink}"),
+            ("前 [字]{.red .bg-blue} 后", Slot::Text, None, "前 [字]{.bg-blue} 后"),
+            (
+                "前 [字]{.red .bg-blue custom=value} 后",
+                Slot::Text,
+                Some("pink"),
+                "[前 [字]{.bg-blue custom=value} 后]{.pink}",
+            ),
+        ];
+        for (source, slot, color, expected) in cases {
+            let Some(Inline::Edit(edit)) = inline_edit(source, 0..source.len(), slot, color) else {
+                panic!("expected an edit for {source:?}");
+            };
+            let mut doc = Document::from_text(source);
+            doc.edit(edit).unwrap();
+            assert_eq!(doc.to_string(), expected);
+            doc.undo();
+            assert_eq!(doc.to_string(), source);
+        }
+    }
+
+    #[test]
+    fn expanding_color_preserves_code_literals() {
+        for (source, slot, color, class) in [
+            ("前 `[示例]{.red}` 后", Slot::Text, "pink", ".pink"),
+            ("前 `==示例==` 后", Slot::Background, "blue", ".bg-blue"),
+        ] {
+            let Some(Inline::Edit(edit)) = inline_edit(source, 0..source.len(), slot, Some(color)) else {
+                panic!("expected a color edit");
+            };
+            let mut doc = Document::from_text(source);
+            doc.edit(edit).unwrap();
+            assert_eq!(doc.to_string(), format!("[{source}]{{{class}}}"));
+        }
+    }
+
+    #[test]
+    fn expanding_color_preserves_untouched_attribute_bytes_and_nested_highlights() {
+        for (source, slot, expected) in [
+            ("a [x]{.red custom=\"v\" #i} b", Slot::Text, "a [x]{custom=\"v\" #i} b"),
+            ("==[x]{.bg-blue #i}==", Slot::Background, "[x]{#i}"),
+            ("[`x]{.red #i}`", Slot::Text, "[`x]{.red #i}`"),
+            (r#"a [x]{custom=\"v .red x" .blue} b"#, Slot::Text, r#"a [x]{custom=\"v .red x"} b"#),
+        ] {
+            let mut doc = Document::from_text(source);
+            if let Some(Inline::Edit(edit)) = inline_edit(source, 0..source.len(), slot, None) {
+                doc.edit(edit).unwrap();
+            }
+            assert_eq!(doc.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn yellow_background_keeps_outer_identity_and_unknown_attributes() {
+        let source = "[前 [字]{.bg-blue} 后]{#anchor .red custom=value}";
+        let selection = 1..source.find("]{#anchor").unwrap();
+        let Some(Inline::Edit(edit)) = inline_edit(source, selection, Slot::Background, Some("yellow"))
+        else {
+            panic!("expected a background edit");
+        };
+        let mut doc = Document::from_text(source);
+        doc.edit(edit).unwrap();
+        assert_eq!(doc.to_string(), "[==前 字 后==]{#anchor .red custom=value}");
+        doc.undo();
+        assert_eq!(doc.to_string(), source);
     }
 
     /// 读回选区上的颜色：菜单用它画选中标记。

@@ -78,6 +78,10 @@ pub struct PersistentAssignment {
 pub fn permanent(doc: &Document, block: BlockId) -> Result<PersistentAssignment, String> {
     let (document, mut edits) = crate::identity::ensure(doc)?;
     let b = doc.blocks().find(block).ok_or("目标块已不存在")?;
+    for alias in aliases(b) {
+        let scoped = format!("{document}#");
+        resolve(doc, alias.strip_prefix(&scoped).unwrap_or(alias))?;
+    }
     let id = match b.persisted_id.as_deref() {
         Some(old) if crate::identity::is_block_id(old) => {
             resolve(doc, old)?;
@@ -108,6 +112,41 @@ pub fn permanent(doc: &Document, block: BlockId) -> Result<PersistentAssignment,
     };
     edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
     Ok(PersistentAssignment { document, id, edits })
+}
+
+/// Retain the resolver's observations for transaction validation after checking the proposed identity.
+pub fn permanent_in(
+    doc: &Document,
+    block: BlockId,
+    path: &VaultPath,
+    resolver: &crate::links::Resolver,
+) -> Result<PersistentAssignment, String> {
+    let assignment = permanent(doc, block)?;
+    let mut probe = doc.clone();
+    probe.edit_group(assignment.edits.clone()).map_err(|e| e.to_string())?;
+    probe.reparse();
+    let mut resolver = resolver.clone();
+    resolver.register_identity(path, &probe);
+    let target = format!("id:{}", assignment.document);
+    if !matches!(resolver.resolve(&target, None, path.parent()), crate::links::Resolution::Resolved { path: p, .. } if p == *path)
+    {
+        return Err("来源文档身份重复，请先解决冲突".into());
+    }
+    let assigned = resolve(&probe, &assignment.id)?;
+    let source = probe.blocks().find(assigned).ok_or("目标块已不存在")?;
+    for id in std::iter::once(assignment.id.as_str()).chain(aliases(source)) {
+        let (document, id) = id.split_once('#').unwrap_or((&assignment.document, id));
+        let target = format!("id:{document}");
+        let fragment = format!("^{id}");
+        if !matches!(
+            resolver.resolve(&target, Some(&fragment), path.parent()),
+            crate::links::Resolution::Resolved { path: p, fragment: Some(f) }
+                if p == *path && f == format!("^{}", assignment.id)
+        ) {
+            return Err(format!("来源块身份重复或无法唯一解析：{target}#{fragment}，请先解决冲突"));
+        }
+    }
+    Ok(assignment)
 }
 
 /// 仅准备一次插入，不修改文档。已有且唯一的 ID 原样复用。
@@ -221,7 +260,7 @@ pub fn assign_on_disk(
     let doc = Document::from_bytes(&bytes).map_err(|e| e.to_string())?;
     let assignment = prepare(&doc, block)?;
     let Some(edit) = assignment.edit else { return Ok((assignment.id, false)) };
-    let after = insert_bytes(&bytes, &edit)?;
+    let after = edit_bytes(&bytes, &edit)?;
     // 再校验一次，覆盖准备 / 验证期间可检测到的外部改动。
     if vault.read_bytes(path).map_err(|e| e.to_string())?.1.hash != stamp.hash {
         return Err("目标笔记已变化，请重新打开补全".into());
@@ -230,25 +269,29 @@ pub fn assign_on_disk(
     Ok((assignment.id, true))
 }
 
-fn insert_bytes(bytes: &[u8], edit: &Edit) -> Result<Vec<u8>, String> {
-    debug_assert!(edit.range.is_empty());
-    let bom = if bytes.starts_with(b"\xef\xbb\xbf") { 3 } else { 0 };
+/// Preserve untouched file bytes when applying a normalized document edit.
+pub fn edit_bytes(bytes: &[u8], edit: &Edit) -> Result<Vec<u8>, String> {
+    let source = crate::text::SourceText::decode(bytes).map_err(|e| e.to_string())?;
+    if source.text.get(edit.range.clone()).is_none() {
+        return Err("块位置超出文件范围或字符边界".into());
+    }
+    let bom = if source.bom { 3 } else { 0 };
     let mut raw = bom;
     let mut normalized = 0;
-    while normalized < edit.range.start && raw < bytes.len() {
-        if bytes[raw..].starts_with(b"\r\n") {
-            raw += 1
+    let mut range = 0..0;
+    for (offset, position) in [(edit.range.start, &mut range.start), (edit.range.end, &mut range.end)] {
+        while normalized < offset {
+            if bytes[raw..].starts_with(b"\r\n") {
+                raw += 1;
+            }
+            raw += 1;
+            normalized += 1;
         }
-        raw += 1;
-        normalized += 1;
+        *position = raw;
     }
-    if normalized != edit.range.start {
-        return Err("块位置超出文件范围".into());
-    }
-    let crlf = bytes[bom..].windows(2).any(|pair| pair == b"\r\n");
-    let text = if crlf { edit.text.replace('\n', "\r\n") } else { edit.text.clone() };
+    let text = crate::text::SourceText::encode(&edit.text, false, source.line_ending);
     let mut after = bytes.to_vec();
-    after.splice(raw..raw, text.bytes());
+    after.splice(range, text);
     Ok(after)
 }
 
@@ -267,6 +310,70 @@ mod tests {
         assert_eq!(doc.blocks().iter().find(|(_, b)| b.id == block).unwrap().1.kind.tag(), kind);
         assert!(prepare(&doc, block).unwrap().edit.is_none());
         (doc, plan.id)
+    }
+
+    #[test]
+    fn permanent_in_preserves_legacy_alias_without_confusing_other_document_short_ids() {
+        let document = crate::identity::new_document_id();
+        let other_document = crate::identity::new_document_id();
+        let source = VaultPath::new("source.md").unwrap();
+        let other = VaultPath::new("other.md").unwrap();
+        let mut doc = Document::from_text(&format!("---\naero:\n  id: {document}\n---\n\nsource ^old\n"));
+        let other_doc =
+            Document::from_text(&format!("---\naero:\n  id: {other_document}\n---\n\nother ^old\n"));
+        let mut resolver = crate::links::Resolver::new();
+        resolver.register_identity(&source, &doc);
+        resolver.register_identity(&other, &other_doc);
+        let assignment = permanent_in(&doc, candidates(&doc)[0].block, &source, &resolver).unwrap();
+        assert_eq!(assignment.document, document);
+        assert!(crate::identity::is_block_id(&assignment.id));
+        doc.edit_group(assignment.edits).unwrap();
+        doc.reparse();
+        assert!(doc.to_string().contains(&format!("{document}#old")));
+        resolver.register_identity(&source, &doc);
+        assert_eq!(
+            resolver.resolve(&format!("id:{document}"), Some("^old"), ""),
+            crate::links::Resolution::Resolved {
+                path: source.clone(),
+                fragment: Some(format!("^{}", assignment.id))
+            },
+        );
+        let reused = permanent_in(&doc, resolve(&doc, &assignment.id).unwrap(), &source, &resolver).unwrap();
+        assert_eq!(reused.id, assignment.id);
+        assert!(reused.edits.is_empty());
+    }
+
+    #[test]
+    fn permanent_in_rejects_alias_only_owners_in_other_documents() {
+        let document = crate::identity::new_document_id();
+        let other_document = crate::identity::new_document_id();
+        let block = crate::identity::new_block_id();
+        let source = VaultPath::new("source.md").unwrap();
+        let other = VaultPath::new("other.md").unwrap();
+        let doc = Document::from_text(&format!("---\naero:\n  id: {document}\n---\n\nsource ^{block}\n"));
+        let other_doc = Document::from_text(&format!(
+            "---\naero:\n  id: {other_document}\n---\n\nother {{aero-aliases=\"{block}\"}}\n"
+        ));
+        let mut resolver = crate::links::Resolver::new();
+        resolver.register_identity(&source, &doc);
+        resolver.register_identity(&other, &other_doc);
+        assert!(permanent_in(&doc, candidates(&doc)[0].block, &source, &resolver).is_err());
+    }
+
+    #[test]
+    fn permanent_rejects_ambiguous_source_aliases_before_assigning_identity() {
+        let document = crate::identity::new_document_id();
+        let block = crate::identity::new_block_id();
+        let other = crate::identity::new_block_id();
+        for source in [
+            format!("source {{aero-aliases=\"old\"}} ^{block}\n\nother ^old\n"),
+            format!("source {{aero-aliases=\"{document}#old\"}} ^{block}\n\nother ^old\n"),
+            format!("source {{aero-aliases=\"old\"}}\n\nother {{aero-aliases=\"old\"}} ^{other}\n"),
+        ] {
+            let doc = Document::from_text(&format!("---\naero:\n  id: {document}\n---\n\n{source}"));
+            let block = candidates(&doc)[0].block;
+            assert!(permanent(&doc, block).is_err(), "must reject ambiguous alias: {source}");
+        }
     }
 
     #[test]
@@ -323,6 +430,13 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].excerpt.chars().count(), 60);
         assert_eq!(list[0].persisted_id.as_deref(), Some("existing"));
+    }
+
+    #[test]
+    fn identity_byte_edits_preserve_unedited_mixed_endings() {
+        let bytes = "\u{feff}front\r\n中文 ^old\n\nlast\r\n".as_bytes();
+        let after = edit_bytes(bytes, &Edit::replace(14..17, "new")).unwrap();
+        assert_eq!(after, "\u{feff}front\r\n中文 ^new\n\nlast\r\n".as_bytes());
     }
 
     #[test]

@@ -309,6 +309,7 @@ pub struct Markup {
     pub fonts: Vec<(Range<usize>, SharedString)>,
     /// Ranges underlined with a dashed line, e.g. links whose target does not exist.
     pub dashed: Vec<(Range<usize>, gpui::Hsla)>,
+    pub inline_objects: Vec<(Range<usize>, gpui::Size<Pixels>, u64)>,
 }
 
 impl Markup {
@@ -318,6 +319,7 @@ impl Markup {
             && self.styles.is_empty()
             && self.fonts.is_empty()
             && self.dashed.is_empty()
+            && self.inline_objects.is_empty()
     }
 
     /// Whether the byte at `offset` is hidden.
@@ -334,12 +336,15 @@ impl Markup {
             .map(|(range, style)| {
                 (
                     range.clone(),
-                    FontOverride { weight: style.font_weight, style: style.font_style, family: None },
+                    FontOverride { weight: style.font_weight, style: style.font_style, ..Default::default() },
                 )
             })
             .collect();
         out.extend(self.fonts.iter().map(|(range, family)| {
             (range.clone(), FontOverride { family: Some(family.clone()), ..Default::default() })
+        }));
+        out.extend(self.inline_objects.iter().map(|(range, size, _)| {
+            (range.clone(), FontOverride { object: Some(*size), ..Default::default() })
         }));
         out
     }
@@ -363,6 +368,7 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) text: Rope,
     /// Marker hiding and inline styles. Empty for ordinary inputs.
     pub(super) markup: Markup,
+    pub(super) inline_object_layout: Vec<(u64, Bounds<Pixels>)>,
     pub(super) display_map: DisplayMap,
     pub(super) undo_manager: UndoManager,
     pub(super) search_session: super::SearchSession,
@@ -651,6 +657,50 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    pub(super) fn object_row_heights(&self, base: Pixels) -> std::collections::BTreeMap<usize, Pixels> {
+        let mut heights = std::collections::BTreeMap::new();
+        for (range, size, _) in &self.markup.inline_objects {
+            if range.start >= self.text.len() {
+                continue;
+            }
+            let pos = self.text.offset_to_point(range.start);
+            if self.display_map.is_buffer_line_hidden(pos.row) {
+                continue;
+            }
+            let row = self
+                .display_map
+                .buffer_pos_to_display_pos(super::display_map::BufferPoint::new(pos.row, pos.column))
+                .row;
+            let height = heights.entry(row).or_insert(base);
+            *height = (*height).max(size.height);
+        }
+        heights
+    }
+
+    pub(super) fn display_row_top(&self, row: usize, base: Pixels) -> Pixels {
+        row * base
+            + self.object_row_heights(base).range(..row).map(|(_, height)| *height - base).sum::<Pixels>()
+    }
+
+    pub(super) fn display_row_at_y(&self, y: Pixels, base: Pixels) -> usize {
+        let mut extra = px(0.);
+        for (row, height) in self.object_row_heights(base) {
+            let top = row * base + extra;
+            if y < top {
+                break;
+            }
+            if y < top + height {
+                return row;
+            }
+            extra += height - base;
+        }
+        ((y - extra).max(px(0.)) / base) as usize
+    }
+
+    pub fn inline_object_bounds(&self) -> &[(u64, Bounds<Pixels>)] {
+        &self.inline_object_layout
+    }
+
     pub fn set_text_align(&mut self, text_align: TextAlign, cx: &mut Context<Self>) {
         if self.text_align == text_align {
             return;
@@ -727,6 +777,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             focus_handle: focus_handle.clone(),
             text: "".into(),
             markup: Markup::default(),
+            inline_object_layout: Vec::new(),
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
             search_session: super::SearchSession::default(),
             search_activation_revision: 0,
@@ -889,37 +940,6 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) {
         self.placeholder = placeholder.into();
         cx.notify();
-    }
-
-    /// Find which line and sub-line the given offset belongs to, along with the position within that sub-line.
-    ///
-    /// Returns:
-    ///
-    /// - The index of the line (zero-based) containing the offset.
-    /// - The index of the sub-line (zero-based) within the line containing the offset.
-    /// - The position of the offset.
-    pub(super) fn line_and_position_for_offset(
-        &self,
-        offset: usize,
-    ) -> (usize, usize, Option<Point<Pixels>>) {
-        let Some(last_layout) = &self.last_layout else {
-            return (0, 0, None);
-        };
-        let line_height = last_layout.line_height;
-
-        let mut y_offset = last_layout.visible_top;
-        for (vi, line) in last_layout.lines.iter().enumerate() {
-            let prev_lines_offset = last_layout.visible_line_byte_offsets[vi];
-            let local_offset = offset.saturating_sub(prev_lines_offset);
-            if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
-                let sub_line_index = (pos.y / line_height) as usize;
-                let adjusted_pos = point(pos.x + last_layout.line_number_width, pos.y + y_offset);
-                return (vi, sub_line_index, Some(adjusted_pos));
-            }
-
-            y_offset += line.size(line_height).height;
-        }
-        (0, 0, None)
     }
 
     /// Set the text of the input field.
@@ -2364,7 +2384,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         let row = point.row;
 
         // Calculate row offset by multiplying the number of lines before it with the line height
-        let mut row_offset_y = line_height * self.display_map.buffer_line_to_display_row(row);
+        let mut row_offset_y =
+            self.display_row_top(self.display_map.buffer_line_to_display_row(row), line_height);
 
         // For Right alignment use 0 margin: the cursor indicator is clamped inside bounds
         // in layout_cursor, so shifting the text here would cause a first-click visual jump.
@@ -3031,6 +3052,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// One drawn character to the left, stepping over concealed bytes. Returns `offset`
     /// when only concealed bytes lie before it: the caret is already where the text starts.
     pub(super) fn previous_visible_boundary(&self, offset: usize) -> usize {
+        if let Some((range, _, _)) =
+            self.markup.inline_objects.iter().find(|(r, _, _)| r.start < offset && offset <= r.end)
+        {
+            return range.start;
+        }
         let mut at = offset;
         loop {
             if let Some(range) =
@@ -3055,6 +3081,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// One drawn character to the right, stepping over concealed bytes. Returns `offset`
     /// when only concealed bytes follow it.
     pub(super) fn next_visible_boundary(&self, offset: usize) -> usize {
+        if let Some((range, _, _)) = self.markup.inline_objects.iter().find(|(r, _, _)| r.contains(&offset)) {
+            return range.end;
+        }
         let mut at = offset;
         loop {
             if let Some(range) = self.markup.hard_breaks.iter().find(|range| range.contains(&at)) {
@@ -3328,20 +3357,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             return None;
         };
 
-        let (_, _, start_pos) = self.line_and_position_for_offset(range.start);
-        let (_, _, end_pos) = self.line_and_position_for_offset(range.end);
-
-        let Some(start_pos) = start_pos else {
-            return None;
-        };
-        let Some(end_pos) = end_pos else {
-            return None;
-        };
-
-        Some(Bounds::from_corners(
-            last_bounds.origin + start_pos,
-            last_bounds.origin + end_pos + point(px(0.), last_layout.line_height),
-        ))
+        let mut bounds = last_layout.range_bounds(range).into_iter().reduce(|a, b| a.union(&b))?;
+        bounds.origin += last_bounds.origin;
+        Some(bounds)
     }
 
     /// Replace text in range in silent.
@@ -3916,51 +3934,11 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
-        let line_height = last_layout.line_height;
-        let line_number_width = last_layout.line_number_width;
         let range = self.range_from_utf16(&range_utf16);
-
-        let mut start_origin = None;
-        let mut end_origin = None;
-        let line_number_origin = point(line_number_width, px(0.));
-        let mut y_offset = last_layout.visible_top;
-
-        for (vi, line) in last_layout.lines.iter().enumerate() {
-            if start_origin.is_some() && end_origin.is_some() {
-                break;
-            }
-
-            let index_offset = last_layout.visible_line_byte_offsets[vi];
-
-            if start_origin.is_none() {
-                if let Some(p) =
-                    line.position_for_index(range.start.saturating_sub(index_offset), last_layout, false)
-                {
-                    start_origin = Some(p + point(px(0.), y_offset));
-                }
-            }
-
-            if end_origin.is_none() {
-                if let Some(p) =
-                    line.position_for_index(range.end.saturating_sub(index_offset), last_layout, false)
-                {
-                    end_origin = Some(p + point(px(0.), y_offset));
-                }
-            }
-
-            y_offset += line.size(line_height).height;
-        }
-
-        let start_origin = start_origin.unwrap_or_default();
-        let mut end_origin = end_origin.unwrap_or_default();
-        // Ensure at same line.
-        end_origin.y = start_origin.y;
-
-        Some(Bounds::from_corners(
-            bounds.origin + line_number_origin + start_origin,
-            // + line_height for show IME panel under the cursor line.
-            bounds.origin + line_number_origin + point(end_origin.x, end_origin.y + line_height),
-        ))
+        let affinity = range.is_empty() && range.start == self.cursor() && self.cursor_line_end_affinity;
+        let mut first_row = last_layout.range_bounds_with_affinity(&range, affinity).into_iter().next()?;
+        first_row.origin += bounds.origin;
+        Some(first_row)
     }
 
     fn character_index_for_point(
@@ -3970,13 +3948,21 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let last_layout = self.last_layout.as_ref()?;
-        let line_point = self.last_bounds?.localize(&point)?;
+        if !self.input_bounds.contains(&point) {
+            return None;
+        }
+        let line_point =
+            point - self.last_bounds?.origin - gpui::point(last_layout.line_number_width, px(0.));
+        let mut y = last_layout.visible_top;
 
         for (vi, line) in last_layout.lines.iter().enumerate() {
             let offset = last_layout.visible_line_byte_offsets[vi];
-            if let Some(utf8_index) = line.index_for_position(line_point, last_layout) {
+            if let Some(utf8_index) =
+                line.index_for_position(line_point - gpui::point(px(0.), y), last_layout)
+            {
                 return Some(self.offset_to_utf16(offset + utf8_index));
             }
+            y += line.size(last_layout.line_height).height;
         }
 
         None
@@ -4107,8 +4093,9 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
 mod tests {
     use super::*;
 
+    use crate::input::display_map::LineLayout;
     use crate::theme::Theme;
-    use gpui::{TestAppContext, VisualTestContext, size};
+    use gpui::{TestAppContext, TextRun, VisualTestContext, size};
 
     use crate::input::{EditorMode, EditorState, InputMode, LanguageConfig, TextareaMode};
 
@@ -4199,9 +4186,345 @@ mod tests {
         }
     }
 
+    #[track_caller]
+    fn g10_assert_bounds(actual: Bounds<Pixels>, expected: Bounds<Pixels>) {
+        for delta in [
+            actual.left() - expected.left(),
+            actual.right() - expected.right(),
+            actual.top() - expected.top(),
+            actual.bottom() - expected.bottom(),
+        ] {
+            assert!(delta.abs() < px(0.001), "{actual:?} != {expected:?}");
+        }
+    }
+
+    fn g10_layout(window: &Window, rows: &[&[&str]], align: TextAlign, justify: bool) -> LastLayout {
+        let style = window.text_style();
+        let mut offsets = Vec::new();
+        let mut offset = 0;
+        let lines = rows
+            .iter()
+            .map(|rows| {
+                offsets.push(offset);
+                let mut line = LineLayout::new().lines(
+                    rows.iter()
+                        .map(|text| {
+                            offset += text.len();
+                            window.text_system().shape_line(
+                                (*text).to_owned().into(),
+                                px(14.),
+                                &[TextRun {
+                                    len: text.len(),
+                                    font: style.font(),
+                                    color: style.color,
+                                    ..Default::default()
+                                }],
+                                None,
+                            )
+                        })
+                        .collect(),
+                );
+                offset += 1;
+                if justify {
+                    line.justify(px(240.));
+                }
+                line
+            })
+            .collect();
+        LastLayout {
+            visible_range: 0..rows.len(),
+            visible_buffer_lines: (0..rows.len()).collect(),
+            visible_line_byte_offsets: offsets,
+            visible_top: px(0.),
+            visible_range_offset: 0..offset - 1,
+            lines: Rc::new(lines),
+            line_height: px(20.),
+            wrap_width: Some(px(240.)),
+            wrapping_indent: WrappingIndent::None,
+            line_number_width: px(0.),
+            space_width: px(4.),
+            cursor_bounds: None,
+            text_align: align,
+            content_width: px(240.),
+        }
+    }
+
+    #[gpui::test]
+    fn g10_aligned_multiline_range_and_selection_share_row_extents(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state);
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, _| {
+                    for (align, justify) in
+                        [(TextAlign::Center, false), (TextAlign::Right, false), (TextAlign::Left, true)]
+                    {
+                        let layout = g10_layout(window, &[&["one two ", "three ", "four"]], align, justify);
+                        let origin = point(px(31.), px(43.));
+                        state.text = Rope::from("one two three four");
+                        state.last_bounds = Some(Bounds::new(origin, size(px(240.), px(200.))));
+                        state.last_layout = Some(layout.clone());
+                        let line = &layout.lines[0];
+                        let mut left = px(240.);
+                        let mut right = px(0.);
+                        let mut offset = 0;
+                        for (row, shaped) in line.wrapped_lines.iter().enumerate() {
+                            let x = LastLayout::alignment_offset(align, layout.content_width, shaped.width);
+                            left = left.min(x);
+                            right = right.max(x + shaped.width);
+                            let b = state.range_to_bounds(&(offset..offset + shaped.len)).unwrap();
+                            g10_assert_bounds(
+                                b,
+                                Bounds::new(origin + point(x, row * px(20.)), size(shaped.width, px(20.))),
+                            );
+                            offset += shaped.len;
+                        }
+                        let expected = Bounds::new(origin + point(left, px(0.)), size(right - left, px(60.)));
+                        g10_assert_bounds(state.range_to_bounds(&(0..offset)).unwrap(), expected);
+                        let path = super::super::element::TextElement::<TextareaMode>::layout_match_range(
+                            0..offset,
+                            &layout,
+                            &state.last_bounds.unwrap(),
+                        )
+                        .unwrap();
+                        g10_assert_bounds(path.bounds, expected);
+                    }
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn g10_native_empty_range_respects_the_current_wrap_end_affinity(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state);
+        view.window_handle.update(cx, |_, window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("one two three", window, cx);
+                let layout = g10_layout(window, &[&["one two ", "three"]], TextAlign::Right, false);
+                state.last_layout = Some(layout.clone());
+                state.set_selected_range(8..8, cx);
+                state.cursor_line_end_affinity = true;
+                let bounds = Bounds::new(point(px(30.), px(40.)), size(px(240.), px(100.)));
+                let expected = layout.lines[0].position_for_index(8, &layout, true).unwrap();
+                let actual = state.bounds_for_range(8..8, bounds, window, cx).unwrap();
+                assert_eq!(actual.origin, bounds.origin + expected);
+            });
+        }).unwrap();
+    }
+
+    #[gpui::test]
+    fn g10_unbreakable_word_exposes_its_full_horizontal_scroll_width(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state);
+        cx.simulate_window_resize(view.window_handle.into(), size(px(100.), px(250.)));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| view.input.update(cx, |state, cx| {
+            state.set_value("W".repeat(50), window, cx);
+            state.set_selected_range(50..50, cx);
+            state.focus(window, cx);
+        }));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let state = view.input.read(cx);
+            let layout = state.last_layout.as_ref().unwrap();
+            let width = layout.lines[0].size(layout.line_height).width;
+            assert!(width > state.input_bounds.size.width);
+            assert!(state.scroll_size.width >= width, "scroll={:?}, actual={width:?}", state.scroll_size.width);
+        });
+    }
+
+    #[gpui::test]
+    fn g10_ime_range_ends_on_its_wrapped_row(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state);
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    for align in [TextAlign::Center, TextAlign::Right] {
+                        let layout = g10_layout(window, &[&["one two ", "three"]], align, false);
+                        state.text = Rope::from("one two three");
+                        state.last_layout = Some(layout.clone());
+                        let bounds = Bounds::new(point(px(30.), px(40.)), size(px(240.), px(100.)));
+                        let expected = Bounds::new(
+                            bounds.origin
+                                + point(
+                                    LastLayout::alignment_offset(
+                                        align,
+                                        layout.content_width,
+                                        layout.lines[0].wrapped_lines[0].width,
+                                    ),
+                                    px(0.),
+                                ),
+                            size(layout.lines[0].wrapped_lines[0].width, px(20.)),
+                        );
+                        g10_assert_bounds(
+                            state.bounds_for_range(0..8, bounds, window, cx).unwrap(),
+                            expected,
+                        );
+                    }
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn g10_native_point_uses_visible_top_preceding_heights_scroll_and_utf16(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state);
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.text = Rope::from("hidden\nalpha beta\n😀中文");
+                    let mut layout =
+                        g10_layout(window, &[&["alpha ", "beta"], &["😀中文"]], TextAlign::Right, false);
+                    layout.visible_buffer_lines = vec![1, 2];
+                    layout.visible_range = 1..3;
+                    layout.visible_line_byte_offsets = vec![7, 18];
+                    layout.visible_range_offset = 7..state.text.len();
+                    layout.line_number_width = px(17.);
+                    for top in [40., 400.] {
+                        layout.visible_top = px(top);
+                        let origin = point(px(23.), px(25. - top));
+                        state.last_bounds = Some(Bounds::new(origin, size(px(280.), px(240.))));
+                        state.input_bounds = Bounds::new(point(px(13.), px(5.)), size(px(290.), px(220.)));
+                        state.last_layout = Some(layout.clone());
+                        for (line_index, byte, y) in [(0, 1, 0.), (0, 7, 20.), (1, 4, 40.)] {
+                            let line = &layout.lines[line_index];
+                            let p = line.position_for_index(byte, &layout, false).unwrap();
+                            let click = origin + point(p.x + px(17.) + px(0.1), px(top + y + 5.));
+                            let expected =
+                                state.offset_to_utf16(layout.visible_line_byte_offsets[line_index] + byte);
+                            assert_eq!(
+                                state.character_index_for_point(click, window, cx),
+                                Some(expected),
+                                "top {top}, line {line_index}, byte {byte}"
+                            );
+                        }
+                    }
+                });
+            })
+            .unwrap();
+    }
+
     #[test]
     fn hard_breaks_make_markup_nonempty() {
         assert!(!Markup { hard_breaks: vec![3..7], ..Default::default() }.is_empty());
+    }
+
+    #[gpui::test]
+    fn g10_inline_object_arrow_stops_and_native_composition(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::build_textarea(cx, |state| state.auto_grow(1, 100));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("😀$abc$乙\n末", window, cx);
+                state.set_markup(
+                    Markup { inline_objects: vec![(4..9, size(px(80.), px(64.)), 7)], ..Default::default() },
+                    cx,
+                );
+                assert_eq!(state.next_visible_boundary(4), 9);
+                assert_eq!(state.previous_visible_boundary(9), 4);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                let object = state.inline_object_bounds()[0].1;
+                assert_eq!(object.size, size(px(80.), px(64.)));
+                let following = state.range_to_bounds(&(13..16)).unwrap();
+                assert!(following.top() >= object.bottom());
+                let after = state.range_to_bounds(&(9..12)).unwrap();
+                assert_eq!(
+                    state.character_index_for_point(
+                        point(after.left() + px(0.1), after.center().y),
+                        window,
+                        cx
+                    ),
+                    Some(7)
+                );
+                let utf16 = state.range_to_utf16(&(9..12));
+                assert_eq!(utf16, 7..8);
+                assert_eq!(state.range_from_utf16(&utf16), 9..12);
+                let handle = state.focus_handle.clone();
+                state.replace_and_mark_text_in_range(Some(7..8), "ni", Some(2..2), window, cx);
+                assert_eq!(state.focus_handle, handle);
+                assert_eq!(state.text.to_string(), "😀$abc$ni\n末");
+                assert!(state.ime_marked_range.is_some());
+                state.replace_and_mark_text_in_range(None, "你", Some(1..1), window, cx);
+                assert_eq!(state.text.to_string(), "😀$abc$你\n末");
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn g10_pending_to_ready_object_metrics_reflow_without_replacing_input(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::build_textarea(cx, |state| state.auto_grow(1, 100));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.simulate_resize(size(px(300.), px(400.)));
+        let markup = |width, height| Markup {
+            inline_objects: vec![
+                (4..7, size(px(width), px(height)), 0),
+                (12..15, size(px(width), px(height)), 1),
+            ],
+            ..Default::default()
+        };
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("甲 $x$ 乙 $y$ 丙", window, cx);
+                state.set_selected_range(16..19, cx);
+                state.set_markup(markup(20., 16.), cx);
+            })
+        });
+        cx.run_until_parked();
+        let (rows, height) = view.input.read_with(&cx, |state, _| {
+            let layout = state.last_layout.as_ref().unwrap();
+            (
+                state.display_map.display_row_count(),
+                layout.lines.iter().map(|line| line.size(layout.line_height).height).sum::<Pixels>(),
+            )
+        });
+        cx.update(|_, cx| view.input.update(cx, |state, cx| state.set_markup(markup(180., 64.), cx)));
+        cx.run_until_parked();
+        view.input.read_with(&cx, |state, _| {
+            let count = state.display_map.display_row_count();
+            assert!(count > rows);
+            let layout = state.last_layout.as_ref().unwrap();
+            let actual = layout.lines.iter().map(|line| line.size(layout.line_height).height).sum::<Pixels>();
+            assert!(actual > height);
+            assert_eq!(state.display_row_top(count, layout.line_height), actual);
+            assert_eq!(state.selected_range(), 16..19);
+            assert_eq!(state.value(), "甲 $x$ 乙 $y$ 丙");
+            assert_eq!(state.inline_object_bounds().len(), 2);
+            for (_, bounds) in state.inline_object_bounds() {
+                assert_eq!(bounds.size, size(px(180.), px(64.)));
+            }
+            assert!(state.inline_object_bounds()[1].1.top() >= state.inline_object_bounds()[0].1.bottom());
+        });
+    }
+
+    #[gpui::test]
+    fn g10_vertical_navigation_crosses_tall_inline_object_row(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::build_textarea(cx, |state| state.auto_grow(1, 100));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("甲$x$<br>乙", window, cx);
+                state.set_markup(
+                    Markup {
+                        conceal: vec![6..10],
+                        hard_breaks: vec![6..10],
+                        inline_objects: vec![(3..6, size(px(40.), px(64.)), 0)],
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            })
+        });
+        cx.run_until_parked();
+        view.input.read_with(&cx, |state, _| {
+            assert_eq!(state.vertical_target(0, Some((px(0.), 0)), false, 1).0, 10);
+            assert_eq!(state.vertical_target(10, Some((px(0.), 0)), false, -1).0, 0);
+        });
     }
 
     #[gpui::test]
@@ -5103,12 +5426,9 @@ mod tests {
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         cx.update(|window, cx| {
             input_view.input.update(cx, |state, cx| {
-                for symbol in [
-                    "\u{1F44D}\u{1F3FD}",
-                    "\u{1F469}\u{200D}\u{1F4BB}",
-                    "\u{1F1E8}\u{1F1F3}",
-                    "e\u{301}",
-                ] {
+                for symbol in
+                    ["\u{1F44D}\u{1F3FD}", "\u{1F469}\u{200D}\u{1F4BB}", "\u{1F1E8}\u{1F1F3}", "e\u{301}"]
+                {
                     let text = format!("a{symbol}z");
                     let end = 1 + symbol.len();
                     state.set_value(text.clone(), window, cx);

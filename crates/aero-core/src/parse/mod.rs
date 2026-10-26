@@ -290,10 +290,16 @@ impl<'t> Cx<'t> {
 
     fn convert_node<'a>(&mut self, node: &'a AstNode<'a>, parent: &Range<usize>) -> Option<ParsedBlock> {
         let ast = node.data();
-        let Some(raw_range) = self.sourcepos_range(ast.sourcepos) else {
+        let Some(mut raw_range) = self.sourcepos_range(ast.sourcepos) else {
             self.report.dropped += 1;
             return None;
         };
+        // Directive closure can leave parent end positions before their actual children.
+        for child in node.descendants().skip(1) {
+            if let Some(range) = self.sourcepos_range(child.data().sourcepos) {
+                raw_range.end = raw_range.end.max(range.end);
+            }
+        }
         let range = self.sanitize(raw_range, parent, &ast.value);
         let attrs = ast
             .attrs
@@ -603,6 +609,28 @@ mod tests {
             kinds(text),
             [BlockKind::Paragraph, BlockKind::FootnoteDefinition { name: "1".into() }, BlockKind::Paragraph,]
         );
+    }
+
+    #[test]
+    fn directive_closer_does_not_truncate_the_last_list_paragraph() {
+        for body in ["second item", "列表第二项"] {
+            let source = format!(":::highlight\n- {body}\n:::\n");
+            let parsed = parse(&source);
+            let paragraphs = ParsedBlock::iter(&parsed.blocks)
+                .filter(|(_, b)| b.kind == BlockKind::Paragraph)
+                .map(|(_, b)| &source[b.range.clone()])
+                .collect::<Vec<_>>();
+            let arena = comrak::Arena::new();
+            let root = comrak::parse_document(&arena, &source, &comrak_options());
+            let positions = root
+                .descendants()
+                .map(|n| {
+                    let data = n.data();
+                    (format!("{:?}", data.value), data.sourcepos)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(paragraphs, [body], "{positions:?}; {parsed:?}");
+        }
     }
 
     #[test]

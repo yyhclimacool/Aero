@@ -3,12 +3,13 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use gpui::{
-    App, Boundary, Font, FontStyle, FontWeight, Pixels, Point, ShapedLine, SharedString, Size, TextAlign,
-    TextRun, Window, WindowTextSystem, point, px, size,
+    App, Boundary, Bounds, Font, FontStyle, FontWeight, Pixels, Point, ShapedLine, SharedString, Size,
+    TextAlign, TextRun, Window, WindowTextSystem, point, px, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
 use sum_tree::{Bias, Dimensions, SumTree};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::input::{
     Point as TreeSitterPoint, RopeExt,
@@ -141,6 +142,7 @@ pub(crate) struct FontOverride {
     pub(crate) weight: Option<FontWeight>,
     pub(crate) style: Option<FontStyle>,
     pub(crate) family: Option<SharedString>,
+    pub(crate) object: Option<Size<Pixels>>,
 }
 
 /// Shapes whole display lines. Characters are not measured one at a time: an isolated `，`
@@ -201,12 +203,8 @@ fn batch_x_for_indices<'a>(
         .collect()
 }
 
-/// Same break rules as GPUI's `LineWrapper::wrap_line`, over pre-measured characters, plus
-/// East Asian line-breaking (kinsoku): a line never starts with closing punctuation such as
-/// `。`, `，` or `」`, and never ends with opening punctuation such as `「` or `（`. The
-/// character that would be orphaned moves to the next line together with its neighbor.
-///
-/// `chars` are `(byte index in the line, char, width)` of the drawn characters.
+/// Wrap measured graphemes at word/CJK opportunities, allowing unbreakable runs to overflow.
+/// `chars` holds each grapheme's source byte index, first character, and measured width.
 fn wrap_chars(chars: &[(usize, char, Pixels)], space: Pixels, wrap_width: Pixels) -> Vec<Boundary> {
     const MAX_INDENT: u32 = 256;
     let mut out = Vec::new();
@@ -221,8 +219,7 @@ fn wrap_chars(chars: &[(usize, char, Pixels)], space: Pixels, wrap_width: Pixels
         if c == '\n' {
             continue;
         }
-        let opportunity = if is_word_char(c) { prev_c == ' ' && c != ' ' } else { c != ' ' };
-        if opportunity && first_non_whitespace.is_some() && !no_break_before(c) && !no_break_after(prev_c) {
+        if legal_break(prev_c, c) && first_non_whitespace.is_some() {
             last_candidate = k;
             last_candidate_width = width;
         }
@@ -230,17 +227,12 @@ fn wrap_chars(chars: &[(usize, char, Pixels)], space: Pixels, wrap_width: Pixels
             first_non_whitespace = Some(k);
         }
         width += item_width;
-        if width > wrap_width && k > last_wrap {
+        if width > wrap_width && last_candidate > last_wrap {
             if let (None, Some(first)) = (indent, first_non_whitespace) {
                 indent = Some(MAX_INDENT.min((first - last_wrap) as u32));
             }
-            if last_candidate > last_wrap {
-                last_wrap = last_candidate;
-                width -= last_candidate_width;
-            } else {
-                last_wrap = k;
-                width = item_width;
-            }
+            last_wrap = last_candidate;
+            width -= last_candidate_width;
             last_candidate = 0;
             if let Some(indent) = indent {
                 width += space * indent as f32;
@@ -252,9 +244,22 @@ fn wrap_chars(chars: &[(usize, char, Pixels)], space: Pixels, wrap_width: Pixels
     out
 }
 
+fn legal_break(left: char, right: char) -> bool {
+    !right.is_whitespace()
+        && !matches!(left, '\u{00a0}' | '\u{202f}' | '\u{2011}')
+        && !no_break_after(left)
+        && !no_break_before(right)
+        && (left.is_whitespace() || !is_word_char(right) || !is_word_char(left))
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x3400..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x323af
+        | 0x3040..=0x30ff | 0xac00..=0xd7af)
+}
+
 /// Characters GPUI keeps attached to the previous word.
 fn is_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
+    (c.is_alphanumeric() && !is_cjk(c))
         || matches!(c, '\u{00C0}'..='\u{024F}' | '\u{0400}'..='\u{04FF}' | '\u{1E00}'..='\u{1EFF}')
         || matches!(c, '\u{0300}'..='\u{036F}' | '\u{0980}'..='\u{09FF}')
         || matches!(
@@ -514,15 +519,15 @@ impl TextWrapper {
         let fonts: SmallVec<[&(Range<usize>, FontOverride); 4]> =
             fonts.iter().filter(|(range, _)| overlaps(range)).collect();
 
-        let mut display = String::with_capacity(line.len());
+        let objects: Vec<_> = fonts
+            .iter()
+            .filter_map(|(range, font)| font.object.map(|size| (range.clone(), size, 0)))
+            .collect();
+        let conceal: Vec<_> = conceal.into_iter().cloned().collect();
+        let (display, map) = ConcealMap::present(line, line_start, &conceal, &objects);
         let mut runs: Vec<TextRun> = Vec::new();
-        // (byte index in `line`, char, byte index in `display`)
-        let mut drawn = Vec::with_capacity(line.len());
-        for (i, ch) in line.char_indices() {
-            let abs = line_start + i;
-            if conceal.iter().any(|range| range.contains(&abs)) {
-                continue;
-            }
+        for (at, ch) in display.char_indices() {
+            let abs = line_start + map.to_buffer(at);
             let font =
                 measure.font(fonts.iter().filter(|(range, _)| range.contains(&abs)).map(|(_, font)| font));
             match runs.last_mut() {
@@ -531,25 +536,35 @@ impl TextWrapper {
                     len: ch.len_utf8(),
                     font,
                     color: gpui::black(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
+                    ..Default::default()
                 }),
             }
-            drawn.push((i, ch, display.len()));
-            display.push(ch);
         }
         if display.is_empty() {
             return Vec::new();
         }
+        let drawn: Vec<_> = display
+            .grapheme_indices(true)
+            .map(|(at, cluster)| (map.to_buffer(at), cluster.chars().next().unwrap(), at))
+            .collect();
         let layout = measure.text.layout_line(&display, measure.font_size, &runs, None);
         let positions = batch_x_for_indices(
             layout.runs.iter().flat_map(|run| run.glyphs.iter()),
             layout.width,
             drawn.iter().map(|&(_, _, at)| at).chain(std::iter::once(display.len())),
         );
-        let chars: Vec<(usize, char, Pixels)> =
-            drawn.iter().zip(positions.windows(2)).map(|(&(i, ch, _), xs)| (i, ch, xs[1] - xs[0])).collect();
+        let chars: Vec<(usize, char, Pixels)> = drawn
+            .iter()
+            .zip(positions.windows(2))
+            .map(|(&(i, ch, at), xs)| {
+                let width = map
+                    .objects
+                    .iter()
+                    .find(|(r, _, _)| r.start == at)
+                    .map_or(xs[1] - xs[0], |(_, size, _)| size.width);
+                (i, ch, width)
+            })
+            .collect();
         wrap_chars(&chars, measure.space(), wrap_width)
     }
 
@@ -848,11 +863,87 @@ pub(crate) struct ConcealMap {
     to_buffer: Vec<usize>,
     /// This segment ends in a concealed newline, not a shared soft-wrap boundary.
     hard_break: bool,
+    objects: Vec<(Range<usize>, Size<Pixels>, u64)>,
 }
 
 impl ConcealMap {
     pub(crate) fn new(to_display: Vec<usize>, to_buffer: Vec<usize>) -> Self {
-        Self { to_display, to_buffer, hard_break: false }
+        Self { to_display, to_buffer, hard_break: false, objects: Vec::new() }
+    }
+
+    pub(crate) fn present(
+        source: &str,
+        start: usize,
+        conceal: &[Range<usize>],
+        objects: &[(Range<usize>, Size<Pixels>, u64)],
+    ) -> (String, Self) {
+        let mut display = String::new();
+        let mut map = Self::new(vec![0; source.len() + 1], vec![0]);
+        let mut i = 0;
+        while i < source.len() {
+            let abs = start + i;
+            let object = objects.iter().find(|(r, _, _)| {
+                r.start == abs
+                    && r.end > abs
+                    && r.end <= start + source.len()
+                    && source.is_char_boundary(r.end - start)
+            });
+            let (n, ch) = match object {
+                Some((range, _, _)) => (range.end - abs, '\u{fffc}'),
+                None => {
+                    let ch = source[i..].chars().next().unwrap();
+                    (ch.len_utf8(), ch)
+                }
+            };
+            let at = display.len();
+            map.to_display[i..i + n].fill(at);
+            if object.is_some() || !conceal.iter().any(|r| r.contains(&abs)) {
+                display.push(ch);
+                map.to_buffer.resize(display.len() + 1, i);
+                map.to_buffer[at..display.len()].fill(i);
+                map.to_buffer[display.len()] = i + n;
+                if let Some((_, size, key)) = object {
+                    map.objects.push((at..display.len(), *size, *key));
+                }
+            }
+            i += n;
+        }
+        map.to_display[source.len()] = display.len();
+        (display, map)
+    }
+
+    pub(crate) fn apply_objects(&self, line: &mut ShapedLine) {
+        if self.objects.is_empty() {
+            return;
+        }
+        let deltas: Vec<_> = self
+            .objects
+            .iter()
+            .map(|(r, size, _)| (r.end, size.width - (line.x_for_index(r.end) - line.x_for_index(r.start))))
+            .collect();
+        let mut layout = gpui::LineLayout {
+            len: line.len,
+            font_size: line.font_size,
+            width: line.width,
+            ascent: line.ascent,
+            descent: line.descent,
+            runs: line.runs.clone(),
+        };
+        for run in &mut layout.runs {
+            for glyph in &mut run.glyphs {
+                glyph.position.x += deltas
+                    .iter()
+                    .filter(|(end, _)| *end <= glyph.index)
+                    .map(|(_, delta)| *delta)
+                    .sum::<Pixels>();
+            }
+        }
+        layout.width += deltas.iter().map(|(_, delta)| *delta).sum::<Pixels>();
+        *std::ops::DerefMut::deref_mut(line) = std::sync::Arc::new(layout);
+    }
+
+    pub(crate) fn set_empty_offset(&mut self, offset: usize) {
+        self.to_buffer[0] = offset;
     }
 
     pub(crate) fn with_hard_break(mut self, hard_break: bool) -> Self {
@@ -875,13 +966,6 @@ impl ConcealMap {
 
 impl LineLayout {
     pub(crate) fn justify(&mut self, width: Pixels) {
-        use unicode_segmentation::UnicodeSegmentation;
-        let cjk = |c: char| {
-            matches!(c as u32, 0x3400..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x323af
-            | 0x3040..=0x30ff | 0xac00..=0xd7af)
-        };
-        let opening = |c: char| "（《〈「『【〔［｛([{".contains(c);
-        let closing = |c: char| "，。！？；：、）》〉」』】〕］｝,.;:!?)]}".contains(c);
         let count = self.wrapped_lines.len();
         for i in 0..count.saturating_sub(1) {
             if self.conceal.get(i).and_then(|m| m.as_ref()).is_some_and(|m| m.hard_break) {
@@ -899,17 +983,9 @@ impl LineLayout {
             for pair in clusters.windows(2) {
                 let (at, left) = pair[0];
                 let (next, right) = pair[1];
-                let a = left.chars().last().unwrap();
+                let a = left.chars().next().unwrap();
                 let b = right.chars().next().unwrap();
-                if (left == " " && at > 0 && !right.chars().all(char::is_whitespace))
-                    || ((cjk(a) || cjk(b))
-                        && !opening(a)
-                        && !closing(b)
-                        && !a.is_whitespace()
-                        && !b.is_whitespace()
-                        && left.chars().count() == 1
-                        && right.chars().count() == 1)
-                {
+                if legal_break(a, b) && (!a.is_whitespace() || at > 0) {
                     gaps.push(next);
                 }
             }
@@ -1024,6 +1100,85 @@ impl LineLayout {
             .unwrap_or_else(|| if line_index == 0 { px(0.) } else { self.wrap_indent })
     }
 
+    fn row_offset(&self, row: usize, align: TextAlign, width: Pixels) -> Pixels {
+        let indent = self.line_indent(row);
+        indent + LastLayout::alignment_offset(align, width, indent + self.wrapped_lines[row].width)
+    }
+
+    pub(crate) fn row_height(&self, row: usize, base: Pixels) -> Pixels {
+        self.conceal
+            .get(row)
+            .and_then(|map| map.as_ref())
+            .map_or(base, |map| map.objects.iter().map(|(_, size, _)| size.height).fold(base, Pixels::max))
+    }
+
+    pub(crate) fn row_top(&self, row: usize, base: Pixels) -> Pixels {
+        row * base
+            + self
+                .conceal
+                .iter()
+                .take(row)
+                .flatten()
+                .map(|map| map.objects.iter().map(|(_, size, _)| size.height).fold(base, Pixels::max) - base)
+                .sum::<Pixels>()
+    }
+
+    pub(crate) fn row_at_y(&self, y: Pixels, base: Pixels) -> usize {
+        let mut bottom = px(0.);
+        for row in 0..self.wrapped_lines.len() {
+            bottom += self.row_height(row, base);
+            if y < bottom {
+                return row;
+            }
+        }
+        self.wrapped_lines.len().saturating_sub(1)
+    }
+
+    pub(crate) fn object_bounds(&self, layout: &LastLayout) -> Vec<(u64, Bounds<Pixels>)> {
+        let mut out = Vec::new();
+        for (row, map) in self.conceal.iter().enumerate() {
+            if let Some(map) = map {
+                for (range, size, key) in &map.objects {
+                    let x = self.row_offset(row, layout.text_align, layout.content_width)
+                        + self.wrapped_lines[row].x_for_index(range.start);
+                    let y = self.row_top(row, layout.line_height)
+                        + (self.row_height(row, layout.line_height) - size.height).half();
+                    out.push((*key, Bounds::new(point(x, y), *size)));
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn range_bounds(&self, range: Range<usize>, layout: &LastLayout) -> Vec<Bounds<Pixels>> {
+        self.range_bounds_with_affinity(range, layout, false)
+    }
+
+    pub(crate) fn range_bounds_with_affinity(&self, range: Range<usize>, layout: &LastLayout, affinity: bool) -> Vec<Bounds<Pixels>> {
+        if range.start > self.len() || range.end < range.start {
+            return Vec::new();
+        }
+        let Some(start) = self.position_for_index(range.start, layout, range.is_empty() && affinity) else {
+            return Vec::new();
+        };
+        let Some(end) = self.position_for_index(range.end.min(self.len()), layout, !range.is_empty() || affinity) else {
+            return Vec::new();
+        };
+        let first = self.row_at_y(start.y, layout.line_height);
+        let last = self.row_at_y(end.y, layout.line_height);
+        (first..=last)
+            .map(|row| {
+                let left = self.row_offset(row, layout.text_align, layout.content_width);
+                let start_x = if row == first { start.x } else { left };
+                let end_x = if row == last { end.x } else { left + self.wrapped_lines[row].width };
+                Bounds::from_corners(
+                    point(start_x.min(end_x), self.row_top(row, layout.line_height)),
+                    point(start_x.max(end_x), self.row_top(row + 1, layout.line_height)),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn lines(mut self, wrapped_lines: SmallVec<[ShapedLine; 1]>) -> Self {
         self.set_wrapped_lines(wrapped_lines);
         self
@@ -1102,15 +1257,14 @@ impl LineLayout {
                 let local = offset.saturating_sub(acc_len);
                 let display = self.display_index(i, local);
                 let x = line.x_for_index(display)
-                    + last_layout.alignment_offset(line.width)
-                    + self.line_indent(i);
+                    + self.row_offset(i, last_layout.text_align, last_layout.content_width);
                 return Some(point(x, offset_y));
             }
 
             // Always advance by the buffer length. The last line gets +1 so the
             // cursor can be placed after the final character.
             acc_len += if is_last { buf_len + 1 } else { buf_len };
-            offset_y += last_layout.line_height;
+            offset_y += self.row_height(i, last_layout.line_height);
         }
 
         None
@@ -1124,10 +1278,9 @@ impl LineLayout {
     pub(crate) fn closest_index_for_x(&self, x: Pixels, last_layout: &LastLayout) -> usize {
         let mut acc_len = 0;
         for (i, line) in self.wrapped_lines.iter().enumerate() {
-            let x = x - last_layout.alignment_offset(line.width);
-            let line_indent = self.line_indent(i);
-            if x <= line_indent + line.width {
-                let display = line.closest_index_for_x(x - line_indent);
+            let x = x - self.row_offset(i, last_layout.text_align, last_layout.content_width);
+            if x <= line.width {
+                let display = line.closest_index_for_x(x);
                 return acc_len + self.buffer_index(i, display);
             }
             acc_len += self.segment_buffer_len(i);
@@ -1147,13 +1300,13 @@ impl LineLayout {
     ) -> Option<(usize, usize, Pixels)> {
         let mut offset = 0;
         let mut line_top = px(0.);
-        for (i, line) in self.wrapped_lines.iter().enumerate() {
-            let line_bottom = line_top + last_layout.line_height;
+        for i in 0..self.wrapped_lines.len() {
+            let line_bottom = line_top + self.row_height(i, last_layout.line_height);
             if pos.y >= line_top && pos.y < line_bottom {
                 return Some((
                     i,
                     offset,
-                    pos.x - last_layout.alignment_offset(line.width) - self.line_indent(i),
+                    pos.x - self.row_offset(i, last_layout.text_align, last_layout.content_width),
                 ));
             }
 
@@ -1233,7 +1386,7 @@ impl LineLayout {
             .map(|(ix, line)| line.width + self.line_indent(ix))
             .max()
             .unwrap_or(self.longest_width);
-        size(width, self.wrapped_lines.len() * line_height)
+        size(width, self.row_top(self.wrapped_lines.len(), line_height))
     }
 
     /// Paint only the glyph background quads of this line.
@@ -1257,10 +1410,13 @@ impl LineLayout {
 
         for (ix, line) in self.wrapped_lines.iter().enumerate() {
             _ = line.paint_background(
-                pos + point(self.line_indent(ix), ix * line_height),
-                line_height,
-                text_align,
-                align_width,
+                pos + point(
+                    self.row_offset(ix, text_align, align_width.unwrap_or(line.width)),
+                    self.row_top(ix, line_height),
+                ),
+                self.row_height(ix, line_height),
+                TextAlign::Left,
+                None,
                 window,
                 cx,
             );
@@ -1278,10 +1434,13 @@ impl LineLayout {
     ) {
         for (ix, line) in self.wrapped_lines.iter().enumerate() {
             _ = line.paint(
-                pos + point(self.line_indent(ix), ix * line_height),
-                line_height,
-                text_align,
-                align_width,
+                pos + point(
+                    self.row_offset(ix, text_align, align_width.unwrap_or(line.width)),
+                    self.row_top(ix, line_height),
+                ),
+                self.row_height(ix, line_height),
+                TextAlign::Left,
+                None,
                 window,
                 cx,
             );
@@ -1293,11 +1452,24 @@ impl LineLayout {
                 let invisible = if *is_tab { indicators.tab.clone() } else { indicators.space.clone() };
 
                 let origin = point(
-                    pos.x + *x_position + self.line_indent(*line_index),
-                    pos.y + *line_index as f32 * line_height,
+                    pos.x
+                        + *x_position
+                        + self.row_offset(
+                            *line_index,
+                            text_align,
+                            align_width.unwrap_or(self.wrapped_lines[*line_index].width),
+                        ),
+                    pos.y + self.row_top(*line_index, line_height),
                 );
 
-                _ = invisible.paint(origin, line_height, text_align, align_width, window, cx);
+                _ = invisible.paint(
+                    origin,
+                    self.row_height(*line_index, line_height),
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             }
         }
     }
@@ -1450,13 +1622,17 @@ mod tests {
             })
             .collect();
             let layout = measure.text.layout_line(display, measure.font_size, &runs, None);
-            let visible_source = source.char_indices().filter(|&(_, ch)| ch != '*' && ch != '~');
+            let visible_source = source.grapheme_indices(true).filter(|&(_, ch)| ch != "*" && ch != "~");
             let chars: Vec<_> = display
-                .char_indices()
+                .grapheme_indices(true)
                 .zip(visible_source)
-                .map(|((at, ch), (source_at, source_ch))| {
-                    assert_eq!(ch, source_ch);
-                    (source_at, ch, layout.x_for_index(at + ch.len_utf8()) - layout.x_for_index(at))
+                .map(|((at, cluster), (source_at, source_cluster))| {
+                    assert_eq!(cluster, source_cluster);
+                    (
+                        source_at,
+                        cluster.chars().next().unwrap(),
+                        layout.x_for_index(at + cluster.len()) - layout.x_for_index(at),
+                    )
                 })
                 .collect();
             let conceal: Vec<_> = source
@@ -1485,6 +1661,168 @@ mod tests {
                 .is_empty()
             );
         });
+    }
+
+    #[gpui::test]
+    fn g10_presented_wrap_keeps_graphemes_and_words_atomic(cx: &mut gpui::TestAppContext) {
+        use unicode_segmentation::UnicodeSegmentation;
+        cx.update(|cx| {
+            let measure = Measure {
+                text: WindowTextSystem::new(cx.text_system().clone()),
+                base: test_font(),
+                font_size: px(14.),
+            };
+            for atom in ["👍🏽", "👩‍💻", "🇨🇳", "e\u{301}clair", "unbreakableEnglishword", "Καλημέρα"]
+            {
+                let source = format!("**{atom}** tail");
+                let conceal = vec![0..2, 2 + atom.len()..4 + atom.len()];
+                let breaks = TextWrapper::wrap_presented_line(&measure, &source, 0, &conceal, &[], px(1.));
+                assert_eq!(
+                    breaks.iter().map(|b| b.ix).collect::<Vec<_>>(),
+                    vec![source.find("tail").unwrap()],
+                    "{source}"
+                );
+                assert!(breaks.iter().all(|b| source.grapheme_indices(true).any(|(at, _)| at == b.ix)));
+            }
+        });
+    }
+
+    #[test]
+    fn g10_justify_uses_legal_gaps_and_leaves_hard_break_rows_left() {
+        let row = |text: &str| {
+            let glyphs: Vec<_> =
+                text.grapheme_indices(true).enumerate().map(|(i, (at, _))| (at, i as f32 * 10.)).collect();
+            let mut row = ShapedLine::default();
+            row.text = text.to_owned().into();
+            *std::ops::DerefMut::deref_mut(&mut row) =
+                std::sync::Arc::new(glyph_layout(&[&glyphs], text.len(), 30.));
+            row
+        };
+        let mut layout = LineLayout::new()
+            .lines(smallvec::smallvec![row("甲ぁ乙"), row("甲 乙"), row("末")])
+            .with_conceal(vec![
+                None,
+                Some(ConcealMap::new((0..=7).collect(), (0..=7).collect()).with_hard_break(true)),
+                None,
+            ]);
+        layout.justify(px(100.));
+        assert_eq!(layout.wrapped_lines[0].x_for_index(3), px(10.), "small kana stays attached");
+        assert_eq!(layout.wrapped_lines[0].x_for_index(6), px(90.));
+        assert_eq!(layout.wrapped_lines[1].width, px(30.), "hard-break final row");
+        assert_eq!(layout.wrapped_lines[2].width, px(30.), "paragraph final row");
+    }
+
+    #[gpui::test]
+    fn g10_inline_objects_wrap_atomically_and_reflow_on_resize(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let source = "甲 $abcdefgh$ 乙 $x$ 丙";
+            let mut wrapper = TextWrapper::new(test_font(), px(16.), Some(px(90.)));
+            wrapper.prepare_if_need(&Rope::from(source), cx);
+            let objects = [(4..14, size(px(75.), px(42.))), (19..22, size(px(65.), px(18.)))];
+            let fonts = objects
+                .iter()
+                .map(|(range, size)| {
+                    (range.clone(), FontOverride { object: Some(*size), ..Default::default() })
+                })
+                .collect();
+            wrapper.set_conceal(vec![], vec![], fonts, cx);
+            let rows = &wrapper.line(0).unwrap().wrapped_lines;
+            assert!(rows.len() >= 3, "measured objects must consume wrap width: {rows:?}");
+            for (object, _) in &objects {
+                assert!(rows.iter().any(|row| row.start <= object.start && row.end >= object.end));
+                assert!(!rows.iter().any(|row| object.start < row.end && row.end < object.end));
+            }
+            let before = rows.len();
+            wrapper.set_conceal(
+                vec![],
+                vec![],
+                objects
+                    .iter()
+                    .map(|(range, _)| {
+                        (
+                            range.clone(),
+                            FontOverride { object: Some(size(px(5.), px(16.))), ..Default::default() },
+                        )
+                    })
+                    .collect(),
+                cx,
+            );
+            assert!(wrapper.line(0).unwrap().wrapped_lines.len() < before);
+        });
+    }
+
+    #[gpui::test]
+    fn g10_object_rows_share_alignment_selection_and_actual_height(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let text = WindowTextSystem::new(cx.text_system().clone());
+            for (align, justify) in
+                [(TextAlign::Center, false), (TextAlign::Right, false), (TextAlign::Left, true)]
+            {
+                let (display, map) =
+                    ConcealMap::present("前 $x$ 后", 0, &[], &[(4..7, size(px(80.), px(48.)), 42)]);
+                let mut shaped = text.shape_line(
+                    display.clone().into(),
+                    px(16.),
+                    &[TextRun {
+                        len: display.len(),
+                        font: test_font(),
+                        color: gpui::black(),
+                        ..Default::default()
+                    }],
+                    None,
+                );
+                map.apply_objects(&mut shaped);
+                let final_row = text.shape_line(
+                    "末".into(),
+                    px(16.),
+                    &[TextRun { len: 3, font: test_font(), color: gpui::black(), ..Default::default() }],
+                    None,
+                );
+                let mut line = LineLayout::new()
+                    .lines(smallvec::smallvec![shaped, final_row])
+                    .with_conceal(vec![Some(map), None]);
+                if justify {
+                    line.justify(px(240.));
+                }
+                let mut layout = test_last_layout(px(20.));
+                layout.content_width = px(240.);
+                layout.text_align = align;
+                assert_eq!(line.size(px(20.)).height, px(68.));
+                let rect = line.object_bounds(&layout)[0].1;
+                assert_eq!(rect.size, size(px(80.), px(48.)));
+                assert_eq!(line.position_for_index(4, &layout, false).unwrap().x, rect.left());
+                assert_eq!(line.position_for_index(11, &layout, false).unwrap().y, px(48.));
+                assert_eq!(
+                    line.closest_index_for_position(rect.origin + point(px(2.), px(22.)), &layout).unwrap().0,
+                    4
+                );
+                assert_eq!(line.range_bounds(4..7, &layout)[0].size.height, px(48.));
+            }
+        });
+    }
+
+    #[test]
+    fn g10_object_source_mapping_keeps_utf8_edges() {
+        let (display, map) = ConcealMap::present("😀$abc$乙", 0, &[], &[(4..9, size(px(80.), px(44.)), 7)]);
+        assert_eq!(display, "😀\u{fffc}乙");
+        for at in 4..9 {
+            assert_eq!(map.to_display(at), 4);
+        }
+        assert_eq!(map.to_display(9), 7);
+        assert_eq!(map.to_buffer(4), 4);
+        assert_eq!(map.to_buffer(7), 9);
+        assert_eq!(map.to_buffer(display.len()), 12);
+    }
+
+    #[test]
+    fn g10_overflow_waits_for_legal_cjk_punctuation_break() {
+        for (source, expected) in
+            [("「甲」乙", vec![9]), ("甲，乙。丙", vec![6, 12]), ("longword next", vec![9])]
+        {
+            let chars: Vec<_> = source.char_indices().map(|(at, c)| (at, c, px(10.))).collect();
+            let breaks = wrap_chars(&chars, px(10.), px(1.));
+            assert_eq!(breaks.iter().map(|b| b.ix).collect::<Vec<_>>(), expected, "{source}");
+        }
     }
 
     #[test]
@@ -2210,6 +2548,21 @@ mod tests {
         let line = wrapper.line(0).unwrap();
         assert_eq!(line.indent, 0);
         assert_eq!(line.wrapped_lines.as_slice(), [0..5, 5..13, 13..21, 21..24]);
+    }
+
+    #[test]
+    fn g10_row_alignment_reserves_continuation_indent_once() {
+        let mut row = ShapedLine::default();
+        *std::ops::DerefMut::deref_mut(&mut row) = std::sync::Arc::new(glyph_layout(&[&[(0, 0.)]], 1, 30.));
+        let line = LineLayout::new().lines(smallvec::smallvec![row.clone(), row]).wrap_indent(px(20.));
+        for (align, expected) in [(TextAlign::Center, px(45.)), (TextAlign::Right, px(70.))] {
+            let mut context = test_last_layout(px(20.));
+            context.content_width = px(100.);
+            context.text_align = align;
+            let position = line.position_for_index(1, &context, false).unwrap();
+            assert_eq!(position, point(expected, px(20.)));
+            assert_eq!(line.closest_index_for_position(position, &context), Some((1, false)));
+        }
     }
 
     #[test]

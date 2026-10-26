@@ -173,6 +173,8 @@ fn place_preview(
 /// 悬停预览要渲染的 Markdown。整篇只取大约前 300 个字符（按纯文本计，不切开一个字符）；
 /// 标题 / `^块` 取整个片段。front matter 不在叶子里，不会出现。
 fn excerpt(doc: &Document, fragment: Option<&str>) -> Result<String, String> {
+    #[cfg(test)]
+    tests::EXCERPT_ANALYSES.with(|count| count.set(count.get() + 1));
     let range = fragment_range(doc, fragment)?;
     let leaves: Vec<_> = aero_core::index::indexable_leaves(doc)
         .into_iter()
@@ -270,6 +272,7 @@ impl Editor {
         // 保存 / watch 通知也包括目标正文变化，不能只比较目录中的路径和别名。
         self.invalidate_fragment_marks();
         // 目录一变，之前"解析不到"的嵌入可能就能解析了
+        self.embeds.clear_content();
         self.refresh_embeds(cx);
         let hovered = self.link_preview.hovered.clone();
         let scroll_at_hover = self.link_preview.scroll_at_hover;
@@ -532,6 +535,16 @@ impl Editor {
         }
     }
 
+    pub(super) fn refresh_reference_hover(&mut self, ready: bool, cx: &mut Context<Self>) {
+        if self.link_preview.hovered.as_ref().is_some_and(|(url, _)|
+            aero_core::links::decode_note_url(url).is_some_and(|(_, fragment)|
+                fragment.as_deref().is_some_and(|fragment| fragment.starts_with('^'))))
+        {
+            self.close_link_popup(cx);
+            if ready { self.schedule_link_preview(cx); }
+        }
+    }
+
     fn schedule_link_preview(&mut self, cx: &mut Context<Self>) {
         let delay = match preview_mode(cx) {
             LinkPreviewMode::Hover => Duration::from_millis(500),
@@ -617,6 +630,22 @@ impl Editor {
                 }
             });
         };
+        if fragment.as_deref().is_some_and(|fragment| fragment.starts_with('^')) {
+            if let Some(view) = self.live_embed(&target, fragment.as_deref(), None, cx) {
+                let popup = match view {
+                    embeds_ui::EmbedView::Ready { path, title, source, .. } => Popup {
+                        title: title.to_string(), body: source.to_string(), rich: true, origin: Some(path), bounds,
+                    },
+                    embeds_ui::EmbedView::Failed(error) => Popup {
+                        title: target, body: error.to_string(), rich: false, origin: None, bounds,
+                    },
+                    embeds_ui::EmbedView::Loading => Popup {
+                        title: target, body: "正在载入引用…".into(), rich: false, origin: None, bounds,
+                    },
+                };
+                return cx.background_spawn(async move { popup });
+            }
+        }
         let resolution = if target.is_empty() {
             Resolution::Resolved { path: self.path.clone(), fragment }
         } else if let Some(resolver) = &self.link_preview.resolver {
@@ -826,6 +855,54 @@ mod tests {
         sync::{Arc, atomic::Ordering},
         time::Duration,
     };
+
+    thread_local! {
+        pub(super) static EXCERPT_ANALYSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[gpui_kit::test]
+    fn g08_reference_hover_refreshes_after_source_generation_changes(cx: &mut TestAppContext) {
+        let (_dir, vault, _, editor) = super::super::tests::open(cx, "[[source#^p]]\n");
+        let path = aero_core::VaultPath::new("source.md").unwrap();
+        vault.write_bytes(&path, b"old body ^p\n").unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let source = cx.new(|cx| Editor::new(vault.clone(), path, doc, stamp, cx));
+        cx.run_until_parked();
+        let bounds = Bounds::from_corners(point(px(20.), px(20.)), point(px(100.), px(45.)));
+        editor.update(cx, |e, cx| {
+            e.link_preview.hovered = Some((aero_core::links::encode_note_url("source", Some("^p")).into(), bounds));
+            e.link_preview.popup = Some(super::Popup { title: "old".into(), body: "old body ^p".into(), rich: true, origin: None, bounds });
+            super::set_preview_mode(crate::paths::LinkPreviewMode::Command, cx);
+            e.link_preview.platform_down = true;
+        });
+        source.update(cx, |e, cx| {
+            e.doc.edit(aero_core::Edit::replace(0..e.doc.len(), "---\ntitle: New title\n---\n\nnew body ^p\n")).unwrap();
+            e.doc.reparse();
+            e.publish_live(cx);
+        });
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            let popup = e.link_preview.popup.as_ref().unwrap();
+            assert_eq!(popup.title, "New title");
+            assert_eq!(popup.body, "new body ^p");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn g08_reference_hover_reuses_prepared_live_source(cx: &mut TestAppContext) {
+        let (_dir, _vault, _path, editor) = super::super::tests::open(cx, "[[#^p]]\n\nbody ^p\n");
+        editor.update(cx, |e, cx| e.refresh_embeds(cx));
+        cx.run_until_parked();
+        let count = EXCERPT_ANALYSES.get();
+        let bounds = Bounds::from_corners(point(px(20.), px(20.)), point(px(100.), px(45.)));
+        for _ in 0..3 {
+            let task = editor.read_with(cx, |e, cx| e.load_link_preview(aero_core::links::encode_note_url("", Some("^p")).into(), bounds, cx));
+            let popup = cx.foreground_executor().block_on(task);
+            assert_eq!(popup.body, "body ^p");
+            assert!(popup.rich);
+        }
+        assert_eq!(EXCERPT_ANALYSES.get(), count, "hover should reuse the prepared reference instead of analyzing the document");
+    }
 
     fn fragment_editor(cx: &mut TestAppContext, source: &str) -> (tempfile::TempDir, Entity<Editor>) {
         cx.update(gpui_kit::init);

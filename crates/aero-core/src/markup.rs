@@ -20,14 +20,14 @@ pub enum Mark {
     Code,
     Highlight,
     Link,
-    /// 调色板类名，文字色是 `red`，背景色是 `bg-blue`。
-    Palette(Vec<String>),
+    Palette([Option<String>; 2]),
 }
 
 pub struct Analysis {
     pub conceal: Vec<Range<usize>>,
     pub hard_breaks: Vec<Range<usize>>,
     pub styles: Vec<(Range<usize>, Mark)>,
+    pub invalid_colors: Vec<(Range<usize>, Slot)>,
     /// 链接文字的区间与地址。笔记链接的地址是 [`crate::links::encode_note_url`] 的结果。
     pub links: Vec<(Range<usize>, String)>,
 }
@@ -69,12 +69,13 @@ pub fn analyze_editing(src: &str, selection: Option<Range<usize>>) -> Analysis {
     let wikilinks = crate::links::scan(src);
     let pointers = crate::links::pointers(src);
     let mut out =
-        Analysis { conceal: Vec::new(), hard_breaks: Vec::new(), styles: Vec::new(), links: Vec::new() };
+        Analysis { conceal: Vec::new(), hard_breaks: Vec::new(), styles: Vec::new(), invalid_colors: Vec::new(), links: Vec::new() };
     let mut code = Vec::new();
+    let mut attached = Vec::new();
 
     for node in root.descendants() {
         let Some(mut range) = positions.range(node) else { continue };
-        if matches!(node.data().value, NodeValue::Code(_))
+        if matches!(node.data().value, NodeValue::Code(_) | NodeValue::Link(_) | NodeValue::Image(_))
             && let Some(text) = src.get(range.clone())
             && let Some(brace) = text.rfind('{')
         {
@@ -83,13 +84,18 @@ pub fn analyze_editing(src: &str, selection: Option<Range<usize>>) -> Analysis {
                 range.end = at;
             }
         }
-        if matches!(node.data().value, NodeValue::Code(_)) {
+        if matches!(node.data().value, NodeValue::Code(_) | NodeValue::CodeBlock(_)) {
             code.push(range.clone());
         }
+        let first = out.styles.len();
         mark_node(src, &range, node, &wikilinks, &pointers, selection.as_ref(), &mut out);
+        if let Some((content, _)) = out.styles.get(first) {
+            attached.push((range.end, content.clone()));
+        }
     }
     line_prefixes(src, &code, &mut out.conceal);
-    color_marks(src, &code, &mut out);
+    color_marks(src, &code, &attached, &mut out);
+    out.styles.sort_by_key(|(range, _)| std::cmp::Reverse(range.len()));
     escapes(src, &code, &mut out.conceal);
     out.conceal.sort_by_key(|range| range.start);
     out
@@ -298,7 +304,7 @@ fn line_prefixes(src: &str, code: &[Range<usize>], conceal: &mut Vec<Range<usize
     }
 }
 
-fn color_marks(src: &str, code: &[Range<usize>], out: &mut Analysis) {
+fn color_marks(src: &str, code: &[Range<usize>], attached: &[(usize, Range<usize>)], out: &mut Analysis) {
     let mut search = 0;
     while let Some(rel) = src[search..].find('{') {
         let open = search + rel;
@@ -307,27 +313,38 @@ fn color_marks(src: &str, code: &[Range<usize>], out: &mut Analysis) {
             continue;
         };
         search = end;
-        if !colors::has_color(&attrs) {
+        if !colors::has_color(&attrs)
+            && !attrs.pairs.iter().any(|(key, _)| key == Slot::Text.key() || key == Slot::Background.key())
+        {
             continue;
         }
         if code.iter().any(|code| code.start <= open && end <= code.end) {
             continue;
         }
-        let classes: Vec<String> = attrs
-            .classes
-            .iter()
-            .filter(|class| Slot::Text.owns(class) || Slot::Background.owns(class))
-            .cloned()
-            .collect();
-        if open > 0 && src.as_bytes()[open - 1] == b']' {
-            if let Some(bracket) = colors::bracket_start(src, open - 1, colors::line_start(src, open)) {
+        let values = [Slot::Text, Slot::Background].map(|slot| slot.color_of(&attrs).map(str::to_owned));
+        let content = if let Some((_, content)) = attached.iter().find(|(at, _)| *at == open) {
+            Some(content.clone())
+        } else if open > 0 && src.as_bytes()[open - 1] == b']' {
+            colors::bracket_start(src, open - 1, colors::line_start(src, open)).map(|bracket| {
                 out.conceal.push(bracket..bracket + 1);
-                out.conceal.push(open - 1..end);
-                let content = bracket + 1..open - 1;
-                if content.start < content.end && !classes.is_empty() {
-                    out.styles.push((content, Mark::Palette(classes)));
+                out.conceal.push(open - 1..open);
+                bracket + 1..open - 1
+            })
+        } else {
+            None
+        };
+        if let Some(content) = content
+            && !content.is_empty()
+        {
+            for slot in [Slot::Text, Slot::Background] {
+                if attrs.pairs.iter().any(|(key, value)| {
+                    key == slot.key() && colors::CustomColor::parse(value).is_none()
+                }) {
+                    out.invalid_colors.push((content.clone(), slot));
                 }
-                continue;
+            }
+            if values.iter().any(Option::is_some) {
+                out.styles.push((content, Mark::Palette(values)));
             }
         }
         out.conceal.push(open..end);
@@ -394,6 +411,71 @@ mod tests {
 
     fn hidden(src: &str) -> String {
         analyze(src).visible_text(src)
+    }
+
+    #[test]
+    fn custom_colors_have_painted_ranges_after_reopen() {
+        for value in ["#2457A780", "rgba(44,44,43,0.37500001)"] {
+            let source = format!("before [word]{{color=\"{value}\"}} after");
+            let reopened = crate::Document::from_text(&source).to_string();
+            let analysis = analyze(&reopened);
+            assert_eq!(analysis.visible_text(&reopened), "before word after");
+            assert!(analysis.styles.iter().any(|(range, mark)| {
+                &reopened[range.clone()] == "word" && matches!(mark, Mark::Palette(_))
+            }), "{source}");
+        }
+    }
+
+    #[test]
+    fn attached_colors_paint_only_inline_content() {
+        for element in ["**word**", "*word*", "~~word~~", "==word==", "`word`", "[word](https://example.com)"] {
+            let source = format!("before {element}{{color=\"#2457A7\" background=\"rgba(1,2,3,0.25)\"}} after");
+            let analysis = analyze(&source);
+            assert_eq!(analysis.visible_text(&source), "before word after", "{source}");
+            assert!(analysis.styles.iter().any(|(range, mark)| {
+                &source[range.clone()] == "word" && matches!(mark, Mark::Palette(_))
+            }), "{source}: {:?}", analysis.styles);
+        }
+    }
+
+    #[test]
+    fn invalid_color_attributes_are_concealed_without_painting_literals() {
+        let source = "[word]{color=\"#oops\"} and `[literal]{color=\"#123456\"}`";
+        let analysis = analyze(source);
+        assert_eq!(analysis.visible_text(source), "word and [literal]{color=\"#123456\"}");
+        assert!(!analysis.styles.iter().any(|(_, mark)| matches!(mark, Mark::Palette(_))));
+    }
+
+    #[test]
+    fn nested_color_marks_apply_inner_channels_last() {
+        let source = "[outer [inner]{.green} ==yellow==]{.red .bg-blue}";
+        let analysis = analyze(source);
+        for (word, expected) in [("inner", [Some("green"), Some("blue")]), ("yellow", [Some("red"), Some("yellow")])] {
+            let at = source.find(word).unwrap();
+            let mut effective = [None, None];
+            for (range, mark) in &analysis.styles {
+                if range.contains(&at) {
+                    match mark {
+                        Mark::Palette(values) => {
+                            for i in 0..2 {
+                                if values[i].is_some() { effective[i] = values[i].as_deref(); }
+                            }
+                        }
+                        Mark::Highlight => effective[1] = Some("yellow"),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(effective, expected, "{word}");
+        }
+    }
+
+    #[test]
+    fn color_like_fenced_code_is_not_concealed_or_painted() {
+        let source = "```text\n[word]{color=\"#123456\"}\n```";
+        let analysis = analyze(source);
+        assert_eq!(analysis.visible_text(source), source);
+        assert!(!analysis.styles.iter().any(|(_, mark)| matches!(mark, Mark::Palette(_))));
     }
 
     #[test]

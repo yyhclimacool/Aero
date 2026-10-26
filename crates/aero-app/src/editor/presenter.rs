@@ -49,14 +49,46 @@ pub(super) struct Presenter {
     /// 不折行时文字的宽度。只给居中、靠右的单元格量，它们按这个宽度摆位置。
     pub natural_width: Option<Pixels>,
     text: String,
-    extra: Extra,
-    styled: Option<StyleStamp>,
+    pub(super) extra: Extra,
+    pub(super) styled: Option<StyleStamp>,
+    pub(super) inline_math: Vec<super::math_ui::InlineMath>,
+    inline_refs_text: Option<(SharedString, bool)>,
+    inline_refs: Vec<InlineReference>,
     _focus: Subscription,
+}
+
+const REFERENCE_KEY: u64 = 1 << 63;
+
+struct InlineReference {
+    link: aero_core::links::LinkSpan,
+    address: Range<usize>,
+    view: Option<ReferenceLabel>,
+    label: SharedString,
+    metrics: Option<(Font, Pixels, Pixels)>,
+    size: Size<Pixels>,
+}
+
+#[derive(PartialEq)]
+struct ReferenceLabel {
+    title: SharedString,
+    excerpt: SharedString,
+    destination: Option<(VaultPath, Option<String>)>,
+    failed: bool,
+    conflict: bool,
+}
+
+impl InlineReference {
+    fn revealed(&self, selection: Option<&Range<usize>>) -> bool {
+        selection.is_some_and(|s| {
+            self.link.range.start < s.start && s.end < self.link.range.end
+                && self.address.start <= s.start && s.end <= self.address.end
+        })
+    }
 }
 
 /// 决定标记样式的输入。任何一项变了才重算，免得每帧重新解析每一段。
 #[derive(Clone, PartialEq)]
-struct StyleStamp {
+pub(super) struct StyleStamp {
     text: String,
     extra: Extra,
     dark: bool,
@@ -106,7 +138,7 @@ impl Editor {
             let range = unit.range.clone();
             match &unit.kind {
                 BlockKind::Paragraph | BlockKind::Heading { .. }
-                    if self.presents_text(unit.id, &text, cx) =>
+                    if self.presents_text(&text) =>
                 {
                     let checked = unit.list.as_ref().is_some_and(|list| list.checked == Some(true));
                     specs.push(spec(key, range, false, Extra { checked, ..Default::default() }));
@@ -161,14 +193,11 @@ impl Editor {
         specs
     }
 
-    /// 这一段按文字画。独占一段的图片 / 笔记嵌入与带行内公式的段落另有画法。
-    fn presents_text(&self, id: BlockId, text: &str, cx: &App) -> bool {
+    fn presents_text(&self, text: &str) -> bool {
         let trimmed = text.trim();
         !preview::is_image_embed(trimmed)
             && !preview::is_note_embed(trimmed)
             && aero_core::rich_content::pdf_embed(text).is_none()
-            && !has_html_break(text)
-            && !self.renders_inline_formulas(id, text, cx)
     }
 
     fn ensure_presenter(&mut self, spec: Spec, window: &mut Window, cx: &mut Context<Self>) {
@@ -208,6 +237,9 @@ impl Editor {
                 text: String::new(),
                 extra: Extra::default(),
                 styled: None,
+                inline_math: Vec::new(),
+                inline_refs_text: None,
+                inline_refs: Vec::new(),
                 _focus: focus,
             };
             self.presenters.insert(spec.key, presenter);
@@ -286,7 +318,92 @@ impl Editor {
             // 文字控件在右侧留了光标的余量，量出来的宽度要把它加上，否则会被折行
             p.natural_width = Some(width + px(12.));
         }
+        self.sync_inline_math(spec.key, window, cx);
+        self.sync_inline_references(spec.key, window, cx);
         self.restyle_presenter(spec.key, cx);
+    }
+
+    fn sync_inline_references(&mut self, key: Key, window: &mut Window, cx: &mut Context<Self>) {
+        use super::embeds_ui::EmbedView;
+        let p = self.presenters.get_mut(&key).expect("presenter exists");
+        let text = p.textarea.read(cx).value();
+        if p.inline_refs_text.as_ref() != Some(&(text.clone(), p.extra.code)) {
+            p.inline_refs = if p.extra.code {
+                Vec::new()
+            } else {
+                aero_core::links::scan(&text).into_iter()
+                    .filter(|link| link.pointer.is_none()
+                        && link.fragment.as_deref().is_some_and(|f| f.starts_with('^')))
+                    .map(|link| InlineReference {
+                        address: aero_core::links::head_range(&text, &link),
+                        link,
+                        view: None,
+                        label: SharedString::default(),
+                        metrics: None,
+                        size: size(px(0.), px(0.)),
+                    }).collect()
+            };
+            p.inline_refs_text = Some((text, p.extra.code));
+            p.styled = None;
+            p.natural_width = None;
+        }
+        if p.inline_refs.is_empty() { return; }
+        let available = p.textarea.read(cx).input_bounds().size.width;
+        let cap = if available > px(0.) { (available - px(12.)).max(px(1.)).min(px(320.)) } else { px(320.) };
+        let mut font = window.text_style().font();
+        font.weight = match key.part {
+            Part::CalloutTitle | Part::Cell(0, _) => FontWeight::SEMIBOLD,
+            _ => FontWeight::NORMAL,
+        };
+        let mut em = px(BODY_FONT_SIZE);
+        if key.part == Part::Unit
+            && let Some(block) = self.doc.blocks().find(key.id)
+            && let BlockKind::Heading { level } = block.kind
+        {
+            em = heading_size(level);
+            font.weight = if level == 1 { FontWeight::BOLD } else { FontWeight::SEMIBOLD };
+        }
+        let views: Vec<_> = self.presenters[&key].inline_refs.iter().map(|reference| {
+            let link = &reference.link;
+            let view = self.live_embed(&link.target, link.fragment.as_deref(), None, cx)
+                .unwrap_or_else(|| self.embed_view_from(&link.target, link.fragment.as_deref(), None));
+            match view {
+                EmbedView::Ready { path, fragment, title, excerpt, conflict, .. } => ReferenceLabel {
+                    title, excerpt, destination: Some((path, fragment)), failed: false,
+                    conflict: conflict.is_some(),
+                },
+                view => ReferenceLabel {
+                    title: format!("{}#{}", link.target, link.fragment.as_deref().unwrap_or("")).into(),
+                    failed: matches!(view, EmbedView::Failed(_)),
+                    excerpt: match view {
+                        EmbedView::Failed(error) => error,
+                        _ => "正在载入引用…".into(),
+                    },
+                    destination: None,
+                    conflict: false,
+                },
+            }
+        }).collect();
+        let p = self.presenters.get_mut(&key).expect("presenter exists");
+        for (reference, view) in p.inline_refs.iter_mut().zip(views) {
+            let changed = reference.view.as_ref() != Some(&view);
+            if changed {
+                let title = view.title.split_whitespace().collect::<Vec<_>>().join(" ");
+                reference.label = format!("{title} · {}{}", view.excerpt,
+                    if view.conflict { " · 来源冲突" } else { "" }).into();
+                reference.view = Some(view);
+            }
+            let metrics = (font.clone(), em, cap);
+            if changed || reference.metrics.as_ref() != Some(&metrics) {
+                let run = TextRun { len: reference.label.len(), font: font.clone(),
+                    color: cx.theme().link, ..Default::default() };
+                let width = window.text_system().shape_line(reference.label.clone(), em, &[run], None).width;
+                reference.size = size((width + px(8.)).min(cap), em * BODY_LINE_HEIGHT);
+                reference.metrics = Some(metrics);
+                p.styled = None;
+                p.natural_width = None;
+            }
+        }
     }
 
     /// 标记样式跟着文字、主题和链接解析结果走；都没变就不重算。
@@ -319,8 +436,16 @@ impl Editor {
                 &aero_core::containers::continuation(&self.doc, key.id),
             );
         }
-        let links = analysis.links.clone();
+        let references: Vec<_> = p.inline_refs.iter().enumerate()
+            .filter(|(_, reference)| p.inline_refs_text.as_ref().is_some_and(|(source, _)| source.as_ref() == text)
+                && !reference.revealed(selection.as_ref())).collect();
+        let links: Vec<_> = analysis.links.iter().filter(|(range, _)| !references.iter().any(|(_, reference)|
+            reference.link.range.start <= range.start && range.end <= reference.link.range.end)).cloned().collect();
         let mut markup = self.presenter_markup(&text, &analysis, &p.extra, cx);
+        markup.inline_objects = p.inline_math.iter().enumerate().map(|(ix, formula)|
+            (formula.range.clone(), formula.size, ix as u64)).collect();
+        markup.inline_objects.extend(references.iter().map(|(ix, reference)|
+            (reference.link.range.clone(), reference.size, REFERENCE_KEY | *ix as u64)));
         let previewing = preview.is_some();
         if let Some((range, slot, color)) = preview {
             let color = crate::colors::token(slot, &color, dark);
@@ -407,19 +532,13 @@ impl Editor {
                     };
                     HighlightStyle { color: Some(color), underline, ..Default::default() }
                 }
-                Mark::Palette(classes) => {
-                    let mut style = HighlightStyle::default();
-                    for class in classes {
-                        if let Some(name) = class.strip_prefix("bg-") {
-                            if let Some(bg) = crate::colors::token(Slot::Background, name, dark) {
-                                style.background_color = Some(bg);
-                            }
-                        } else if let Some(fg) = crate::colors::token(Slot::Text, class, dark) {
-                            style.color = Some(fg);
-                        }
-                    }
-                    style
-                }
+                Mark::Palette([text, background]) => HighlightStyle {
+                    color: text.as_deref().and_then(|value| crate::colors::token(Slot::Text, value, dark)),
+                    background_color: background.as_deref().and_then(|value| {
+                        crate::colors::token(Slot::Background, value, dark)
+                    }),
+                    ..Default::default()
+                },
             };
             styles.push((range.clone(), style));
         }
@@ -429,6 +548,7 @@ impl Editor {
             styles,
             fonts,
             dashed,
+            ..Default::default()
         }
     }
 
@@ -443,6 +563,13 @@ impl Editor {
             let prefix = aero_core::containers::continuation(&self.doc, id);
             analysis.conceal.extend(aero_core::containers::prefix_ranges(text, &prefix));
             analysis.conceal.sort_by_key(|r| (r.start, r.end));
+            if let Some(p) = self.presenters.iter().find_map(|(key, p)|
+                (key.id == id && p.inline_refs_text.as_ref().is_some_and(|(source, _)| source.as_ref() == text)).then_some(p))
+            {
+                // Objects own the whole source span; address editing must not inherit alias concealment.
+                analysis.conceal.retain(|range| !p.inline_refs.iter().any(|reference|
+                    range.start < reference.link.range.end && reference.link.range.start < range.end));
+            }
         }
         analysis
     }
@@ -533,6 +660,60 @@ impl Editor {
         })
     }
 
+    fn inline_reference_overlay(&self, key: Key, cx: &mut Context<Self>) -> AnyElement {
+        let p = &self.presenters[&key];
+        let textarea = p.textarea.clone();
+        let editing = self.focused.as_ref().is_some_and(|f| f.textarea == textarea);
+        let selection = editing.then(|| textarea.read(cx).selected_range());
+        let children: Vec<_> = p.inline_refs.iter().enumerate()
+            .filter(|(_, reference)| !reference.revealed(selection.as_ref()))
+            .filter_map(|(ix, reference)| {
+                let view = reference.view.as_ref()?;
+                let (font, em, _) = reference.metrics.as_ref()?;
+                let destination = view.destination.clone();
+                let ready = destination.is_some();
+                let label = reference.label.clone();
+                let child = div().id(SharedString::from(format!("inline-reference-{ix}")))
+                    .debug_selector(move || format!("inline-reference-{label}"))
+                    .w(reference.size.width).h(reference.size.height).px(px(4.))
+                    .font_family(font.family.clone()).font_weight(font.weight).text_size(*em)
+                    .line_height(relative(BODY_LINE_HEIGHT)).truncate()
+                    .text_color(if view.failed { cx.theme().danger } else { cx.theme().link })
+                    .when(ready, |el| el.cursor_pointer())
+                    .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                        if ready && !event.modifiers.shift && event.click_count == 1 {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                        }
+                    })
+                    .on_click(cx.listener(move |_, event: &ClickEvent, _, cx| {
+                        if event.is_right_click() || matches!(event, ClickEvent::Mouse(click)
+                            if click.down.modifiers.shift || click.down.click_count > 1) { return; }
+                        if let Some((path, fragment)) = &destination {
+                            cx.stop_propagation();
+                            cx.emit(EditorEvent::ResolvedSourceClicked { path: path.clone(), fragment: fragment.clone() });
+                        }
+                    }))
+                    .child(reference.label.clone()).into_any_element();
+                Some((REFERENCE_KEY | ix as u64, child))
+            }).collect();
+        canvas(move |_, window, cx| {
+            let bounds = textarea.read(cx).inline_object_bounds().to_vec();
+            let mut painted = Vec::new();
+            for (id, mut child) in children {
+                if let Some((_, rect)) = bounds.iter().find(|(key, _)| *key == id) {
+                    child.layout_as_root(size(AvailableSpace::Definite(rect.size.width),
+                        AvailableSpace::Definite(rect.size.height)), window, cx);
+                    child.prepaint_at(rect.origin, window, cx);
+                    painted.push(child);
+                }
+            }
+            painted
+        }, |_, children, window, cx| {
+            for mut child in children { child.paint(window, cx); }
+        }).absolute().size_full().into_any_element()
+    }
+
     /// 一段文字的控件，外面包着认领焦点与链接的处理。
     pub(super) fn render_presenter(&self, key: Key, cx: &mut Context<Self>) -> Option<AnyElement> {
         let p = self.presenters.get(&key)?;
@@ -542,7 +723,10 @@ impl Editor {
             .id(SharedString::from(format!("text-{}-{:?}", key.id.0, key.part)))
             .relative()
             .w_full()
+            .when(!p.inline_math.is_empty(), |el| el.debug_selector(|| "math-text".to_owned()))
             .child(Textarea::new(&p.textarea))
+            .when(!p.inline_math.is_empty(), |el| el.child(self.inline_math_overlay(key, cx)))
+            .when(!p.inline_refs.is_empty(), |el| el.child(self.inline_reference_overlay(key, cx)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -667,11 +851,6 @@ pub(super) fn fence_body(src: &str) -> Option<Range<usize>> {
 /// 这张表按单元格画、按单元格编辑。
 pub(super) fn presents_table(text: &str) -> bool {
     table::parse(text).is_some()
-}
-
-/// 段落中的 HTML 换行仍走预览；表格单元格用 hard_breaks 保留源字节。
-fn has_html_break(text: &str) -> bool {
-    text.to_ascii_lowercase().contains("<br")
 }
 
 /// 引用里只有段落（没有列表、代码、嵌套引用）时按文字画；复杂的仍用源码编辑。

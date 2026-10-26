@@ -30,6 +30,7 @@ mod live_sources;
 mod math_ui;
 mod navigation;
 mod ops;
+pub(crate) use ops::SelectionPlan;
 mod pairs;
 mod pairs_ui;
 mod parsing;
@@ -131,6 +132,10 @@ pub enum EditorEvent {
     /// 预览里点了 wikilink：已解码的目标与可选片段（`target` 为空 = 同篇锚点 `[[#h]]`），工作区负责解析与打开
     LinkClicked {
         target: String,
+        fragment: Option<String>,
+    },
+    ResolvedSourceClicked {
+        path: VaultPath,
         fragment: Option<String>,
     },
     /// `[[显示名]](相对路径)`：路径相对当前笔记目录，不创建缺失目标。
@@ -261,6 +266,7 @@ pub struct Editor {
     parse_task: Option<Task<()>>,
     parse_window: Option<AnyWindowHandle>,
     preview: Entity<preview::PreviewState>,
+    reference_cache: std::cell::RefCell<preview::ReferenceCache>,
     _preview_subscription: Subscription,
     _live_subscription: Subscription,
     link_preview: link_preview::LinkPreview,
@@ -290,6 +296,7 @@ pub struct Editor {
     slash: Option<SlashMenu>,
     /// 颜色菜单（7.7）；开着时焦点在它的过滤输入框上
     color_menu: Option<colors_ui::ColorMenu>,
+    color_cache: Option<colors_ui::ColorCache>,
     /// 块菜单（5.3）
     block_menu: Option<block_menu::BlockMenu>,
     hovered_block: Option<BlockId>,
@@ -378,7 +385,7 @@ impl Editor {
         stamp: FileStamp,
         cx: &mut Context<Self>,
     ) -> Self {
-        crate::workspace::history::attach(vault.id(), &path, &mut doc, cx);
+        crate::workspace::history::attach(vault.id(), &path, &mut doc, stamp, cx);
         doc.track_edits();
         let units = units::units(&doc);
         let unit_structure = viewport::structure(&doc);
@@ -412,6 +419,7 @@ impl Editor {
             parse_window: None,
             units,
             preview,
+            reference_cache: Default::default(),
             _preview_subscription: preview_subscription,
             _live_subscription: live_subscription,
             link_preview: link_preview::LinkPreview::default(),
@@ -434,6 +442,7 @@ impl Editor {
             picker_open: false,
             slash: None,
             color_menu: None,
+            color_cache: None,
             block_menu: None,
             hovered_block: None,
             block_drop: None,
@@ -543,6 +552,65 @@ impl Editor {
         }
         self.resume_io(cx);
         cx.notify();
+    }
+
+    pub(crate) fn finish_source_metadata(
+        &mut self,
+        change: &aero_core::transaction::FileChange,
+        stamp: Option<FileStamp>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let result: Result<(), String> = (|| {
+            let before = change.before.as_deref().ok_or("缺少来源原内容")?;
+            let after = change.after.as_deref().ok_or("缺少来源身份内容")?;
+            let stamp = stamp.ok_or("无法读取来源保存版本")?;
+            let expected = aero_core::text::SourceText::decode(before).map_err(|e| e.to_string())?;
+            let next = aero_core::text::SourceText::decode(after).map_err(|e| e.to_string())?;
+            if self.path != change.path
+                || self.doc.to_string() != expected.text
+                || self.stamp.hash != aero_core::hash_bytes(before)
+                || stamp.hash != aero_core::hash_bytes(after)
+                || self.dirty
+                || self.io.writing
+            {
+                return Err("来源版本已变化，保留编辑内容并停止保存".into());
+            }
+            let edit = minimal_edit(0, &expected.text, &next.text);
+            if let Some(edit) = &edit
+                && let Some(focused) = &mut self.focused
+            {
+                if edit.range.end <= focused.range.start {
+                    focused.range.start = (focused.range.start as isize + edit.delta()) as usize;
+                    focused.range.end = (focused.range.end as isize + edit.delta()) as usize;
+                } else if edit.range.start < focused.range.end {
+                    self.focused = None;
+                }
+            }
+            self.doc.edit_group(edit.into_iter().collect()).map_err(|e| e.to_string())?;
+            self.doc.bom = next.bom;
+            self.doc.line_ending = next.line_ending;
+            self.last_edit_at = None;
+            self.after_doc_change(cx);
+            self.ensure_current_parse();
+            self.clamp_selection();
+            self.publish_live(cx);
+            self.stamp = stamp;
+            self.save_task = None;
+            self.dirty = false;
+            self.save_state = SaveState::Clean;
+            self.set_banner(None, cx);
+            self.resume_io(cx);
+            cx.emit(EditorEvent::Changed);
+            cx.notify();
+            Ok(())
+        })();
+        if let Err(error) = &result {
+            self.io.suspended = true;
+            self.io.checking = None;
+            self.io.check_generation += 1;
+            self.save_failed(error.clone(), cx);
+        }
+        result
     }
 
     pub fn set_picker_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1019,21 +1087,6 @@ impl Editor {
             let at = cursor.min(text.len());
             if let Some(local) = math_ui::inline_formula_containing(&text, at) {
                 self.open_math_popup(range.start + local.start..range.start + local.end, id, window, cx);
-                return;
-            }
-            if let Some(local) = math_ui::text_span_for_cursor(&text, at) {
-                let abs = range.start + local.start..range.start + local.end;
-                let rel = at.saturating_sub(local.start).min(abs.len());
-                self.focus_range(abs, id, nl, rel, window, cx);
-                return;
-            }
-            if let Some(formula) = aero_core::highlight::inline_formulas(&text).into_iter().next() {
-                self.open_math_popup(
-                    range.start + formula.range.start..range.start + formula.range.end,
-                    id,
-                    window,
-                    cx,
-                );
                 return;
             }
         }
@@ -1604,7 +1657,35 @@ impl Editor {
     }
 
     /// ⏎：编辑 `head` 那块，光标在块末。
+    fn focus_selected_node(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.selected_node else { return false };
+        let Some(index) = self.units.iter().position(|u| {
+            (u.id == id || aero_core::containers::ancestors(&self.doc, u.id).iter().any(|b| b.id == id))
+                && !self.keeps_rendered_image(u.id, cx)
+                && !preview::is_note_embed(self.doc.slice(u.range.clone()).to_string().trim())
+        }) else { return false };
+        self.selected_node = None;
+        self.selection = None;
+        self.focus_unit(index, 0, window, cx);
+        true
+    }
+
+    fn capture_selected_input(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.io.suspended {
+            cx.stop_propagation();
+            return false;
+        }
+        let key = &event.keystroke;
+        if key.modifiers.platform || key.modifiers.control || key.modifiers.function
+            || key.key_char.as_deref().is_none_or(|text| text.is_empty() || text.chars().any(char::is_control))
+        {
+            return false;
+        }
+        self.focus_selected_node(window, cx)
+    }
+
     fn on_edit_selected(&mut self, _: &EditSelectedBlock, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_selected_node(window, cx) { return; }
         let Some(sel) = self.selection else {
             cx.propagate();
             return;
@@ -1614,36 +1695,35 @@ impl Editor {
         self.focus_unit(sel.head, len, window, cx);
     }
 
-    /// 选中块的 Markdown 源码（整行，列表项含标记与嵌套子项）。
-    fn selected_source(&self) -> Option<String> {
+    fn selection_plan(&self) -> Option<SelectionPlan> {
         if let Some(id) = self.selected_node {
-            return aero_core::properties::owned_range(&self.doc, id)
-                .map(|r| aero_core::containers::standalone(&self.doc, r));
+            return Some(SelectionPlan::nodes(&self.doc, &[id]));
         }
         let sel = self.selection?;
-        let span = ops::units_span(&self.doc, &self.units, sel.first(), sel.last());
-        Some(aero_core::containers::standalone(&self.doc, span))
+        Some(SelectionPlan::units(&self.doc, &self.units, sel.first(), sel.last()))
+    }
+
+    fn selected_source(&self) -> Option<String> {
+        self.selection_plan().map(|plan| plan.source(&self.doc))
     }
 
     /// ⌫ / ⌦：删掉选中的块，一个撤销组；选区落到原位置上的下一块（没有就上一块；文档空了回浏览态）。
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_current_parse();
-        if let Some(id) = self.selected_node.take() {
-            if let Some(range) = aero_core::properties::owned_range(&self.doc, id) {
-                let at = range.start;
-                self.structural_edit(Edit::delete(range), at, window, cx);
-            }
-            return;
-        }
-        let Some(sel) = self.selection else { return };
-        let edit = ops::delete_units(&self.doc, &self.units, sel.first(), sel.last());
-        if let Err(err) = self.doc.edit(edit) {
+        let Some(plan) = self.selection_plan() else { return };
+        let Some(at) = plan.start() else { return };
+        let first = self.selection.map(|s| s.first());
+        if let Err(err) = self.doc.edit_group(plan.deletions(&self.doc)) {
             log::error!("edit rejected: {err}");
             return;
         }
-        let first = sel.first();
+        self.selected_node = None;
         self.last_edit_at = None;
         self.after_doc_change(cx);
+        let Some(first) = first else {
+            self.focus_at(at.min(self.doc.len()), None, window, cx);
+            return;
+        };
         if self.units.is_empty() {
             self.selection = None;
             self.focus_handle.focus(window, cx);
@@ -1709,12 +1789,8 @@ impl Editor {
 
     fn on_cut_selected(&mut self, _: &CutSelectedBlocks, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_current_parse();
-        let range = self
-            .selected_node
-            .and_then(|id| aero_core::properties::owned_range(&self.doc, id))
-            .or_else(|| self.selection.map(|s| ops::units_span(&self.doc, &self.units, s.first(), s.last())));
-        if let Some(range) = range {
-            self.cut_blocks(range, window, cx);
+        if let Some(plan) = self.selection_plan() {
+            self.cut_selection(plan, window, cx);
         } else {
             cx.propagate();
         }
@@ -2097,9 +2173,28 @@ impl Editor {
             let next = presenter::Key { id, part: presenter::Part::Cell(row, col + 1) };
             let (row, col) = if self.presenters.contains_key(&next) { (row, col + 1) } else { (row + 1, 0) };
             self.move_table_cell(id, row, col, window, cx);
-        } else {
+        } else if !self.change_list_level(true, window, cx) {
             cx.propagate();
         }
+    }
+
+    fn change_list_level(&mut self, increase: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.note_source || self.input_composing(window, cx) || self.editing_code() { return false; }
+        let Some(focused) = self.focused.as_ref() else { return false };
+        if focused.math_popup || !self.focused_unit().is_some_and(|ix| {
+            self.units[ix].is_text() || matches!(self.units[ix].kind, BlockKind::ListItem { .. })
+        }) || self.presenter_key_of(&focused.textarea).is_some_and(|key| key.part != presenter::Part::Unit) {
+            return false;
+        }
+        let Some(id) = focused.id.and_then(|id| ops::list_item_for(&self.doc, id)) else { return false };
+        self.ensure_current_parse();
+        let plan = if increase { ops::list_indent(&self.doc, id) } else { ops::list_outdent(&self.doc, id) };
+        if let Some(plan) = plan { self.apply_plan(plan, window, cx); }
+        true
+    }
+
+    fn on_list_outdent(&mut self, _: &crate::actions::ListOutdent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.change_list_level(false, window, cx) { cx.propagate(); }
     }
 
     /// 文本已改：重解析、刷新单位、标脏、排队保存。
@@ -2411,6 +2506,10 @@ impl Editor {
                 cx.notify();
             }
             ops::Backspace::Edit(plan) => self.apply_plan(plan, window, cx),
+            ops::Backspace::Blocked(reason) => {
+                use gpui_kit::component::{WindowExt as _, notification::Notification};
+                window.push_notification(Notification::warning(reason), cx);
+            }
             ops::Backspace::MoveTo { unit, cursor } => self.focus_unit(unit, cursor, window, cx),
             ops::Backspace::StyleMismatch { unit, cursor } => {
                 self.focus_unit(unit, cursor, window, cx);
@@ -2650,7 +2749,7 @@ impl Editor {
         );
         if let Some(affected) = self.doc.undo() {
             if let Some(token) = self.doc.history_transaction(true).map(str::to_owned) {
-                Self::complete_cut(&token, true, cx);
+                cx.defer(move |cx| Self::complete_cut(&token, false, cx));
             }
             operation.scope(|| self.after_history(affected, window, cx));
             operation.finish(crate::diagnostics::Outcome::Ok);
@@ -2749,7 +2848,11 @@ impl Editor {
         if !self.dirty || self.io.writing || self.io.suspended || self.is_deleted() {
             return;
         }
-        self.start_checked_write(false, cx);
+        if self.io.strict {
+            self.transaction_save_now(cx);
+        } else {
+            self.start_checked_write(false, cx);
+        }
     }
 
     fn start_write(&mut self, cx: &mut Context<Self>) {
@@ -2777,16 +2880,26 @@ impl Editor {
         let expected_path = path.clone();
         let conflict_base = self.conflict_path();
         let epoch = self.io.epoch;
+        let request = io::SaveRequest {
+            vault,
+            path: path.clone(),
+            known: stamp,
+            conflict_base,
+            snapshot,
+            bom,
+            ending,
+            epoch,
+            allow_missing,
+            admission: self.save_admission(),
+            journal_root: self.io.journal_root.clone(),
+        };
         self.io.checking = None;
         self.io.check_generation += 1;
         self.io.writing = true;
         self.save_state = SaveState::Saving;
         cx.emit(EditorEvent::Changed);
-        let job = operation.scope(|| {
-            io::WriteJob::spawn(path.clone(), epoch, version, move || {
-                io::save(&vault, &path, stamp, conflict_base, snapshot, bom, ending, allow_missing)
-            })
-        });
+        let job =
+            operation.scope(|| io::WriteJob::spawn(path.clone(), epoch, version, move || request.save()));
         self.io.pending = Some(job.clone());
         let write = cx.background_spawn(async move { job.wait() });
         cx.spawn(async move |this, cx| {
@@ -2794,17 +2907,12 @@ impl Editor {
             operation.stage("ui_apply", Default::default());
             let saved = outcome.result.is_ok();
             let _ = this.update(cx, |this, cx| {
-                this.io.writing = false;
-                this.io.pending = None;
                 if this.io.epoch != epoch || this.path != expected_path {
                     operation.finish(crate::diagnostics::Outcome::Stale);
-                    if this.save_state == SaveState::Saving {
-                        this.save_state = if this.dirty { SaveState::Dirty } else { SaveState::Clean };
-                    }
-                    cx.emit(EditorEvent::Changed);
-                    cx.notify();
                     return;
                 }
+                this.io.writing = false;
+                this.io.pending = None;
                 if let Some(copy) = outcome.conflict {
                     this.set_banner(Some(Banner::Conflict { copy: copy.clone() }), cx);
                     cx.emit(EditorEvent::PathsTouched(vec![copy]));
@@ -2867,6 +2975,8 @@ impl Editor {
 
     pub(crate) fn resume_io(&mut self, cx: &mut Context<Self>) {
         self.io.suspended = false;
+        self.io.strict = false;
+        self.io.admitted = None;
         for presenter in self.presenters.values() {
             presenter.textarea.update(cx, |s, cx| s.set_disabled(false, cx));
         }
@@ -2912,6 +3022,8 @@ impl Editor {
             ending: self.doc.line_ending,
             epoch: self.io.epoch,
             allow_missing: false,
+            admission: self.save_admission(),
+            journal_root: self.io.journal_root.clone(),
         };
         let guard = request.finish(
             self.io.pending.clone(),
@@ -2919,6 +3031,7 @@ impl Editor {
             self.io.remove_after_save.take(),
         );
         let job = guard.job();
+        self.io.terminating = Some(job.clone());
         let wait = cx.background_spawn(async move {
             let _ = job.wait();
         });
@@ -2949,19 +3062,30 @@ impl Editor {
             return Ok(None);
         }
         self.save_task = None;
-        let conflict = match self.disk_state()? {
-            Disk::Changed(disk) => Some(self.backup_disk(&disk)?),
-            Disk::Missing => {
-                log::warn!("{}: deleted on disk; unsaved changes dropped", self.path.as_str());
-                return Ok(None);
-            }
-            Disk::Unchanged => None,
-        };
-        let stamp = self.vault.write_bytes(&self.path, &self.doc.to_bytes())?;
-        self.stamp = stamp;
-        self.dirty = false;
-        self.save_state = SaveState::Saved(Instant::now());
-        Ok(conflict)
+        let outcome = io::SaveRequest {
+            vault: self.vault.clone(),
+            path: self.path.clone(),
+            known: self.stamp,
+            conflict_base: self.conflict_path(),
+            snapshot: self.doc.snapshot(),
+            bom: self.doc.bom,
+            ending: self.doc.line_ending,
+            epoch: self.io.epoch,
+            allow_missing: false,
+            admission: self.save_admission(),
+            journal_root: self.io.journal_root.clone(),
+        }
+        .save();
+        let stamp = outcome.result.map_err(|error| VaultError::Io {
+            path: self.vault.fs_path(&self.path),
+            source: std::io::Error::other(error),
+        })?;
+        if let Some(stamp) = stamp {
+            self.stamp = stamp;
+            self.dirty = false;
+            self.save_state = SaveState::Saved(Instant::now());
+        }
+        Ok(outcome.conflict)
     }
 
     // ---- 外部修改（方案 12：vault 监听 + 2 s 轮询兜底 + 写前校验；不做三方合并） ----
@@ -2979,7 +3103,7 @@ impl Editor {
     /// 监听 / 轮询 / 窗口激活时调用：无未保存修改则重载，有则留冲突副本并立即落盘本地版本；
     /// 文件不见了进入"已删除"态，又出现了（比如从废纸篓放回）则解除。
     pub fn check_external(&mut self, cx: &mut Context<Self>) {
-        if self.io.writing || self.io.suspended || self.io.checking.is_some() {
+        if self.io.writing || self.io.suspended || self.io.checking.is_some() || self.io.cut.is_some() {
             return;
         }
         let (vault, path, stamp) = (self.vault.clone(), self.path.clone(), self.stamp);
@@ -3075,7 +3199,7 @@ impl Editor {
         self.highlight = None;
         self.highlight_task = None;
         self.doc = doc;
-        crate::workspace::history::attach(self.vault.id(), &self.path, &mut self.doc, cx);
+        crate::workspace::history::attach(self.vault.id(), &self.path, &mut self.doc, stamp, cx);
         self.doc.track_edits();
         self.embeds.clear_content();
         self.update_local_link_names();
@@ -3203,6 +3327,15 @@ impl Editor {
 
     /// 横幅"另存为…"：写到 vault 内的另一条路径并改跟它。
     pub fn save_as(&mut self, path: VaultPath, cx: &mut Context<Self>) -> Result<(), VaultError> {
+        if self.io.suspended || self.io.cut.is_some() {
+            return Err(VaultError::Io {
+                path: self.vault.fs_path(&path),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "请先完成或撤销剪切及关联事务，再另存为",
+                ),
+            });
+        }
         let operation = crate::diagnostics::Operation::new(
             "note_save_as",
             crate::diagnostics::Facts {
@@ -3619,11 +3752,20 @@ impl Editor {
             // 列表项自己的颜色由 `render_list_item` 画：它要把标记列也包进背景里
             BlockKind::ListItem { .. } => Some(self.render_list_item(b, None, depth, inherited, cx)),
             kind if aero_core::containers::is_editable(kind) => {
-                let mut els: Vec<AnyElement> = b
-                    .children
-                    .iter()
-                    .filter_map(|child| self.render_block(child, depth + 1, None, cx))
-                    .collect();
+                let mut pending = self.container_empty_slots(b.id).iter().copied().peekable();
+                let mut els = Vec::new();
+                for child in &b.children {
+                    let start = self.doc.range_of(child).start;
+                    while pending.peek().is_some_and(|offset| *offset <= start) {
+                        els.push(self.render_empty_slot(pending.next().unwrap(), cx));
+                    }
+                    if let Some(child) = self.render_block(child, depth + 1, None, cx) {
+                        els.push(child);
+                    }
+                }
+                for offset in pending {
+                    els.push(self.render_empty_slot(offset, cx));
+                }
                 if els.is_empty() {
                     let key = presenter::Key::unit(b.id);
                     if let Some(text) = self.render_presenter(key, cx) {
@@ -3672,7 +3814,11 @@ impl Editor {
         let width = f32::from(self.scroll.bounds().size.width).min(COLUMN_WIDTH);
         let indent = indent.min((width - 160.).max(0.));
         rendered.map(|body| {
-            if indent > 0. { div().w_full().pl(px(indent)).child(body).into_any_element() } else { body }
+            div().w_full()
+                .text_color(paint.text.unwrap_or(cx.theme().foreground))
+                .when(indent > 0., |el| el.pl(px(indent)))
+                .child(body)
+                .into_any_element()
         })
     }
 
@@ -4143,29 +4289,15 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let range = self.doc.content_range(b);
+        if let Some(reference) = self.render_standalone_reference(b, cx) {
+            let unit = self.unit_frame(b.id, false, paint, reference, cx).into_any_element();
+            return Some(self.with_gutter(b.id, depth, unit, cx));
+        }
         if let Some(el) = self.render_presented_unit(b, depth, paint, cx) {
             return Some(el);
         }
         if self.is_focused_block(b.id) && !self.focused.as_ref().is_some_and(|focused| focused.math_popup) {
             let full = self.doc.slice(range.clone()).to_string();
-            if self.renders_inline_formulas(b.id, &full, cx)
-                && let Some(mixed) = self.render_with_inline_math(
-                    &full,
-                    range.start,
-                    b.id,
-                    self.text_view_style(cx),
-                    SharedString::from(format!("blk-{}-{}", cx.entity_id(), b.id.0)),
-                    self.focused.as_ref().map(|focused| focused.range.clone()),
-                    cx,
-                )
-            {
-                let body = Self::painted(
-                    div().w_full().when(matches!(b.kind, BlockKind::Heading { .. }), |el| el.pt_2()),
-                    paint,
-                )
-                .child(mixed);
-                return Some(self.with_gutter(b.id, depth, body.into_any_element(), cx));
-            }
             if matches!(b.kind, BlockKind::Callout { .. })
                 && self.hides_markers(cx)
                 && !self.block_shows_source(b.id)
@@ -4222,7 +4354,6 @@ impl Editor {
             return None;
         }
         let theme = cx.theme().clone();
-        let base = range.start;
         let text: SharedString = aero_core::containers::local_source(&self.doc, b.id)
             .unwrap_or_else(|| self.doc.slice(range).to_string())
             .into();
@@ -4281,26 +4412,17 @@ impl Editor {
                     Some(color) => style.with_foreground(color),
                     None => style,
                 };
-                if matches!(
-                    b.kind,
-                    BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::ListItem { .. }
-                ) && let Some(mixed) =
-                    self.render_with_inline_math(&text, base, id, style.clone(), view_id.clone(), None, cx)
-                {
-                    mixed
-                } else {
-                    preview::markdown(
-                        view_id,
-                        rendered,
-                        style,
-                        reveal,
-                        self.preview.clone(),
-                        cx.entity(),
-                        id,
-                        0,
-                    )
-                    .into_any_element()
-                }
+                preview::markdown(
+                    view_id,
+                    rendered,
+                    style,
+                    reveal,
+                    self.preview.clone(),
+                    cx.entity(),
+                    id,
+                    0,
+                )
+                .into_any_element()
             }
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });
@@ -4509,11 +4631,16 @@ impl Render for Editor {
                     cx.notify();
                 }
             }))
-            .capture_key_down(cx.listener(|this, _, _, cx| {
-                if this.io.suspended {
-                    cx.stop_propagation();
+            .capture_key_down({
+                let editor = cx.weak_entity();
+                move |event, window, cx| {
+                    let changed = editor.update(cx, |this, cx| this.capture_selected_input(event, window, cx)).unwrap_or(false);
+                    if changed {
+                        // Install the focused native client before the platform delivers this key's text.
+                        window.draw(cx).clear(cx);
+                    }
                 }
-            }))
+            })
             .track_focus(&self.focus_handle)
             // 菜单面板由 occlude 排除；在正文链接吞掉捕获事件前关闭菜单。
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
@@ -4534,6 +4661,7 @@ impl Render for Editor {
             )
             .on_action(cx.listener(Self::on_convert_block))
             .on_action(cx.listener(Self::on_menu_confirm))
+            .on_action(cx.listener(Self::on_list_outdent))
             .on_action(cx.listener(Self::on_link_alias))
             .on_action(cx.listener(Self::on_edit_link))
             .on_action(cx.listener(Self::on_open_character_palette))

@@ -94,6 +94,12 @@ pub enum ColorPickerEvent {
     Change(Option<Hsla>),
 }
 
+#[derive(Clone)]
+enum ColorPickerPopupEvent {
+    Opened(Option<Hsla>),
+    Cancelled,
+}
+
 /// The four component sliders owned by a [`ColorPickerState`].
 ///
 /// Applications render these with their own slider presentation; the picker
@@ -185,7 +191,8 @@ pub struct ColorPickerState {
     /// A builder-supplied value cannot reach the sliders without a `Window`,
     /// so the first render flushes it through [`Self::sync_pending_value`].
     needs_slider_sync: bool,
-    suppress_input_change: bool,
+    hex_display: String,
+    hex_dirty: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -201,11 +208,11 @@ impl ColorPickerState {
             window,
             |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => {
-                    if this.suppress_input_change {
-                        this.suppress_input_change = false;
+                    let value = input.read(cx).value();
+                    if !this.hex_dirty && value.as_str() == this.hex_display {
                         return;
                     }
-                    let value = input.read(cx).value();
+                    this.hex_dirty = true;
                     if this.preview_hex(value.as_str(), window, cx) {
                         let color = this.preview.expect("valid hex leaves a preview");
                         this.sliders.write(color, window, cx);
@@ -244,7 +251,8 @@ impl ColorPickerState {
             hex_input,
             sliders,
             needs_slider_sync: false,
-            suppress_input_change: false,
+            hex_display: String::new(),
+            hex_dirty: false,
             _subscriptions: subscriptions,
         }
     }
@@ -276,6 +284,11 @@ impl ColorPickerState {
     /// The hex text field. Render it with an application-owned input element.
     pub fn hex_input(&self) -> &Entity<InputState> {
         &self.hex_input
+    }
+
+    /// Whether the hex field contains a user edit rather than a synchronized display value.
+    pub fn hex_dirty(&self) -> bool {
+        self.hex_dirty
     }
 
     /// The HSLA component sliders.
@@ -343,7 +356,11 @@ impl ColorPickerState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Hsla> {
-        let value = parse_hex(value)?;
+        let value = if !self.hex_dirty && value == self.hex_display {
+            self.displayed_color()?
+        } else {
+            parse_hex(value)?
+        };
         self.select_color(value, window, cx);
         Some(value)
     }
@@ -359,19 +376,39 @@ impl ColorPickerState {
         self.update_value(Some(value), true, window, cx);
     }
 
+    /// Reports opening as `(true, initial_value)` and cancellation as `(false, None)`, not commits.
+    pub fn subscribe_popup<T: 'static>(
+        picker: &Entity<Self>,
+        window: &mut Window,
+        cx: &mut Context<T>,
+        mut callback: impl FnMut(&mut T, bool, Option<Hsla>, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        cx.subscribe_in(picker, window, move |this, _, event, window, cx| match event {
+            ColorPickerPopupEvent::Opened(value) => callback(this, true, *value, window, cx),
+            ColorPickerPopupEvent::Cancelled => callback(this, false, None, window, cx),
+        })
+    }
+
     /// Sets whether the picker popup is open.
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.open == open {
             return;
         }
         self.open = open;
+        if open {
+            cx.emit(ColorPickerPopupEvent::Opened(self.value));
+        } else {
+            self.preview = self.value;
+            self.hex_dirty = false;
+            self.needs_slider_sync = true;
+            cx.emit(ColorPickerPopupEvent::Cancelled);
+        }
         cx.notify();
     }
 
     /// Toggles the picker popup.
     pub fn toggle_open(&mut self, cx: &mut Context<Self>) {
-        self.open = !self.open;
-        cx.notify();
+        self.set_open(!self.open, cx);
     }
 
     /// Returns whether the picker popup is open.
@@ -434,14 +471,16 @@ impl ColorPickerState {
     /// Writes the hex field, suppressing the change it would otherwise feed
     /// back through `Hsla` → hex → `Hsla` and lose precision to.
     fn write_hex_input(&mut self, value: Option<Hsla>, window: &mut Window, cx: &mut App) {
-        self.suppress_input_change = true;
         let text = value.map(hex_string).unwrap_or_default();
+        self.hex_display = text.clone();
+        self.hex_dirty = false;
         self.hex_input
             .update(cx, |input, cx| input.set_value(text, window, cx));
     }
 }
 
 impl EventEmitter<ColorPickerEvent> for ColorPickerState {}
+impl EventEmitter<ColorPickerPopupEvent> for ColorPickerState {}
 
 impl Focusable for ColorPickerState {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -907,6 +946,62 @@ mod tests {
     }
 
     #[gpui::test]
+    fn popup_notifications_capture_baseline_and_only_cancel_on_dismissal(cx: &mut TestAppContext) {
+        let (state, cx) = state(cx);
+        let original = hsla(0., 0., 0., 0.375000000123);
+        let changed = hsla(0., 1., 0.5, 1.);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|window, cx| state.update(cx, |_, cx| {
+            let events = events.clone();
+            ColorPickerState::subscribe_popup(&state, window, cx, move |_, open, value, _, _| {
+                events.borrow_mut().push((open, value));
+            })
+        }));
+        cx.update(|window, cx| state.update(cx, |state, cx| {
+            state.set_value(original, window, cx);
+            state.set_open(true, cx);
+            state.set_open(true, cx);
+            state.update_color(changed, window, cx);
+            state.select_color(changed, window, cx);
+            state.set_open(false, cx);
+        }));
+        assert_eq!(&*events.borrow(), &[(true, Some(original))]);
+        cx.update(|_, cx| state.update(cx, |state, cx| {
+            state.set_open(true, cx);
+            state.set_open(false, cx);
+            state.set_open(false, cx);
+        }));
+        assert_eq!(&*events.borrow(), &[(true, Some(original)), (true, Some(changed)), (false, None)]);
+    }
+
+    #[gpui::test]
+    fn hex_dirty_tracks_user_input_not_display_sync(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (state, cx) = state(cx);
+        let original = hsla(0., 0., 0., 0.375000000123);
+        cx.update(|window, cx| state.update(cx, |state, cx| {
+            state.set_value(original, window, cx);
+            state.set_open(true, cx);
+            state.hex_input.update(cx, |input, cx| input.focus(window, cx));
+        }));
+        assert!(!state.read_with(cx, |state, _| state.hex_dirty()));
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("#FF0000FF");
+        assert!(state.read_with(cx, |state, _| state.hex_dirty()));
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| {
+            let input = state.read(cx).hex_input().clone();
+            input.update(cx, |_, cx| cx.emit(InputEvent::Change));
+        });
+        state.read_with(cx, |state, cx| {
+            assert!(!state.hex_dirty());
+            assert!(!state.is_open());
+            assert_eq!(state.hex_input.read(cx).value().as_str(), "#FF0000");
+            assert_eq!(state.value(), parse_hex("#FF0000FF"));
+        });
+    }
+
+    #[gpui::test]
     fn committing_hex_updates_the_value_and_closes(cx: &mut TestAppContext) {
         let (state, cx) = state(cx);
 
@@ -922,6 +1017,77 @@ mod tests {
             assert_eq!(state.preview(), committed);
             assert!(!state.is_open());
         });
+    }
+
+    #[gpui::test]
+    fn untouched_hex_enter_preserves_full_precision(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (state, cx) = state(cx);
+        let color = hsla(0., 0., 0., 0.375000000123);
+        let changes = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|window, cx| {
+            let changes = changes.clone();
+            let subscription = cx.subscribe(&state, move |_, event: &ColorPickerEvent, _| {
+                let ColorPickerEvent::Change(color) = event;
+                changes.borrow_mut().push(*color);
+            });
+            state.update(cx, |state, cx| {
+                state.set_value(color, window, cx);
+                state.set_open(true, cx);
+                state.hex_input.update(cx, |input, cx| input.focus(window, cx));
+            });
+            window.draw(cx).clear(cx);
+            subscription
+        });
+        cx.run_until_parked();
+        state.read_with(cx, |state, cx| {
+            assert_eq!(state.hex_input.read(cx).value().as_str(), "#0000005F");
+        });
+        cx.simulate_keystrokes("enter");
+        state.read_with(cx, |state, _| {
+            assert!(!state.is_open());
+            assert_eq!(state.value(), Some(color));
+            assert_eq!(state.preview(), Some(color));
+        });
+        assert!(changes.borrow().iter().all(|value| *value == Some(color)));
+    }
+
+    #[gpui::test]
+    fn edited_hex_enter_applies_and_cancel_reopen_discards_draft(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (state, cx) = state(cx);
+        let original = hsla(0., 0., 0., 0.375000000123);
+        cx.update(|window, cx| state.update(cx, |state, cx| {
+            state.set_value(original, window, cx);
+            state.set_open(true, cx);
+            state.hex_input.update(cx, |input, cx| input.focus(window, cx));
+        }));
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("#2457A780");
+        cx.update(|window, cx| state.update(cx, |state, cx| {
+            state.set_open(false, cx);
+            state.set_open(true, cx);
+            state.sync_pending_value(window, cx);
+        }));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(state.read_with(cx, |state, _| state.value()), Some(original));
+        cx.update(|window, cx| state.update(cx, |state, cx| {
+            state.set_open(true, cx);
+            state.sync_pending_value(window, cx);
+        }));
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("#2457A780");
+        cx.simulate_keystrokes("enter");
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.value(), parse_hex("#2457A780"));
+            assert!(!state.is_open());
+        });
+        cx.update(|window, cx| state.update(cx, |state, cx| {
+            state.set_value(original, window, cx);
+            state.set_open(true, cx);
+        }));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(state.read_with(cx, |state, _| state.value()), Some(original));
     }
 
     #[gpui::test]

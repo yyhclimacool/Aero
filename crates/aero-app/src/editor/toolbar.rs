@@ -218,7 +218,8 @@ impl Editor {
             }
         };
         let Some(document) = aero_core::identity::read(&self.doc).ok().and_then(|m| m.id) else { return };
-        cx.write_to_clipboard(ClipboardItem::new_string(format!("[[id:{document}#^{id}]]")));
+        let label = aero_core::links::readable_alias(&self.title());
+        cx.write_to_clipboard(ClipboardItem::new_string(format!("[[id:{document}#^{id}|{label}]]")));
     }
 
     fn add_block_id(&mut self, window: &mut Window, cx: &mut Context<Self>) {

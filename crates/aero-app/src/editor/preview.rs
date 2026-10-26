@@ -84,6 +84,7 @@ fn markdown_chain(
     let embed_style = style.clone();
     let embed_id = id.clone();
     let embed_origin = origin.clone();
+    let callout_chain = chain.clone();
     let highlight_editor = editor.clone();
     let highlight_style = style.clone();
     let highlight_id = id.clone();
@@ -203,6 +204,7 @@ fn markdown_chain(
                 block,
                 depth,
                 origin.clone(),
+                callout_chain.clone(),
                 cx,
             )
         })
@@ -336,8 +338,15 @@ fn note_embed(source: &str) -> Option<NoteEmbed> {
     let trimmed = source.trim();
     let embeds = aero_core::links::scan_embeds(trimmed);
     let [embed] = embeds.as_slice() else { return None };
-    if embed.range != (0..trimmed.len()) || aero_core::attachments::Kind::for_path(&embed.target).is_some() {
+    if aero_core::attachments::Kind::for_path(&embed.target).is_some() {
         return None;
+    }
+    if embed.range != (0..trimmed.len()) {
+        let doc = aero_core::Document::from_text(trimmed);
+        let [block] = doc.blocks().roots.as_slice() else { return None };
+        if block.kind != aero_core::BlockKind::Paragraph || doc.content_range(block) != embed.range {
+            return None;
+        }
     }
     Some(NoteEmbed {
         target: embed.target.clone(),
@@ -352,7 +361,7 @@ fn render_note_embed(
     embed: &NoteEmbed,
     style: &TextViewStyle,
     editor: &Entity<super::Editor>,
-    block: aero_core::BlockId,
+    _block: aero_core::BlockId,
     depth: u8,
     origin: Option<&aero_core::VaultPath>,
     chain: &[(aero_core::VaultPath, Option<String>)],
@@ -368,13 +377,6 @@ fn render_note_embed(
             None => format!("embed-{target}"),
         }
     };
-    if depth >= EMBED_DEPTH {
-        return div()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child("同步引用已达到 3 跳展开上限")
-            .into_any_element();
-    }
     let view = editor
         .read(cx)
         .live_embed(&embed.target, embed.fragment.as_deref(), origin, cx)
@@ -394,33 +396,19 @@ fn render_note_embed(
                     .child(error),
             )
             .into_any_element(),
-        EmbedView::Ready { path, fragment, title, source } => {
-            if chain.contains(&(path.clone(), fragment.clone())) {
-                return div().text_xs().text_color(theme.danger).child("同步引用形成循环").into_any_element();
-            }
-            let mut chain = chain.to_vec();
-            chain.push((path.clone(), fragment.clone()));
-            let click = {
-                let (editor, target, fragment) = (editor.clone(), path.as_str().to_owned(), fragment.clone());
-                move |event: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    if event.is_right_click() {
-                        return;
-                    }
-                    cx.stop_propagation();
-                    // 与点 wikilink 同一条路：工作区负责打开并定位
-                    editor.update(cx, |_, cx| {
-                        cx.emit(super::EditorEvent::LinkClicked {
-                            target: target.clone(),
-                            fragment: fragment.clone(),
-                        });
-                    });
-                }
-            };
-            let label = match &fragment {
-                Some(f) if !f.is_empty() => format!("{title} › {f}"),
-                _ => title,
-            };
-            let content: AnyElement = if depth < EMBED_DEPTH {
+        EmbedView::Ready { path, fragment, title, source, conflict, .. } => {
+            let limit = if chain.contains(&(path.clone(), fragment.clone())) {
+                Some(("embed-limit-cycle", "同步引用形成循环"))
+            } else if depth >= EMBED_DEPTH {
+                Some(("embed-limit-depth", "同步引用已达到 3 跳展开上限"))
+            } else { None };
+            let header = source_header(&id, &title, &path, fragment.as_deref(), conflict.as_ref(), editor, cx);
+            let content = if let Some((selector, message)) = limit {
+                div().debug_selector(move || selector.to_owned())
+                    .text_xs().text_color(theme.muted_foreground).child(message).into_any_element()
+            } else {
+                let mut chain = chain.to_vec();
+                chain.push((path.clone(), fragment.clone()));
                 markdown_chain(
                     format!("{id}-body").into(),
                     aero_core::links::to_markdown(&source).into(),
@@ -428,27 +416,16 @@ fn render_note_embed(
                     0,
                     editor.read(cx).preview.clone(),
                     editor.clone(),
-                    block,
+                    aero_core::BlockId(u64::MAX),
                     depth + 1,
-                    Some(path),
+                    Some(path.clone()),
                     chain,
-                )
-                .into_any_element()
-            } else {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("同步引用已达到 3 跳展开上限")
-                    .into_any_element()
+                ).into_any_element()
             };
-            v_flex()
-                .id(id.clone())
-                .gap_1()
-                .cursor_pointer()
-                .on_click(click)
-                .child(div().text_xs().text_color(theme.muted_foreground).child(label))
-                .child(content)
-                .into_any_element()
+            v_flex().id(id.clone()).gap_1()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(source_click(editor, path.clone(), fragment))
+                .child(header).child(content).into_any_element()
         }
     };
     div()
@@ -465,6 +442,139 @@ fn render_note_embed(
                 .child(body),
         )
         .into_any_element()
+}
+
+fn source_click(
+    editor: &Entity<super::Editor>,
+    path: aero_core::VaultPath,
+    fragment: Option<String>,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let editor = editor.clone();
+    move |event, _, cx| {
+        if event.is_right_click() { return; }
+        cx.stop_propagation();
+        editor.update(cx, |_, cx| cx.emit(super::EditorEvent::ResolvedSourceClicked {
+            path: path.clone(), fragment: fragment.clone(),
+        }));
+    }
+}
+
+fn source_header(
+    id: &SharedString,
+    title: &str,
+    path: &aero_core::VaultPath,
+    fragment: Option<&str>,
+    conflict: Option<&aero_core::VaultPath>,
+    editor: &Entity<super::Editor>,
+    cx: &App,
+) -> AnyElement {
+    let title = title.to_owned();
+    let selector = format!("source-go-{path}#{}", fragment.unwrap_or(""));
+    let location = match fragment {
+        Some(fragment) => format!("只读 · {path} › {fragment}"),
+        None => format!("只读 · {path}"),
+    };
+    v_flex().gap_1()
+        .child(h_flex().gap_2().justify_between()
+            .child(div().debug_selector({ let title = title.clone(); move || format!("reference-title-{title}") })
+                .text_sm().text_color(cx.theme().link).child(title))
+            .child(div().id(SharedString::from(format!("{id}-go"))).debug_selector(move || selector.clone())
+                .text_xs().text_color(cx.theme().link).cursor_pointer().child("前往原文")
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(source_click(editor, path.clone(), fragment.map(str::to_owned)))))
+        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(location))
+        .when_some(conflict, |el, copy| el.child(div().debug_selector(|| "source-conflict".into())
+            .text_xs().text_color(cx.theme().warning)
+            .child(format!("来源存在冲突，显示当前编辑缓冲区 · 磁盘副本：{copy}"))))
+        .into_any_element()
+}
+
+fn block_reference(source: &str) -> Option<aero_core::links::LinkSpan> {
+    #[cfg(test)]
+    tests::REFERENCE_CLASSIFICATIONS.with(|count| count.set(count.get() + 1));
+    let source = source.trim();
+    let links = aero_core::links::scan(source);
+    let [link] = links.as_slice() else { return None };
+    (link.range == (0..source.len()) && link.fragment.as_deref().is_some_and(|f| f.starts_with('^')))
+        .then(|| link.clone())
+}
+
+#[derive(Default)]
+pub(super) struct ReferenceCache {
+    revision: Option<(u64, u64)>,
+    entries: HashMap<aero_core::BlockId, Option<std::sync::Arc<StandaloneReference>>>,
+}
+
+struct StandaloneReference {
+    source: String,
+    link: aero_core::links::LinkSpan,
+}
+
+impl ReferenceCache {
+    fn classify(
+        &mut self,
+        doc: &aero_core::Document,
+        epoch: u64,
+        block: &aero_core::Block,
+    ) -> Option<std::sync::Arc<StandaloneReference>> {
+        let revision = (epoch, doc.version());
+        if self.revision != Some(revision) {
+            self.entries.clear();
+            self.revision = Some(revision);
+        }
+        if let Some(reference) = self.entries.get(&block.id) {
+            return reference.clone();
+        }
+        let paragraph = doc.slice(doc.content_range(block));
+        let mut prefix = paragraph.chars().skip_while(|ch| ch.is_whitespace());
+        let reference = if prefix.next() == Some('[') && prefix.next() == Some('[') {
+            let source = paragraph.to_string();
+            block_reference(&source).map(|link| std::sync::Arc::new(StandaloneReference { source, link }))
+        } else {
+            None
+        };
+        if self.entries.len() >= 512 {
+            if let Some(old) = self.entries.keys().next().copied() { self.entries.remove(&old); }
+        }
+        self.entries.insert(block.id, reference.clone());
+        reference
+    }
+}
+
+impl super::Editor {
+    pub(super) fn render_standalone_reference(
+        &self,
+        block: &aero_core::Block,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if block.kind != aero_core::BlockKind::Paragraph || self.is_focused_block(block.id)
+            || !self.hides_markers(cx) || self.block_shows_source(block.id) {
+            return None;
+        }
+        let reference = self.reference_cache.borrow_mut().classify(&self.doc, self.io.epoch, block)?;
+        let StandaloneReference { source, link } = reference.as_ref();
+        let id: SharedString = format!("reference-{}-{}", cx.entity_id(), block.id.0).into();
+        let view = self.live_embed(&link.target, link.fragment.as_deref(), None, cx)
+            .unwrap_or_else(|| self.embed_view_from(&link.target, link.fragment.as_deref(), None));
+        let body = match view {
+            super::embeds_ui::EmbedView::Ready { path, fragment, title, excerpt, conflict, .. } => {
+                v_flex().id(id.clone()).gap_2()
+                    .on_click(source_click(&cx.entity(), path.clone(), fragment.clone()))
+                    .child(source_header(&id, &title, &path, fragment.as_deref(), conflict.as_ref(), &cx.entity(), cx))
+                    .child(div().debug_selector({ let excerpt = excerpt.clone(); move || format!("reference-excerpt-{excerpt}") })
+                        .text_sm().child(excerpt)).into_any_element()
+            }
+            super::embeds_ui::EmbedView::Loading => div().text_xs().child("正在载入引用…").into_any_element(),
+            super::embeds_ui::EmbedView::Failed(error) => v_flex().gap_1()
+                .child(embed_source(format!("{id}-source").into(), &source, cx))
+                .child(div().debug_selector(|| "reference-error".into()).text_xs().text_color(cx.theme().danger).child(error))
+                .into_any_element(),
+        };
+        Some(div().id(id).debug_selector(|| "block-reference".into()).w_full().p_3().my_1()
+            .rounded(px(6.)).border_1().border_color(cx.theme().border)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation()).child(body).into_any_element())
+    }
 }
 
 /// 渲染不了就显示源码：内容永不丢失。
@@ -807,6 +917,9 @@ fn image_click(
         }
         let double = matches!(event, ClickEvent::Mouse(click) if click.down.click_count >= 2);
         cx.stop_propagation();
+        if block == aero_core::BlockId(u64::MAX) {
+            return;
+        }
         let target = target.clone();
         editor.update(cx, |editor, cx| {
             if double {
@@ -1099,6 +1212,7 @@ fn render_callout(
     block: aero_core::BlockId,
     depth: u8,
     origin: Option<aero_core::VaultPath>,
+    chain: Vec<(aero_core::VaultPath, Option<String>)>,
     cx: &mut App,
 ) -> AnyElement {
     let (label, icon, color) = appearance(&callout.kind, cx);
@@ -1184,7 +1298,7 @@ fn render_callout(
         .child(header)
         .when(open && !callout.body.is_empty(), |el| {
             el.child(div().debug_selector(move || format!("callout-body-{title}")).w_full().min_w_0().child(
-                markdown_from(
+                markdown_chain(
                     format!("{id}-body").into(),
                     aero_core::links::to_markdown(&callout.body).into(),
                     style,
@@ -1194,6 +1308,7 @@ fn render_callout(
                     block,
                     depth,
                     origin,
+                    chain,
                 ),
             ))
         })
@@ -1207,6 +1322,216 @@ mod tests {
     use gpui_kit::{
         ClickEvent, Modifiers, MouseButton, MouseClickEvent, MouseDownEvent, MouseUpEvent, point, px,
     };
+
+    thread_local! {
+        pub(super) static REFERENCE_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[gpui_kit::test]
+    fn g08_reference_redraw_does_not_reclassify_or_rebuild_live_snapshots(cx: &mut gpui_kit::TestAppContext) {
+        use super::super::{Editor, embeds_ui::SNAPSHOT_ANALYSES};
+        use gpui_kit::{AppContext as _, VisualTestContext};
+        let (_dir, vault, _, editor) = super::super::tests::open(cx, "ordinary paragraph\n\n[[source#^p]]\n");
+        let path = aero_core::VaultPath::new("source.md").unwrap();
+        vault.write_bytes(&path, b"live body ^p\n").unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let _source = cx.new(|cx| Editor::new(vault.clone(), path, doc, stamp, cx));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let classifications = REFERENCE_CLASSIFICATIONS.get();
+        let analyses = SNAPSHOT_ANALYSES.get();
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                editor.update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear(cx);
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(REFERENCE_CLASSIFICATIONS.get(), classifications, "redraw must reuse per-revision paragraph classification");
+        assert_eq!(SNAPSHOT_ANALYSES.get(), analyses, "paint must not reconstruct live source snapshots");
+    }
+
+    #[test]
+    fn g08_reference_classification_is_bounded_and_invalidates_by_document_revision() {
+        let mut doc = aero_core::Document::from_text("[[source#^p]]\n");
+        let mut cache = super::ReferenceCache::default();
+        let first = cache.classify(&doc, 0, &doc.blocks().roots[0]).unwrap();
+        let again = cache.classify(&doc, 0, &doc.blocks().roots[0]).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        let before = REFERENCE_CLASSIFICATIONS.get();
+        doc.edit(aero_core::Edit::replace(0..doc.len(), "[[changed#^p]]\n")).unwrap();
+        doc.reparse();
+        let changed = cache.classify(&doc, 0, &doc.blocks().roots[0]).unwrap();
+        assert_eq!(changed.link.target, "changed");
+        assert!(!std::sync::Arc::ptr_eq(&first, &changed));
+        assert!(std::sync::Arc::ptr_eq(&changed, &cache.classify(&doc, 0, &doc.blocks().roots[0]).unwrap()));
+        assert_eq!(REFERENCE_CLASSIFICATIONS.get(), before + 1);
+        let reloaded = aero_core::Document::from_text("[[reload#^p]]\n");
+        assert_eq!(cache.classify(&reloaded, 1, &reloaded.blocks().roots[0]).unwrap().link.target, "reload");
+        let ordinary = aero_core::Document::from_text(&"ordinary paragraph\n\n".repeat(600));
+        let before = REFERENCE_CLASSIFICATIONS.get();
+        for block in &ordinary.blocks().roots {
+            assert!(cache.classify(&ordinary, 2, block).is_none());
+        }
+        assert_eq!(REFERENCE_CLASSIFICATIONS.get(), before, "ordinary Rope prefixes need no Markdown analysis");
+        assert!(cache.entries.len() <= 512);
+    }
+
+    #[gpui_kit::test]
+    fn g08_standalone_reference_card_is_live_readonly_and_navigates(cx: &mut gpui_kit::TestAppContext) {
+        use super::super::{Editor, EditorEvent, Banner};
+        use gpui_kit::{AppContext as _, VisualTestContext};
+        let original = "[[source#^p|stale copied hint]]\n";
+        let (_dir, vault, destination, editor) = super::super::tests::open(cx, original);
+        let path = aero_core::VaultPath::new("source.md").unwrap();
+        vault.write_bytes(&path, b"---\ntitle: Disk title\n---\n\ndisk excerpt ^p\n").unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let source = cx.new(|cx| Editor::new(vault.clone(), path.clone(), doc, stamp, cx));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _subscription = cx.update(|window, cx| {
+            window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+            let events = events.clone();
+            cx.subscribe(&editor, move |_, event, _| if let EditorEvent::ResolvedSourceClicked { path, fragment } = event {
+                events.lock().unwrap().push((path.as_str().to_owned(), fragment.clone()));
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("block-reference").is_some(), "standalone navigation is not an editable alias");
+        cx.update(|_, cx| source.update(cx, |e, cx| {
+            e.doc.edit(aero_core::Edit::replace(0..e.doc.len(), "---\ntitle: Live title\n---\n\nlive excerpt ^p\n")).unwrap();
+            e.doc.reparse();
+            e.publish_live(cx);
+            e.set_banner(Some(Banner::Conflict { copy: aero_core::VaultPath::new("source.conflict.md").unwrap() }), cx);
+        }));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("source-conflict").is_some(), "conflict must not silently switch to disk");
+        assert!(cx.debug_bounds("reference-title-Live title").is_some());
+        assert!(cx.debug_bounds("reference-excerpt-live excerpt").is_some());
+        let jump = cx.debug_bounds("source-go-source.md#^p").unwrap();
+        cx.simulate_click(jump.center(), gpui_kit::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(*events.lock().unwrap(), vec![("source.md".into(), Some("^p".into()))]);
+        cx.update(|_, cx| {
+            assert!(editor.read(cx).focused.is_none());
+            assert!(source.read(cx).focused.is_none());
+            assert_eq!(editor.read(cx).doc.to_string(), original);
+            assert_eq!(source.read(cx).doc.version(), 1);
+        });
+        assert_eq!(vault.read_bytes(&destination).unwrap().0, original.as_bytes());
+        assert!(vault.read(&path).unwrap().0.to_string().contains("disk excerpt"));
+    }
+
+    #[gpui_kit::test]
+    fn g08_sync_conflict_badge_updates_without_body_revision(cx: &mut gpui_kit::TestAppContext) {
+        use super::super::{Editor, Banner};
+        use gpui_kit::{AppContext as _, VisualTestContext};
+        let (_dir, vault, _, editor) = super::super::tests::open(cx, "![[source#^p]]\n");
+        let path = aero_core::VaultPath::new("source.md").unwrap();
+        vault.write_bytes(&path, b"buffer body ^p\n").unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        let source = cx.new(|cx| Editor::new(vault.clone(), path.clone(), doc, stamp, cx));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+            editor.update(cx, |e, cx| e.refresh_embeds(cx));
+        });
+        cx.run_until_parked();
+        for conflict in [true, false] {
+            cx.update(|_, cx| source.update(cx, |e, cx| e.set_banner(conflict.then(|| Banner::Conflict { copy: aero_core::VaultPath::new("conflict.md").unwrap() }), cx)));
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(cx.debug_bounds("source-conflict").is_some(), conflict);
+            cx.update(|_, cx| {
+                assert!(matches!(editor.read(cx).live_embed("source", Some("^p"), None, cx), Some(super::super::embeds_ui::EmbedView::Ready { source, .. }) if source == "buffer body ^p"));
+                assert_eq!(source.read(cx).doc.version(), 0);
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn g08_cycle_and_depth_placeholders_keep_clickable_actual_source(cx: &mut gpui_kit::TestAppContext) {
+        use super::super::EditorEvent;
+        use gpui_kit::VisualTestContext;
+        for cycle in [true, false] {
+            let (_dir, vault, _, editor) = super::super::tests::open(cx, "![[b]]\n");
+            for (name, body) in [("b", "![[c]]"), ("c", "![[d]]"), ("d", if cycle { "![[b]]" } else { "![[e]]" }), ("e", "last body")] {
+                vault.write_bytes(&aero_core::VaultPath::new(&format!("{name}.md")).unwrap(), body.as_bytes()).unwrap();
+            }
+            let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _subscription = cx.update(|window, cx| {
+                window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+                editor.update(cx, |e, cx| e.refresh_embeds(cx));
+                let events = events.clone();
+                cx.subscribe(&editor, move |_, event, _| if let EditorEvent::ResolvedSourceClicked { path, .. } = event {
+                    events.lock().unwrap().push(path.as_str().to_owned());
+                })
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let reason = if cycle { "embed-limit-cycle" } else { "embed-limit-depth" };
+            assert!(cx.debug_bounds(reason).is_some(), "{reason}");
+            let target = if cycle { "b.md" } else { "e.md" };
+            let selector = if cycle { "source-go-b.md#" } else { "source-go-e.md#" };
+            let jump = cx.debug_bounds(selector).expect("placeholder retains actual destination");
+            cx.simulate_click(jump.center(), gpui_kit::Modifiers::default());
+            cx.run_until_parked();
+            assert_eq!(*events.lock().unwrap(), vec![target]);
+            cx.update(|_, cx| assert!(editor.read(cx).focused.is_none()));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn g08_readonly_source_images_do_not_select_destination_for_editing(cx: &mut gpui_kit::TestAppContext) {
+        let (_dir, _vault, _, editor) = super::super::tests::open(cx, "![[source]]\n");
+        let cx = &mut gpui_kit::VisualTestContext::from_window(cx.windows()[0], cx);
+        let click = super::image_click(&editor, aero_core::BlockId(u64::MAX), 0, "source.png".into());
+        cx.update(|window, cx| {
+            click(&mouse_click(MouseButton::Left), window, cx);
+            assert!(editor.read(cx).selected_image.is_none());
+            assert!(editor.read(cx).focused.is_none());
+            assert_eq!(editor.read(cx).doc.to_string(), "![[source]]\n");
+        });
+    }
+
+    #[test]
+    fn g08_nested_reference_recognition_keeps_identity_metadata_out_of_body() {
+        assert!(super::note_embed("![[source#^p|readable]] {.red} ^own").is_some());
+        assert!(super::note_embed("![[source#^p]] ordinary text").is_none());
+        assert!(super::block_reference("[[source#^p|readable]]").is_some());
+        for inline in ["before [[source#^p]]", "[[source#^p]] after", "![[source#^p]]", "[[source]]", "`[[source#^p]]`"] {
+            assert!(super::block_reference(inline).is_none(), "ordinary inline selection must stay intact: {inline}");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn g08_callout_chains_are_scoped_and_repeated_noncycle_sources_expand(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::VisualTestContext;
+        for cycle in [false, true] {
+            let (_dir, vault, _, editor) = super::super::tests::open(cx, "![[b#^same]]\n\n![[b#^same]]\n");
+            let b = aero_core::VaultPath::new("b.md").unwrap();
+            let c = aero_core::VaultPath::new("c.md").unwrap();
+            vault.write_bytes(&b, b"![[c#^same]] ^same\n").unwrap();
+            vault.write_bytes(&c, if cycle { b"> [!note] Loop\n> ![[b#^same]]\n\n^same\n" } else { b"last body ^same\n" }).unwrap();
+            let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+            cx.update(|window, cx| {
+                window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+                editor.update(cx, |e, cx| e.refresh_embeds(cx));
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(cx.debug_bounds("source-go-c.md#^same").is_some(), "same short IDs in different documents are not a cycle");
+            assert_eq!(cx.debug_bounds("embed-limit-cycle").is_some(), cycle);
+            assert!(cx.debug_bounds("embed-limit-depth").is_none(), "callouts preserve the chain without consuming a hop");
+        }
+    }
 
     #[test]
     fn callout_body_preserves_markdown_structure_and_lazy_lines() {

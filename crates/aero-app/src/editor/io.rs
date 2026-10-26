@@ -7,8 +7,150 @@ pub(super) struct IoState {
     pub check_generation: u64,
     pub writing: bool,
     pub pending: Option<WriteJob>,
+    pub terminating: Option<WriteJob>,
     pub suspended: bool,
     pub remove_after_save: Option<VaultPath>,
+    pub journal_root: Option<std::path::PathBuf>,
+    pub cut: Option<CutSave>,
+    pub strict: bool,
+    pub admitting: bool,
+    pub admitted: Option<(u64, u64, FileStamp)>,
+}
+
+#[derive(Clone)]
+pub(super) struct CutSave {
+    pub token: String,
+    pub vault: std::sync::Arc<Vault>,
+    pub journal: std::sync::Arc<std::sync::Mutex<aero_core::transaction::PendingCut>>,
+}
+
+impl Drop for IoState {
+    fn drop(&mut self) {
+        if let Some(cut) = self.cut.take() {
+            let pending = self.pending.take();
+            let terminating = self.terminating.take();
+            let _ = std::thread::Builder::new().name("aero-cut-close".into()).spawn(move || {
+                for job in pending.into_iter().chain(terminating) {
+                    job.wait();
+                }
+                let mut journal = cut.journal.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(error) = journal.recover_cancel(&cut.vault) {
+                    log::error!("关闭剪切来源时恢复失败：{error}");
+                }
+            });
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) enum SaveAdmission {
+    #[default]
+    Ordinary,
+    Strict,
+    Cut {
+        cut: CutSave,
+        restore: Vec<u8>,
+        cancelled: bool,
+    },
+    Blocked(String),
+}
+
+impl Editor {
+    pub(crate) fn set_journal_root(&mut self, root: std::path::PathBuf) {
+        self.io.journal_root = Some(root);
+    }
+
+    pub(super) fn save_admission(&self) -> SaveAdmission {
+        if let Some(cut) = &self.io.cut {
+            let cancelled = self.doc.history_transaction(true) == Some(cut.token.as_str());
+            let restored =
+                if cancelled { Ok(self.doc.clone()) } else { self.doc.without_transaction(&cut.token) };
+            return match restored {
+                Ok(doc) => SaveAdmission::Cut { cut: cut.clone(), restore: doc.to_bytes(), cancelled },
+                Err(error) => SaveAdmission::Blocked(error),
+            };
+        }
+        if self.io.strict { SaveAdmission::Strict } else { SaveAdmission::Ordinary }
+    }
+
+    pub(crate) fn admit_transaction_save(&mut self, cx: &mut Context<Self>) -> bool {
+        self.io.strict = true;
+        self.save_task = None;
+        let key = (self.io.epoch, self.doc.version(), self.stamp);
+        if self.io.admitted == Some(key) || self.io.admitting {
+            return true;
+        }
+        if self.io.writing || self.io.suspended {
+            return false;
+        }
+        self.io.checking = None;
+        self.io.check_generation += 1;
+        self.io.admitting = true;
+        self.io.writing = true;
+        self.save_state = SaveState::Saving;
+        let (vault, path, bytes) = (self.vault.clone(), self.path.clone(), self.doc.to_bytes());
+        let previous = self.io.pending.take();
+        let mut job = WriteJob::spawn(path.clone(), key.0, key.1, move || {
+            let result = (|| {
+                let mut stamp = key.2;
+                if let Some(previous) = previous {
+                    match previous.wait().result {
+                        Ok(Some(owned)) => stamp = owned,
+                        Ok(None) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                aero_core::transaction::validate_write(&vault, &path, stamp, bytes)?;
+                Ok(Some(stamp))
+            })();
+            SaveOutcome { result, conflict: None }
+        });
+        job.publishes = false;
+        self.io.pending = Some(job.clone());
+        let wait = cx.background_spawn(async move { job.wait() });
+        cx.spawn(async move |this, cx| {
+            let outcome = wait.await;
+            let _ = this.update(cx, |e, cx| {
+                if e.io.epoch != key.0 {
+                    return;
+                }
+                e.io.pending = None;
+                e.io.writing = false;
+                e.io.admitting = false;
+                match outcome.result {
+                    Ok(Some(stamp)) => {
+                        e.stamp = stamp;
+                        e.io.admitted = Some((key.0, key.1, stamp));
+                        e.save_state = SaveState::Dirty;
+                    }
+                    Err(error) => e.save_failed(error, cx),
+                    Ok(None) => unreachable!(),
+                }
+                cx.emit(EditorEvent::Changed);
+                cx.notify();
+            });
+        })
+        .detach();
+        true
+    }
+
+    pub(crate) fn transaction_save_now(&mut self, cx: &mut Context<Self>) {
+        if !self.admit_transaction_save(cx) || self.io.admitting {
+            return;
+        }
+        // Every dirty participant must pass admission before any pre-save writes.
+        if Self::live_editors(self.vault.id(), cx).into_iter().any(|editor| {
+            editor.entity_id() != cx.entity_id() && {
+                let e = editor.read(cx);
+                e.io.admitting || matches!(e.save_state, SaveState::Failed(_))
+            }
+        }) {
+            return;
+        }
+        if self.dirty && !self.io.writing && !self.io.suspended && !self.is_deleted() {
+            self.start_checked_write(false, cx);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -24,6 +166,7 @@ pub(super) struct WriteJob {
     path: VaultPath,
     epoch: u64,
     version: u64,
+    publishes: bool,
     result: std::sync::Arc<(std::sync::Mutex<Option<SaveOutcome>>, std::sync::Condvar)>,
 }
 
@@ -70,7 +213,7 @@ impl WriteJob {
             failed.finish(crate::diagnostics::Outcome::Failed);
             *result.0.lock().unwrap() = Some(SaveOutcome { result: Err(error.to_string()), conflict: None });
         }
-        Self { path, epoch, version, result }
+        Self { path, epoch, version, publishes: true, result }
     }
 
     pub(super) fn wait(&self) -> SaveOutcome {
@@ -93,10 +236,44 @@ pub(super) struct SaveRequest {
     pub ending: aero_core::LineEnding,
     pub epoch: u64,
     pub allow_missing: bool,
+    pub admission: SaveAdmission,
+    pub journal_root: Option<std::path::PathBuf>,
 }
 
 impl SaveRequest {
     pub(super) fn save(self) -> SaveOutcome {
+        if let Some(root) = &self.journal_root
+            && !matches!(self.admission, SaveAdmission::Cut { cancelled: true, .. })
+            && let Err(error) = aero_core::transaction::check_recovery(root)
+        {
+            return SaveOutcome { result: Err(error), conflict: None };
+        }
+        let bytes =
+            || aero_core::SourceText::encode(&String::from(self.snapshot.text()), self.bom, self.ending);
+        let admitted = match &self.admission {
+            SaveAdmission::Ordinary => None,
+            SaveAdmission::Blocked(error) => Some(Err(error.clone())),
+            SaveAdmission::Strict => {
+                Some(aero_core::transaction::write_checked(&self.vault, &self.path, self.known, bytes()))
+            }
+            SaveAdmission::Cut { cut, restore, cancelled } => Some((|| {
+                let mut journal = cut.journal.lock().map_err(|_| "剪切恢复锁已损坏".to_owned())?;
+                let change = aero_core::transaction::validate_write(
+                    &self.vault,
+                    &self.path,
+                    self.known,
+                    if *cancelled { restore.clone() } else { bytes() },
+                )?;
+                if *cancelled {
+                    journal.restore(&self.vault, change, self.snapshot.version())
+                } else {
+                    journal.publish(&self.vault, change, restore.clone(), self.snapshot.version())
+                }
+            })()),
+        };
+        if let Some(result) = admitted {
+            return SaveOutcome { result: result.map(Some), conflict: None };
+        }
         save(
             &self.vault,
             &self.path,
@@ -126,7 +303,10 @@ impl SaveRequest {
                         // Do not retry a failed write/backup during irrevocable native shutdown.
                         Err(_) => return outcome,
                     }
-                    if previous.version == self.snapshot.version() && matches!(outcome.result, Ok(Some(_))) {
+                    if previous.publishes
+                        && previous.version == self.snapshot.version()
+                        && matches!(outcome.result, Ok(Some(_)))
+                    {
                         return outcome;
                     }
                     conflict = outcome.conflict;
@@ -267,8 +447,153 @@ mod tests {
             ending: aero_core::LineEnding::CrLf,
             epoch: 7,
             allow_missing: false,
+            admission: super::SaveAdmission::Ordinary,
+            journal_root: None,
         };
         (dir, request)
+    }
+
+    #[gpui_kit::test]
+    fn g11_transaction_admission_checks_disk_in_worker_before_any_write(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let (dir, request) = request();
+        let (doc, stamp) = request.vault.read(&request.path).unwrap();
+        cx.update(gpui_kit::init);
+        let editor = cx.new(|cx| super::Editor::new(request.vault, request.path, doc, stamp, cx));
+        std::fs::write(dir.path().join("a.md"), b"external\n").unwrap();
+        editor.update(cx, |e, cx| {
+            e.doc.edit(Edit::insert(0, "dirty ")).unwrap();
+            e.after_doc_change(cx);
+            assert!(
+                e.admit_transaction_save(cx),
+                "admission queues disk validation instead of reading under the UI lock"
+            );
+            assert_eq!(e.save_state, super::SaveState::Saving);
+        });
+        cx.run_until_parked();
+        assert!(editor.read_with(cx, |e, _| matches!(e.save_state, super::SaveState::Failed(_))));
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"external\n");
+    }
+
+    #[gpui_kit::test]
+    fn g11_admitted_source_waits_for_other_participants(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let (dir, request) = request();
+        let other = VaultPath::new("b.md").unwrap();
+        request.vault.create_bytes(&other, b"other\n").unwrap();
+        cx.update(gpui_kit::init);
+        let editors = [request.path.clone(), other.clone()].map(|path| {
+            let (doc, stamp) = request.vault.read(&path).unwrap();
+            cx.new(|cx| super::Editor::new(request.vault.clone(), path, doc, stamp, cx))
+        });
+        for editor in &editors {
+            editor.update(cx, |e, cx| {
+                e.doc.edit(Edit::insert(0, "dirty ")).unwrap();
+                e.after_doc_change(cx);
+                e.save_task = None;
+            });
+        }
+        editors[0].update(cx, |e, cx| {
+            assert!(e.admit_transaction_save(cx));
+        });
+        cx.run_until_parked();
+        request.vault.write_bytes(&other, b"external\n").unwrap();
+        editors[1].update(cx, |e, cx| {
+            assert!(e.admit_transaction_save(cx));
+        });
+        editors[0].update(cx, |e, cx| e.transaction_save_now(cx));
+        assert!(!editors[0].read_with(cx, |e, _| e.io.writing));
+        cx.run_until_parked();
+        editors[0].update(cx, |e, cx| e.transaction_save_now(cx));
+        assert!(!editors[0].read_with(cx, |e, _| e.io.writing));
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"base\n");
+    }
+
+    #[test]
+    fn g11_lazy_cut_save_adopts_the_previous_owned_write_stamp() {
+        let (dir, mut first) = request();
+        first.bom = false;
+        first.ending = aero_core::LineEnding::Lf;
+        let mut deletion = first.clone();
+        deletion.snapshot = Document::from_text("base\n").snapshot();
+        let root = dir.path().join("journal");
+        let journal = Arc::new(std::sync::Mutex::new(aero_core::transaction::PendingCut::unpublished(
+            root.clone(),
+            first.path.clone(),
+            "cut-token".into(),
+        )));
+        let vault = first.vault.clone();
+        deletion.admission = super::SaveAdmission::Cut {
+            cut: super::CutSave { token: "cut-token".into(), vault: vault.clone(), journal: journal.clone() },
+            restore: b"first base\n".to_vec(),
+            cancelled: false,
+        };
+        deletion.journal_root = Some(root.clone());
+        let (release, gate) = mpsc::channel();
+        let previous =
+            WriteJob::spawn(first.path.clone(), first.epoch, first.snapshot.version(), move || {
+                gate.recv().unwrap();
+                first.save()
+            });
+        let guard = deletion.finish(Some(previous), true, None);
+        assert!(!root.exists());
+        release.send(()).unwrap();
+        assert!(guard.wait().result.is_ok());
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"base\n");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        drop(guard);
+        drop(journal);
+        aero_core::transaction::recover(&vault, &root).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"first base\n");
+    }
+
+    #[gpui_kit::test]
+    fn g11_native_guard_does_not_mistake_admission_for_a_saved_snapshot(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let (dir, request) = request();
+        let (doc, stamp) = request.vault.read(&request.path).unwrap();
+        cx.update(gpui_kit::init);
+        let editor = cx.new(|cx| super::Editor::new(request.vault, request.path, doc, stamp, cx));
+        let (guard, wait) = editor.update(cx, |e, cx| {
+            e.doc.edit(Edit::insert(0, "dirty ")).unwrap();
+            e.after_doc_change(cx);
+            assert!(e.admit_transaction_save(cx));
+            e.native_save_barrier(cx)
+        });
+        drop(wait);
+        assert!(guard.wait().result.is_ok());
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"dirty base\n");
+    }
+
+    #[test]
+    fn g11_strict_save_rejects_readonly_and_same_stat_external_content() {
+        for readonly in [false, true] {
+            let (dir, mut request) = request();
+            request.admission = super::SaveAdmission::Strict;
+            let path = dir.path().join("a.md");
+            let original = std::fs::metadata(&path).unwrap().permissions();
+            if readonly {
+                let mut permissions = original.clone();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            } else {
+                std::fs::write(&path, b"disk\n").unwrap();
+                std::fs::File::open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(request.known.mtime))
+                    .unwrap();
+                assert_eq!(
+                    request.vault.stat(&request.path).unwrap(),
+                    (request.known.mtime, request.known.size)
+                );
+            }
+            let outcome = request.save();
+            assert!(outcome.result.is_err());
+            assert!(outcome.conflict.is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), if readonly { b"base\n" } else { b"disk\n" });
+            assert!(!dir.path().join("a.conflict-test.md").exists());
+            std::fs::set_permissions(path, original).unwrap();
+        }
     }
 
     #[test]

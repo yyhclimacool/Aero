@@ -454,7 +454,7 @@ impl<M: InputModeKind> TextElement<M> {
         let visible_buffer_lines = &last_layout.visible_buffer_lines;
         let caret_for = |row: usize, offset: usize, affinity: bool| -> Point<Pixels> {
             // y of the top of buffer line `row` in content space.
-            let top = line_height * state.display_map.buffer_line_to_display_row(row);
+            let top = state.display_row_top(state.display_map.buffer_line_to_display_row(row), line_height);
             let line_origin = point(px(0.), top);
 
             if let Some(vi) = visible_buffer_lines.iter().position(|&bl| bl == row) {
@@ -462,7 +462,10 @@ impl<M: InputModeKind> TextElement<M> {
                 let line_start = last_layout.visible_line_byte_offsets[vi];
                 let local = offset.saturating_sub(line_start);
                 if let Some(pos) = line.position_for_index(local, last_layout, affinity) {
-                    return line_origin + pos;
+                    let row = line.row_at_y(pos.y, line_height);
+                    return line_origin
+                        + pos
+                        + point(px(0.), (line.row_height(row, line_height) - line_height).half());
                 }
             }
             line_origin
@@ -627,84 +630,19 @@ impl<M: InputModeKind> TextElement<M> {
             return None;
         }
 
-        let line_height = last_layout.line_height;
-        let visible_top = last_layout.visible_top;
-        let lines = &last_layout.lines;
-        let line_number_width = last_layout.line_number_width;
-
-        let start_ix = range.start;
-        let end_ix = range.end;
-
-        // Start from visible_top (which already accounts for all lines before visible range)
-        let mut offset_y = visible_top;
-        let mut line_corners = vec![];
-
-        // Iterate only over visible (non-hidden) buffer lines
-        for (prev_lines_offset, line) in last_layout.visible_line_byte_offsets.iter().zip(lines.iter()) {
-            let prev_lines_offset = *prev_lines_offset;
-            let line_size = line.size(line_height);
-            let line_wrap_width = line_size.width;
-
-            let line_origin = point(px(0.), offset_y);
-
-            let line_cursor_start =
-                line.position_for_index(start_ix.saturating_sub(prev_lines_offset), last_layout, false);
-            // The end of a range closes the row it lands on: a range ending exactly on a soft
-            // wrap boundary highlights to the end of that row instead of opening a zero-width
-            // sliver at the start of the next one.
-            let line_cursor_end =
-                line.position_for_index(end_ix.saturating_sub(prev_lines_offset), last_layout, true);
-
-            if line_cursor_start.is_some() || line_cursor_end.is_some() {
-                let start = line_cursor_start
-                    .unwrap_or_else(|| line.position_for_index(0, last_layout, false).unwrap());
-
-                let end = line_cursor_end
-                    .unwrap_or_else(|| line.position_for_index(line.len(), last_layout, false).unwrap());
-
-                // Split the selection into multiple items
-                let wrapped_lines =
-                    (end.y / line_height).ceil() as usize - (start.y / line_height).ceil() as usize;
-
-                let mut end_x = end.x;
-                if wrapped_lines > 0 {
-                    end_x = line_wrap_width;
+        let mut line_corners: Vec<_> = last_layout
+            .range_bounds(&range)
+            .into_iter()
+            .map(|mut rect| {
+                rect.size.width = rect.size.width.max(px(6.));
+                Corners {
+                    top_left: rect.origin,
+                    top_right: point(rect.right(), rect.top()),
+                    bottom_left: point(rect.left(), rect.bottom()),
+                    bottom_right: rect.bottom_right(),
                 }
-
-                // Ensure at least 6px width for the selection for empty lines.
-                end_x = end_x.max(start.x + px(6.));
-
-                line_corners.push(Corners {
-                    top_left: line_origin + point(start.x, start.y),
-                    top_right: line_origin + point(end_x, start.y),
-                    bottom_left: line_origin + point(start.x, start.y + line_height),
-                    bottom_right: line_origin + point(end_x, start.y + line_height),
-                });
-
-                // wrapped lines
-                for i in 1..=wrapped_lines {
-                    let indent = line.line_indent((start.y / line_height) as usize + i);
-                    let start = point(indent, start.y + i as f32 * line_height);
-                    let mut end = point(end.x, end.y + i as f32 * line_height);
-                    if i < wrapped_lines {
-                        end.x = line_size.width;
-                    }
-
-                    line_corners.push(Corners {
-                        top_left: line_origin + point(start.x, start.y),
-                        top_right: line_origin + point(end.x, start.y),
-                        bottom_left: line_origin + point(start.x, start.y + line_height),
-                        bottom_right: line_origin + point(end.x, start.y + line_height),
-                    });
-                }
-            }
-
-            if line_cursor_start.is_some() && line_cursor_end.is_some() {
-                break;
-            }
-
-            offset_y += line_size.height;
-        }
+            })
+            .collect();
 
         let mut points = vec![];
         if line_corners.is_empty() {
@@ -737,7 +675,7 @@ impl<M: InputModeKind> TextElement<M> {
 
         // print_points_as_svg_path(&line_corners, &points);
 
-        let path_origin = bounds.origin + point(line_number_width, px(0.));
+        let path_origin = bounds.origin;
         let first_p = *points.get(0).unwrap();
         let mut builder = gpui::PathBuilder::fill();
         builder.move_to(path_origin + first_p);
@@ -894,27 +832,22 @@ impl<M: InputModeKind> TextElement<M> {
         scroll_top = clamp_auto_grow_vertical_scroll_offset(
             &state.mode,
             scroll_top,
-            line_height * total_lines,
+            state.display_row_top(total_lines, line_height),
             input_height,
         );
 
-        // Display rows are uniformly `line_height` tall, so the visible window maps
-        // directly to a display-row range.
         let viewport_top = (-scroll_top).max(px(0.));
         let viewport_bottom = viewport_top + input_height;
-        let line_height_f = f32::from(line_height);
-        let first_display =
-            ((f32::from(viewport_top) / line_height_f).floor() as usize).min(display_count - 1);
-        let last_display =
-            ((f32::from(viewport_bottom) / line_height_f).ceil() as usize).min(display_count - 1);
+        let first_display = state.display_row_at_y(viewport_top, line_height).min(display_count - 1);
+        let last_display = (state.display_row_at_y(viewport_bottom, line_height) + 1).min(display_count - 1);
 
         let start_line = state.display_map.display_row_to_buffer_line(first_display);
         let end_line = state.display_map.display_row_to_buffer_line(last_display);
 
         // y of the top of the first visible buffer line (in content space).
         let visible_top = match state.display_map.buffer_line_to_display_row_range(start_line) {
-            Some(range) => line_height * range.start,
-            None => line_height * first_display,
+            Some(range) => state.display_row_top(range.start, line_height),
+            None => state.display_row_top(first_display, line_height),
         };
 
         let visible_range = start_line..(end_line + 1 + extra_rows).min(buffer_line_count);
@@ -1320,7 +1253,13 @@ impl<M: InputModeKind> TextElement<M> {
                     at = next;
                 }
                 for (y, x0, x1) in segments {
-                    let y = origin.y + line_top + y + baseline + px(2.);
+                    let row = line.row_at_y(y, line_height);
+                    let y = origin.y
+                        + line_top
+                        + y
+                        + baseline
+                        + px(2.)
+                        + (line.row_height(row, line_height) - line_height).half();
                     let mut x = x0;
                     while x < x1 {
                         let width = px(2.).min(x1 - x);
@@ -1348,51 +1287,18 @@ impl<M: InputModeKind> TextElement<M> {
         if !markup.conceal.iter().any(hits)
             && !markup.styles.iter().any(|(range, _)| hits(range))
             && !markup.fonts.iter().any(|(range, _)| hits(range))
+            && !markup.inline_objects.iter().any(|(range, _, _)| hits(range))
         {
             return None;
         }
 
-        let mut display = String::with_capacity(segment.len());
-        let mut to_display = vec![0; segment.len() + 1];
-        let mut i = 0;
-        while i < segment.len() {
-            let ch = segment[i..].chars().next().unwrap_or('\u{FFFD}');
-            let n = ch.len_utf8().min(segment.len() - i);
-            let abs = abs_start + i;
-            let hidden = markup.conceal.iter().any(|range| abs >= range.start && abs < range.end);
-            let at = display.len();
-            for b in 0..n {
-                to_display[i + b] = at;
-            }
-            if !hidden {
-                display.push(ch);
-            }
-            i += n;
-        }
-        to_display[segment.len()] = display.len();
-
-        let mut to_buffer = vec![segment.len(); display.len() + 1];
-        to_buffer[0] = 0;
-        i = 0;
-        while i < segment.len() {
-            let ch = segment[i..].chars().next().unwrap_or('\u{FFFD}');
-            let n = ch.len_utf8().min(segment.len() - i);
-            let abs = abs_start + i;
-            let hidden = markup.conceal.iter().any(|range| abs >= range.start && abs < range.end);
-            if !hidden {
-                let at = to_display[i];
-                for b in 0..n {
-                    to_buffer[at + b] = i;
-                }
-                to_buffer[at + n] = i + n;
-            }
-            i += n;
-        }
+        let (display, mut map) =
+            ConcealMap::present(segment, abs_start, &markup.conceal, &markup.inline_objects);
 
         let mut runs: Vec<TextRun> = Vec::new();
         let mut cursor = 0;
         while cursor < display.len() {
-            let buf = to_buffer.get(cursor).copied().unwrap_or(0);
+            let buf = map.to_buffer(cursor);
             let ch = display[cursor..].chars().next().unwrap_or('\u{FFFD}');
             let n = ch.len_utf8();
             let mut run = Self::run_at(base_runs, buf).unwrap_or_else(|| TextRun {
@@ -1415,6 +1321,12 @@ impl<M: InputModeKind> TextElement<M> {
                     run.font.family = family.clone();
                 }
             }
+            if markup.inline_objects.iter().any(|(range, _, _)| range.start == abs) {
+                run.color = gpui::transparent_black();
+                run.background_color = None;
+                run.underline = None;
+                run.strikethrough = None;
+            }
             if let Some(last) = runs.last_mut()
                 && last.font == run.font
                 && last.color == run.color
@@ -1435,11 +1347,10 @@ impl<M: InputModeKind> TextElement<M> {
             if let Some(range) = hard_break {
                 // An empty visual row still has its own editable source position,
                 // immediately before its newline (not after a concealed prefix).
-                to_buffer[0] = range.start - abs_start;
+                map.set_empty_offset(range.start - abs_start);
             }
         }
-        let map = (display.len() != segment.len())
-            .then(|| ConcealMap::new(to_display, to_buffer).with_hard_break(hard_break.is_some()));
+        let map = map.with_hard_break(hard_break.is_some());
         let text: SharedString = display.into();
         let shaped_runs = if text.is_empty() {
             vec![TextRun {
@@ -1453,8 +1364,9 @@ impl<M: InputModeKind> TextElement<M> {
         } else {
             runs
         };
-        let shaped = window.text_system().shape_line(text, font_size, &shaped_runs, None);
-        Some((shaped, shaped_runs, map))
+        let mut shaped = window.text_system().shape_line(text, font_size, &shaped_runs, None);
+        map.apply_objects(&mut shaped);
+        Some((shaped, shaped_runs, Some(map)))
     }
 
     fn run_at(runs: &[TextRun], index: usize) -> Option<TextRun> {
@@ -1913,7 +1825,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             if state.mode.is_auto_grow() {
                 // Auto grow to let height match to rows, but not exceed max rows.
                 let rows = state.mode.max_rows().min(state.mode.rows());
-                style.min_size.height = (rows * line_height).into();
+                style.min_size.height = state.display_row_top(rows, line_height).into();
             } else {
                 style.min_size.height = line_height.into();
             }
@@ -2131,6 +2043,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 )
                 .width;
         }
+        longest_line_width =
+            lines.iter().map(|line| line.size(line_height).width).fold(longest_line_width, Pixels::max);
         last_layout.lines = Rc::new(lines);
 
         let (ghost_first_line, ghost_lines) =
@@ -2155,8 +2069,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
             } else {
                 longest_line_width
             },
-            (total_wrapped_lines as f32 * line_height + empty_bottom_height.max(ghost_lines_height))
-                .max(bounds.size.height),
+            (state.display_row_top(total_wrapped_lines, line_height)
+                + empty_bottom_height.max(ghost_lines_height))
+            .max(bounds.size.height),
         );
 
         // TODO: should be add some gap to right, to convenient to focus on boundary position
@@ -2262,6 +2177,17 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state,
         )));
         let fold_icon_layout = self.layout_fold_icons(original_x, &bounds, &last_layout, window, cx);
+        self.state.update(cx, |state, _| {
+            state.inline_object_layout.clear();
+            let mut y = last_layout.visible_top;
+            for line in last_layout.lines.iter() {
+                for (key, mut object) in line.object_bounds(&last_layout) {
+                    object.origin += bounds.origin + point(last_layout.line_number_width, y);
+                    state.inline_object_layout.push((key, object));
+                }
+                y += line.size(line_height).height;
+            }
+        });
 
         PrepaintState {
             bounds,

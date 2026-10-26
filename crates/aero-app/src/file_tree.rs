@@ -59,6 +59,10 @@ pub struct TrashAttachment(pub String);
 #[action(namespace = file_tree, no_json)]
 pub struct TopLevelDocument(pub String);
 
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = file_tree, no_json)]
+pub struct ImportAsCopy(pub String);
+
 struct RenameInput {
     path: VaultPath,
     directory: bool,
@@ -566,6 +570,25 @@ impl FileTree {
             .or_else(|| self.selected.as_ref().map(|p| p.parent().to_owned()))
     }
 
+    pub(crate) fn set_documents(&mut self, documents: bool, cx: &mut Context<Self>) {
+        if self.documents == documents {
+            return;
+        }
+        self.documents = documents;
+        self.document_drop = None;
+        self.document_drop_bounds = None;
+        let path = tree_view_file(&self.vault);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::write(path, if documents { "documents" } else { "files" }) {
+            self.error = Some(format!("无法保存树视图偏好：{error}"));
+        }
+        self.rebuild_rows();
+        self.scroll_to_selection();
+        cx.notify();
+    }
+
     pub fn selected(&self) -> Option<&VaultPath> {
         self.selected.as_ref()
     }
@@ -941,6 +964,10 @@ impl FileTree {
                     .child(
                         div()
                             .id("tree-view-toggle")
+                            .debug_selector({
+                                let documents = self.documents;
+                                move || if documents { "tree-view-documents".into() } else { "tree-view-files".into() }
+                            })
                             .px_2()
                             .text_xs()
                             .child(if self.documents { "文档 ▾" } else { "文件 ▾" })
@@ -948,19 +975,7 @@ impl FileTree {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.documents = !this.documents;
-                                    let path = tree_view_file(&this.vault);
-                                    if let Some(parent) = path.parent() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                    if let Err(error) = std::fs::write(
-                                        path,
-                                        if this.documents { "documents" } else { "files" },
-                                    ) {
-                                        this.error = Some(format!("无法保存树视图偏好：{error}"));
-                                    }
-                                    this.rebuild_rows();
-                                    cx.notify();
+                                    this.set_documents(!this.documents, cx);
                                 }),
                             ),
                     )
@@ -1310,6 +1325,7 @@ impl FileTree {
                             .separator()
                             .menu("重命名", Box::new(RenameEntry(rel.clone())))
                             .menu("移至顶层", Box::new(TopLevelDocument(rel.clone())))
+                            .menu("作为副本导入…", Box::new(ImportAsCopy(rel.clone())))
                             .menu("移到废纸篓", Box::new(TrashNote(rel.clone())))
                             .separator()
                             .menu("在 Finder 中显示", Box::new(RevealInFinder(rel.clone())))
@@ -1459,6 +1475,22 @@ impl Render for FileTree {
                     cx.emit(FileTreeEvent::Reparent { path, parent: None, before: None });
                 }
             }))
+            .on_action(cx.listener(|_this, action: &ImportAsCopy, window, cx| {
+                let Ok(path) = VaultPath::new(&action.0) else { return };
+                let answer = window.prompt(
+                    PromptLevel::Warning,
+                    "将此文件作为独立副本导入？",
+                    Some("仅对副本使用：将重新分配此文件的文档和块身份，并更新文件内部引用。其他文件不变；旧身份引用仍属于原件。本操作可撤销。"),
+                    &["取消", "作为副本导入"],
+                    cx,
+                );
+                cx.spawn(async move |this, cx| {
+                    if answer.await.ok() != Some(1) { return }
+                    let _ = this.update(cx, |_, cx| cx.emit(FileTreeEvent::Operation(
+                        crate::workspace::files::Operation::ImportCopy { path, journal: Default::default() }
+                    )));
+                }).detach();
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" && cx.stop_active_drag(window) {
                     this.document_drop = None;
@@ -1502,6 +1534,35 @@ mod tests {
     use aero_core::Vault;
     use gpui_kit::{AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext};
     use std::sync::Arc;
+
+    #[gpui_kit::test]
+    fn copy_import_requires_explicit_confirmation(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("copy.md"), "unchanged").unwrap();
+        let vault = Arc::new(Vault::open(dir.path()).unwrap());
+        let (tree, _) = cx.add_window_view(|_, cx| FileTree::new(vault.clone(), cx));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            let output = requests.clone();
+            cx.subscribe(&tree, move |_, event, _| {
+                if let super::FileTreeEvent::Operation(operation) = event { output.borrow_mut().push(operation.clone()); }
+            }).detach();
+            tree.update(cx, |tree, cx| tree.focus(window, cx));
+        });
+        cx.run_until_parked();
+        for accept in [false, true] {
+            cx.update(|window, cx| window.dispatch_action(Box::new(super::ImportAsCopy("copy.md".into())), cx));
+            cx.run_until_parked();
+            assert!(cx.has_pending_prompt());
+            cx.simulate_prompt_answer(if accept { "作为副本导入" } else { "取消" });
+            cx.run_until_parked();
+            assert_eq!(requests.borrow().len(), usize::from(accept));
+        }
+        assert!(matches!(&requests.borrow()[0], crate::workspace::files::Operation::ImportCopy { path, .. } if path.as_str() == "copy.md"));
+        assert_eq!(std::fs::read_to_string(dir.path().join("copy.md")).unwrap(), "unchanged");
+    }
 
     fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, Arc<Vault>, Entity<FileTree>) {
         cx.update(|cx| {

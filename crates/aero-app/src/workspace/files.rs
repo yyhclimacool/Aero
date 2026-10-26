@@ -3,7 +3,16 @@
 use super::*;
 use aero_core::VaultError;
 use aero_core::transaction::{FileChange, Transaction};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SyncRevision {
+    pub(crate) entity: EntityId,
+    pub(crate) path: VaultPath,
+    pub(crate) version: u64,
+    pub(crate) epoch: u64,
+}
 
 #[derive(Default)]
 struct Busy(std::collections::HashSet<String>);
@@ -78,7 +87,9 @@ pub(crate) enum Operation {
         destination: VaultPath,
         before: Vec<u8>,
         range: std::ops::Range<usize>,
+        selection: Option<crate::editor::SelectionPlan>,
         cut: Option<FileChange>,
+        pending_cut: Option<Arc<std::sync::Mutex<aero_core::transaction::PendingCut>>>,
         journal: PathBuf,
     },
     CreateChild {
@@ -101,6 +112,14 @@ pub(crate) enum Operation {
         open: Option<VaultPath>,
         journal: PathBuf,
     },
+    SyncReference {
+        token: String,
+        changes: Vec<FileChange>,
+        history_changes: Option<Vec<FileChange>>,
+        membership: BTreeSet<VaultPath>,
+        revisions: BTreeMap<EntityId, SyncRevision>,
+        journal: PathBuf,
+    },
     Create {
         directory: String,
         base: String,
@@ -111,6 +130,10 @@ pub(crate) enum Operation {
         paths: Vec<PathBuf>,
         directory: String,
         note: Option<VaultPath>,
+    },
+    ImportCopy {
+        path: VaultPath,
+        journal: PathBuf,
     },
     AttachmentRename {
         from: VaultPath,
@@ -123,6 +146,19 @@ pub(crate) enum Operation {
 }
 
 impl Operation {
+    pub(super) fn validate_live(&self, vault: &str, cx: &App) -> Result<(), String> {
+        if let Self::SyncReference { revisions, .. } = self {
+            let actual = Editor::live_editors(vault, cx)
+                .into_iter()
+                .map(|editor| (editor.entity_id(), editor.read(cx).sync_revision(editor.entity_id())))
+                .collect::<BTreeMap<_, _>>();
+            if &actual != revisions {
+                return Err("笔记已变化，请重新选择来源".into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn cancel(&self, cx: &mut App) {
         if let Self::Paste { token, cut: Some(_), .. } = self {
             Editor::complete_cut(token, false, cx);
@@ -132,8 +168,10 @@ impl Operation {
         match self {
             Self::Paste { journal, .. }
             | Self::Transaction { journal, .. }
+            | Self::SyncReference { journal, .. }
             | Self::CreateChild { journal, .. }
-            | Self::Reparent { journal, .. } => *journal = path,
+            | Self::Reparent { journal, .. }
+            | Self::ImportCopy { journal, .. } => *journal = path,
             _ => {}
         }
     }
@@ -143,8 +181,10 @@ impl Operation {
             Self::CreateChild { .. } => "document_child_create",
             Self::Reparent { .. } => "document_reparent",
             Self::Transaction { .. } => "workspace_transaction",
+            Self::SyncReference { .. } => "sync_reference",
             Self::Create { .. } => "file_create",
             Self::Import { .. } => "file_import",
+            Self::ImportCopy { .. } => "document_import_copy",
             Self::AttachmentRename { .. } => "attachment_rename",
             Self::Trash { .. } => "file_trash",
         }
@@ -154,6 +194,8 @@ impl Operation {
 #[derive(Default)]
 struct Outcome {
     history: Option<(String, Vec<FileChange>, Option<bool>)>,
+    source_metadata: Vec<FileChange>,
+    show_documents: bool,
     open: Option<(VaultPath, bool)>,
     trashed: Option<VaultPath>,
     removed: Vec<(VaultPath, Option<VaultPath>)>,
@@ -244,7 +286,18 @@ fn execute_with_paste_snapshot(
 ) -> Result<Outcome, String> {
     let mut outcome = Outcome::default();
     match operation {
-        Operation::Paste { token, payload, source, destination, before, range, cut, journal } => {
+        Operation::Paste {
+            token,
+            payload,
+            source,
+            destination,
+            before,
+            range,
+            selection,
+            cut,
+            pending_cut,
+            journal,
+        } => {
             let (actual, _) = vault.read_bytes(&destination).map_err(|e| e.to_string())?;
             if actual != before {
                 return Err("目标文档已变化，请重新粘贴".into());
@@ -260,7 +313,11 @@ fn execute_with_paste_snapshot(
                 &document,
                 cut.is_some(),
             )?;
-            doc = crate::editor::insert_tree(&doc, range, &plan.source)?;
+            doc = if let Some(selection) = selection {
+                selection.replace(&doc, &plan.source)?
+            } else {
+                crate::editor::insert_tree(&doc, range, &plan.source)?
+            };
             // Metadata is inserted after the body, so its original prefix offsets remain valid.
             doc.edit_group(metadata).map_err(|e| e.to_string())?;
             if cut.is_some() {
@@ -293,7 +350,23 @@ fn execute_with_paste_snapshot(
                     history.push(cut);
                 }
             }
-            commit_restoring(vault, &journal, changes, control, restorations)?;
+            if let Some(pending) = pending_cut {
+                // Retain ownership through sealing/rollback so editor Drop cannot race the worker.
+                let mut pending = pending.lock().map_err(|_| "剪切恢复锁已损坏".to_owned())?;
+                let transaction = pending.prepare_paste(vault, changes, restorations)?;
+                if let Some(control) = control
+                    && let Err(error) = control.begin_commit()
+                {
+                    transaction.cancel(vault)?;
+                    return Err(error);
+                }
+                transaction.commit(vault)?;
+            } else {
+                if !restorations.is_empty() {
+                    return Err("剪切缺少早期恢复日志".into());
+                }
+                commit_restoring(vault, &journal, changes, control, restorations)?;
+            }
             outcome.touched = history.iter().map(|c| c.path.clone()).collect();
             outcome.history = Some((token, history, None));
         }
@@ -303,7 +376,7 @@ fn execute_with_paste_snapshot(
                 return Err("创建位置已变化，请重新执行子文档命令".into());
             }
             let (child, changes) = aero_core::relations::child_at(vault, &parent, &doc, range)?;
-            return execute_controlled(
+            let mut outcome = execute_controlled(
                 vault,
                 Operation::Transaction {
                     token: aero_core::identity::new_block_id(),
@@ -314,7 +387,9 @@ fn execute_with_paste_snapshot(
                     journal,
                 },
                 control,
-            );
+            )?;
+            outcome.show_documents = true;
+            return Ok(outcome);
         }
         Operation::Reparent { path, parent, before, journal } => {
             let changes = aero_core::relations::reparent(vault, &path, parent.as_ref(), before.as_ref())?;
@@ -330,6 +405,23 @@ fn execute_with_paste_snapshot(
                 },
                 control,
             );
+        }
+        Operation::SyncReference { token, changes, history_changes, membership, journal, .. } => {
+            let transaction =
+                Transaction::prepare(vault, &journal, changes.clone())?.observe_notes(membership);
+            if let Some(control) = control
+                && let Err(error) = control.begin_commit()
+            {
+                transaction.cancel(vault)?;
+                return Err(error);
+            }
+            transaction.commit(vault)?;
+            let changed = changes.into_iter().filter(|c| c.before != c.after).collect::<Vec<_>>();
+            let history = history_changes.unwrap_or_else(|| changed.clone());
+            outcome.source_metadata =
+                changed.iter().filter(|c| !history.iter().any(|h| h.path == c.path)).cloned().collect();
+            outcome.touched = changed.iter().map(|c| c.path.clone()).collect();
+            outcome.history = Some((token, history, None));
         }
         Operation::Transaction { token, changes, history_changes, direction, open, journal } => {
             if changes.is_empty() {
@@ -404,6 +496,36 @@ fn execute_with_paste_snapshot(
                 }
             }
         }
+        Operation::ImportCopy { path, journal } => {
+            let (before, _) = vault.read_bytes(&path).map_err(|e| e.to_string())?;
+            let original = aero_core::Document::from_bytes(&before).map_err(|e| e.to_string())?;
+            let meta = aero_core::identity::read(&original)?;
+            let id = aero_core::identity::new_document_id();
+            let copied = aero_core::clipboard::copy_tree(&original.to_string(), &aero_core::clipboard::Payload {
+                version: 1, vault: vault.id().into(), path: path.to_string(), document: meta.id, cut: None,
+            }, &id)?;
+            let mut copied = aero_core::Document::from_text(&copied);
+            if let Some(old) = aero_core::identity::read(&original)?.id {
+                let source = copied.to_string();
+                let mut references = aero_core::links::scan_for_rename(&source).into_iter()
+                    .filter(|span| span.target == format!("id:{old}")
+                        && !span.fragment.as_deref().is_some_and(|fragment| fragment.starts_with('^')))
+                    .map(|span| aero_core::Edit::replace(aero_core::links::target_range(&source, &span), format!("id:{id}")))
+                    .collect::<Vec<_>>();
+                references.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+                copied.edit_group(references).map_err(|e| e.to_string())?;
+                copied.reparse();
+            }
+            let edits = aero_core::identity::prepare(&copied, &aero_core::identity::Patch { id: Some(id), ..Default::default() })?;
+            copied.edit_group(edits).map_err(|e| e.to_string())?;
+            copied.bom = original.bom;
+            copied.line_ending = original.line_ending;
+            let changes = vec![FileChange { path, before: Some(before), after: Some(copied.to_bytes()) }];
+            return execute_controlled(vault, Operation::Transaction {
+                token: aero_core::identity::new_block_id(), changes, history_changes: None,
+                direction: None, open: None, journal,
+            }, control);
+        }
         Operation::AttachmentRename { from, to } => {
             let report = aero_core::rename::RenamePlan::prepare_attachment(vault, from, to)
                 .and_then(|plan| plan.execute())
@@ -435,6 +557,12 @@ impl Workspace {
     ) {
         let Some(open) = &self.open else { return };
         let vault = open.vault.clone();
+        if let Err(error) = operation.validate_live(vault.id(), cx) {
+            diagnostic.finish(crate::diagnostics::Outcome::Stale);
+            window.push_notification(Notification::warning(error), cx);
+            self.continue_operation(window, cx);
+            return;
+        }
         let cut_token = match &operation {
             Operation::Paste { token, cut: Some(_), .. } => Some(token.clone()),
             _ => None,
@@ -515,8 +643,24 @@ impl Workspace {
                 {
                     super::history::record(open.vault.id(), token, changes, *direction, cx);
                 }
+                let mut completion_error = None;
                 for editor in &editors {
                     let path = editor.read(cx).path().clone();
+                    if let Ok(outcome) = &outcome
+                        && let Some(change) = outcome.source_metadata.iter().find(|c| c.path == path)
+                    {
+                        let stamp = loaded
+                            .iter()
+                            .find(|(p, _)| p == &path)
+                            .and_then(|(_, result)| result.as_ref().ok())
+                            .map(|(_, stamp)| *stamp);
+                        if let Err(error) =
+                            editor.update(cx, |e, cx| e.finish_source_metadata(change, stamp, cx))
+                        {
+                            completion_error.get_or_insert(error);
+                        }
+                        continue;
+                    }
                     if outcome.is_err()
                         && let Some(token) = &cut_token
                         && let Some((_, Ok((document, stamp)))) = loaded.iter().find(|(p, _)| p == &path)
@@ -555,10 +699,13 @@ impl Workspace {
                         editor.update(cx, |e, cx| e.resume_io(cx));
                     }
                 }
-                let outcome = match outcome {
+                let mut outcome = match outcome {
                     Ok(outcome) => outcome,
                     Err(error) => Outcome { error: Some(error), ..Default::default() },
                 };
+                if let Some(error) = completion_error {
+                    outcome.error.get_or_insert(error);
+                }
                 if let Some(token) = &cut_token {
                     Editor::complete_cut(token, outcome.error.is_none(), cx);
                 }
@@ -586,6 +733,11 @@ impl Workspace {
                         open.search.update(cx, |s, cx| s.note_removed(path.clone(), cx));
                     }
                     this.set_favorites(this.favorites().into_iter().filter(|p| p != &path).collect(), cx);
+                }
+                if outcome.show_documents {
+                    if let Some(open) = &this.open {
+                        open.tree.update(cx, |tree, cx| tree.set_documents(true, cx));
+                    }
                 }
                 if let Some((path, created)) = outcome.open {
                     this.open_note(path.clone(), window, cx);
@@ -625,6 +777,140 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn explicit_copy_import_rekeys_only_the_chosen_document_and_undoes() {
+        use aero_core::{Document, VaultPath, identity, transaction::Transaction};
+        let dir = tempfile::tempdir().unwrap();
+        let journal = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let document_id = identity::new_document_id();
+        let block_id = identity::new_block_id();
+        let alias = identity::new_block_id();
+        let source = format!("---\n# keep comment\ntitle: Copy\ncustom: unchanged\naero:\n  id: {document_id}\n---\n\nbody {{.red aero-aliases=\"{alias}\"}} ^{block_id}\n\n![[id:{document_id}#^{block_id}|body]]\n\n[[id:{document_id}|self]]\n\n[[id:{document_id}#标题|heading]]\n");
+        let original = VaultPath::new("original.md").unwrap();
+        let copy = VaultPath::new("copied.md").unwrap();
+        vault.create_bytes(&original, source.as_bytes()).unwrap();
+        vault.create_bytes(&copy, source.as_bytes()).unwrap();
+        let result = execute(&vault, Operation::ImportCopy { path: copy.clone(), journal: journal.path().into() }).unwrap();
+        assert_eq!(vault.read_bytes(&original).unwrap().0, source.as_bytes());
+        let (doc, _) = vault.read(&copy).unwrap();
+        let new_doc_id = identity::read(&doc).unwrap().id.unwrap();
+        assert_ne!(new_doc_id, document_id);
+        let block = doc.blocks().iter().find(|(_, b)| b.persisted_id.is_some()).unwrap().1;
+        let new_block = block.persisted_id.as_deref().unwrap();
+        assert_ne!(new_block, block_id);
+        assert!(aero_core::block_refs::aliases(block).next().is_none());
+        assert!(doc.to_string().contains("# keep comment\ntitle: Copy\ncustom: unchanged"));
+        assert!(doc.to_string().contains(&format!("![[id:{new_doc_id}#^{new_block}|body]]")));
+        assert!(doc.to_string().contains(&format!("[[id:{new_doc_id}|self]]")));
+        assert!(doc.to_string().contains(&format!("[[id:{new_doc_id}#标题|heading]]")));
+        let (_, changes, _) = result.history.unwrap();
+        Transaction::prepare(&vault, journal.path(), changes.iter().map(|c| c.reverse()).collect()).unwrap().commit(&vault).unwrap();
+        assert_eq!(vault.read_bytes(&copy).unwrap().0, source.as_bytes());
+        assert_eq!(Document::from_text(&source).to_bytes(), source.as_bytes());
+    }
+
+    #[test]
+    fn g02_paste_transaction_replaces_cross_parent_selection_and_undoes_exact_bytes() {
+        use aero_core::{Document, VaultPath, clipboard::Payload, transaction::FileChange};
+        for pasted in [
+            "replacement ^copied",
+            ":::highlight {.green}\nchild\n:::\n\n^copied",
+            "```text\n::: \t\n```\n\n^copied",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = tempfile::tempdir().unwrap();
+            let vault = Vault::open(dir.path()).unwrap();
+            let origin = VaultPath::new("source.md").unwrap();
+            let target = VaultPath::new("target.md").unwrap();
+            let before = ":::highlight {.red custom=one}\nleft kept ^keep-left\n\nfirst ^first\n:::\n\n^left\n\n:::highlight {.blue custom=two}\nsecond ^second\n\nright kept ^keep-right\n:::\n\n^right\n\n<!-- opaque  bytes -->\n";
+            vault.create_bytes(&origin, pasted.as_bytes()).unwrap();
+            vault.create_bytes(&target, before.as_bytes()).unwrap();
+            let mut doc = Document::from_text(&format!("temporary\n\n{before}"));
+            doc.edit(aero_core::Edit::delete(0.."temporary\n\n".len())).unwrap();
+            doc.reparse();
+            let first = aero_core::block_refs::resolve(&doc, "first").unwrap();
+            let second = aero_core::block_refs::resolve(&doc, "second").unwrap();
+            let outcome = execute(
+                &vault,
+                Operation::Paste {
+                    token: "g02-paste".into(),
+                    payload: Payload {
+                        version: 1,
+                        vault: vault.id().into(),
+                        path: origin.to_string(),
+                        document: None,
+                        cut: None,
+                    },
+                    source: pasted.into(),
+                    destination: target.clone(),
+                    before: before.as_bytes().to_vec(),
+                    range: usize::MAX..usize::MAX,
+                    selection: Some(crate::editor::SelectionPlan::nodes(&doc, &[first, second])),
+                    cut: None,
+                    pending_cut: None,
+                    journal: journal.path().into(),
+                },
+            )
+            .unwrap();
+            let (result, _) = vault.read(&target).unwrap();
+            for (name, kept, count) in [("left", "keep-left", 2), ("right", "keep-right", 1)] {
+                let id = aero_core::block_refs::resolve(&result, name).unwrap();
+                let parent = result.blocks().find(id).unwrap();
+                assert!(matches!(parent.kind, aero_core::BlockKind::Directive { .. }), "{result}");
+                assert_eq!(
+                    parent.children.iter().filter(|b| b.kind != aero_core::BlockKind::Marker).count(),
+                    count,
+                    "{result}"
+                );
+                let kept = aero_core::block_refs::resolve(&result, kept).unwrap();
+                assert!(parent.children.iter().any(|b| b.id == kept));
+            }
+            let left =
+                result.blocks().find(aero_core::block_refs::resolve(&result, "left").unwrap()).unwrap();
+            let copied = &left.children[1];
+            let original_tree = Document::from_text(pasted);
+            let original_block = &original_tree.blocks().roots[0];
+            assert_eq!(copied.kind, original_block.kind);
+            assert_eq!(copied.attrs, original_block.attrs);
+            assert!(copied.persisted_id.is_some());
+            assert_ne!(copied.persisted_id, original_block.persisted_id);
+            if matches!(copied.kind, aero_core::BlockKind::Directive { .. }) {
+                assert_eq!(copied.children.len(), 1);
+                assert_eq!(
+                    aero_core::containers::local_source(&result, copied.children[0].id).as_deref(),
+                    Some("child")
+                );
+                assert_eq!(copied.children[0].persisted_id, original_block.children[0].persisted_id);
+            } else {
+                assert_eq!(
+                    aero_core::containers::local_source(&result, copied.id),
+                    aero_core::containers::local_source(&original_tree, original_block.id)
+                );
+            }
+            for removed in ["first", "second"] {
+                assert!(aero_core::block_refs::resolve(&result, removed).is_err());
+            }
+            assert!(result.to_string().ends_with("<!-- opaque  bytes -->\n"));
+            let (token, history, _) = outcome.history.unwrap();
+            assert_eq!(history.len(), 1);
+            execute(
+                &vault,
+                Operation::Transaction {
+                    token,
+                    changes: history.iter().map(FileChange::reverse).collect(),
+                    history_changes: None,
+                    direction: Some(false),
+                    open: None,
+                    journal: journal.path().into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(vault.read_bytes(&target).unwrap().0, before.as_bytes());
+            assert_eq!(vault.read_bytes(&origin).unwrap().0, pasted.as_bytes());
+        }
+    }
+
+    #[test]
     fn paste_rejects_destination_changed_between_initial_read_and_relocation_scan() {
         use aero_core::{VaultPath, clipboard::Payload, transaction::FileChange};
         let dir = tempfile::tempdir().unwrap();
@@ -653,11 +939,13 @@ mod tests {
             destination: target.clone(),
             before: b"destination\n".to_vec(),
             range: 11..11,
+            selection: None,
             cut: Some(FileChange {
                 path: source.clone(),
                 before: Some(source_before),
                 after: Some(source_cut.clone()),
             }),
+            pending_cut: None,
             journal: journal.path().into(),
         };
         let result = super::execute_with_paste_snapshot(&vault, operation, None, || {
@@ -674,6 +962,105 @@ mod tests {
             "no transaction writes; the coordinator still owns pending-cut recovery"
         );
         assert_eq!(std::fs::read_dir(journal.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn g11_pending_cut_later_edits_survive_paste_and_joint_undo() {
+        use aero_core::{
+            Document, Edit, VaultPath,
+            clipboard::Payload,
+            transaction::{FileChange, PendingCut},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let journal = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let source = VaultPath::new("a.md").unwrap();
+        let target = VaultPath::new("b.md").unwrap();
+        let id = aero_core::identity::new_document_id();
+        let block = aero_core::identity::new_block_id();
+        let moved = format!("move ^{block}\n\n");
+        let original = format!("---\naero:\n  id: {id}\n---\n\n{moved}keep\n");
+        vault.create_bytes(&source, original.as_bytes()).unwrap();
+        vault.create_bytes(&target, b"destination\n").unwrap();
+        let token = aero_core::identity::new_block_id();
+        let mut doc = Document::from_text(&original);
+        let at = original.find(&moved).unwrap();
+        doc.edit_transaction(vec![Edit::delete(at..at + moved.len())], &token).unwrap();
+        let mut pending = PendingCut::prepare(
+            &vault,
+            journal.path(),
+            &token,
+            FileChange {
+                path: source.clone(),
+                before: Some(original.as_bytes().to_vec()),
+                after: Some(doc.to_bytes()),
+            },
+            original.as_bytes().to_vec(),
+            doc.version(),
+        )
+        .unwrap();
+        let change = FileChange {
+            path: source.clone(),
+            before: Some(vault.read_bytes(&source).unwrap().0),
+            after: Some(doc.to_bytes()),
+        };
+        pending.publish(&vault, change, original.as_bytes().to_vec(), doc.version()).unwrap();
+        doc.edit(Edit::insert(doc.len(), "later\n")).unwrap();
+        let restored = doc.without_transaction(&token).unwrap();
+        let change = FileChange {
+            path: source.clone(),
+            before: Some(vault.read_bytes(&source).unwrap().0),
+            after: Some(doc.to_bytes()),
+        };
+        pending.publish(&vault, change, restored.to_bytes(), doc.version()).unwrap();
+        let outcome = execute(
+            &vault,
+            Operation::Paste {
+                token: token.clone(),
+                payload: Payload {
+                    version: 1,
+                    vault: vault.id().into(),
+                    path: source.to_string(),
+                    document: Some(id),
+                    cut: Some(token.clone()),
+                },
+                source: moved,
+                destination: target.clone(),
+                before: b"destination\n".to_vec(),
+                range: 12..12,
+                selection: None,
+                cut: Some(FileChange {
+                    path: source.clone(),
+                    before: Some(restored.to_bytes()),
+                    after: Some(doc.to_bytes()),
+                }),
+                pending_cut: Some(Arc::new(std::sync::Mutex::new(pending))),
+                journal: journal.path().into(),
+            },
+        )
+        .unwrap();
+        let (_, history, _) = outcome.history.unwrap();
+        assert_eq!(history.iter().find(|c| c.path == source).unwrap().before, Some(restored.to_bytes()));
+        aero_core::transaction::recover(&vault, journal.path()).unwrap();
+        assert_eq!(
+            vault.read_bytes(&source).unwrap().0,
+            doc.to_bytes(),
+            "sealed paste must not resurrect a second copy"
+        );
+        execute(
+            &vault,
+            Operation::Transaction {
+                token,
+                changes: history.iter().map(FileChange::reverse).collect(),
+                history_changes: None,
+                direction: Some(false),
+                open: None,
+                journal: journal.path().into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(vault.read_bytes(&source).unwrap().0, format!("{original}later\n").as_bytes());
+        assert_eq!(vault.read_bytes(&target).unwrap().0, b"destination\n");
     }
 
     #[test]

@@ -874,3 +874,51 @@ fn every_visible_glyph_is_drawn_inside_the_text_area(cx: &mut TestAppContext) {
         });
     }
 }
+
+#[gpui_kit::test]
+fn g10_html_break_paragraphs_keep_presenter_geometry_in_all_alignments(cx: &mut TestAppContext) {
+    for align in ["left", "center", "right", "justify"] {
+        let source = format!("甲<br><br>乙 {{align={align}}}\n\n<br>甲<br> {{align={align}}}\n\n甲 `<br>` 乙 {{align={align}}}\n\n<br><br> {{align={align}}}\n");
+        let (_dir, editor) = open(cx, &source);
+        let handle = *cx.windows().last().unwrap();
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        cx.simulate_resize(size(px(900.), px(1200.)));
+        draw(cx);
+        let keys = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| Key::unit(u.id)).collect::<Vec<_>>());
+        assert_eq!(keys.len(), 4);
+        for (case, key) in keys.into_iter().enumerate() {
+            let (ta, snapshot) = cx.update(|_, cx| {
+                let e = editor.read(cx);
+                let p = e.presenters.get(&key).expect("HTML breaks must use the shared presenter");
+                let ta = p.textarea.read(cx);
+                let expected = match align {
+                    "center" => gpui_kit::TextAlign::Center,
+                    "right" => gpui_kit::TextAlign::Right,
+                    _ => gpui_kit::TextAlign::Left,
+                };
+                assert_eq!(ta.presentation().text_align(), expected);
+                let text = ta.value();
+                let analysis = aero_core::markup::analyze(&text);
+                assert_eq!(analysis.hard_breaks.len(), if case == 2 { 0 } else { 2 });
+                let points = std::iter::once(0).chain(analysis.hard_breaks.iter().map(|r| r.end));
+                let snapshot = points.map(|at| ta.range_to_bounds(&(at..at)).unwrap()).collect::<Vec<_>>();
+                for pair in snapshot.windows(2) {
+                    assert_eq!(pair[1].top() - pair[0].top(), ta.line_height().unwrap());
+                }
+                (p.textarea.clone(), snapshot)
+            });
+            let before = rows(&editor, cx);
+            cx.update(|window, cx| editor.update(cx, |e, cx| e.adopt_presenter(key, &ta, window, cx)));
+            draw(cx);
+            assert_eq!(rows(&editor, cx), before, "{align}, case {case}");
+            cx.update(|_, cx| {
+                let ta = ta.read(cx);
+                let text = ta.value();
+                let analysis = aero_core::markup::analyze(&text);
+                let points = std::iter::once(0).chain(analysis.hard_breaks.iter().map(|r| r.end));
+                assert_eq!(points.map(|at| ta.range_to_bounds(&(at..at)).unwrap()).collect::<Vec<_>>(), snapshot);
+                assert_eq!(editor.read(cx).doc.to_string(), source);
+            });
+        }
+    }
+}

@@ -540,7 +540,10 @@ impl Workspace {
                 }
             }
             FileTreeEvent::Operation(operation) => {
-                this.request_operation(PendingOperation::File(operation.clone()), window, cx)
+                let Some(open) = &this.open else { return };
+                let mut operation = operation.clone();
+                operation.set_journal(this.data_dir.join("transactions").join(open.vault.id()));
+                this.request_operation(PendingOperation::File(operation), window, cx)
             }
             FileTreeEvent::ToggleFavorite(path) => this.toggle_favorite(path.clone(), cx),
             FileTreeEvent::Move { from, to } => this.move_entry(from.clone(), to.clone(), window, cx),
@@ -567,6 +570,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Subscription {
+        if let Some(open) = &self.open {
+            let root = self.data_dir.join("transactions").join(open.vault.id());
+            editor.update(cx, |e, _| e.set_journal_root(root));
+        }
         cx.subscribe_in(editor, window, |this, editor, event, window, cx| match event {
             EditorEvent::Changed => {
                 if let Some(open) = &this.open {
@@ -593,6 +600,9 @@ impl Workspace {
             EditorEvent::OpenRequested(path) => this.open_note(path.clone(), window, cx),
             EditorEvent::LinkClicked { target, fragment } => {
                 this.on_link_clicked(target.clone(), fragment.clone(), window, cx)
+            }
+            EditorEvent::ResolvedSourceClicked { path, fragment } => {
+                this.on_resolved_source_clicked(path.clone(), fragment.clone(), window, cx)
             }
             EditorEvent::VaultLink { path, fragment } => {
                 this.on_vault_link(path.clone(), fragment.clone(), window, cx)
@@ -631,6 +641,21 @@ impl Workspace {
                 editor.update(cx, |e, cx| e.load_tags(*generation, task, cx));
             }
         })
+    }
+
+    fn on_resolved_source_clicked(
+        &mut self,
+        path: VaultPath,
+        fragment: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session_busy() { return; }
+        // Source cards already carry vault-root paths, not relative wikilink text.
+        self.open_note(path.clone(), window, cx);
+        if let Some(fragment) = fragment {
+            self.navigate_note(&path, tabs::Navigation::Fragment(fragment), window, cx);
+        }
     }
 
     /// `[[显示名]](相对路径)`：`.md` 打开笔记并定位，其他已存在的文件在访达中显示。缺失时不创建。
@@ -1438,6 +1463,13 @@ impl Workspace {
             .into_iter()
             .filter_map(|op| {
                 if let PendingOperation::File(operation) = op.operation {
+                    if let Some(open) = &self.open
+                        && let Err(error) = operation.validate_live(open.vault.id(), cx)
+                    {
+                        op.diagnostic.finish(crate::diagnostics::Outcome::Stale);
+                        log::warn!("file operation during shutdown: {error}");
+                        return None;
+                    }
                     Some((operation, op.diagnostic))
                 } else {
                     None
@@ -1557,7 +1589,35 @@ impl Workspace {
             .detach();
             return;
         }
+        if let Some(open) = &self.open {
+            let keep = match &self.pending_operation.as_ref().unwrap().operation {
+                PendingOperation::File(files::Operation::Paste { token, cut: Some(_), .. }) => {
+                    Some(token.as_str())
+                }
+                _ => None,
+            };
+            if let Err(error) = Editor::settle_cuts(open.vault.id(), keep, cx) {
+                if let Some(op) = self.pending_operation.take()
+                    && let PendingOperation::File(op) = op.operation
+                {
+                    op.cancel(cx);
+                }
+                window.push_notification(Notification::error(error).title("剪切恢复"), cx);
+                return;
+            }
+        }
         let editors: Vec<_> = self.open.iter().flat_map(|o| Editor::live_editors(o.vault.id(), cx)).collect();
+        if let Some(open) = &self.open
+            && let Some(QueuedOperation { operation: PendingOperation::File(operation), .. }) =
+                &self.pending_operation
+            && let Err(error) = operation.validate_live(open.vault.id(), cx)
+        {
+            let rejected = self.pending_operation.take().unwrap();
+            rejected.diagnostic.finish(crate::diagnostics::Outcome::Stale);
+            window.push_notification(Notification::warning(error), cx);
+            self.continue_operation(window, cx);
+            return;
+        }
         let is_history = self.pending_operation.as_ref().is_some_and(|q| {
             matches!(
                 &q.operation,
@@ -1587,12 +1647,48 @@ impl Workspace {
             return;
         }
         let mut waiting = false;
+        let strict = self.pending_operation.as_ref().is_some_and(|q| {
+            matches!(
+                &q.operation,
+                PendingOperation::Rename { .. }
+                    | PendingOperation::File(
+                        files::Operation::Paste { .. }
+                            | files::Operation::CreateChild { .. }
+                            | files::Operation::Reparent { .. }
+                            | files::Operation::ImportCopy { .. }
+                            | files::Operation::Transaction { .. }
+                            | files::Operation::SyncReference { .. }
+                    )
+            )
+        });
         let diagnostic = self.pending_operation.as_ref().unwrap().diagnostic.clone();
+        if strict {
+            let mut rejected = false;
+            for editor in &editors {
+                if matches!(editor.read(cx).save_state(), SaveState::Dirty)
+                    && !editor.update(cx, |e, cx| e.admit_transaction_save(cx))
+                {
+                    rejected = true;
+                }
+            }
+            if rejected {
+                self.continue_operation(window, cx);
+                return;
+            }
+        }
         for editor in editors {
             match editor.read(cx).save_state() {
                 SaveState::Dirty => {
                     waiting = true;
-                    diagnostic.scope(|| editor.update(cx, |e, cx| e.save_now(cx)));
+                    diagnostic.scope(|| {
+                        editor.update(cx, |e, cx| {
+                            if strict {
+                                e.transaction_save_now(cx);
+                            } else {
+                                e.save_now(cx);
+                            }
+                        })
+                    });
                 }
                 SaveState::Saving => waiting = true,
                 _ => {}
@@ -2463,6 +2559,92 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn tree_copy_import_uses_the_workspace_journal(cx: &mut TestAppContext) {
+        let id = aero_core::identity::new_document_id();
+        let source = format!("---\naero: {{id: {id}}}\n---\nbody\n");
+        let (dir, _data, workspace) = open(cx, Some(&source));
+        std::fs::write(dir.path().join("copy.md"), &source).unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let tree = workspace.read(cx).open.as_ref().unwrap().tree.clone();
+            tree.update(cx, |_, cx| cx.emit(crate::file_tree::FileTreeEvent::Operation(super::files::Operation::ImportCopy {
+                path: VaultPath::new("copy.md").unwrap(), journal: Default::default(),
+            })));
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).session_busy()));
+        let raw = std::fs::read(dir.path().join("copy.md")).unwrap();
+        let copy = aero_core::Document::from_bytes(&raw).unwrap();
+        assert_ne!(aero_core::identity::read(&copy).unwrap().id.as_deref(), Some(id.as_str()));
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), source);
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn mixed_line_ending_sibling_opened_after_creation_can_join_undo(cx: &mut TestAppContext) {
+        let parent_id = aero_core::identity::new_document_id();
+        let parent = format!("---\naero: {{id: {parent_id}}}\n---\nparent\n");
+        let (dir, _data, workspace) = open(cx, Some(&parent));
+        let raw = format!("---\r\naero:\n  id: {}\r\n  parent: {parent_id}\n---\r\nsibling\n", aero_core::identity::new_document_id());
+        std::fs::write(dir.path().join("sibling.md"), &raw).unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.request_operation(super::PendingOperation::File(super::files::Operation::CreateChild {
+                parent: VaultPath::new("a.md").unwrap(), before: parent.as_bytes().to_vec(),
+                range: parent.len()..parent.len(), journal: w.data_dir.join("transactions").join(w.open.as_ref().unwrap().vault.id()),
+            }), window, cx);
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| {
+            let w = workspace.read(cx);
+            !w.session_busy() && w.open.as_ref().unwrap().editor().is_some_and(|e| e.read(cx).path().as_str() != "a.md")
+        }));
+        let child = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().read(cx).path().clone());
+        workspace.update_in(cx, |w, window, cx| w.open_note(VaultPath::new("sibling.md").unwrap(), window, cx));
+        wait_until(cx, |cx| cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().is_some_and(|e| e.read(cx).path().as_str() == "sibling.md")));
+        workspace.update_in(cx, |w, window, cx| w.open_note(child.clone(), window, cx));
+        wait_until(cx, |cx| cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().is_some_and(|e| e.read(cx).path() == &child)));
+        cx.update(|window, cx| {
+            let editor = workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone();
+            editor.update(cx, |e, cx| e.focus_browse(window, cx));
+        });
+        cx.simulate_keystrokes("cmd-z");
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).session_busy()));
+        assert!(!dir.path().join(child.as_str()).exists());
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), parent);
+        assert_eq!(std::fs::read_to_string(dir.path().join("sibling.md")).unwrap(), raw);
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn child_creation_switches_file_view_to_documents(cx: &mut TestAppContext) {
+        let original = "parent\n";
+        let (_dir, _data, workspace) = open(cx, Some(original));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            let tree = workspace.read(cx).open.as_ref().unwrap().tree.clone();
+            tree.update(cx, |tree, cx| tree.reveal_folder("", cx));
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |w, window, cx| {
+            w.request_operation(super::PendingOperation::File(super::files::Operation::CreateChild {
+                parent: VaultPath::new("a.md").unwrap(), before: original.as_bytes().to_vec(),
+                range: original.len()..original.len(), journal: w.data_dir.join("transactions").join(w.open.as_ref().unwrap().vault.id()),
+            }), window, cx);
+        });
+        wait_until(cx, |cx| cx.update(|_, cx| {
+            let w = workspace.read(cx);
+            !w.session_busy() && w.open.as_ref().unwrap().editor().is_some_and(|e| e.read(cx).path().as_str() != "a.md")
+        }));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("tree-view-documents").is_some());
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
     fn undo_child_creation_closes_removed_tab_and_parent_can_redo(cx: &mut TestAppContext) {
         let original = "before\n\n/子文档\n\nafter\n";
         let (dir, _data, workspace) = open(cx, Some(original));
@@ -2596,6 +2778,307 @@ mod tests {
         assert!(
             dir.path().join("queued.md").exists(),
             "accepted operation must not be cancelled by an internally deleted editor awaiting tab closure"
+        );
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    fn g07_queued_sync(cx: &mut TestAppContext, mutation: &str) {
+        let (dir, _data, workspace) = open(cx, Some("source\n"));
+        std::fs::write(dir.path().join("b.md"), "placeholder\n").unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let source = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone()
+        });
+        workspace.update_in(cx, |w, window, cx| w.open_note(VaultPath::new("b.md").unwrap(), window, cx));
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .open
+                    .as_ref()
+                    .unwrap()
+                    .editor()
+                    .is_some_and(|e| e.read(cx).path().as_str() == "b.md")
+            })
+        });
+        let target = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        workspace.update(cx, |w, _| {
+            w.session_closing = true;
+            w.pending_operation = Some(super::QueuedOperation {
+                operation: super::PendingOperation::File(super::files::Operation::Create {
+                    directory: String::new(),
+                    base: "unused".into(),
+                    unique: true,
+                    text: String::new(),
+                }),
+                diagnostic: crate::diagnostics::Operation::new("test_queue", Default::default()),
+            });
+        });
+        if mutation == "saving" {
+            target.update(cx, |e, cx| e.test_sync_revise(cx));
+        }
+        let path = VaultPath::new("a.md").unwrap();
+        for selection in [None, Some(&path), Some(&path)] {
+            cx.update(|window, cx| target.update(cx, |e, cx| e.test_sync_picker(selection, window, cx)));
+            cx.run_until_parked();
+        }
+        assert_eq!(workspace.read_with(cx, |w, _| w.operation_queue.len()), 1);
+        match mutation {
+            "saving" => {}
+            "epoch" => source.update(cx, |e, cx| e.set_path(path.clone(), cx)),
+            "revision" => {
+                let before = target.read_with(cx, |e, _| e.reference_snapshot().1.version());
+                target.update(cx, |e, cx| e.test_sync_revise(cx));
+                assert_eq!(
+                    target.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string()),
+                    "placeholder\n"
+                );
+                assert!(target.read_with(cx, |e, _| e.reference_snapshot().1.version()) > before);
+            }
+            "membership" => {
+                let after = workspace.read_with(cx, |w, _| {
+                    let super::PendingOperation::File(super::files::Operation::SyncReference {
+                        changes, ..
+                    }) = &w.operation_queue[0].operation
+                    else {
+                        panic!("expected sync operation")
+                    };
+                    changes.iter().find(|c| c.path == path).unwrap().after.clone().unwrap()
+                });
+                std::fs::write(dir.path().join("duplicate.md"), after).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        workspace.update_in(cx, |w, window, cx| {
+            w.pending_operation = None;
+            w.session_closing = false;
+            w.continue_operation(window, cx);
+            if mutation == "saving" {
+                assert!(w.pending_operation.is_some());
+                assert_eq!(target.read(cx).save_state(), &SaveState::Saving);
+                source.update(cx, |e, cx| e.set_path(path.clone(), cx));
+            }
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let w = workspace.read(cx);
+                !w.session_busy() && w.pending_operation.is_none() && w.operation_queue.is_empty()
+            })
+        });
+        assert_eq!(std::fs::read(dir.path().join("b.md")).unwrap(), b"placeholder\n", "stale {mutation}");
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"source\n");
+        if mutation == "membership" {
+            assert!(dir.path().join("duplicate.md").exists());
+        }
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn g07_queued_sync_rejects_source_epoch_change(cx: &mut TestAppContext) {
+        g07_queued_sync(cx, "epoch");
+    }
+
+    #[gpui_kit::test]
+    fn g07_queued_sync_rejects_destination_revision_even_if_bytes_match(cx: &mut TestAppContext) {
+        g07_queued_sync(cx, "revision");
+    }
+
+    #[gpui_kit::test]
+    fn g07_sync_revalidates_live_revision_after_save_admission(cx: &mut TestAppContext) {
+        g07_queued_sync(cx, "saving");
+    }
+
+    #[gpui_kit::test]
+    fn g07_queued_sync_rejects_new_duplicate_managed_note(cx: &mut TestAppContext) {
+        g07_queued_sync(cx, "membership");
+    }
+
+    #[gpui_kit::test]
+    fn g07_sync_source_metadata_preserves_local_history(cx: &mut TestAppContext) {
+        let (dir, _data, workspace) = open(cx, Some("source\n"));
+        std::fs::write(dir.path().join("b.md"), "placeholder\n").unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let source = cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+            workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone()
+        });
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input("ordinary ");
+        let ordinary = source.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string());
+        assert_ne!(ordinary, "source\n");
+        workspace.update_in(cx, |w, window, cx| w.open_note(VaultPath::new("b.md").unwrap(), window, cx));
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .open
+                    .as_ref()
+                    .unwrap()
+                    .editor()
+                    .is_some_and(|e| e.read(cx).path().as_str() == "b.md")
+            })
+        });
+        let target = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        let path = VaultPath::new("a.md").unwrap();
+        for selection in [None, Some(&path), Some(&path)] {
+            cx.update(|window, cx| target.update(cx, |e, cx| e.test_sync_picker(selection, window, cx)));
+            cx.run_until_parked();
+        }
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let w = workspace.read(cx);
+                !w.session_busy() && w.pending_operation.is_none()
+            })
+        });
+        let assigned = std::fs::read(dir.path().join("a.md")).unwrap();
+        assert!(String::from_utf8_lossy(&assigned).contains("aero:"));
+        let token = target.read_with(cx, |e, _| e.history_transaction(false).unwrap().to_owned());
+        workspace.update_in(cx, |w, window, cx| w.request_history(&token, false, window, cx));
+        wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).session_busy()));
+        assert_eq!(std::fs::read(dir.path().join("b.md")).unwrap(), b"placeholder\n");
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), assigned);
+        workspace.update_in(cx, |w, window, cx| w.open_note(path.clone(), window, cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(
+            source.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string()),
+            ordinary,
+            "metadata must be one local undo group, not a replacement Document"
+        );
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(source.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string()), "source\n");
+        cx.simulate_keystrokes("cmd-shift-z cmd-shift-z");
+        assert_eq!(
+            source.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string().into_bytes()),
+            assigned
+        );
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn g11_cut_save_is_recoverable_before_paste_scan(cx: &mut TestAppContext) {
+        let original = "move me\n\nremaining\n";
+        let (dir, data, workspace) = open(cx, Some(original));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        let source = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape cmd-x");
+        source.update(cx, |e, cx| e.save_now(cx));
+        wait_until(cx, |cx| {
+            !matches!(source.read_with(cx, |e, _| e.save_state().clone()), SaveState::Saving)
+        });
+        assert!(!std::fs::read_to_string(dir.path().join("a.md")).unwrap().contains("move me"));
+        let vault = Vault::open(dir.path()).unwrap();
+        let journal = data.path().join("transactions").join(vault.id());
+        assert!(journal.exists(), "cut deletion must have durable recovery before any paste scan");
+        // Copy the durable crash image: the live process's OS lease is not inherited.
+        let crash = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(&journal).unwrap() {
+            let entry = entry.unwrap();
+            let target = crash.path().join(entry.file_name());
+            std::fs::create_dir(&target).unwrap();
+            for image in std::fs::read_dir(entry.path()).unwrap() {
+                let image = image.unwrap();
+                std::fs::copy(image.path(), target.join(image.file_name())).unwrap();
+            }
+        }
+        aero_core::transaction::recover(&vault, &journal).unwrap();
+        assert!(
+            !std::fs::read_to_string(dir.path().join("a.md")).unwrap().contains("move me"),
+            "a second session must not recover a live cut"
+        );
+        aero_core::transaction::recover(&vault, crash.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), original);
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn g11_rename_settles_pending_cut_before_changing_source_path(cx: &mut TestAppContext) {
+        let original = "move me\n\nremaining\n";
+        let (dir, _data, workspace) = open(cx, Some(original));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let source = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape cmd-x");
+        source.update(cx, |e, cx| e.save_now(cx));
+        wait_until(cx, |cx| {
+            !matches!(source.read_with(cx, |e, _| e.save_state().clone()), SaveState::Saving)
+        });
+        workspace.update_in(cx, |w, window, cx| {
+            w.request_operation(
+                super::PendingOperation::Rename {
+                    old: VaultPath::new("a.md").unwrap(),
+                    target: VaultPath::new("renamed.md").unwrap(),
+                    title: None,
+                },
+                window,
+                cx,
+            )
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace.read(cx).pending_operation.is_none() && !workspace.read(cx).rename_pending
+            })
+        });
+        assert_eq!(std::fs::read_to_string(dir.path().join("renamed.md")).unwrap(), original);
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn g11_dirty_transaction_participant_rejects_external_bytes(cx: &mut TestAppContext) {
+        use super::{PendingOperation, files::Operation};
+        use aero_core::transaction::FileChange;
+        let (dir, data, workspace) = open(cx, Some("body\n"));
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let editor = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input("local ");
+        let before = editor.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string().into_bytes());
+        std::fs::write(dir.path().join("a.md"), b"external\n").unwrap();
+        workspace.update_in(cx, |w, window, cx| {
+            w.request_operation(
+                PendingOperation::File(Operation::Transaction {
+                    token: aero_core::identity::new_block_id(),
+                    changes: vec![FileChange {
+                        path: VaultPath::new("a.md").unwrap(),
+                        before: Some(before.clone()),
+                        after: Some(b"result\n".to_vec()),
+                    }],
+                    history_changes: None,
+                    direction: None,
+                    open: None,
+                    journal: data.path().join("transactions").join(w.open.as_ref().unwrap().vault.id()),
+                }),
+                window,
+                cx,
+            );
+        });
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace.read(cx).pending_operation.is_none() && !workspace.read(cx).session_busy()
+            })
+        });
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"external\n");
+        assert_eq!(
+            editor.read_with(cx, |e, _| e.reference_snapshot().1.text().to_string().into_bytes()),
+            before
         );
         cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
     }
@@ -4448,6 +4931,48 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|_, cx| assert!(view.read(cx).hits().is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn g08_resolved_source_click_opens_root_despite_nested_name_collision(cx: &mut TestAppContext) {
+        for (text, selector, limit) in [
+            ("[[RootSource#^p|hint]]\n", "source-go-Source.md#^p", None),
+            ("[[RootSource#^p|hint]]\n", "reference-excerpt-root body", None),
+            ("![[RootSource#^p]]\n", "source-go-Source.md#^p", None),
+            ("![[Hop1]]\n", "source-go-Source.md#^p", Some("embed-limit-depth")),
+            ("![[RootSource#^p]]\n", "source-go-Source.md#^p", Some("embed-limit-cycle")),
+        ] {
+            let (dir, _data, workspace) = open(cx, Some("initial\n"));
+            std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+            let body = if limit == Some("embed-limit-cycle") { "![[RootSource#^p]] ^p" } else { "root body ^p" };
+            std::fs::write(dir.path().join("Source.md"), format!("---\ntitle: RootSource\n---\n\n{body}\n")).unwrap();
+            for (name, body) in [("Hop1.md", "![[Hop2]]"), ("Hop2.md", "![[Hop3]]"), ("Hop3.md", "![[RootSource#^p]]")] {
+                std::fs::write(dir.path().join(name), body).unwrap();
+            }
+            std::fs::write(dir.path().join("nested/Source.md"), "wrong body ^p\n").unwrap();
+            std::fs::write(dir.path().join("nested/Target.md"), text).unwrap();
+            let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+            cx.update(|window, cx| {
+                window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+                let search = workspace.read(cx).open.as_ref().unwrap().search.clone();
+                search.read(cx).close_blocking();
+                search.read(cx).catalog.invalidate();
+                workspace.update(cx, |w, cx| w.open_note(VaultPath::new("nested/Target.md").unwrap(), window, cx));
+            });
+            wait_until(cx, |cx| {
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                cx.debug_bounds(selector).is_some()
+            });
+            if let Some(limit) = limit { assert!(cx.debug_bounds(limit).is_some(), "{limit}"); }
+            let jump = cx.debug_bounds(selector).expect("resolved source rendered");
+            cx.simulate_click(jump.center(), gpui_kit::Modifiers::default());
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                let editor = workspace.read(cx).open.as_ref().unwrap().editor().unwrap().read(cx);
+                assert_eq!(editor.path().as_str(), "Source.md", "{selector} must not resolve relative again");
+                assert!(editor.highlighted_block().is_some(), "resolved fragment must be revealed");
+            });
+        }
     }
 
     /// 真实点击预览里的 wikilink（mouse down、一帧、mouse up——真机上两者之间必有重绘）：

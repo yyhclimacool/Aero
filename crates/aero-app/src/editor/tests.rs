@@ -223,7 +223,13 @@ pub(super) fn open(
     let path = VaultPath::new("a.md").unwrap();
     let (doc, stamp) = Editor::load(vault.clone(), path.clone()).unwrap();
     let (v, p) = (vault.clone(), path.clone());
-    let (editor, _) = cx.add_window_view(|_, cx| Editor::new(v, p, doc, stamp, cx));
+    let journal = tempfile::tempdir().unwrap();
+    let (editor, _) = cx.add_window_view(|_, cx| {
+        let mut editor = Editor::new(v, p, doc, stamp, cx);
+        editor.set_journal_root(journal.path().to_owned());
+        cx.on_release(move |_, cx| cx.defer(move |_| drop(journal))).detach();
+        editor
+    });
     (dir, vault, path, editor)
 }
 
@@ -1994,7 +2000,7 @@ fn toolbar_more_menu_copies_a_block_link_and_adds_an_id(cx: &mut TestAppContext)
         item.text().unwrap_or_default()
     });
     let document = aero_core::identity::read(&aero_core::Document::from_text(&body)).unwrap().id.unwrap();
-    assert_eq!(copied, format!("[[id:{document}#^{id}]]"));
+    assert_eq!(copied, format!("[[id:{document}#^{id}|a]]"));
     assert_eq!(body.matches('^').count(), 1, "只写一个块 id：{body}");
 }
 
@@ -4945,6 +4951,895 @@ fn block_selection_keyboard_flow(cx: &mut TestAppContext) {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), text(&editor, cx));
 }
 
+#[gpui_kit::test]
+fn attributed_root_list_exit_does_not_drop_defaults_or_add_a_highlight(cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt as _;
+    let source = "- {aero-owner=item .red align=center} ^item\n\n  body\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("home backspace");
+    assert_eq!(text(&editor, cx), source);
+    cx.update(|window, cx| {
+        assert!(!editor.read(cx).doc.can_undo());
+        assert_eq!(window.notifications(cx).len(), 1);
+    });
+}
+
+#[gpui_kit::test]
+fn highlight_final_list_item_has_a_text_presenter(cx: &mut TestAppContext) {
+    let source = "# 完整性冒烟\n\n首段保留。\n\n:::highlight {.bg-blue}\n容器内首段。\n\n> 引用内首段。\n>\n> 引用内后段。\n\n- 列表第一项\n\n  列表续段\n\n  - 嵌套项\n\n- 列表第二项\n:::\n\n```text\n保留代码中的空行\n\n\n\n最后一行\n```\n\n末段保留。\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let texts =
+            e.units.iter().map(|u| (u.id, e.doc.slice(u.range.clone()).to_string())).collect::<Vec<_>>();
+        let (id, _) = texts
+            .iter()
+            .find(|(_, text)| text == "列表第二项")
+            .unwrap_or_else(|| panic!("{texts:?}; {:?}", e.doc));
+        let presenter =
+            e.presenters.get(&super::presenter::Key::unit(*id)).expect("last item's text presenter");
+        assert_eq!(presenter.textarea.read(cx).value(), "列表第二项");
+    });
+}
+
+#[gpui_kit::test]
+fn enter_inside_highlight_keeps_empty_editor_inside_container(cx: &mut TestAppContext) {
+    let source = ":::highlight\ninside\n:::\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let container = cx.update(|_, cx| editor.read(cx).doc.blocks().roots[0].id);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    let bounds = cx.debug_bounds(Box::leak(format!("block-body-{}", container.0).into_boxed_str())).unwrap();
+    let input = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().textarea.read(cx).input_bounds());
+    assert!(
+        input.top() >= bounds.top() && input.bottom() <= bounds.bottom(),
+        "input={input:?}, container={bounds:?}"
+    );
+    cx.simulate_input("new child");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.doc.blocks().roots[0].children.iter().any(|b| e.doc.block_text(b).contains("new child")));
+    });
+}
+
+#[gpui_kit::test]
+fn enter_on_interior_container_blank_stays_inside(cx: &mut TestAppContext) {
+    let source = ":::highlight\nfirst\n\n\nlast\n:::\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let at = source.find("\n\n\n").unwrap() + 2;
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.focus_at(at, None, window, cx)));
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("middle");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(
+            e.doc.blocks().roots[0].children.iter().any(|b| e.doc.block_text(b).contains("middle")),
+            "{}; focus={:?}",
+            e.doc,
+            e.focused.as_ref().map(|f| (&f.range, f.id))
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn backspace_at_nonempty_container_start_does_not_select_subtree_for_deletion(cx: &mut TestAppContext) {
+    let source = ":::highlight\nfirst\n\nsecond\n:::\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("home backspace backspace");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn save_as_cannot_bypass_pending_cut_recovery(cx: &mut TestAppContext) {
+    let (_dir, vault, path, editor) = open(cx, "first\n\nsecond\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("escape cmd-x");
+    let before = vault.read_bytes(&path).unwrap().0;
+    let destination = VaultPath::new("copy.md").unwrap();
+    cx.update(|_, cx| {
+        editor.update(cx, |e, cx| {
+            assert!(e.io.cut.is_some());
+            assert!(e.save_as(destination.clone(), cx).is_err());
+            assert_eq!(e.path(), &path);
+        });
+    });
+    assert!(!vault.exists(&destination));
+    assert_eq!(vault.read_bytes(&path).unwrap().0, before);
+}
+
+#[gpui_kit::test]
+fn quoted_empty_slot_remains_visible_after_blur(cx: &mut TestAppContext) {
+    let source = "> inside {.red}\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("enter");
+    let offset = cx.update(|_, cx| editor.read(cx).focused.as_ref().unwrap().range.start);
+    cx.simulate_keystrokes("escape escape");
+    settle(cx);
+    let state = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        (
+            e.doc.to_string(),
+            e.empty_slots.iter().map(|s| (s.range.clone(), e.available_empty_slot(s))).collect::<Vec<_>>(),
+            e.doc.blocks().roots.iter().map(|b| (b.kind.clone(), e.doc.range_of(b))).collect::<Vec<_>>(),
+        )
+    });
+    assert!(
+        cx.debug_bounds(Box::leak(format!("empty-paragraph-{offset}").into_boxed_str())).is_some(),
+        "offset={offset}, {state:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn selecting_list_continuation_keeps_sibling_blocks(cx: &mut TestAppContext) {
+    let source = "- first\n\n  continuation\n\n  - nested\n\n- second\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let ix = e
+                .units
+                .iter()
+                .position(|u| e.doc.slice(u.range.clone()).to_string() == "continuation")
+                .unwrap();
+            e.select_blocks(ix, ix, window, cx);
+        });
+    });
+    cx.simulate_keystrokes("cmd-c");
+    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some("continuation".to_owned()));
+    cx.simulate_keystrokes("backspace");
+    let remaining = text(&editor, cx);
+    assert!(!remaining.contains("continuation"));
+    assert!(remaining.contains("first") && remaining.contains("nested") && remaining.contains("second"));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn g02_explicit_list_children_keep_item_and_sibling_identities(cx: &mut TestAppContext) {
+    let source = "- first ^first\n\n  continuation ^cont\n\n  - nested ^nested\n\n- second ^second\n\noutside ^outside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for name in ["first", "cont", "nested"] {
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                e.selection = None;
+                e.selected_node = Some(aero_core::block_refs::resolve(&e.doc, name).unwrap());
+                e.focus_handle.focus(window, cx);
+            })
+        });
+        cx.simulate_keystrokes("cmd-c");
+        let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+        assert_eq!(copied.matches('^').count(), 1, "{name}: {copied}");
+        assert!(!copied.starts_with('-'), "leaf is not an item: {copied}");
+        cx.simulate_keystrokes("backspace");
+        cx.update(|_, cx| {
+            let e = editor.read(cx);
+            assert!(aero_core::block_refs::resolve(&e.doc, name).is_err());
+            for kept in ["first", "cont", "nested", "second", "outside"].into_iter().filter(|id| *id != name)
+            {
+                let id = aero_core::block_refs::resolve(&e.doc, kept).unwrap();
+                if kept != "outside" {
+                    assert!(
+                        !aero_core::containers::ancestors(&e.doc, id).is_empty(),
+                        "{name}: detached {kept}: {}",
+                        e.doc
+                    );
+                }
+            }
+            assert!(matches!(e.doc.blocks().roots[0].kind, aero_core::BlockKind::List { .. }));
+        });
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn g02_last_list_item_delete_and_cut_preserve_parent_metadata(cx: &mut TestAppContext) {
+    use aero_core::{BlockKind, block_refs::resolve, containers};
+    for source in [
+        "kept ^keep\n\n- item ^item\n\n^list\n",
+        "kept ^keep\n\n- item ^item\n\n{.red custom=value aero-aliases=oldlist} ^list\n",
+        "kept ^keep\n\n- {.blue aero-owner=item aero-aliases=oldchild} ^child\n\n  item ^item\n\n{.red custom=value aero-aliases=oldlist} ^list\n",
+        "- item ^item\n\n{.red custom=value aero-aliases=oldlist} ^list\n\nkept ^keep\n",
+        "- outer ^outer\n\n  kept ^keep\n\n  3. item ^item\n\n  {.red custom=value aero-aliases=oldlist} ^list\n\nend\n",
+        "> kept ^keep\n>\n> - item ^item\n>\n> {.red custom=value aero-aliases=oldlist} ^list\n\noutside\n",
+    ] {
+        let (_dir, _vault, _path, editor) = open(cx, source);
+        let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+        for whole_list in [false, true] {
+            for action in ["backspace", "cmd-x"] {
+                let (attrs, parent_depth, keep_depth) = cx.update(|window, cx| {
+                    editor.update(cx, |e, cx| {
+                        let list = resolve(&e.doc, "list").unwrap();
+                        let block = e.doc.blocks().find(list).unwrap();
+                        assert!(matches!(block.kind, BlockKind::List { .. }));
+                        let snapshot = (
+                            block.attrs.clone(),
+                            containers::ancestors(&e.doc, list).len(),
+                            containers::ancestors(&e.doc, resolve(&e.doc, "keep").unwrap()).len(),
+                        );
+                        let item = resolve(&e.doc, "item").unwrap();
+                        if whole_list {
+                            e.selection = None;
+                            e.selected_node = Some(list);
+                            e.focus_handle.focus(window, cx);
+                        } else {
+                            let ix = e.unit_index(item).unwrap();
+                            e.select_blocks(ix, ix, window, cx);
+                        }
+                        snapshot
+                    })
+                });
+                cx.simulate_keystrokes("cmd-c");
+                let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+                assert_eq!(copied.contains("^list"), whole_list);
+                cx.simulate_keystrokes(action);
+                if action == "cmd-x" {
+                    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some(copied));
+                }
+                cx.update(|_, cx| {
+                    let e = editor.read(cx);
+                    let keep = resolve(&e.doc, "keep").expect("previous paragraph keeps its identity");
+                    assert_eq!(e.doc.blocks().find(keep).unwrap().kind, BlockKind::Paragraph);
+                    assert_eq!(containers::ancestors(&e.doc, keep).len(), keep_depth);
+                    for removed in ["item", "child", "oldchild"] {
+                        assert!(resolve(&e.doc, removed).is_err(), "{removed}: {}", e.doc);
+                    }
+                    if whole_list {
+                        assert!(resolve(&e.doc, "list").is_err());
+                        assert!(resolve(&e.doc, "oldlist").is_err());
+                        assert!(!e.doc.to_string().contains("custom=value"));
+                    } else {
+                        let list = resolve(&e.doc, "list").unwrap();
+                        let block = e.doc.blocks().find(list).unwrap();
+                        assert!(matches!(block.kind, BlockKind::List { .. }), "{}", e.doc);
+                        assert_eq!(block.attrs, attrs);
+                        assert_eq!(containers::ancestors(&e.doc, list).len(), parent_depth);
+                        if source.contains("oldlist") {
+                            assert_eq!(resolve(&e.doc, "oldlist").unwrap(), list);
+                        }
+                        assert_eq!(block.children.len(), 1);
+                        let placeholder = &block.children[0];
+                        assert_eq!(placeholder.kind, BlockKind::ListItem { task: None });
+                        assert!(placeholder.children.is_empty());
+                        assert!(placeholder.persisted_id.is_none() && placeholder.attrs.is_empty());
+                    }
+                });
+                cx.simulate_keystrokes("cmd-z");
+                assert_eq!(text(&editor, cx), source, "{action}: whole_list={whole_list}");
+            }
+        }
+    }
+}
+
+#[test]
+fn g02_first_and_last_items_retain_list_until_explicitly_deleted() {
+    use aero_core::{BlockKind, Document, block_refs::resolve};
+    let source = "kept ^keep\n\n- first ^first\n- last ^last\n\n{.blue aero-aliases=oldlist} ^list\n";
+    for order in [["first", "last"], ["last", "first"]] {
+        let mut doc = Document::from_text(source);
+        for (step, name) in order.into_iter().enumerate() {
+            let before = doc.to_string();
+            let units = super::units::units(&doc);
+            let ix = units.iter().position(|u| u.id == resolve(&doc, name).unwrap()).unwrap();
+            let plan = super::SelectionPlan::units(&doc, &units, ix, ix);
+            let edits = plan.deletions(&doc);
+            doc.edit_group(edits.clone()).unwrap();
+            doc.reparse();
+            let list = resolve(&doc, "list").unwrap();
+            assert!(matches!(doc.blocks().find(list).unwrap().kind, BlockKind::List { .. }), "{doc}");
+            assert_eq!(resolve(&doc, "oldlist").unwrap(), list);
+            assert!(resolve(&doc, "keep").is_ok());
+            assert!(resolve(&doc, name).is_err());
+            assert_eq!(resolve(&doc, order[1]).is_ok(), step == 0);
+            doc.undo().unwrap();
+            assert_eq!(doc.to_string(), before);
+            doc.edit_group(edits).unwrap();
+            doc.reparse();
+        }
+    }
+}
+
+#[test]
+fn g02_multi_item_deletion_and_replacement_keep_parent_metadata() {
+    use aero_core::{BlockKind, Document, block_refs::resolve};
+    let source = "kept ^keep\n\n- first ^first\n- last ^last\n\n{.red aero-aliases=oldlist} ^list\n";
+    for replace in [false, true] {
+        let mut doc = Document::from_text(source);
+        let units = super::units::units(&doc);
+        let plan = super::SelectionPlan::units(&doc, &units, usize::from(!replace), 2);
+        if replace {
+            doc = plan.replace(&doc, "pasted").unwrap();
+        } else {
+            doc.edit_group(plan.deletions(&doc)).unwrap();
+            doc.reparse();
+        }
+        let list = resolve(&doc, "list").unwrap();
+        let block = doc.blocks().find(list).unwrap();
+        assert!(matches!(block.kind, BlockKind::List { .. }), "{doc}");
+        assert_eq!(resolve(&doc, "oldlist").unwrap(), list);
+        assert_eq!(block.attrs.classes, ["red"]);
+        assert_eq!(block.children.len(), 1);
+        assert!(block.children[0].children.is_empty());
+        assert!(resolve(&doc, "first").is_err() && resolve(&doc, "last").is_err());
+        assert_eq!(resolve(&doc, "keep").is_ok(), !replace);
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+}
+
+#[test]
+fn g02_move_last_item_keeps_identified_list_placeholder() {
+    use aero_core::{BlockKind, Document, block_refs::resolve};
+    let source = "kept ^keep\n\n- moving ^moving\n\n{.red aero-aliases=oldlist} ^list\n\noutside ^outside\n";
+    let mut doc = Document::from_text(source);
+    let list = resolve(&doc, "list").unwrap();
+    let item = doc.blocks().find(list).unwrap().children[0].id;
+    let plan = super::ops::move_node(&doc, item, resolve(&doc, "outside").unwrap(), true, false)
+        .expect("moving the only item retains the identified parent");
+    doc.edit(plan.edit).unwrap();
+    doc.reparse();
+    let list = resolve(&doc, "list").unwrap();
+    assert_eq!(resolve(&doc, "oldlist").unwrap(), list);
+    let placeholder = &doc.blocks().find(list).unwrap().children[0];
+    assert_eq!(placeholder.kind, BlockKind::ListItem { task: None });
+    assert!(placeholder.children.is_empty() && placeholder.persisted_id.is_none());
+    assert!(resolve(&doc, "keep").is_ok());
+    assert!(doc.to_string().find("outside").unwrap() < doc.to_string().find("moving").unwrap());
+    doc.undo().unwrap();
+    assert_eq!(doc.to_string(), source);
+}
+
+#[gpui_kit::test]
+fn g02_cross_highlight_selection_keeps_unselected_parents(cx: &mut TestAppContext) {
+    let source = ":::highlight {.red custom=one}\nfirst ^first\n:::\n\n^left\n\n:::highlight {.blue custom=two}\nsecond ^second\n:::\n\n^right\n\n<!-- opaque  bytes -->\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(0, 1, window, cx)));
+    cx.simulate_keystrokes("cmd-c");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("first ^first\n\nsecond ^second")
+    );
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text(&editor, cx), source.replace("first ^first", "").replace("second ^second", ""));
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        for id in ["left", "right"] {
+            let block = e.doc.blocks().find(aero_core::block_refs::resolve(&e.doc, id).unwrap()).unwrap();
+            assert!(matches!(block.kind, aero_core::BlockKind::Directive { .. }));
+            assert!(block.children.is_empty());
+        }
+    });
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn g02_continuation_cut_uses_same_targets_as_copy_and_delete(cx: &mut TestAppContext) {
+    let source =
+        "- first ^first\n\n  continuation ^cont\n\n  - nested ^nested\n\n- second ^second\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(1, 1, window, cx)));
+    cx.simulate_keystrokes("cmd-x");
+    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("continuation ^cont"));
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        for id in ["first", "nested", "second"] {
+            assert!(aero_core::block_refs::resolve(&e.doc, id).is_ok(), "lost {id}");
+        }
+        assert!(aero_core::block_refs::resolve(&e.doc, "cont").is_err());
+    });
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn g02_explicit_item_and_list_keep_selected_context(cx: &mut TestAppContext) {
+    let source =
+        "- first ^first\n\n  continuation ^cont\n\n  - nested ^nested\n\n- second ^second\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for whole_list in [false, true] {
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                let list = &e.doc.blocks().roots[0];
+                e.selected_node = Some(if whole_list { list.id } else { list.children[0].id });
+                e.selection = None;
+                e.focus_handle.focus(window, cx);
+            })
+        });
+        cx.simulate_keystrokes("cmd-c");
+        let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+        assert!(copied.starts_with("- first"));
+        assert!(copied.contains("\n  continuation") && copied.contains("\n  - nested"), "{copied}");
+        assert_eq!(copied.contains("second"), whole_list);
+        cx.simulate_keystrokes("backspace");
+        let remaining = text(&editor, cx);
+        assert!(!remaining.contains("first") && !remaining.contains("nested"));
+        assert_eq!(remaining.contains("second"), !whole_list);
+        assert!(remaining.contains("outside"));
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn g02_cut_explicit_leaf_item_and_list_match_copy_scope(cx: &mut TestAppContext) {
+    let source = "- first ^first\n\n  continuation ^cont\n\n  - nested ^nested\n\n- second ^second\n\noutside ^outside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for scope in 0..3 {
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                let list = &e.doc.blocks().roots[0];
+                e.selected_node = Some(match scope {
+                    0 => aero_core::block_refs::resolve(&e.doc, "first").unwrap(),
+                    1 => list.children[0].id,
+                    _ => list.id,
+                });
+                e.selection = None;
+                e.focus_handle.focus(window, cx);
+            })
+        });
+        cx.simulate_keystrokes("cmd-c");
+        let copied = cx.read_from_clipboard().and_then(|c| c.text());
+        cx.simulate_keystrokes("cmd-x");
+        assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), copied);
+        cx.update(|_, cx| {
+            let e = editor.read(cx);
+            assert!(aero_core::block_refs::resolve(&e.doc, "first").is_err());
+            for (id, keep) in
+                [("cont", scope == 0), ("nested", scope == 0), ("second", scope < 2), ("outside", true)]
+            {
+                assert_eq!(aero_core::block_refs::resolve(&e.doc, id).is_ok(), keep, "scope={scope}: {id}");
+            }
+            if scope == 0 {
+                let id = aero_core::block_refs::resolve(&e.doc, "cont").unwrap();
+                assert!(!aero_core::containers::ancestors(&e.doc, id).is_empty());
+            }
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.run_until_parked();
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn g02_cut_across_highlights_preserves_both_parent_identities(cx: &mut TestAppContext) {
+    let source = ":::highlight {.red}\nfirst ^first\n:::\n\n^left\n\n:::highlight {.blue}\nsecond ^second\n:::\n\n^right\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(0, 1, window, cx)));
+    cx.simulate_keystrokes("cmd-x");
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+        Some("first ^first\n\nsecond ^second")
+    );
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        for id in ["left", "right"] {
+            let block = e.doc.blocks().find(aero_core::block_refs::resolve(&e.doc, id).unwrap()).unwrap();
+            assert!(block.children.is_empty());
+        }
+    });
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn g02_copy_multiple_continuations_exports_standalone_siblings(cx: &mut TestAppContext) {
+    let source = "- first\n\n  continuation\n\n  another\n\n  - nested\n  - sibling\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for (first, last, expected) in [(1, 2, "continuation\n\nanother"), (3, 4, "- nested\n- sibling")] {
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(first, last, window, cx)));
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some(expected));
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn g02_keyboard_item_and_descendants_are_copied_once(cx: &mut TestAppContext) {
+    let source = "- first\n\n  continuation\n\n  - nested\n\n- second\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(0, 2, window, cx)));
+    cx.simulate_keystrokes("cmd-c");
+    let copied = cx.read_from_clipboard().and_then(|c| c.text()).unwrap();
+    assert_eq!(copied.trim_end(), "- first\n\n  continuation\n\n  - nested");
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text(&editor, cx), "- second\n\noutside\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn g02_dragging_quote_and_highlight_children_to_root_uses_node_scope(cx: &mut TestAppContext) {
+    use aero_core::{BlockKind, containers};
+    use gpui_kit::{Modifiers, MouseButton, point, px};
+    for source in [
+        "> moving\n>\n> kept\n\noutside\n",
+        ":::highlight\nmoving\n\nkept\n:::\n\noutside\n",
+    ] {
+        let (_dir, _vault, _path, editor) = open(cx, source);
+        let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (moving, outside) = cx.update(|_, cx| {
+            let e = editor.read(cx);
+            assert!(e.units[0].list.is_none());
+            (e.units[0].id, e.units.last().unwrap().id)
+        });
+        hover_block(moving, cx);
+        let handle =
+            cx.debug_bounds(Box::leak(format!("gutter-handle-{}", moving.0).into_boxed_str())).unwrap();
+        let target = cx.debug_bounds(Box::leak(format!("unit-{}", outside.0).into_boxed_str())).unwrap();
+        let drop_at = point(target.left() + px(24.), target.bottom() - px(4.));
+        cx.simulate_mouse_down(handle.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            handle.center() + point(px(12.), px(0.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(drop_at, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("block-drop-line").is_some());
+        cx.simulate_mouse_up(drop_at, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let e = editor.read(cx);
+            let roots = &e.doc.blocks().roots;
+            assert_eq!(roots.len(), 3, "{}", e.doc);
+            assert_eq!(roots[2].kind, BlockKind::Paragraph, "{}", e.doc);
+            assert_eq!(containers::local_source(&e.doc, roots[2].id).as_deref(), Some("moving"));
+            assert_eq!(containers::local_source(&e.doc, roots[1].id).as_deref(), Some("outside"));
+            assert!(containers::is_editable(&roots[0].kind));
+            if source.starts_with('>') {
+                assert_eq!(roots[0].kind, BlockKind::BlockQuote);
+            }
+            assert_eq!(roots[0].children.len(), 1);
+            assert_eq!(containers::local_source(&e.doc, roots[0].children[0].id).as_deref(), Some("kept"));
+        });
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
+fn g02_dragging_list_child_outside_does_not_move_item(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, point, px};
+    let source =
+        "- first ^first\n\n  continuation ^cont\n\n  - nested ^nested\n\n- second ^second\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for name in ["first", "cont", "nested"] {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let target = cx.update(|_, cx| editor.read(cx).units.last().unwrap().id);
+        let bounds = cx.debug_bounds(Box::leak(format!("unit-{}", target.0).into_boxed_str())).unwrap();
+        cx.simulate_mouse_move(bounds.origin + point(px(24.), px(4.)), None, Modifiers::default());
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                let id = aero_core::block_refs::resolve(&e.doc, name).unwrap();
+                e.finish_block_drag(
+                    &super::block_menu::BlockDrag { id, revision: e.doc.version() },
+                    window,
+                    cx,
+                );
+            })
+        });
+        cx.update(|_, cx| {
+            let e = editor.read(cx);
+            let moved = aero_core::block_refs::resolve(&e.doc, name).unwrap();
+            assert!(aero_core::containers::ancestors(&e.doc, moved).is_empty(), "{name}: {}", e.doc);
+            for kept in ["first", "cont", "nested"].into_iter().filter(|id| *id != name) {
+                let id = aero_core::block_refs::resolve(&e.doc, kept).unwrap();
+                assert!(
+                    !aero_core::containers::ancestors(&e.doc, id).is_empty(),
+                    "{name}: moved sibling {kept}: {}",
+                    e.doc
+                );
+            }
+        });
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[test]
+fn drag_node_keeps_list_body_scope() {
+    use aero_core::{Document, block_refs::resolve, containers};
+    let source = "- first ^first\n\n  continuation ^cont\n\n  - nested ^nested\n\n- second ^second\n\noutside ^outside\n";
+    for scope in ["first", "cont", "item"] {
+        let mut doc = Document::from_text(source);
+        let from = if scope == "item" {
+            doc.blocks().roots[0].children[0].id
+        } else {
+            resolve(&doc, scope).unwrap()
+        };
+        let to = resolve(&doc, "outside").unwrap();
+        let plan = super::ops::move_node(&doc, from, to, true, false).unwrap();
+        let focus = plan.focus_offset;
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let focused = match scope {
+            "first" => "first ^first",
+            "cont" => "continuation ^cont",
+            _ => "- first ^first",
+        };
+        assert!(doc.to_string()[focus..].starts_with(focused), "focus={focus}: {doc}");
+        for name in ["first", "cont", "nested"] {
+            let id = resolve(&doc, name).unwrap();
+            let ancestors = containers::ancestors(&doc, id);
+            if scope == "item" {
+                assert!(doc.range_of(doc.blocks().find(id).unwrap()).start >= focus, "{doc}");
+                assert_eq!(ancestors.len(), if name == "nested" { 4 } else { 2 });
+            } else if name == scope {
+                assert!(ancestors.is_empty(), "{scope}: {doc}");
+            } else {
+                assert!(!ancestors.is_empty(), "{scope}: detached sibling: {doc}");
+                assert!(doc.range_of(doc.blocks().find(id).unwrap()).start < focus, "{doc}");
+            }
+        }
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+}
+
+#[test]
+fn g02_move_ordered_outer_item_keeps_remaining_list_scope() {
+    use aero_core::{Document, block_refs::resolve, containers};
+    let source = "1. first ^first\n\n   continuation ^cont\n\n2. second ^second\n\noutside ^outside\n";
+    let mut doc = Document::from_text(source);
+    let from = doc.blocks().roots[0].children[0].id;
+    let to = resolve(&doc, "outside").unwrap();
+    let plan = super::ops::move_node(&doc, from, to, true, false).unwrap();
+    doc.edit(plan.edit).unwrap();
+    doc.reparse();
+    let first = resolve(&doc, "first").unwrap();
+    let cont = resolve(&doc, "cont").unwrap();
+    assert_eq!(
+        containers::ancestors(&doc, first).last().unwrap().id,
+        containers::ancestors(&doc, cont).last().unwrap().id
+    );
+    assert!(doc.to_string().contains("2. second ^second"));
+    assert!(doc.to_string().find("outside").unwrap() < doc.to_string().find("first").unwrap());
+    doc.undo().unwrap();
+    assert_eq!(doc.to_string(), source);
+}
+
+#[test]
+fn g02_move_preserves_unrelated_distinct_list_markers() {
+    let source = "one\n\ntwo\n\n- dash\n\n* star\n";
+    let mut doc = aero_core::Document::from_text(source);
+    let one = doc.blocks().roots[0].id;
+    let two = doc.blocks().roots[1].id;
+    let plan = super::ops::move_node(&doc, one, two, true, false).unwrap();
+    doc.edit(plan.edit).unwrap();
+    doc.reparse();
+    assert_eq!(doc.blocks().roots.len(), 4);
+    assert!(doc.to_string().ends_with("- dash\n\n* star\n"));
+    doc.undo().unwrap();
+    assert_eq!(doc.to_string(), source);
+}
+
+#[test]
+fn g02_move_node_cancels_unchanged_sibling_slot() {
+    let doc = aero_core::Document::from_text("one\n\ntwo\n\nthree\n");
+    let one = doc.blocks().roots[0].id;
+    let two = doc.blocks().roots[1].id;
+    assert!(super::ops::move_node(&doc, one, two, false, false).is_none());
+    assert!(super::ops::move_node(&doc, two, one, true, false).is_none());
+}
+
+#[gpui_kit::test]
+fn g02_drag_dispatch_into_list_item_keeps_body_child_scope(cx: &mut TestAppContext) {
+    use aero_core::{block_refs::resolve, containers};
+    use gpui_kit::{Modifiers, point, px};
+    let source = "- first ^first\n\n  moving ^moving\n\n- resident ^resident\n\n  continuation ^cont\n\n  - nested ^nested\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let target = cx.update(|_, cx| resolve(&editor.read(cx).doc, "resident").unwrap());
+    let bounds = cx.debug_bounds(Box::leak(format!("unit-{}", target.0).into_boxed_str())).unwrap();
+    cx.simulate_mouse_move(
+        point(bounds.right() - px(12.), bounds.top() + px(4.)),
+        None,
+        Modifiers::default(),
+    );
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let id = resolve(&e.doc, "moving").unwrap();
+            e.finish_block_drag(&super::block_menu::BlockDrag { id, revision: e.doc.version() }, window, cx);
+            let moved = resolve(&e.doc, "moving").unwrap();
+            let resident = resolve(&e.doc, "resident").unwrap();
+            assert_eq!(
+                containers::ancestors(&e.doc, moved).last().unwrap().id,
+                containers::ancestors(&e.doc, resident).last().unwrap().id,
+                "{}",
+                e.doc
+            );
+        })
+    });
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[test]
+fn g02_move_into_list_item_keeps_existing_children_and_undo() {
+    use aero_core::{Document, block_refs::resolve, containers};
+    for marker in ["- ", "12. ", "-\t"] {
+        let prefix = if marker == "- " { "  " } else { "    " };
+        let source = format!(
+            "moving ^moving\n\n{marker}resident ^resident\n\n{prefix}continuation ^cont\n\n{prefix}- nested ^nested\n\noutside\n"
+        );
+        let mut doc = Document::from_text(&source);
+        let from = resolve(&doc, "moving").unwrap();
+        let resident = resolve(&doc, "resident").unwrap();
+        let to = containers::ancestors(&doc, resident).last().unwrap().id;
+        let plan = super::ops::move_node(&doc, from, to, false, true).expect("Into ListItem");
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let moved = resolve(&doc, "moving").unwrap();
+        let resident = resolve(&doc, "resident").unwrap();
+        let item = containers::ancestors(&doc, resident).last().unwrap().id;
+        assert_eq!(containers::ancestors(&doc, moved).last().unwrap().id, item, "{doc}");
+        assert_eq!(containers::ancestors(&doc, resolve(&doc, "cont").unwrap()).last().unwrap().id, item);
+        assert!(containers::ancestors(&doc, resolve(&doc, "nested").unwrap()).iter().any(|b| b.id == item));
+        assert_eq!(containers::local_source(&doc, moved).as_deref(), Some("moving"));
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+}
+
+#[test]
+fn g02_selection_paste_grows_highlight_ancestors_without_changing_literals() {
+    use aero_core::{BlockKind, Document, containers};
+    for pasted in [":::highlight {.red}\nchild\n:::", "```text\n::: \t\n```", "~~~text\n\t:::::\n~~~"] {
+        let source = "  ::::highlight {.outer}\n  > :::highlight {.inner}\n  > selected\n  >\n  > kept\n  > :::\n  ::::\n\noutside\n";
+        let doc = Document::from_text(source);
+        let target = super::units::units(&doc)[0].id;
+        let mut result = super::SelectionPlan::nodes(&doc, &[target]).replace(&doc, pasted).unwrap();
+        assert_eq!(result.blocks().roots.len(), 2, "{result}");
+        let outer = &result.blocks().roots[0];
+        assert_eq!(outer.attrs.classes, ["outer"]);
+        let inner = &outer.children[0].children[0];
+        assert_eq!(inner.attrs.classes, ["inner"], "{result}");
+        assert_eq!(inner.children.len(), 2, "{result}");
+        let inserted = &inner.children[0];
+        let parsed = Document::from_text(pasted);
+        assert_eq!(inserted.kind, parsed.blocks().roots[0].kind);
+        assert_eq!(
+            containers::local_source(&result, inserted.id),
+            containers::local_source(&parsed, parsed.blocks().roots[0].id)
+        );
+        if matches!(inserted.kind, BlockKind::Directive { .. }) {
+            assert_eq!(inserted.children.len(), 1);
+            assert_eq!(containers::local_source(&result, inserted.children[0].id).as_deref(), Some("child"));
+        }
+        assert_eq!(containers::local_source(&result, inner.children[1].id).as_deref(), Some("kept"));
+        result.undo().unwrap();
+        assert_eq!(result.to_string(), source);
+    }
+}
+
+#[test]
+fn g02_selection_paste_retains_receiving_code_opening_indent() {
+    use aero_core::{Document, containers};
+    let pasted = "~~~text\n  replacement\n~~~";
+    for source in ["  ~~~text\n    old\n  ~~~\n\nkept\n", ">   ~~~text\n>     old\n>   ~~~\n>\n> kept\n"] {
+        let doc = Document::from_text(source);
+        let target = super::units::units(&doc)[0].id;
+        let mut result = super::SelectionPlan::nodes(&doc, &[target]).replace(&doc, pasted).unwrap();
+        let units = super::units::units(&result);
+        assert_eq!(units.len(), 2);
+        assert_eq!(containers::local_source(&result, units[0].id).as_deref(), Some(pasted));
+        assert_eq!(containers::local_source(&result, units[1].id).as_deref(), Some("kept"));
+        result.undo().unwrap();
+        assert_eq!(result.to_string(), source);
+    }
+}
+
+#[test]
+fn g02_outer_item_into_item_moves_subtree_after_existing_nested_items() {
+    use aero_core::{Document, block_refs::resolve, containers};
+    let source = "- moving ^moving\n\n  companion ^companion\n\n- resident ^resident\n\n  - nested ^nested\n\noutside\n";
+    let mut doc = Document::from_text(source);
+    let from = doc.blocks().roots[0].children[0].id;
+    let to = doc.blocks().roots[0].children[1].id;
+    let plan = super::ops::move_node(&doc, from, to, false, true).unwrap();
+    doc.edit(plan.edit).unwrap();
+    doc.reparse();
+    let resident = resolve(&doc, "resident").unwrap();
+    let recipient = containers::ancestors(&doc, resident).last().unwrap().id;
+    let moving = resolve(&doc, "moving").unwrap();
+    let companion = resolve(&doc, "companion").unwrap();
+    assert_eq!(
+        containers::ancestors(&doc, moving).last().unwrap().id,
+        containers::ancestors(&doc, companion).last().unwrap().id
+    );
+    for id in [moving, companion, resolve(&doc, "nested").unwrap()] {
+        assert!(containers::ancestors(&doc, id).iter().any(|b| b.id == recipient), "{doc}");
+    }
+    doc.undo().unwrap();
+    assert_eq!(doc.to_string(), source);
+}
+
+#[test]
+fn g02_selection_paste_rejects_unclosed_tree_without_ids() {
+    let source = "> selected\n>\n> kept\n\noutside\n";
+    let doc = aero_core::Document::from_text(source);
+    let target = super::units::units(&doc)[0].id;
+    assert!(super::SelectionPlan::nodes(&doc, &[target]).replace(&doc, "```text\nliteral").is_err());
+    assert_eq!(doc.to_string(), source);
+}
+
+#[gpui_kit::test]
+fn g02_clipboard_emits_nested_selection_paste(cx: &mut TestAppContext) {
+    let source = ":::highlight\nfirst\n:::\n\n:::highlight\nsecond\n:::\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let _subscription = cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+        let observed = observed.clone();
+        cx.subscribe(&editor, move |_, event, _| {
+            if let super::EditorEvent::TransactionRequested(operation) = event {
+                *observed.lock().unwrap() = Some(operation.clone());
+            }
+        })
+    });
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(0, 1, window, cx)));
+    cx.simulate_keystrokes("cmd-c");
+    cx.simulate_keystrokes("cmd-v");
+    cx.run_until_parked();
+    let operation = observed.lock().unwrap().take().expect("selection paste transaction");
+    let crate::workspace::files::Operation::Paste { selection: Some(plan), before, .. } = operation else {
+        panic!("missing captured selection plan");
+    };
+    let snapshot = aero_core::Document::from_bytes(&before).unwrap();
+    assert_eq!(plan.source(&snapshot), "first\n\nsecond");
+    assert_eq!(text(&editor, cx), source);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("cmd-v");
+    cx.run_until_parked();
+    assert!(matches!(
+        *observed.lock().unwrap(),
+        Some(crate::workspace::files::Operation::Paste { selection: None, .. })
+    ));
+}
+
+#[gpui_kit::test]
+fn deleting_quote_child_keeps_unselected_container(cx: &mut TestAppContext) {
+    let source = "> only\n\noutside\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.select_blocks(0, 0, window, cx)));
+    cx.simulate_keystrokes("backspace");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(matches!(e.doc.blocks().roots[0].kind, aero_core::BlockKind::BlockQuote));
+        assert!(e.doc.blocks().roots[0].children.is_empty());
+    });
+    assert!(text(&editor, cx).contains("outside"));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
 /// Type labels and six-dot handles open the captured block menu without edits.
 #[gpui_kit::test]
 fn gutter_type_and_handle_open_menu_without_geometry_or_document_changes(cx: &mut TestAppContext) {
@@ -5636,10 +6531,93 @@ fn inline_math_renders_inside_a_paragraph(cx: &mut TestAppContext) {
     assert!(f32::from(prose.size.width) > 8., "文字不能被挤成 0 宽: {:?}", prose.size);
     assert!(f32::from(prose.size.height) > 8., "文字不能被挤成 0 高: {:?}", prose.size);
     cx.update(|_, cx| {
-        let value = editor.read(cx).focused.as_ref().unwrap().textarea.read(cx).value().to_string();
-        assert!(!value.contains('$'), "段落文本框里不能出现公式源码: {value}");
-        assert!(!value.contains("E=mc^2"), "段落文本框里不能出现公式源码: {value}");
-        assert!(value.contains('能') || value.contains('恒'), "文本框里应仍是公式外面的字: {value}");
+        let ta = editor.read(cx).focused.as_ref().unwrap().textarea.read(cx);
+        assert_eq!(ta.value(), "能量 $E=mc^2$ 守恒", "同一源码缓冲区包含完整段落");
+        assert_eq!(ta.inline_object_bounds().len(), 1, "公式源码由原子位图替代显示");
+    });
+}
+
+#[gpui_kit::test]
+fn g10_inline_bitmaps_share_aligned_persistent_textarea(cx: &mut TestAppContext) {
+    for align in ["center", "right", "justify"] {
+        let source = format!("前文 $E=mc^2$ [后文](https://example.com) $x^2$ 末尾 {{align={align}}}\n\n`$literal$`\n");
+        let (_dir, _cache, _vault, editor) = open_with_images(cx, &source);
+        let handle = *cx.windows().last().unwrap();
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        rich_root(&editor, cx);
+        settle(cx);
+        let (key, ta, before, click_at) = cx.update(|_, cx| {
+            let e = editor.read(cx);
+            let key = super::presenter::Key::unit(e.units[0].id);
+            let p = e.presenters.get(&key).expect("inline formulas need one persistent paragraph presenter");
+            let ta = p.textarea.read(cx);
+            let bounds = ta.range_to_bounds(&(0..6)).unwrap();
+            let whole = ta.range_to_bounds(&(0..ta.value().len())).unwrap();
+            let input = ta.input_bounds();
+            if align == "center" {
+                assert!((whole.center().x - input.center().x).abs() < gpui_kit::px(1.));
+            } else if align == "right" {
+                assert!((whole.right() - input.right()).abs() < gpui_kit::px(1.));
+            }
+            assert_eq!(ta.inline_object_bounds().len(), 2);
+            for ((_, rect), formula) in ta.inline_object_bounds().iter().zip(&p.inline_math) {
+                assert_eq!(rect.size, formula.size);
+                assert_eq!(ta.range_to_bounds(&formula.range).unwrap().left(), rect.left());
+            }
+            assert!(e.presenters[&super::presenter::Key::unit(e.units[1].id)].inline_math.is_empty());
+            (key, p.textarea.clone(), bounds, bounds.center())
+        });
+        let bitmap = cx.debug_bounds("math-inline-0").expect("bitmap");
+        cx.simulate_click(click_at, gpui_kit::Modifiers::default());
+        settle(cx);
+        cx.update(|_, cx| {
+            let e = editor.read(cx);
+            assert_eq!(e.focused.as_ref().unwrap().textarea, ta);
+            assert_eq!(e.presenter_key_of(&ta), Some(key));
+            assert_eq!(ta.read(cx).range_to_bounds(&(0..6)).unwrap(), before, "{align}: focus moved text");
+            assert!(ta.read(cx).value().contains("$E=mc^2$"), "source stays canonical");
+            assert_eq!(e.doc.to_string(), source);
+        });
+        assert_eq!(cx.debug_bounds("math-inline-0").unwrap(), bitmap, "{align}: focus moved formula");
+    }
+}
+
+#[gpui_kit::test]
+fn g10_two_inline_formulas_wrap_with_links_and_selection(cx: &mut TestAppContext) {
+    let source = format!("{} $\\frac{{a+b}}{{c+d}}$ [链接](https://example.com) {} $x^2$ 末尾 {{align=justify}}\n\n后续段落\n",
+        "前文 words ".repeat(15), "中间 words ".repeat(15));
+    let (_dir, _cache, _vault, editor) = open_with_images(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    settle(cx);
+    let (ta, range, before, objects, link) = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let p = &e.presenters[&super::presenter::Key::unit(e.units[0].id)];
+        let ta = p.textarea.read(cx);
+        let objects = ta.inline_object_bounds().to_vec();
+        assert_eq!(objects.len(), 2);
+        assert!(objects[1].1.top() > objects[0].1.top(), "formulas must cross shared wraps");
+        let link = p.links[0].0.clone();
+        let link_bounds = ta.range_to_bounds(&link).unwrap();
+        assert!(link_bounds.bottom() >= objects[0].1.bottom());
+        if link_bounds.top() < objects[0].1.bottom() {
+            assert!(link_bounds.left() >= objects[0].1.right());
+        }
+        let before = ta.range_to_bounds(&(0..ta.value().len())).unwrap();
+        assert!((before.size.width - ta.input_bounds().size.width).abs() < gpui_kit::px(1.), "justified rows fill the shared width");
+        (p.textarea.clone(), p.range.clone(), before, objects, link)
+    });
+    cx.update(|window, cx| editor.update(cx, |e, cx| {
+        e.focus_range(range, Some(e.units[0].id), false, link.start, window, cx);
+        ta.update(cx, |ta, cx| ta.set_selected_range(0..link.end, cx));
+    }));
+    settle(cx);
+    cx.update(|_, cx| {
+        let state = ta.read(cx);
+        assert_eq!(state.inline_object_bounds(), objects.as_slice());
+        assert_eq!(state.range_to_bounds(&(0..state.value().len())).unwrap(), before);
+        assert_eq!(editor.read(cx).focused.as_ref().unwrap().textarea, ta);
+        assert_eq!(editor.read(cx).doc.to_string(), source);
     });
 }
 
@@ -5817,4 +6795,391 @@ fn large_wiki_query_cancels_old_work_and_defers_enter(cx: &mut TestAppContext) {
     // Current unsaved metadata replaces the supplied title, so no result is a
     // deliberate unresolved link; Enter must wait for this query, never Target 0.
     assert_eq!(text(&editor, cx), "body [[Target Z]]\n");
+}
+
+#[gpui_kit::test]
+fn phase2_selected_container_enter_and_typing_keep_subtree(cx: &mut TestAppContext) {
+    let source = ":::highlight\nfirst ^first\n\nsecond ^second\n:::\n\n^box\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| {
+        e.selected_node = Some(e.doc.blocks().roots[0].id);
+        e.focus_handle.focus(window, cx);
+        cx.notify();
+    }));
+    settle(cx);
+    cx.simulate_keystrokes("enter");
+    editor.read_with(cx, |e, _| {
+        assert!(e.selected_node.is_none());
+        assert_eq!(e.focused.as_ref().unwrap().id, Some(e.units[0].id));
+    });
+    assert_eq!(text(&editor, cx), source);
+    cx.simulate_input("X");
+    assert_eq!(text(&editor, cx), source.replace("first ^first", "Xfirst ^first"));
+}
+
+#[gpui_kit::test]
+fn phase2_list_tab_and_shift_tab_are_structural(cx: &mut TestAppContext) {
+    let source = "- parent\n- [x] child ^child\n\n  continuation ^cont\n\n  - nested ^nested\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 1, cx);
+    cx.simulate_keystrokes("tab");
+    let indented = text(&editor, cx);
+    assert_ne!(indented, source);
+    editor.read_with(cx, |e, _| {
+        let id = aero_core::block_refs::resolve(&e.doc, "child").unwrap();
+        assert_eq!(aero_core::containers::ancestors(&e.doc, id).iter()
+            .filter(|b| matches!(b.kind, aero_core::BlockKind::ListItem { .. })).count(), 2);
+        assert!(aero_core::block_refs::resolve(&e.doc, "cont").is_ok());
+        assert!(aero_core::block_refs::resolve(&e.doc, "nested").is_ok());
+    });
+    cx.simulate_keystrokes("shift-tab");
+    editor.read_with(cx, |e, _| {
+        let id = aero_core::block_refs::resolve(&e.doc, "child").unwrap();
+        assert_eq!(aero_core::containers::ancestors(&e.doc, id).iter()
+            .filter(|b| matches!(b.kind, aero_core::BlockKind::ListItem { .. })).count(), 1);
+    });
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), indented);
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[test]
+fn phase2_list_backspace_precedes_outer_boundary() {
+    let mut doc = aero_core::Document::from_text("> - parent\n>   - [x] child ^child\n>\n>     continuation ^cont\n>\n>     - nested ^nested\n");
+    let units = super::units::units(&doc);
+    let super::ops::Backspace::Edit(plan) = super::ops::backspace_at_start(&doc, &units, 1) else { panic!("list must outdent") };
+    doc.edit(plan.edit).unwrap();
+    doc.reparse();
+    let id = aero_core::block_refs::resolve(&doc, "child").unwrap();
+    assert_eq!(aero_core::containers::ancestors(&doc, id).iter()
+        .filter(|b| matches!(b.kind, aero_core::BlockKind::ListItem { .. })).count(), 1);
+    assert!(doc.to_string().contains("[x] child"));
+    assert!(aero_core::block_refs::resolve(&doc, "cont").is_ok());
+    assert!(aero_core::block_refs::resolve(&doc, "nested").is_ok());
+}
+
+#[gpui_kit::test]
+fn phase2_selected_container_ascii_system_keys_and_native_client(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+    let source = ":::highlight\nfirst ^first\n\nsecond ^second\n:::\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let client = editor.read_with(cx, |e, _| e.presenters[&super::presenter::Key::unit(e.units[0].id)].textarea.clone());
+    cx.update(|window, cx| editor.update(cx, |e, cx| {
+        e.selected_node = Some(e.doc.blocks().roots[0].id);
+        e.focus_handle.focus(window, cx);
+        cx.notify();
+    }));
+    settle(cx);
+    cx.simulate_keystrokes("cmd-c left");
+    assert_eq!(text(&editor, cx), source);
+    editor.read_with(cx, |e, _| assert!(e.selected_node.is_some()));
+    cx.simulate_keystrokes("x");
+    settle(cx);
+    assert_eq!(text(&editor, cx), source.replace("first ^first", "xfirst ^first"));
+    editor.read_with(cx, |e, _| assert_eq!(e.focused.as_ref().unwrap().textarea, client));
+    cx.update(|window, cx| client.update(cx, |ta, cx| {
+        ta.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+    }));
+    settle(cx);
+    editor.read_with(cx, |e, _| assert_eq!(e.focused.as_ref().unwrap().textarea, client));
+    cx.update(|window, cx| client.update(cx, |ta, cx| ta.replace_text_in_range(None, "你", window, cx)));
+    settle(cx);
+    assert!(text(&editor, cx).contains("x你first ^first"));
+}
+
+#[gpui_kit::test]
+fn phase2_into_drop_feedback_has_receiver_bounds_without_layout_shift(cx: &mut TestAppContext) {
+    use gpui_kit::{point, px};
+    let (_dir, _vault, _path, editor) = open(cx, "outside\n\n:::highlight\ninside\n:::\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let (id, bounds) = editor.read_with(cx, |e, _| {
+        let id = e.doc.blocks().roots[1].id;
+        (id, e.unit_bounds.iter().find(|(block, _)| *block == id).unwrap().1)
+    });
+    let source = editor.read_with(cx, |e, _| e.units[0].id);
+    hover_block(source, cx);
+    let handle = cx.debug_bounds(Box::leak(format!("gutter-handle-{}", source.0).into_boxed_str())).unwrap();
+    cx.simulate_mouse_move(handle.center(), None, Default::default());
+    cx.simulate_mouse_down(handle.center(), gpui_kit::MouseButton::Left, Default::default());
+    cx.simulate_mouse_move(handle.center() + point(px(12.), px(0.)), gpui_kit::MouseButton::Left, Default::default());
+    cx.simulate_mouse_move(point(bounds.left() + px(3.), bounds.top() + bounds.size.height / 2.), gpui_kit::MouseButton::Left, Default::default());
+    settle(cx);
+    let hint = editor.read_with(cx, |e, _| format!("drag={} hint={:?} bounds={:?}", e.dragging_block, e.block_drop, e.unit_bounds));
+    assert_eq!(cx.debug_bounds("block-drop-receiver").expect(&hint), bounds);
+    editor.read_with(cx, |e, _| assert_eq!(e.unit_bounds.iter().find(|(block, _)| *block == id).unwrap().1, bounds));
+}
+
+#[gpui_kit::test]
+fn phase2_empty_selected_container_uses_placeholder(cx: &mut TestAppContext) {
+    let source = ":::highlight\n\n:::\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| {
+        e.selected_node = Some(e.doc.blocks().roots[0].id);
+        e.focus_handle.focus(window, cx);
+        cx.notify();
+    }));
+    settle(cx);
+    cx.simulate_keystrokes("x");
+    settle(cx);
+    editor.read_with(cx, |e, _| {
+        assert_eq!(e.doc.blocks().roots.len(), 1);
+        assert_eq!(e.doc.blocks().roots[0].children.len(), 1);
+        assert_eq!(e.doc.slice(e.doc.content_range(&e.doc.blocks().roots[0].children[0])).to_string(), "x");
+    });
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn phase2_tab_preserves_table_code_and_plain_input_semantics(cx: &mut TestAppContext) {
+    let source = "- parent\n\n  ```rs\n  code\n  ```\n\n  | a | b |\n  | - | - |\n  | c | d |\n\nplain\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 1, cx);
+    cx.simulate_keystrokes("tab");
+    assert_ne!(text(&editor, cx), source);
+    editor.read_with(cx, |e, _| assert!(e.editing_code()));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+    cx.update(|window, cx| editor.update(cx, |e, cx| {
+        e.focus_unit(2, 2, window, cx);
+    }));
+    settle(cx);
+    let first = editor.read_with(cx, |e, _| e.presenter_key_of(&e.focused.as_ref().unwrap().textarea).unwrap());
+    cx.simulate_keystrokes("tab");
+    let next = editor.read_with(cx, |e, _| e.presenter_key_of(&e.focused.as_ref().unwrap().textarea).unwrap());
+    assert_ne!(first, next);
+    assert_eq!(text(&editor, cx), source);
+    focus_unit(&editor, 3, cx);
+    cx.simulate_keystrokes("tab");
+    assert!(!text(&editor, cx).contains("indent="));
+    editor.read_with(cx, |e, _| assert!(e.units.last().unwrap().list.is_none()));
+}
+
+#[gpui_kit::test]
+fn phase2_menu_indent_accounts_for_ancestor_insets_and_undo(cx: &mut TestAppContext) {
+    let source = ":::highlight\ntext {indent=7} ^body\n:::\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(gpui_kit::size(gpui_kit::px(420.), gpui_kit::px(700.)));
+    settle(cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| {
+        e.open_block_menu(e.units[0].id, gpui_kit::point(gpui_kit::px(10.), gpui_kit::px(30.)), window, cx);
+    }));
+    settle(cx);
+    let layout = cx.debug_bounds("block-menu-layout").unwrap().center();
+    cx.simulate_click(layout, Default::default());
+    settle(cx);
+    let increase = cx.debug_bounds("block-layout-4").unwrap().center();
+    cx.simulate_click(increase, Default::default());
+    assert_eq!(text(&editor, cx), source);
+    let decrease = cx.debug_bounds("block-layout-5").unwrap().center();
+    cx.simulate_click(decrease, Default::default());
+    assert_eq!(text(&editor, cx), source.replace("indent=7", "indent=6"));
+    editor.read_with(cx, |e, _| assert_eq!(e.doc.blocks().roots.len(), 1));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn phase2_indented_code_and_source_fences_do_not_take_list_tab(cx: &mut TestAppContext) {
+    let source = "- parent\n\n      code\n\n  ```rs\n  fenced\n  ```\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for index in [1, 2] {
+        cx.update(|window, cx| editor.update(cx, |e, cx| {
+            assert!(matches!(e.units[index].kind, aero_core::BlockKind::CodeBlock | aero_core::BlockKind::CodeFence { .. }));
+            let unit = e.units[index].clone();
+            e.focus_range(unit.range, Some(unit.id), true, 0, window, cx);
+            assert!(!e.change_list_level(true, window, cx));
+            assert!(!e.change_list_level(false, window, cx));
+        }));
+    }
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn phase2_protected_unwrap_disabled_but_delete_and_undo_allowed(cx: &mut TestAppContext) {
+    let source = ":::highlight\nbody ^body\n:::\n\n^box\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| {
+        e.open_block_menu(e.doc.blocks().roots[0].id, gpui_kit::point(gpui_kit::px(10.), gpui_kit::px(30.)), window, cx);
+    }));
+    settle(cx);
+    let unwrap = cx.debug_bounds("block-menu-unwrap").unwrap().center();
+    cx.simulate_click(unwrap, Default::default());
+    assert_eq!(text(&editor, cx), source);
+    let delete = cx.debug_bounds("block-menu-delete").unwrap().center();
+    cx.simulate_click(delete, Default::default());
+    assert!(!text(&editor, cx).contains("body"));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn g08_inline_reference_updates_live_label_not_source_and_opens_actual_path(cx: &mut TestAppContext) {
+    let document_id = aero_core::identity::new_document_id();
+    let block_id = aero_core::identity::new_block_id();
+    let original = format!("before [[id:{document_id}#^{block_id}|old title]] after\n");
+    let (_dir, vault, destination, editor) = open(cx, &original);
+    let path = VaultPath::new("nested/source.md").unwrap();
+    let disk = format!("---\ntitle: Same name\naero:\n  id: {document_id}\n---\n\ndisk excerpt ^{block_id}\n");
+    vault.write_bytes(&path, disk.as_bytes()).unwrap();
+    vault.write_bytes(&VaultPath::new("source.md").unwrap(), b"---\ntitle: Same name\n---\n\nwrong source ^p\n").unwrap();
+    let (doc, stamp) = vault.read(&path).unwrap();
+    let source = cx.new(|cx| Editor::new(vault.clone(), path.clone(), doc, stamp, cx));
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    assert!(cx.debug_bounds("inline-reference-Same name · disk excerpt").is_some());
+    focus_unit(&editor, 0, cx);
+    settle(cx);
+    let (ta, selection) = cx.update(|_, cx| {
+        let ta = editor.read(cx).focused.as_ref().unwrap().textarea.clone();
+        let selection = ta.read(cx).selected_range();
+        (ta, selection)
+    });
+    cx.update(|_, cx| source.update(cx, |e, cx| {
+        e.doc.edit(aero_core::Edit::replace(0..e.doc.len(), disk.replace("Same name", "Current title").replace("disk excerpt", "live excerpt"))).unwrap();
+        e.doc.reparse();
+        e.publish_live(cx);
+    }));
+    settle(cx);
+    assert!(cx.debug_bounds("inline-reference-Current title · live excerpt").is_some());
+    let analyses = super::embeds_ui::SNAPSHOT_ANALYSES.get();
+    settle(cx);
+    assert_eq!(super::embeds_ui::SNAPSHOT_ANALYSES.get(), analyses, "redraw must use prepared source views");
+    cx.update(|_, cx| {
+        assert_eq!(editor.read(cx).focused.as_ref().unwrap().textarea, ta);
+        assert_eq!(ta.read(cx).selected_range(), selection);
+        assert_eq!(editor.read(cx).doc.to_string(), original);
+    });
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _subscription = cx.update(|_, cx| {
+        let events = events.clone();
+        cx.subscribe(&editor, move |_, event, _| {
+            if let super::EditorEvent::ResolvedSourceClicked { path, fragment } = event {
+                events.lock().unwrap().push((path.clone(), fragment.clone()));
+            }
+        })
+    });
+    let jump = cx.debug_bounds("inline-reference-Current title · live excerpt").unwrap().center();
+    cx.simulate_click(jump, Default::default());
+    settle(cx);
+    assert_eq!(*events.lock().unwrap(), vec![(path.clone(), Some(format!("^{block_id}")))]);
+    assert_eq!(vault.read_bytes(&destination).unwrap().0, original.as_bytes());
+    assert_eq!(vault.read_bytes(&path).unwrap().0, disk.as_bytes());
+}
+
+#[gpui_kit::test]
+fn g08_inline_reference_retarget_uses_new_cached_source(cx: &mut TestAppContext) {
+    let original = "before [[first#^p|old title]] after\n";
+    let (_dir, vault, _, editor) = open(cx, original);
+    let mut sources = Vec::new();
+    for (name, title) in [("first", "First"), ("second", "Second")] {
+        let path = VaultPath::new(&format!("{name}.md")).unwrap();
+        vault.write_bytes(&path, format!("---\ntitle: {title}\n---\n\n{title} excerpt ^p\n").as_bytes()).unwrap();
+        let (doc, stamp) = vault.read(&path).unwrap();
+        sources.push(cx.new(|cx| Editor::new(vault.clone(), path, doc, stamp, cx)));
+    }
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    assert!(cx.debug_bounds("inline-reference-First · First excerpt").is_some());
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "[[first#^p|old title]]", cx);
+    cx.simulate_keystrokes("cmd-k");
+    settle(cx);
+    assert_eq!(selected_inline_text(&editor, cx), "first");
+    assert!(cx.debug_bounds("inline-reference-First · First excerpt").is_none(), "explicit address editing reveals source");
+    cx.update(|_, cx| {
+        let ta = editor.read(cx).focused.as_ref().unwrap().textarea.read(cx);
+        assert!(ta.range_to_bounds(&ta.selected_range()).unwrap().size.width > gpui_kit::px(10.));
+    });
+    cx.simulate_input("second");
+    cx.simulate_keystrokes("cmd-right");
+    settle(cx);
+    assert_eq!(text(&editor, cx), original.replace("first#", "second#"));
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let ta = e.focused.as_ref().unwrap().textarea.read(cx);
+        eprintln!("retarget selection {:?}, value {}, current {}, objects {:?}", ta.selected_range(), ta.value(), e.embeds_current(cx), ta.inline_object_bounds());
+        if let Some(super::embeds_ui::EmbedView::Ready { title, excerpt, .. }) = e.live_embed("second", Some("^p"), None, cx) {
+            eprintln!("ready {title} / {excerpt}");
+        }
+    });
+    assert!(cx.debug_bounds("inline-reference-Second · Second excerpt").is_some());
+    assert!(cx.debug_bounds("inline-reference-First · First excerpt").is_none());
+}
+
+#[gpui_kit::test]
+fn g08_inline_reference_and_formula_share_atomic_selection_and_raw_clipboard(cx: &mut TestAppContext) {
+    let reference = "[[source#^p|old title]]";
+    let original = format!("before {reference} after $x^2$ end ^owner\n");
+    let (_dir, _cache, vault, editor) = open_with_images(cx, &original);
+    vault.write_bytes(&VaultPath::new("source.md").unwrap(), b"---\ntitle: Current\n---\n\nexcerpt ^p\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    let (ta, range, objects) = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let p = &e.presenters[&super::presenter::Key::unit(e.units[0].id)];
+        let objects = p.textarea.read(cx).inline_object_bounds().to_vec();
+        assert_eq!(objects.len(), 2);
+        let math = objects.iter().find(|(key, _)| *key == 0).unwrap().1;
+        let reference = objects.iter().find(|(key, _)| *key == 1 << 63).unwrap().1;
+        assert!(reference.right() < math.left() || reference.bottom() <= math.top());
+        (p.textarea.clone(), p.range.clone(), objects)
+    });
+    cx.update(|window, cx| editor.update(cx, |e, cx| {
+        e.focus_range(range, Some(e.units[0].id), false, 7, window, cx);
+    }));
+    settle(cx);
+    cx.simulate_keystrokes("shift-right");
+    settle(cx);
+    assert_eq!(selected_inline_text(&editor, cx), reference);
+    cx.update(|_, cx| assert_eq!(ta.read(cx).inline_object_bounds(), objects.as_slice()));
+    cx.simulate_keystrokes("cmd-c");
+    cx.update(|_, cx| assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some(reference)));
+    cx.simulate_keystrokes("right");
+    cx.simulate_input("新增");
+    settle(cx);
+    assert_eq!(text(&editor, cx), original.replace("]] after", "]]新增 after"));
+    cx.update(|_, cx| assert_eq!(editor.read(cx).focused.as_ref().unwrap().textarea, ta));
+    assert!(cx.debug_bounds("math-inline-0").is_some());
+}
+
+#[gpui_kit::test]
+fn g08_inline_reference_excludes_raw_links_code_and_explicit_source(cx: &mut TestAppContext) {
+    let original = "before [[source#^p|old]] after [[source]] [web](https://example.com) `[[source#^p]]`\n\n```\n[[source#^p]]\n```\n";
+    let (_dir, vault, _, editor) = open(cx, original);
+    vault.write_bytes(&VaultPath::new("source.md").unwrap(), b"body ^p\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    rich_root(&editor, cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        for (ix, count) in [(0, 1), (1, 0)] {
+            assert_eq!(e.presenters[&super::presenter::Key::unit(e.units[ix].id)].textarea.read(cx).inline_object_bounds().len(), count);
+        }
+    });
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "web", cx);
+    cx.simulate_keystrokes("cmd-k");
+    assert_eq!(selected_inline_text(&editor, cx), "https://example.com");
+    cx.simulate_input("https://new.example");
+    settle(cx);
+    assert!(cx.debug_bounds("inline-reference-source · body").is_some());
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.toggle_note_source(cx)));
+    settle(cx);
+    focus_unit(&editor, 0, cx);
+    settle(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.presenters.is_empty());
+        assert!(e.focused.as_ref().unwrap().textarea.read(cx).inline_object_bounds().is_empty());
+        assert_eq!(e.doc.to_string(), original.replace("https://example.com", "https://new.example"));
+    });
 }

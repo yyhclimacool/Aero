@@ -29,11 +29,12 @@ pub(super) struct BlockDrag {
     pub revision: u64,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct BlockDropHint {
     before: usize,
     parent: Option<usize>,
     node: Option<(BlockId, bool, bool)>,
+    receiver: Option<Bounds<Pixels>>,
     origin: Point<Pixels>,
     width: Pixels,
 }
@@ -62,7 +63,66 @@ impl Render for BlockDragGhost {
     }
 }
 
+fn unwrap_reason(doc: &aero_core::Document, id: BlockId) -> Option<&'static str> {
+    let block = doc.blocks().find(id)?;
+    (block.persisted_id.is_some() || aero_core::block_refs::aliases(block).next().is_some())
+        .then_some("此容器有引用身份，解除会破坏引用范围")
+}
+
+fn image_only(source: &str) -> bool {
+    if preview::is_image_embed(source) { return true; }
+    let analysis = aero_core::markup::analyze(source);
+    let images: Vec<_> = analysis.conceal.iter().filter(|open| source[open.start..].starts_with("!["))
+        .filter_map(|open| {
+            analysis.conceal.iter().find(|close| close.start >= open.end
+                && source[close.start..].starts_with(']')
+                && (open.end == close.start || analysis.links.iter().any(|(label, _)| *label == (open.end..close.start))))
+                .map(|close| open.start..close.end)
+        }).collect();
+    !images.is_empty() && source.char_indices().all(|(at, ch)| ch.is_whitespace() || images.iter().any(|range| range.contains(&at)))
+}
+
+fn layout_reason(doc: &aero_core::Document, id: BlockId, key: &str, value: Option<&str>, width: f32) -> Option<&'static str> {
+    let Some(block) = doc.blocks().find(id) else { return Some("目标块已不存在") };
+    if key == "indent-step" && matches!(block.kind, BlockKind::ListItem { .. }) {
+        return if value == Some("1") {
+            ops::list_indent(doc, id).is_none().then_some("没有可接收此项的前一列表项")
+        } else {
+            ops::list_outdent(doc, id).is_none().then_some("无法无损降低此项层级")
+        };
+    }
+    let prose = |b: &aero_core::Block| {
+        let source = doc.slice(doc.content_range(b)).to_string();
+        matches!(b.kind, BlockKind::Paragraph | BlockKind::Heading { .. })
+            && !image_only(source.trim()) && !preview::is_note_embed(source.trim())
+    };
+    let supported = prose(block) || (key == "align" && matches!(block.kind, BlockKind::ListItem { .. })
+        && (block.children.is_empty() || block.children.iter().any(prose)));
+    if !supported { return Some("此块没有可设置对齐或视觉缩进的正文") }
+    if key == "indent-step" {
+        let current = aero_core::properties::indent(&block.attrs);
+        if value == Some("1") {
+            if current >= 8 { return Some("视觉缩进最多 8 级") }
+            if width - f32::from(current + 1) * 24. < 160. { return Some("缩进后可编辑宽度不足 160 pt") }
+        } else if current == 0 { return Some("已是默认视觉缩进") }
+    }
+    None
+}
+
 impl Editor {
+    fn block_layout_width(&self, id: BlockId) -> f32 {
+        let indent = self.doc.blocks().find(id).map_or(0., |b| f32::from(aero_core::properties::indent(&b.attrs)) * 24.);
+        if let Some((_, bounds)) = self.unit_bounds.iter().find(|(block, _)| *block == id) {
+            return f32::from(bounds.size.width) + indent;
+        }
+        let insets: f32 = aero_core::containers::ancestors(&self.doc, id).iter().map(|b| {
+            let padding = if aero_core::containers::is_editable(&b.kind) { 34. }
+                else if matches!(b.kind, BlockKind::ListItem { .. }) { 28. } else { 0. };
+            padding + f32::from(aero_core::properties::indent(&b.attrs)) * 24.
+        }).sum();
+        (f32::from(self.scroll.bounds().size.width) - GUTTER - 48.).min(COLUMN_WIDTH) - insets
+    }
+
     pub(super) fn in_block_handle(&self, id: BlockId, cursor: Point<Pixels>) -> bool {
         self.unit_bounds.iter().find(|(block, _)| *block == id).is_some_and(|(_, bounds)| {
             let reach = self.gutter_reaches.get(&id).copied().unwrap_or(px(GUTTER));
@@ -165,6 +225,11 @@ impl Editor {
                 if cursor.y < bounds.top() || cursor.y > bounds.bottom() {
                     return None;
                 }
+                if cursor.x < bounds.left() && aero_core::containers::ancestors(&self.doc, *id).iter().any(|ancestor| {
+                    aero_core::containers::is_editable(&ancestor.kind) && self.unit_bounds.iter().any(|(parent, area)| {
+                        *parent == ancestor.id && cursor.x >= area.left() && cursor.y >= area.top() && cursor.y <= area.bottom()
+                    })
+                }) { return None; }
                 let container = aero_core::containers::is_editable(&block.kind);
                 let structural = container
                     || matches!(
@@ -183,7 +248,7 @@ impl Editor {
                 && cursor.y > bounds.top() + px(8.)
                 && cursor.y < bounds.bottom() - px(8.);
             let after = cursor.y >= bounds.top() + bounds.size.height / 2.;
-            let ordinary = self.unit_index(id).is_some()
+            let ordinary = !container && self.unit_index(id).is_some()
                 && !aero_core::containers::ancestors(&self.doc, id)
                     .iter()
                     .any(|b| aero_core::containers::is_editable(&b.kind));
@@ -192,6 +257,7 @@ impl Editor {
                     before: 0,
                     parent: None,
                     node: Some((id, after, into)),
+                    receiver: into.then_some(bounds),
                     origin: point(
                         bounds.left() + if into { px(16.) } else { px(0.) },
                         if after || into { bounds.bottom() } else { bounds.top() },
@@ -228,6 +294,11 @@ impl Editor {
             before,
             parent,
             node: None,
+            receiver: nest.then(|| {
+                ops::list_item_for(&self.doc, self.units[ix].id)
+                    .and_then(|id| self.unit_bounds.iter().find(|(block, _)| *block == id).map(|(_, bounds)| *bounds))
+                    .unwrap_or(bounds)
+            }),
             origin: point(x, y),
             width: (bounds.right() - x).max(px(48.)),
         })
@@ -255,13 +326,33 @@ impl Editor {
         };
         let plan = if let Some((to, after, into)) = hint.node {
             ops::move_node(&self.doc, drag.id, to, after, into)
+        } else if let Some(parent) =
+            hint.parent.filter(|_| self.unit_index(drag.id).is_none_or(|ix| self.units[ix].list.is_some()))
+        {
+            self.units.get(parent).and_then(|to| {
+                let target = aero_core::containers::ancestors(&self.doc, to.id)
+                    .into_iter()
+                    .rev()
+                    .find(|b| matches!(b.kind, BlockKind::ListItem { .. }))?
+                    .id;
+                ops::move_node(&self.doc, drag.id, target, false, true)
+            })
         } else if let Some(from) = self.unit_index(drag.id) {
-            ops::move_unit(
-                &self.doc,
-                &self.units,
-                from,
-                DropPlace { before: hint.before, parent: hint.parent },
-            )
+            if aero_core::containers::ancestors(&self.doc, drag.id).iter().any(|b| {
+                aero_core::containers::is_editable(&b.kind) || matches!(b.kind, BlockKind::List { .. })
+            }) {
+                let index = hint.before.min(self.units.len().saturating_sub(1));
+                self.units.get(index).and_then(|to| {
+                    ops::move_node(&self.doc, drag.id, to.id, hint.before >= self.units.len(), false)
+                })
+            } else {
+                ops::move_unit(
+                    &self.doc,
+                    &self.units,
+                    from,
+                    DropPlace { before: hint.before, parent: hint.parent },
+                )
+            }
         } else {
             let index = hint.before.min(self.units.len().saturating_sub(1));
             self.units.get(index).and_then(|to| {
@@ -304,6 +395,13 @@ impl Editor {
     pub(super) fn render_block_drop_line(&self, cx: &App) -> Option<AnyElement> {
         let hint = self.block_drop?;
         let color = cx.theme().accent;
+        if let Some(bounds) = hint.receiver {
+            return Some(deferred(anchored().position(bounds.origin).child(
+                div().debug_selector(|| "block-drop-receiver".into())
+                    .w(bounds.size.width).h(bounds.size.height).border_2().border_color(color)
+                    .bg(color.opacity(0.12)).rounded(px(6.)),
+            )).into_any_element());
+        }
         Some(
             deferred(
                 anchored().position(hint.origin).child(
@@ -396,7 +494,16 @@ impl Editor {
         if menu.revision != self.doc.version() {
             return;
         }
+        if layout_reason(&self.doc, menu.block, key, value, self.block_layout_width(menu.block)).is_some() {
+            return;
+        }
         let Some(block) = self.doc.blocks().find(menu.block) else { return };
+        if key == "indent-step" && matches!(block.kind, BlockKind::ListItem { .. }) {
+            let plan = if value == Some("1") { ops::list_indent(&self.doc, menu.block) }
+                else { ops::list_outdent(&self.doc, menu.block) };
+            if let Some(plan) = plan { self.apply_plan(plan, window, cx); }
+            return;
+        }
         let mut attrs = block.attrs.clone();
         if key == "indent-step" {
             let current = aero_core::properties::indent(&attrs) as i32;
@@ -416,6 +523,9 @@ impl Editor {
     fn block_menu_container(&mut self, unwrap: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(menu) = self.block_menu.take() else { return };
         if menu.revision != self.doc.version() {
+            return;
+        }
+        if unwrap && unwrap_reason(&self.doc, menu.block).is_some() {
             return;
         }
         let edit = if unwrap {
@@ -534,7 +644,11 @@ impl Editor {
         rows.push(row("block-menu-layout", "对齐与缩进 ▸".into(), "layout"));
         rows.push(row("block-menu-highlight", "包裹为高亮块".into(), "highlight"));
         if self.doc.blocks().find(block).is_some_and(|b| aero_core::containers::is_editable(&b.kind)) {
-            rows.push(row("block-menu-unwrap", "解除容器".into(), "unwrap"));
+            let reason = unwrap_reason(&self.doc, block);
+            rows.push(row("block-menu-unwrap", "解除容器".into(), if reason.is_some() { "disabled" } else { "unwrap" })
+                .when_some(reason, |el, reason| el.opacity(0.4).cursor_default().tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(reason).build(window, cx)
+                })));
         }
         rows.extend([
             row("block-menu-link", "复制块链接".into(), "link"),
@@ -589,35 +703,34 @@ impl Editor {
     }
 
     fn render_block_layout_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let supported =
-            self.block_menu.as_ref().and_then(|m| self.doc.blocks().find(m.block)).is_some_and(|b| {
-                matches!(
-                    b.kind,
-                    aero_core::BlockKind::Paragraph
-                        | aero_core::BlockKind::Heading { .. }
-                        | aero_core::BlockKind::ListItem { .. }
-                )
-            });
+        let block = self.block_menu.as_ref().unwrap().block;
+        let list = self.doc.blocks().find(block).is_some_and(|b| matches!(b.kind, BlockKind::ListItem { .. }));
+        let width = self.block_layout_width(block);
         let rows = [
             ("左对齐", "align", Some("left")),
             ("居中", "align", Some("center")),
             ("右对齐", "align", Some("right")),
             ("两端对齐", "align", Some("justify")),
-            ("增加视觉缩进", "indent-step", Some("1")),
-            ("减少视觉缩进", "indent-step", Some("-1")),
+            (if list { "增加列表层级" } else { "增加视觉缩进" }, "indent-step", Some("1")),
+            (if list { "减少列表层级" } else { "减少视觉缩进" }, "indent-step", Some("-1")),
         ]
         .into_iter()
         .enumerate()
         .map(|(i, (label, key, value))| {
+            let reason = layout_reason(&self.doc, block, key, value, width);
             div()
                 .id(("block-layout", i))
+                .debug_selector(move || format!("block-layout-{i}"))
                 .px_2()
                 .py_1()
                 .text_sm()
                 .rounded(px(4.))
-                .opacity(if supported { 1. } else { 0.4 })
+                .opacity(if reason.is_none() { 1. } else { 0.4 })
+                .when_some(reason, |el, reason| el.tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(reason).build(window, cx)
+                }))
                 .child(label)
-                .when(supported, |el| {
+                .when(reason.is_none(), |el| {
                     el.cursor_pointer().hover(|s| s.bg(cx.theme().list_hover)).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
@@ -628,6 +741,8 @@ impl Editor {
                 })
         });
         v_flex()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .w(px(180.))
             .p_1()
             .bg(cx.theme().popover)
@@ -690,5 +805,46 @@ impl Editor {
             .shadow_lg()
             .children(rows)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod interaction_tests {
+    use aero_core::{BlockKind, Document};
+    use super::{layout_reason, unwrap_reason};
+
+    #[test]
+    fn phase2_visual_indent_and_alignment_guards() {
+        let doc = Document::from_text("text {indent=7}\n");
+        let id = doc.blocks().roots[0].id;
+        assert!(layout_reason(&doc, id, "indent-step", Some("1"), 352.).is_none());
+        assert!(layout_reason(&doc, id, "indent-step", Some("1"), 351.).is_some());
+        assert!(layout_reason(&doc, id, "indent-step", Some("-1"), 180.).is_none());
+        for source in ["text {indent=8}\n", "text {indent=999}\n"] {
+            let doc = Document::from_text(source);
+            assert!(layout_reason(&doc, doc.blocks().roots[0].id, "indent-step", Some("1"), 900.).is_some());
+            assert_eq!(doc.to_string(), source);
+        }
+        for source in ["![x](pic.png)\n", "![[note]]\n", ":::highlight\ntext\n:::\n", "> text\n", "```rs\nx\n```\n"] {
+            let doc = Document::from_text(source);
+            assert!(layout_reason(&doc, doc.blocks().roots[0].id, "align", Some("center"), 720.).is_some(), "{source}");
+        }
+        for source in ["text\n", "###### title\n", "- body\n"] {
+            let doc = Document::from_text(source);
+            let block = doc.blocks().iter().find(|(_, b)| !matches!(b.kind, BlockKind::List { .. })).unwrap().1;
+            assert!(layout_reason(&doc, block.id, "align", Some("justify"), 720.).is_none());
+        }
+    }
+
+    #[test]
+    fn phase2_unwrap_uses_persisted_identity_not_backlinks() {
+        for source in [":::highlight\nbody\n:::\n", "> body\n"] {
+            let doc = Document::from_text(source);
+            assert!(unwrap_reason(&doc, doc.blocks().roots[0].id).is_none());
+        }
+        for source in [":::highlight\nbody\n:::\n\n^box\n", ":::highlight\nbody\n:::\n\n{aero-aliases=old}\n"] {
+            let doc = Document::from_text(source);
+            assert!(unwrap_reason(&doc, doc.blocks().roots[0].id).is_some());
+        }
     }
 }

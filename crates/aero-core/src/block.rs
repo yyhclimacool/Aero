@@ -110,7 +110,7 @@ fn is_attr_name_char(c: char) -> bool {
 }
 
 /// 按空白切 token，`key="a b"` 的双引号内不切。引号不闭合返回 `None`。
-fn tokenize_attrs(inner: &str) -> Option<Vec<&str>> {
+pub(crate) fn tokenize_attrs(inner: &str) -> Option<Vec<&str>> {
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
     let mut in_quote = false;
