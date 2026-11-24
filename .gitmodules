@@ -1,0 +1,4 @@
+[submodule "forks/gpui-kit"]
+	path = forks/gpui-kit
+	url = git@github.com:yyhclimacool/gpui-kit.git
+	branch = aero-patch

@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 // Exercise the exact production style merger as well as the rendered GPUI tests below.
 extern crate gpui_kit as gpui;
-#[path = "../../../forks/gpui-base/src/text/inline_style.rs"]
+#[path = "../../../forks/gpui-kit/crates/base/src/text/inline_style.rs"]
 mod inline_style;
 
 #[test]

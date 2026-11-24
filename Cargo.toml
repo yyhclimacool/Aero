@@ -3,9 +3,10 @@ resolver = "3"
 # crates/  正式代码，按 docs/project_plan.md 第 4 节分层
 # spikes/  M0 的限时实验，结论写入 docs/decisions/ 后整个目录删除。
 #          注意 cargo 不允许 glob 匹配不到任何包，spikes/ 清空时要把这一项去掉。
-# forks/   本地修复的 UI 底座也纳入 workspace，保证交互回归测试可以运行。
-members = ["crates/*", "spikes/*", "forks/gpui-base"]
+# forks/   GPUI fork 通过 submodule 接入；gpui-base 的测试在其自身工作区运行。
+members = ["crates/*", "spikes/*"]
 default-members = ["crates/aero-app"]
+exclude = ["forks/gpui-kit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,7 +41,7 @@ opt-level = 0
 [profile.dev.package."*"]
 opt-level = 2
 
-# gpui-base 作为 workspace 成员参与测试，但保留 UI 依赖的优化级别。
+# gpui-base 是 submodule 中的 path 依赖，仍保留 UI 依赖的优化级别。
 [profile.dev.package.gpui-base]
 opt-level = 2
 
@@ -51,4 +52,4 @@ debug = "line-tables-only"
 split-debuginfo = "packed"
 
 [patch.crates-io]
-gpui-base = { path = "forks/gpui-base" }
+gpui-base = { path = "forks/gpui-kit/crates/base" }

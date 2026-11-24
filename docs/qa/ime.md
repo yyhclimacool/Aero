@@ -22,7 +22,7 @@ WeType 3.0.0 在 macOS 27.0.1（26A434）、Retina 2× 的实际 Aero debug 窗�
 
 ## 最新代码与验证状态（2026-10-23 更新）
 
-系统字符面板命令、编辑菜单、快捷键以及 Unicode 字素级光标、选区、双击和删除修复已随 `e9d6172` 提交。相关入口见 [`actions.rs`](../../crates/aero-app/src/actions.rs)、[`editor/mod.rs`](../../crates/aero-app/src/editor/mod.rs)、[`selection.rs`](../../forks/gpui-base/src/input/base/selection.rs) 和 [`state.rs`](../../forks/gpui-base/src/input/base/state.rs)。
+系统字符面板命令、编辑菜单、快捷键以及 Unicode 字素级光标、选区、双击和删除修复已随 `e9d6172` 提交。相关入口见 [`actions.rs`](../../crates/aero-app/src/actions.rs)、[`editor/mod.rs`](../../crates/aero-app/src/editor/mod.rs)、[`selection.rs`](../../forks/gpui-kit/crates/base/src/input/base/selection.rs) 和 [`state.rs`](../../forks/gpui-kit/crates/base/src/input/base/state.rs)。
 
 上一轮实际验证已观察到 macOS“表情与符号”窗口弹出；打开面板没有修改测试文档。自动回归覆盖插入位置、选区恢复、Unicode 编辑和撤销，但系统拒绝辅助访问，尚未通过原生面板点选完成插入／取消／删除／撤销的端到端检查，A19 保持部分验收。验证范围见 [系统表情补充记录](edit-experience-2026-10-12.md#系统表情补充记录2026-10-23)。
 

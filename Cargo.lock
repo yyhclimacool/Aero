@@ -2915,18 +2915,14 @@ dependencies = [
  "anyhow",
  "ashpd",
  "async-channel",
- "criterion",
  "data-url",
  "futures",
  "gpui-fast",
- "gpui-fast-platform",
  "gpui-pre",
  "gpui-pre-macros",
- "gpui-pre-platform",
  "gpui-pre-sum-tree",
  "html5ever",
  "image",
- "indoc",
  "instant",
  "itertools 0.13.0",
  "jiff",
@@ -2940,7 +2936,6 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "ropey 2.0.0-beta.1",
- "rust_decimal",
  "schemars",
  "serde",
  "serde_json",
@@ -3027,7 +3022,6 @@ dependencies = [
  "async-task",
  "backtrace",
  "bitflags 2.13.2",
- "criterion",
  "derive_more",
  "embed-resource",
  "etagere",
@@ -3043,7 +3037,6 @@ dependencies = [
  "gpui-pre-shared-string",
  "gpui-pre-sum-tree",
  "gpui-pre-util",
- "hdrhistogram",
  "heapless",
  "icu_segmenter",
  "image",
@@ -3395,7 +3388,6 @@ dependencies = [
  "backtrace",
  "bitflags 2.13.2",
  "chrono",
- "criterion",
  "derive_more",
  "embed-resource",
  "etagere",
@@ -3411,7 +3403,6 @@ dependencies = [
  "gpui-pre-shared-string",
  "gpui-pre-sum-tree",
  "gpui-pre-util",
- "hdrhistogram",
  "heapless",
  "icu_segmenter",
  "image",
@@ -4112,16 +4103,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hdrhistogram"
-version = "7.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
-dependencies = [
- "byteorder",
- "num-traits",
-]
-
-[[package]]
 name = "heapless"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4569,15 +4550,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "indoc"
-version = "2.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
-dependencies = [
- "rustversion",
 ]
 
 [[package]]
@@ -7771,23 +7743,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust_decimal"
-version = "1.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7653272e75dcac41dc199fbea6f5797633994fafd339943c06c9af16bf29cd3a"
-dependencies = [
- "arrayvec",
- "borsh",
- "bytes",
- "num-traits",
- "rand 0.8.8",
- "rand 0.9.5",
- "serde",
- "serde_json",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9697,7 +9652,6 @@ dependencies = [
  "cfg-if",
  "once_cell",
  "rustversion",
- "serde",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]

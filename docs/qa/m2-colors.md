@@ -35,7 +35,7 @@
 - **块颜色**：`Block.attrs` 里的颜色在 `editor/mod.rs` 的渲染路径上生效。背景在最外层那个带颜色的块上铺一次（铺满块矩形、左右各多 8 px、6 px 圆角，含子块），文字色往下传给子块与 `TextViewStyle` 的正文色，`- 列表项 {.green}`、callout 正文、引用里的段落都跟着变。
 - **行内颜色**：`aero_core::highlight::preview` 从"只处理 `==`"扩展成"`==` 与行内属性列表共用一条路"。做法是先扫出承载者（`[文本]{...}` 与紧跟行内元素的 `{...}`，含 comrak 自己解析掉的行内代码 / 链接属性），把标记换成私有使用区的哨兵字符后重新解析，生成 HTML 时再把哨兵换成 `<span class="…">`；代码、数学、HTML、转义 `\[` 里的 `{...}` 不算属性列表，引用式链接那种被两种形式同时认出的只算一处。跨硬换行的 span 每行各自开合，HTML 始终配对。
 - 属性列表本身不进渲染：`[文本]{.red}` 预览出来就是"文本"，调色板外的类名（`{.custom}`）同样只隐藏标记、不上色。
-- gpui-base 的富文本层原来只有 `<mark>` 的背景色，没有文字色。仓库内 `forks/gpui-base` patch 给 `TextMark` 加了 `color`，并让 `<span style="color: …; background-color: …">` 落到文字色与高亮底色；显式颜色压过链接色（`[链接](url){.red}` 是红的）。
+- gpui-base 的富文本层原来只有 `<mark>` 的背景色，没有文字色。仓库内 `forks/gpui-kit/crates/base` patch 给 `TextMark` 加了 `color`，并让 `<span style="color: …; background-color: …">` 落到文字色与高亮底色；显式颜色压过链接色（`[链接](url){.red}` 是红的）。
 
 ## 颜色菜单（`crates/aero-app/src/editor/color_menu.rs` + `colors_ui.rs`）
 
