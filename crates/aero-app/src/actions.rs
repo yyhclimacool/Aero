@@ -5,6 +5,7 @@
 //! 处理不了（光标不在首行 / 末行）时 `cx.propagate()` 再交还给 gpui-base 的文本控件。
 
 use gpui_kit::*;
+use std::rc::Rc;
 
 actions!(
     aero,
@@ -429,10 +430,36 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-h", ApplyLastColor, Some("Editor")),
         KeyBinding::new("cmd-/", OpenColorMenu, Some("Editor")),
     ]);
-    cx.bind_keys((0..=8u8).map(|n| KeyBinding::new(&format!("cmd-alt-{n}"), ConvertBlock(n), Some("Input"))));
-    cx.bind_keys((1..=9usize).map(|n| {
-        KeyBinding::new(&format!("cmd-{n}"), ActivateTab(if n == 9 { usize::MAX } else { n - 1 }), None)
-    }));
+    let input_context =
+        Rc::new(KeyBindingContextPredicate::parse("Input").expect("Input is a valid key binding context"));
+    let convert_block_bindings = (0..=8u8)
+        .map(|n| {
+            KeyBinding::load(
+                &format!("cmd-alt-{n}"),
+                Box::new(ConvertBlock(n)),
+                Some(input_context.clone()),
+                false,
+                None,
+                cx,
+            )
+            .expect("generated block conversion key binding is valid")
+        })
+        .collect::<Vec<_>>();
+    cx.bind_keys(convert_block_bindings);
+    let activate_tab_bindings = (1..=9usize)
+        .map(|n| {
+            KeyBinding::load(
+                &format!("cmd-{n}"),
+                Box::new(ActivateTab(if n == 9 { usize::MAX } else { n - 1 })),
+                None,
+                false,
+                None,
+                cx,
+            )
+            .expect("generated tab activation key binding is valid")
+        })
+        .collect::<Vec<_>>();
+    cx.bind_keys(activate_tab_bindings);
 
     // 窗口里没人处理时的兜底。隐藏类动作走系统，不经过编辑器。
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());

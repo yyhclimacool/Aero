@@ -1,5 +1,5 @@
 use crate::input::InputModeKind;
-use gpui::{Context, Pixels, Point, Window};
+use gpui::{App, Context, Pixels, Point, Window};
 use sum_tree::Bias;
 
 use crate::input::{
@@ -22,7 +22,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// Like [`Self::preferred_column_for`], but resolves an offset on a soft wrap
     /// boundary to the row the caret is drawn on.
-    fn preferred_column_for_with_affinity(
+    pub(super) fn preferred_column_for_with_affinity(
         &self,
         offset: usize,
         line_end_affinity: bool,
@@ -138,6 +138,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         display_point.column = 0;
         let mut new_offset = self.display_map.wrap_display_point_to_offset(display_point);
 
+        let column_anchor = column_anchor
+            .or_else(|| self.preferred_column_for_with_affinity(offset, line_end_affinity));
         let mut new_affinity = false;
         if let Some((preferred_x, column)) = column_anchor {
             // Get display point again to update local_row.
@@ -177,6 +179,30 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         (new_offset, new_affinity)
+    }
+
+    /// Extend to the document edge when there is no further visual row. Plain
+    /// movement retains its column there, but selection must still reach the
+    /// remaining text on the first or last row.
+    pub(super) fn vertical_selection_target(
+        &self,
+        offset: usize,
+        column_anchor: Option<(Pixels, usize)>,
+        line_end_affinity: bool,
+        move_lines: isize,
+    ) -> (usize, bool) {
+        let target = self.vertical_target(offset, column_anchor, line_end_affinity, move_lines);
+        if self.last_layout.is_some() {
+            let row = |offset, affinity| {
+                self.display_map
+                    .offset_to_wrap_display_point_with_affinity(offset, affinity)
+                    .row
+            };
+            if row(offset, line_end_affinity) == row(target.0, target.1) {
+                return (if move_lines < 0 { 0 } else { self.text.len() }, false);
+            }
+        }
+        target
     }
 
     /// Move every cursor through `f`, which maps each selection to a
@@ -253,8 +279,15 @@ impl<M: InputModeKind> InputBaseState<M> {
                     (e, s.preferred_column_for(e), false)
                 } else {
                     let e = s.next_boundary(sel.end.saturating_sub(1));
-                    (e, s.preferred_column_for(e), false)
+                    let affinity = s.line_end_affinity_at(e);
+                    (
+                        e,
+                        s.preferred_column_for_with_affinity(e, affinity),
+                        affinity,
+                    )
                 };
+                let anchor =
+                    anchor.or_else(|| s.preferred_column_for_with_affinity(effective, affinity));
                 let (offset, affinity) = s.vertical_target(effective, anchor, affinity, move_lines);
                 (offset, anchor, affinity)
             },
@@ -264,7 +297,31 @@ impl<M: InputModeKind> InputBaseState<M> {
         );
     }
 
+    /// Whether Left and Right arrows are mirrored: a right-to-left paragraph
+    /// reads from the right, so Right moves back toward its start. Source code
+    /// stays left to right in any layout direction.
+    pub(super) fn arrows_mirrored(&self, cx: &App) -> bool {
+        crate::LayoutDirection::global(cx).is_rtl() && !self.is_code_editor()
+    }
+
     pub(super) fn left(&mut self, _: &MoveLeft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.arrows_mirrored(cx) {
+            self.move_forward(window, cx);
+        } else {
+            self.move_backward(window, cx);
+        }
+    }
+
+    pub(super) fn right(&mut self, _: &MoveRight, window: &mut Window, cx: &mut Context<Self>) {
+        if self.arrows_mirrored(cx) {
+            self.move_backward(window, cx);
+        } else {
+            self.move_forward(window, cx);
+        }
+    }
+
+    /// Moves every caret one character toward the start of the text.
+    fn move_backward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // With a lone cursor at the very start there is nowhere to move.
         // Propagate the keystroke so an ancestor (e.g. a navigable command
         // palette) can act on it. This is harmless when nothing is bound there.
@@ -294,8 +351,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         );
     }
 
-    pub(super) fn right(&mut self, _: &MoveRight, window: &mut Window, cx: &mut Context<Self>) {
-        // Mirror `left`: a lone cursor at the end of the text has nowhere to
+    /// Moves every caret one character toward the end of the text.
+    fn move_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Mirror `move_backward`: a lone cursor at the end of the text has nowhere to
         // move, so let the keystroke bubble to an ancestor.
         if self.selections.is_single()
             && self.active_selection().is_empty()
@@ -411,9 +469,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mirrored = self.arrows_mirrored(cx);
         self.move_all_cursors(
-            |s, sel| {
-                let offset = s.previous_start_of_word_at(sel.cursor_offset());
+            move |s, sel| {
+                let offset = if mirrored {
+                    s.next_end_of_word_at(sel.cursor_offset())
+                } else {
+                    s.previous_start_of_word_at(sel.cursor_offset())
+                };
                 (offset, s.preferred_column_for(offset), false)
             },
             None,
@@ -428,9 +491,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mirrored = self.arrows_mirrored(cx);
         self.move_all_cursors(
-            |s, sel| {
-                let offset = s.next_end_of_word_at(sel.cursor_offset());
+            move |s, sel| {
+                let offset = if mirrored {
+                    s.previous_start_of_word_at(sel.cursor_offset())
+                } else {
+                    s.next_end_of_word_at(sel.cursor_offset())
+                };
                 (offset, s.preferred_column_for(offset), false)
             },
             None,

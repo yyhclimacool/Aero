@@ -4,12 +4,14 @@
 //! https://github.com/zed-industries/zed/blob/main/crates/gpui/examples/input.rs
 use gpui::TextAlign;
 use gpui::{
-    Action, App, AppContext, Bounds, ClipboardItem, Context, Edges, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, HighlightStyle, InteractiveElement as _, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, Styled as _, Subscription, UTF16Selection, Window, actions, div, point,
+    Action, App, AppContext, Bounds, ClipboardItem, Context, Edges, Entity, EntityInputHandler,
+    EventEmitter, FocusHandle, Focusable, HighlightStyle, Hsla, InteractiveElement as _, IntoElement,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels,
+    Point, Render, ScrollEvent, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, UTF16Selection, WeakFocusHandle, Window, actions, div, point,
     prelude::FluentBuilder as _, px,
 };
+use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -20,23 +22,35 @@ use sum_tree::Bias;
 use unicode_segmentation::*;
 
 use super::{
-    DiagnosticSet, DisplayMap, InputContextMenuCapabilities, InputEditorStyle, InputHighlighterFactory,
-    MASK_CHAR, MaskPattern, NativeMenu, NumberStep, WrappingIndent,
+    DiagnosticSet, DisplayMap, FoldPlaceholderRenderer, InputContextMenuCapabilities,
+    InputEditorStyle, InputHighlighterFactory, MASK_CHAR, MaskPattern, NativeMenu, NumberStep,
+    WrappingIndent,
     blink_cursor::BlinkCursor,
     change::Change,
     cursor::{CursorSelection, Selections},
-    element::{EditorScrollbar, EditorScrollbarSnapshot, TextElement},
+    element::{
+        EditorScrollbar, EditorScrollbarSnapshot, LongestLineKey, OverviewRulerRows, TextElement,
+        clamp_horizontal_scroll_offset, line_number_digits_width, line_number_len,
+    },
     kind::InputModeKind,
     mask_pattern::normalize_number_input,
     mode::LayoutMode,
     undo_manager::{EditIntent, UndoManager},
 };
+use crate::ScrollbarPlacement;
 use crate::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
 use crate::input::blink_cursor::CURSOR_WIDTH;
 use crate::input::display_map::FontOverride;
 use crate::input::movement::MoveDirection;
-use crate::input::{InputExtras as _, Position, RopeExt as _, element::RIGHT_MARGIN, layout::LastLayout};
-use crate::{AutoScroll, StepAction};
+use crate::input::rope_ext::{next_grapheme_boundary, previous_grapheme_boundary};
+use crate::input::{
+    EditorLineNumberRenderer, InputEdit, InputExtras as _, Position, RopeExt as _,
+    element::RIGHT_MARGIN, layout::LastLayout,
+};
+use crate::overscroll::Overscroll;
+use crate::{AutoScroll, StepAction, TestSupportExt as _};
+
+pub(super) const EDITOR_ELEMENT_ID: &str = "input-state";
 
 /// Vertical clearance to retain when revealing a text position.
 pub(crate) enum ScrollPadding {
@@ -65,6 +79,7 @@ impl Enter {
 actions!(
     input,
     [
+        ActivateToken,
         Backspace,
         Delete,
         DeleteToBeginningOfLine,
@@ -106,18 +121,41 @@ actions!(
         MoveToNextWord,
         Escape,
         ToggleCodeActions,
+        ShowCompletions,
         Search,
         Replace,
         GoToDefinition,
     ]
 );
 
+/// An event emitted by an input.
+///
+/// Subscribe to [`InputEditsEvent`] for the immutable edits associated with a
+/// change. `Change` itself remains available for consumers that only need a
+/// notification.
 #[derive(Clone)]
 pub enum InputEvent {
     Change,
     PressEnter { secondary: bool, shift: bool },
     Focus,
     Blur,
+}
+
+/// An immutable batch of text edits emitted for one input change.
+///
+/// Each entry contains the edit and the document immediately after it, in
+/// application order. Unlike reading the input state in a `Change` subscriber,
+/// this snapshot remains associated with its event when updates are queued.
+#[derive(Clone)]
+pub struct InputEditsEvent {
+    edits: Vec<(InputEdit, Rope)>,
+}
+
+impl InputEditsEvent {
+    /// The edits and the text after each edit, in application order.
+    pub fn edits(&self) -> &[(InputEdit, Rope)] {
+        &self.edits
+    }
 }
 
 pub(super) const CONTEXT: &str = "Input";
@@ -142,9 +180,34 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("alt-delete", DeleteToNextWordEnd, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-delete", DeleteToNextWordEnd, Some(CONTEXT)),
-        KeyBinding::new("enter", Enter { secondary: false, shift: false }, Some(CONTEXT)),
-        KeyBinding::new("shift-enter", Enter { secondary: false, shift: true }, Some(CONTEXT)),
-        KeyBinding::new("secondary-enter", Enter { secondary: true, shift: false }, Some(CONTEXT)),
+        KeyBinding::new(
+            "enter",
+            Enter {
+                secondary: false,
+                shift: false,
+            },
+            Some(CONTEXT),
+        ),
+        KeyBinding::new(
+            "shift-enter",
+            Enter {
+                secondary: false,
+                shift: true,
+            },
+            Some(CONTEXT),
+        ),
+        KeyBinding::new(
+            if cx.platform_info().is_mac() {
+                "cmd-enter"
+            } else {
+                "ctrl-enter"
+            },
+            Enter {
+                secondary: true,
+                shift: false,
+            },
+            Some(CONTEXT),
+        ),
         KeyBinding::new("escape", Escape, Some(CONTEXT)),
         KeyBinding::new("up", MoveUp, Some(CONTEXT)),
         KeyBinding::new("down", MoveDown, Some(CONTEXT)),
@@ -345,6 +408,70 @@ impl Markup {
     }
 }
 
+/// The document and selections a paste was asked to replace, taken when the
+/// `Paste` action ran so a clipboard read that resolves later can tell
+/// whether it still applies. See [`InputBaseState::paste_target`].
+#[derive(Debug, PartialEq)]
+struct PasteTarget {
+    document_revision: u64,
+    selections: Vec<CursorSelection>,
+}
+
+/// Caret positioning geometry from the input's latest prepaint.
+///
+/// Stashed during prepaint so caret-anchored popups can position themselves
+/// from the current frame's geometry in their deferred prepaint.
+#[derive(Clone, Copy, Debug)]
+#[doc(hidden)]
+pub struct PrepaintCaretGeometry {
+    cursor_bounds: Bounds<Pixels>,
+    line_height: Pixels,
+    input_bounds: Bounds<Pixels>,
+    scroll_offset: Point<Pixels>,
+    pub(super) scroll_y_f64: f64,
+    /// A resize owns visibility while its requested repaint settles.
+    pub(super) resize_reveal_owned: bool,
+}
+
+impl PrepaintCaretGeometry {
+    pub(super) fn new(
+        cursor_bounds: Bounds<Pixels>,
+        line_height: Pixels,
+        input_bounds: Bounds<Pixels>,
+        scroll_offset: Point<Pixels>,
+    ) -> Self {
+        Self {
+            cursor_bounds,
+            line_height,
+            input_bounds,
+            scroll_offset,
+            scroll_y_f64: f64::from(f32::from(scroll_offset.y)),
+            resize_reveal_owned: false,
+        }
+    }
+
+    /// The active caret's bounds from the fresh prepaint layout.
+    pub fn cursor_bounds(&self) -> Bounds<Pixels> {
+        self.cursor_bounds
+    }
+
+    /// Line height from the fresh prepaint layout.
+    pub fn line_height(&self) -> Pixels {
+        self.line_height
+    }
+
+    /// The input container bounds from the fresh prepaint.
+    pub fn input_bounds(&self) -> Bounds<Pixels> {
+        self.input_bounds
+    }
+
+    /// The scroll offset that will be in effect after paint, clamped like
+    /// `InputBaseState::update_scroll_offset` clamps it.
+    pub fn scroll_offset(&self) -> Point<Pixels> {
+        self.scroll_offset
+    }
+}
+
 /// The shared text-editing engine behind [`crate::input::InputState`],
 /// [`crate::input::TextareaState`] and [`crate::input::EditorState`].
 ///
@@ -359,12 +486,32 @@ pub struct InputBaseState<M: InputModeKind> {
     /// State only this mode needs. See [`InputModeKind::Extras`].
     pub(crate) extras: M::Extras,
     pub(super) focus_handle: FocusHandle,
+    selection_focus: Option<WeakFocusHandle>,
     pub(super) mode: LayoutMode,
     pub(super) text: Rope,
     /// Marker hiding and inline styles. Empty for ordinary inputs.
     pub(super) markup: Markup,
     pub(super) display_map: DisplayMap,
     pub(super) undo_manager: UndoManager,
+    pub(super) inline_tokens: Option<Box<super::inline_tokens::InlineTokenStore>>,
+    pub(super) pending_token: Option<super::InlineToken>,
+    pub(super) replaying_history: bool,
+    pub(super) validated_token_edit: bool,
+    pub(super) document_revision: u64,
+    pub(super) token_presentation: super::InlineTokenPresentation,
+    pub(super) token_layout_cache: Option<Box<super::token_presentation::TokenLayoutCache>>,
+    /// Real per-frame bounds of the placed token elements, keyed by token
+    /// start offset; used for hover payloads and stale-hover reconciliation.
+    pub(super) token_bounds: std::collections::HashMap<usize, Bounds<Pixels>>,
+    /// The currently hovered token: its entered span, last measured bounds,
+    /// and UTF-16 range as of entry. Retained so hover exit can still be
+    /// delivered when the token is removed, replaced, scrolled out, or
+    /// disabled.
+    pub(super) hovered_token: Option<super::token_presentation::HoverSnapshot>,
+    pub(super) pending_token_hover_exits: Vec<super::token_presentation::HoverSnapshot>,
+    /// The start offset of a pressed token, with the document revision and
+    /// pointer position at the press.
+    pub(super) pressed_token: Option<(usize, u64, Point<Pixels>)>,
     pub(super) search_session: super::SearchSession,
     /// Advances every time search is explicitly invoked. See
     /// [`InputBaseState::search_activation_revision`].
@@ -385,16 +532,32 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) selected_word_range: Option<CursorSelection>,
     /// The marked range is the temporary insert text on IME typing.
     pub(super) ime_marked_range: Option<CursorSelection>,
+    /// Text before an unannounced IME composition, until the next change.
+    ime_original_text: Option<Rope>,
     pub(super) last_layout: Option<LastLayout>,
+    /// Fresh caret geometry stashed during prepaint for caret-anchored popups.
+    ///
+    /// Popups are positioned in their deferred prepaint, which runs after the
+    /// input's prepaint but before its paint.
+    pub(crate) prepaint_caret_geometry: Option<PrepaintCaretGeometry>,
     pub(super) last_cursor: Option<usize>,
+    /// Where the platform was last told the caret is, for its IME panel.
+    pub(super) ime_anchor: Option<(Point<Pixels>, Option<Bounds<Pixels>>)>,
     /// The input container bounds
     pub(super) input_bounds: Bounds<Pixels>,
     /// The text bounds
     pub(super) last_bounds: Option<Bounds<Pixels>>,
+    /// The fully visible part of the window this input last asked its scroll
+    /// containers to reveal it in, while focused. `None` while unfocused.
+    pub(super) revealed_viewport: Option<Bounds<Pixels>>,
     pub(super) last_selected_range: Option<CursorSelection>,
+    /// The current edit batch, copied into an event when a change is emitted.
+    pub(super) last_input_edits: Vec<(InputEdit, Rope)>,
     pub(super) selecting: bool,
     /// Anchor point of an in-progress columnar (block) selection.
     pub(super) column_select_start: Option<ColumnarPoint>,
+    /// The selection a long press made, with its handles and edit menu.
+    pub(super) touch_selection: super::touch::TouchSelection,
     pub(crate) disabled: bool,
     pub(crate) readonly: bool,
     pub(crate) text_align: TextAlign,
@@ -402,6 +565,10 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) masked: bool,
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
+    /// Overrides for [`Self::text_input_configuration`].
+    pub(super) input_action: Option<TextInputAction>,
+    pub(super) autocorrect: Option<bool>,
+    pub(super) autocapitalize: Option<Autocapitalize>,
     pub(super) show_whitespaces: bool,
     /// This flag tells the renderer to prefer the end of the current visual line.
     pub(crate) cursor_line_end_affinity: bool,
@@ -415,11 +582,26 @@ pub struct InputBaseState<M: InputModeKind> {
     /// The maximum value for [`super::NumberInput`]. See [`Self::max`].
     pub(crate) number_max: Option<f64>,
     pub(crate) scroll_handle: ScrollHandle,
+    /// Whether the text stretches past its ends, see [`Self::scroll_bounce`].
+    scroll_bounce: bool,
+    /// The text's stretch past an end, while it lasts.
+    pub(super) overscroll: Overscroll,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
+    /// Authoritative `f64` vertical scroll offset (`<= 0.0`) to preserve precision past `2^24` px.
+    pub(crate) scroll_y_f64: f64,
+    pub(crate) deferred_scroll_y_f64: Option<f64>,
+    pub(crate) last_synced_handle_y: Cell<Pixels>,
+    /// Authoritative `f64` scrollable height in pixels.
+    pub(crate) scroll_height_f64: f64,
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
     pub(super) editor_scrollbar_snapshot: Cell<Option<EditorScrollbarSnapshot>>,
+    /// Overview ruler marks in display rows, kept between frames.
+    pub(super) overview_ruler_rows: std::cell::RefCell<OverviewRulerRows>,
+    pub(super) scrollbar_placement: ScrollbarPlacement,
+    /// The widest measured unwrapped line width and what it was measured for.
+    pub(super) longest_line_width: Cell<Option<(LongestLineKey, Pixels)>>,
     pub(super) editor_paddings: Edges<Pixels>,
     /// The style this state paints with: what was projected onto it, with
     /// every colour left unset resolved from the palette that is current. It
@@ -431,6 +613,12 @@ pub struct InputBaseState<M: InputModeKind> {
     /// colours once and then never see them as unset again, which is the same
     /// freeze in a different place.
     projected_editor_style: InputEditorStyle,
+    pub(super) fold_placeholder_renderer: Option<FoldPlaceholderRenderer>,
+    pub(super) fold_background: Option<Hsla>,
+    pub(super) accessibility: Option<InputAccessibility>,
+    /// What paints in place of Base's editor scrollbar, when a consumer
+    /// supplies its own.
+    pub(super) scrollbar_renderer: Option<crate::input::EditorScrollbarRenderer>,
 
     /// The mask pattern for formatting the input text
     pub(crate) mask_pattern: MaskPattern,
@@ -446,6 +634,7 @@ pub struct InputBaseState<M: InputModeKind> {
     context_menu_handler:
         Option<Rc<dyn Fn(NativeMenu, InputContextMenuCapabilities, Point<Pixels>, &mut Window, &mut App)>>,
     pending_context_menu: Option<(Point<Pixels>, usize)>,
+    context_menu_offset: Option<usize>,
 
     /// Whether the context menu that shows on right-click is enabled.
     ///
@@ -476,6 +665,74 @@ pub struct InputBaseState<M: InputModeKind> {
     _subscriptions: Vec<Subscription>,
 
     pub(super) auto_scroll: AutoScroll,
+}
+
+/// Accessibility presentation for the editor's existing keyboard-focus boundary.
+///
+/// Frames and their addon controls keep their own identities. This projection
+/// does not create a focus handle or register another text Tab stop. The engine
+/// supplies the live value and guards accessibility actions against its current
+/// disabled, read-only and masked state.
+#[derive(Clone, Debug)]
+pub struct InputAccessibility {
+    role: Option<gpui::Role>,
+    label: Option<SharedString>,
+    placeholder: Option<SharedString>,
+    accessibility_id: Option<SharedString>,
+    value_exposed: bool,
+}
+
+impl InputAccessibility {
+    pub fn new(role: Option<gpui::Role>) -> Self {
+        Self {
+            role,
+            label: None,
+            placeholder: None,
+            accessibility_id: None,
+            value_exposed: true,
+        }
+    }
+
+    pub fn with_label(mut self, label: Option<SharedString>) -> Self {
+        self.label = label;
+        self
+    }
+
+    pub fn with_placeholder(mut self, placeholder: Option<SharedString>) -> Self {
+        self.placeholder = placeholder;
+        self
+    }
+
+    pub fn with_accessibility_id(mut self, id: Option<SharedString>) -> Self {
+        self.accessibility_id = id;
+        self
+    }
+
+    /// Suppress values for secret content even when the mask is revealed.
+    pub fn with_value_exposed(mut self, exposed: bool) -> Self {
+        self.value_exposed = exposed;
+        self
+    }
+
+    pub fn role(&self) -> Option<gpui::Role> {
+        self.role
+    }
+
+    pub fn label(&self) -> Option<&SharedString> {
+        self.label.as_ref()
+    }
+
+    pub fn placeholder(&self) -> Option<&SharedString> {
+        self.placeholder.as_ref()
+    }
+
+    pub fn accessibility_id(&self) -> Option<&SharedString> {
+        self.accessibility_id.as_ref()
+    }
+
+    pub fn value_exposed(&self) -> bool {
+        self.value_exposed
+    }
 }
 
 /// Read-only styling data exposed to presentation facades.
@@ -547,12 +804,24 @@ impl InputPresentation {
 }
 
 impl<M: InputModeKind> EventEmitter<InputEvent> for InputBaseState<M> {}
+impl<M: InputModeKind> EventEmitter<InputEditsEvent> for InputBaseState<M> {}
 
 impl<M: InputModeKind> InputBaseState<M> {
     #[doc(hidden)]
     pub fn cursor_layout(&self) -> Option<(Bounds<Pixels>, Pixels)> {
         let layout = self.last_layout.as_ref()?;
-        Some((layout.cursor_bounds?, layout.line_height))
+        let mut bounds = layout.cursor_bounds?;
+        bounds.origin.y -= self.scroll_handle.offset().y;
+        Some((bounds, layout.line_height))
+    }
+
+    /// Caret geometry from the latest prepaint, for caret-anchored popups.
+    ///
+    /// Popups positioned in their deferred prepaint read this to anchor to
+    /// the current frame's caret instead of the previous frame's paint.
+    #[doc(hidden)]
+    pub fn prepaint_caret_geometry(&self) -> Option<PrepaintCaretGeometry> {
+        self.prepaint_caret_geometry
     }
 
     pub fn input_bounds(&self) -> Bounds<Pixels> {
@@ -561,6 +830,51 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub fn text_bounds(&self) -> Option<Bounds<Pixels>> {
         self.last_bounds
+    }
+
+    /// The cached display map for querying wrapped rows and display positions.
+    ///
+    /// Reading this does not prepare text or force layout. Before the first
+    /// layout, [`DisplayMap::wrap_row_count`] can be zero; prepared empty text
+    /// has one row. The count describes content, independent of minimum rows,
+    /// auto-grow limits and viewport height.
+    ///
+    /// Text edits use the cached wrapping parameters. Layout refreshes the
+    /// cache after width or font changes; consume that count on a subsequent
+    /// render, or use [`Self::prewrap`] to prepare it before the first layout.
+    pub fn display_map(&self) -> &DisplayMap {
+        &self.display_map
+    }
+
+    /// Wrap the text for `font`, `font_size` and `width` before the first
+    /// layout, so that [`DisplayMap::wrap_row_count`] is known on the first frame.
+    ///
+    /// Call it after setting the value and the wrapping indent. `width` is the
+    /// width of the input's text area: its width less its padding, and less
+    /// the line-number gutter for an editor with line numbers. It wraps as
+    /// layout does, a little short of that width and with the state's wrapping
+    /// indent. Once the input has been laid out this does nothing, and layout
+    /// keeps the wrap up to date. The font and font size must match the input's
+    /// actual text style.
+    pub fn prewrap(
+        &mut self,
+        font: gpui::Font,
+        font_size: Pixels,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        if self.last_layout.is_some() {
+            return;
+        }
+        let wrap_width = (width - RIGHT_MARGIN).max(px(1.));
+        self.display_map.set_font(font, font_size, cx);
+        self.display_map
+            .set_tab_size(self.mode.tab_size().tab_size, cx);
+        self.display_map
+            .on_layout_changed(self.soft_wrap.then_some(wrap_width), cx);
+        self.display_map
+            .set_wrapping_indent(self.wrapping_indent, cx);
+        self.display_map.ensure_text_prepared(&self.text, cx);
     }
 
     pub fn diagnostic_popover(&self) -> Option<Rc<crate::input::DiagnosticEntry>> {
@@ -685,10 +999,29 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.context_menu_handler = Some(handler);
     }
 
+    /// Keeps the selection highlighted while this popup or one of its children has focus.
+    ///
+    /// This does not transfer keyboard focus or keep the caret visible. The
+    /// association holds only a weak focus handle. Pass `None` to clear it.
+    pub fn set_selection_focus(&mut self, focus: Option<FocusHandle>, cx: &mut Context<Self>) {
+        self.selection_focus = focus.as_ref().map(FocusHandle::downgrade);
+        cx.notify();
+    }
+
+    /// Whether the input or its associated selection popup has focus.
+    pub fn has_selection_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus_handle.is_focused(window)
+            || self
+                .selection_focus
+                .as_ref()
+                .and_then(WeakFocusHandle::upgrade)
+                .is_some_and(|focus| focus.is_focused(window) || focus.contains_focused(window, cx))
+    }
+
     /// Build the engine. Each mode's own `new` sets its layout on top of this.
     fn new_in_mode(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle().tab_stop(true);
-        let blink_cursor = cx.new(|_| BlinkCursor::new());
+        let blink_cursor = cx.new(BlinkCursor::new);
         let undo_manager = UndoManager::new();
 
         let _subscriptions = vec![
@@ -707,6 +1040,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             cx.observe(&blink_cursor, |_, _, cx| cx.notify()),
             // Blink the cursor when the window is active, pause when it's not.
             cx.observe_window_activation(window, |input, window, cx| {
+                if !window.is_window_active() {
+                    input.cancel_mouse_gesture(cx);
+                }
                 if window.is_window_active() {
                     let focus_handle = input.focus_handle.clone();
                     if focus_handle.is_focused(window) {
@@ -716,6 +1052,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                     }
                 }
             }),
+            cx.observe_window_bounds(window, |input, _, cx| input.cancel_mouse_gesture(cx)),
             cx.on_focus(&focus_handle, window, Self::on_focus),
             cx.on_blur(&focus_handle, window, Self::on_blur),
         ];
@@ -725,6 +1062,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         Self {
             extras: M::Extras::default(),
             focus_handle: focus_handle.clone(),
+            selection_focus: None,
             text: "".into(),
             markup: Markup::default(),
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
@@ -738,11 +1076,24 @@ impl<M: InputModeKind> InputBaseState<M> {
             cursor_surrounding_lines: None,
             blink_cursor,
             undo_manager,
+            inline_tokens: None,
+            pending_token: None,
+            replaying_history: false,
+            validated_token_edit: false,
+            document_revision: 0,
+            token_presentation: Default::default(),
+            token_bounds: Default::default(),
+            hovered_token: None,
+            pending_token_hover_exits: Vec::new(),
+            token_layout_cache: None,
+            pressed_token: None,
             selections: Selections::default(),
             selected_word_range: None,
             ime_marked_range: None,
+            ime_original_text: None,
             input_bounds: Bounds::default(),
             selecting: false,
+            touch_selection: Default::default(),
             disabled: false,
             readonly: false,
             text_align: TextAlign::Left,
@@ -750,6 +1101,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             masked: false,
             clean_on_escape: false,
             submit_on_enter: false,
+            input_action: None,
+            autocorrect: None,
+            autocapitalize: None,
             show_whitespaces: false,
             loading: false,
             pattern: None,
@@ -759,13 +1113,26 @@ impl<M: InputModeKind> InputBaseState<M> {
             number_max: None,
             mode: LayoutMode::default(),
             last_layout: None,
+            prepaint_caret_geometry: None,
             last_bounds: None,
+            revealed_viewport: None,
             last_selected_range: None,
+            last_input_edits: Vec::new(),
             column_select_start: None,
             last_cursor: None,
+            ime_anchor: None,
             scroll_handle: ScrollHandle::new(),
+            scroll_bounce: crate::ScrollBounce::enabled_by_default(),
+            overscroll: Overscroll::default(),
             scroll_size: gpui::size(px(0.), px(0.)),
+            scroll_y_f64: 0.0,
+            deferred_scroll_y_f64: None,
+            last_synced_handle_y: Cell::new(px(0.)),
+            scroll_height_f64: 0.0,
             editor_scrollbar_snapshot: Cell::new(None),
+            overview_ruler_rows: Default::default(),
+            scrollbar_placement: ScrollbarPlacement::default(),
+            longest_line_width: Cell::new(None),
             editor_paddings: Edges::default(),
             deferred_scroll_offset: None,
             placeholder: SharedString::default(),
@@ -773,9 +1140,14 @@ impl<M: InputModeKind> InputBaseState<M> {
             mask_pattern_set: false,
             editor_style: InputEditorStyle::default(),
             projected_editor_style: InputEditorStyle::default(),
+            fold_placeholder_renderer: None,
+            fold_background: None,
+            accessibility: None,
+            scrollbar_renderer: None,
             diagnostic_popover: None,
             context_menu_handler: None,
             pending_context_menu: None,
+            context_menu_offset: None,
             enable_context_menu: true,
             completion_inserting: false,
             overlay_action_handler: None,
@@ -790,8 +1162,10 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// Sets whether the context menu that shows on right-click is enabled.
     ///
-    /// The context menu is enabled by default.
-    /// This value is ignored if a custom context menu builder is defined on the input.
+    /// The context menu is enabled by default. Disabling it turns off the
+    /// right-click menu entirely, including a custom menu set on the element.
+    /// A custom menu already replaces the built-in one, so keep this enabled
+    /// to show only your own items.
     pub fn context_menu(mut self, enable: bool) -> Self {
         self.enable_context_menu = enable;
         self
@@ -840,6 +1214,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn set_highlighter_factory(&mut self, factory: InputHighlighterFactory, cx: &mut Context<Self>) {
         self.mode.set_highlighter_factory(factory);
         self._pending_update = true;
+        self.token_layout_cache = None;
         cx.notify();
     }
 
@@ -853,10 +1228,68 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.projected_editor_style = style;
     }
 
+    /// Draws a placeholder right after the text of each folded line, given its
+    /// buffer row. Clicking it unfolds the line.
+    pub fn set_fold_placeholder_renderer(
+        &mut self,
+        renderer: Option<FoldPlaceholderRenderer>,
+        cx: &mut Context<Self>,
+    ) {
+        self.fold_placeholder_renderer = renderer;
+        cx.notify();
+    }
+
+    /// Fills each folded line across the editor, as VS Code's
+    /// `editor.foldBackground`.
+    pub fn set_fold_background(&mut self, color: Option<Hsla>, cx: &mut Context<Self>) {
+        self.fold_background = color;
+        cx.notify();
+    }
+
+    /// Project semantics onto the editor, never onto a second focus owner.
+    pub fn set_accessibility(&mut self, accessibility: InputAccessibility) {
+        self.accessibility = Some(accessibility);
+    }
+
+    fn handle_accessibility_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.disabled {
+            self.focus(window, cx);
+        }
+    }
+
+    fn handle_accessibility_set_value(
+        &mut self,
+        data: Option<&gpui::accesskit::ActionData>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(gpui::accesskit::ActionData::Value(value)) = data else {
+            return;
+        };
+        // The action may have been queued before editability changed.
+        if self.is_editable() {
+            self.replace_all(value.to_string(), window, cx);
+        }
+    }
+
     /// Set presentation padding for multi-line text and its scrollbar layout.
     #[doc(hidden)]
     pub fn set_editor_paddings(&mut self, paddings: Edges<Pixels>) {
         self.editor_paddings = paddings;
+    }
+
+    /// Supply the element painted in place of the editor's scrollbar, or
+    /// `None` to keep Base's. The renderer is called where the editor paints
+    /// its scrollbar, with that frame's [`EditorScrollbarContext`]. Like
+    /// [`Self::set_editor_style`], this does not notify, so it can be called
+    /// while rendering.
+    ///
+    /// [`EditorScrollbarContext`]: crate::input::EditorScrollbarContext
+    pub fn set_scrollbar_renderer(
+        &mut self,
+        renderer: Option<crate::input::EditorScrollbarRenderer>,
+    ) {
+        self.scrollbar_renderer = renderer;
     }
 
     pub fn apply_highlighter_fold_candidates(
@@ -906,32 +1339,49 @@ impl<M: InputModeKind> InputBaseState<M> {
             return (0, 0, None);
         };
         let line_height = last_layout.line_height;
+        let target_row = self.text.offset_to_point(offset.min(self.text.len())).row;
 
-        let mut y_offset = last_layout.visible_top;
+        let mut row_offset: isize = 0;
         for (vi, line) in last_layout.lines.iter().enumerate() {
-            let prev_lines_offset = last_layout.visible_line_byte_offsets[vi];
-            let local_offset = offset.saturating_sub(prev_lines_offset);
-            if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
+            let buffer_line = last_layout.visible_buffer_lines[vi];
+            if buffer_line == target_row {
+                let y_offset = last_layout.local_row_y(row_offset);
+                let prev_lines_offset = last_layout.visible_line_byte_offsets[vi];
+                let local_offset = offset.saturating_sub(prev_lines_offset).min(line.len());
+                let pos = line
+                    .position_for_index(local_offset, last_layout, false)
+                    .unwrap_or_else(|| point(px(0.), px(0.)));
                 let sub_line_index = (pos.y / line_height) as usize;
                 let adjusted_pos = point(pos.x + last_layout.line_number_width, pos.y + y_offset);
                 return (vi, sub_line_index, Some(adjusted_pos));
             }
 
-            y_offset += line.size(line_height).height;
+            row_offset += line.wrapped_lines.len() as isize;
         }
         (0, 0, None)
     }
 
-    /// Set the text of the input field.
+    /// Set the value of the input field: plain text, or [`InputContent`] to
+    /// restore text together with its inline tokens. Editing history is
+    /// cleared and no [`InputEvent::Change`] is emitted.
     ///
     /// For single-line inputs the caret is placed at the end of the text while
     /// the view is scrolled back to the start, so a long value shows its
     /// beginning instead of its tail (matching HTML `<input>`). Multi-line
     /// inputs reset the selection to `0..0`.
-    pub fn set_value(&mut self, value: impl Into<SharedString>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_value(
+        &mut self,
+        value: impl Into<super::InputContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let content = value.into();
+        self.inline_tokens = None;
         self.undo_manager.set_ignoring(true);
         self.emit_events = false;
-        self.replace_text(value, window, cx);
+        self.replace_text(content.text().clone(), window, cx);
+        self.ime_original_text = None;
+        self.install_tokens(content);
         self.undo_manager.set_ignoring(false);
         self.emit_events = true;
 
@@ -970,7 +1420,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     ///
     /// The `disabled` and `readonly` modes only reject the changes made by the
     /// user, the programmatic APIs must always be able to update the text.
-    fn with_edits_allowed(&mut self, f: impl FnOnce(&mut Self)) {
+    pub(super) fn with_edits_allowed(&mut self, f: impl FnOnce(&mut Self)) {
         let (was_disabled, was_readonly) = (self.disabled, self.readonly);
         (self.disabled, self.readonly) = (false, false);
         f(self);
@@ -1008,7 +1458,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         let text: SharedString = text.into();
         self.with_edits_allowed(|this| {
             this.undo_manager.set_pending_intent(EditIntent::Atomic);
-            let range = 0..this.text.chars().map(|c| c.len_utf16()).sum();
+            let range = 0..this.text.len_utf16();
             this.replace_text_in_range_silent(Some(range), &text, window, cx);
             this.reset_highlighter(cx);
         });
@@ -1040,8 +1490,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         // override the cursor-follow scroll for the next painted frame to keep
         // the start visible; the deferred offset is consumed during that paint.
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        self.scroll_y_f64 = 0.0;
+        self.last_synced_handle_y.set(px(0.));
         if self.is_single_line() {
             self.deferred_scroll_offset = Some(point(px(0.), px(0.)));
+            self.deferred_scroll_y_f64 = Some(0.0);
         }
     }
 
@@ -1060,6 +1513,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         self.disabled = disabled;
+        if disabled {
+            M::hide_context_menu(self, cx);
+            M::clear_inline_completion(self, cx);
+        }
         cx.notify();
     }
 
@@ -1083,6 +1540,8 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         self.readonly = readonly;
         if readonly {
+            M::hide_context_menu(self, cx);
+            M::clear_inline_completion(self, cx);
             self.search_session.replace_mode = false;
         }
         cx.notify();
@@ -1097,6 +1556,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// Set true to clear the input by pressing Escape key.
+    ///
+    /// Not on Android, where Escape is also the back button.
     pub fn clean_on_escape(mut self) -> Self {
         self.clean_on_escape = true;
         self
@@ -1119,6 +1580,59 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn set_submit_on_enter(&mut self, submit: bool, cx: &mut Context<Self>) {
         self.submit_on_enter = submit;
         cx.notify();
+    }
+
+    /// Set the action a software keyboard shows on its enter key, like Search
+    /// or Send. Pressing it still emits [`InputEvent::PressEnter`].
+    ///
+    /// Default is [`TextInputAction::Done`] for a single-line input (and a
+    /// multi-line one that submits on enter), and [`TextInputAction::Enter`]
+    /// (a line break) for a multi-line input.
+    pub fn input_action(mut self, action: TextInputAction) -> Self {
+        self.input_action = Some(action);
+        self
+    }
+
+    /// Set whether the platform may autocorrect the text and offer word
+    /// suggestions.
+    ///
+    /// Default is `false`. Enable this explicitly for fields that accept prose;
+    /// masking or revealing text does not change the setting.
+    pub fn autocorrect(mut self, autocorrect: bool) -> Self {
+        self.autocorrect = Some(autocorrect);
+        self
+    }
+
+    /// Set how a software keyboard capitalizes the text.
+    ///
+    /// Default is [`Autocapitalize::None`]. Enable capitalization explicitly for
+    /// fields where it is appropriate, independently of autocorrection.
+    pub fn autocapitalize(mut self, autocapitalize: Autocapitalize) -> Self {
+        self.autocapitalize = Some(autocapitalize);
+        self
+    }
+
+    /// The text assistance a platform IME (a software keyboard) should give
+    /// this input, from [`Self::input_action`], [`Self::autocorrect`] and
+    /// [`Self::autocapitalize`] or the defaults they describe.
+    pub fn text_input_configuration(&self) -> TextInputConfiguration {
+        // Masking is a presentation choice, not a reliable content type: a
+        // revealed password must not acquire text assistance. Keep assistance
+        // opt-in for structured fields such as passwords, email and URLs.
+        let autocorrect = self.autocorrect.unwrap_or(false);
+        let input_action =
+            self.input_action
+                .unwrap_or(if self.is_multi_line() && !self.submit_on_enter {
+                    TextInputAction::Enter
+                } else {
+                    TextInputAction::Done
+                });
+        TextInputConfiguration {
+            autocorrect,
+            autocapitalize: self.autocapitalize.unwrap_or(Autocapitalize::None),
+            suggestions: autocorrect,
+            input_action,
+        }
     }
 
     /// Set whether to show whitespace characters.
@@ -1171,7 +1685,10 @@ impl<M: InputModeKind> InputBaseState<M> {
     ///
     /// - `None` (default): [`BOTTOM_MARGIN_ROWS`] lines, falling back to
     ///   one line on small viewports.
-    /// - `Some(n)`: exactly `n` lines, clamped to half the viewport.
+    /// - `Some(n)`: requests `n` lines, clamped to half the viewport.
+    ///
+    /// In a constrained viewport, edge clearance yields to the cursor's
+    /// complete visual row so surrounding space cannot clip the text being edited.
     pub fn cursor_surrounding_lines(mut self, lines: Option<usize>) -> Self {
         self.cursor_surrounding_lines = lines;
         self
@@ -1242,6 +1759,31 @@ impl<M: InputModeKind> InputBaseState<M> {
         &self.text
     }
 
+    /// Report the change with its own snapshot before the legacy notification.
+    fn emit_change(&mut self, cx: &mut Context<Self>) {
+        if let Some(original) = self.ime_original_text.take() {
+            self.last_input_edits = vec![(
+                Self::full_input_edit(&original, &self.text),
+                self.text.clone(),
+            )];
+        }
+        cx.emit(InputEditsEvent {
+            edits: self.last_input_edits.clone(),
+        });
+        cx.emit(InputEvent::Change);
+    }
+
+    fn full_input_edit(old_text: &Rope, new_text: &Rope) -> InputEdit {
+        InputEdit {
+            start_byte: 0,
+            old_end_byte: old_text.len(),
+            new_end_byte: new_text.len(),
+            start_position: old_text.offset_to_point(0),
+            old_end_position: old_text.offset_to_point(old_text.len()),
+            new_end_position: new_text.offset_to_point(new_text.len()),
+        }
+    }
+
     /// Return the (0-based) [`Position`] of the cursor.
     pub fn cursor_position(&self) -> Position {
         let offset = self.cursor();
@@ -1298,24 +1840,47 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub(super) fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.break_transaction_coalescing();
-        self.select_all_cursors_to(|s, sel| s.previous_visible_boundary(sel.cursor_offset()), cx);
+        let mirrored = self.arrows_mirrored(cx);
+        self.select_all_cursors_to(
+            move |s, sel| {
+                if mirrored {
+                    s.next_visible_boundary(sel.cursor_offset())
+                } else {
+                    s.previous_visible_boundary(sel.cursor_offset())
+                }
+            },
+            cx,
+        );
     }
 
     pub(super) fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_all_cursors_to(|s, sel| s.next_visible_boundary(sel.cursor_offset()), cx);
+        let mirrored = self.arrows_mirrored(cx);
+        self.select_all_cursors_to(
+            move |s, sel| {
+                if mirrored {
+                    s.previous_visible_boundary(sel.cursor_offset())
+                } else {
+                    s.next_visible_boundary(sel.cursor_offset())
+                }
+            },
+            cx,
+        );
     }
 
     pub(super) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_single_line() {
             return;
         }
-        self.undo_manager.break_transaction_coalescing();
-        self.select_all_cursors_to(
+        self.select_all_cursors_to_with_affinity(
             |s, sel| {
-                let offset =
-                    s.start_of_line_at(sel.cursor_offset(), s.line_end_affinity_for(sel)).saturating_sub(1);
-                s.previous_boundary(offset)
+                s.vertical_selection_target(
+                    sel.cursor_offset(),
+                    sel.column_anchor,
+                    s.line_end_affinity_for(sel),
+                    -1,
+                )
             },
+            true,
             cx,
         );
     }
@@ -1324,14 +1889,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         if self.is_single_line() {
             return;
         }
-        self.undo_manager.break_transaction_coalescing();
-        let len = self.text.len();
-        self.select_all_cursors_to(
+        self.select_all_cursors_to_with_affinity(
             |s, sel| {
-                let offset =
-                    (s.end_of_line_at(sel.cursor_offset(), s.line_end_affinity_for(sel)) + 1).min(len);
-                s.next_boundary(offset)
+                s.vertical_selection_target(
+                    sel.cursor_offset(),
+                    sel.column_anchor,
+                    s.line_end_affinity_for(sel),
+                    1,
+                )
             },
+            true,
             cx,
         );
     }
@@ -1376,12 +1943,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         self.undo_manager.break_transaction_coalescing();
-        self.select_all_cursors_to(
-            |s, sel| s.end_of_line_at(sel.cursor_offset(), s.line_end_affinity_for(sel)),
+        self.select_all_cursors_to_with_affinity(
+            |s, sel| {
+                (
+                    s.end_of_line_at(sel.cursor_offset(), s.line_end_affinity_for(sel)),
+                    true,
+                )
+            },
+            false,
             cx,
         );
-        // Mirrors MoveEnd: the caret belongs at the end of the visual row it is on.
-        self.cursor_line_end_affinity = true;
     }
 
     pub(super) fn select_to_previous_word(
@@ -1391,7 +1962,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         self.undo_manager.break_transaction_coalescing();
-        self.select_all_cursors_to(|s, sel| s.previous_start_of_word_at(sel.cursor_offset()), cx);
+        let mirrored = self.arrows_mirrored(cx);
+        self.select_all_cursors_to(
+            move |s, sel| {
+                if mirrored {
+                    s.next_end_of_word_at(sel.cursor_offset())
+                } else {
+                    s.previous_start_of_word_at(sel.cursor_offset())
+                }
+            },
+            cx,
+        );
     }
 
     pub(super) fn select_to_next_word(
@@ -1401,7 +1982,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         self.undo_manager.break_transaction_coalescing();
-        self.select_all_cursors_to(|s, sel| s.next_end_of_word_at(sel.cursor_offset()), cx);
+        let mirrored = self.arrows_mirrored(cx);
+        self.select_all_cursors_to(
+            move |s, sel| {
+                if mirrored {
+                    s.previous_start_of_word_at(sel.cursor_offset())
+                } else {
+                    s.next_end_of_word_at(sel.cursor_offset())
+                }
+            },
+            cx,
+        );
     }
 
     /// Return the start offset of the previous word.
@@ -1418,10 +2009,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         // FIXME: Avoid to_string
         let left_part = self.text.slice(0..offset).to_string();
 
-        UnicodeSegmentation::split_word_bound_indices(left_part.as_str())
+        let target = UnicodeSegmentation::split_word_bound_indices(left_part.as_str())
             .rfind(|(_, s)| !s.trim_start().is_empty())
             .map(|(i, _)| i)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        self.token_boundary(target, Bias::Left)
     }
 
     /// Return the next end offset of the word after `offset`.
@@ -1434,10 +2026,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
         let right_part = self.text.slice(offset..self.text.len()).to_string();
 
-        UnicodeSegmentation::split_word_bound_indices(right_part.as_str())
+        let target = UnicodeSegmentation::split_word_bound_indices(right_part.as_str())
             .find(|(_, s)| !s.trim_start().is_empty())
             .map(|(i, s)| offset + i + s.len())
-            .unwrap_or(self.text.len())
+            .unwrap_or(self.text.len());
+        self.token_boundary(target, Bias::Right)
     }
 
     /// Get start of line byte offset for the given `offset`.
@@ -1853,10 +2446,41 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.delete_selections(
             true,
             EditIntent::Atomic,
-            |s, offset| offset..s.next_end_of_word_at(offset),
+            |s, offset| offset..s.next_word_delete_end_at(offset, !cfg!(target_os = "macos")),
             window,
             cx,
         );
+    }
+
+    /// Return where a forward word delete starting at `offset` stops.
+    ///
+    /// With `stop_at_whitespace` (Windows and Linux `Ctrl+Delete`, as in
+    /// Notepad and VS Code), a line break or a run of blanks is deleted on its
+    /// own instead of together with the word after it. macOS `Option+Delete`
+    /// deletes through to the end of the next word.
+    pub(super) fn next_word_delete_end_at(&self, offset: usize, stop_at_whitespace: bool) -> usize {
+        if stop_at_whitespace && !self.masked {
+            let mut chars = self.text.slice(offset..self.text.len()).chars();
+            match chars.next() {
+                Some('\r') => {
+                    let next = if chars.next() == Some('\n') { 2 } else { 1 };
+                    return offset + next;
+                }
+                Some('\n') => return offset + 1,
+                Some(c) if c.is_whitespace() => {
+                    let mut end = offset + c.len_utf8();
+                    for c in chars {
+                        if c == '\n' || c == '\r' || !c.is_whitespace() {
+                            break;
+                        }
+                        end += c.len_utf8();
+                    }
+                    return end;
+                }
+                _ => {}
+            }
+        }
+        self.next_end_of_word_at(offset)
     }
 
     pub(super) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
@@ -1872,8 +2496,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         // In multi-line mode with `submit_on_enter` enabled, a plain `Enter`
         // (without Shift) is treated as submit: propagate the action and emit
         // PressEnter without inserting a newline. `Shift+Enter` still inserts
-        // a newline.
-        let insert_newline = self.is_multi_line() && (!self.submit_on_enter || action.shift);
+        // a newline. A secondary `Enter` (Cmd/Ctrl+Enter) is always a submit
+        // gesture and never inserts a newline.
+        let insert_newline =
+            self.is_multi_line() && !action.secondary && (!self.submit_on_enter || action.shift);
 
         if insert_newline {
             if !self.selections.is_single() {
@@ -1980,6 +2606,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
+        // Escape also dismisses a request whose popup has not arrived yet.
+        M::hide_context_menu(self, cx);
+
         // Collapse extra cursors back to the active one first.
         if !self.selections.is_single() {
             self.undo_manager.break_transaction_coalescing();
@@ -1993,12 +2622,21 @@ impl<M: InputModeKind> InputBaseState<M> {
             M::clear_inline_completion(self, cx);
             return; // Consume the escape, don't propagate
         }
+        M::clear_inline_completion(self, cx);
+
+        // The handles and the edit menu are the topmost surface to dismiss.
+        if self.touch_selection().is_some() {
+            self.dismiss_touch_selection(cx);
+            return;
+        }
 
         if self.ime_marked_range.is_some() {
             self.unmark_text(window, cx);
         }
 
-        if self.clean_on_escape {
+        // Android delivers its back button as escape, and back leaves a field's
+        // text alone: it closes what is open or navigates.
+        if self.clean_on_escape && !cfg!(target_os = "android") {
             return self.clean(window, cx);
         }
 
@@ -2020,6 +2658,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
+        self.context_menu_offset = Some(offset);
         if !self.active_selection().contains(offset) {
             self.move_to(offset, None, cx);
         }
@@ -2030,8 +2669,32 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         if let Some(handler) = self.context_menu_handler.clone() {
             let capabilities = self.context_menu_capabilities();
-            cx.defer_in(window, move |_, window, cx| {
+            let input = cx.weak_entity();
+            // The handler runs with the input released, so a custom builder can
+            // read it (cursor, selection, text) to build its items.
+            window.defer(cx, move |window, cx| {
+                if input.upgrade().is_none() {
+                    return;
+                }
+                let previous_focus = window.focused(cx);
                 handler(NativeMenu::new(), capabilities, position, window, cx);
+                // A drawn menu takes focus synchronously; native menus leave it
+                // on the input. Capture it here rather than in the handler.
+                input
+                    .update(cx, |this, cx| {
+                        if window.focused(cx) == previous_focus
+                            && !this.focus_handle.is_focused(window)
+                            && this.has_selection_focus(window, cx)
+                        {
+                            // A custom handler can reuse an already-focused popup.
+                            return;
+                        }
+                        let menu_focus = window.focused(cx).filter(|focus| {
+                            Some(focus) != previous_focus.as_ref() && *focus != this.focus_handle
+                        });
+                        this.set_selection_focus(menu_focus, cx);
+                    })
+                    .ok();
             });
         }
     }
@@ -2106,7 +2769,9 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         self.undo_manager.break_transaction_coalescing();
         let id = self.selections.generate_id();
-        self.selections.add(CursorSelection::new(id, offset, offset));
+        let mut selection = CursorSelection::new(id, offset, offset);
+        selection.column_anchor = self.preferred_column_for(offset);
+        self.selections.add(selection);
         cx.notify();
     }
 
@@ -2166,13 +2831,44 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A token that consumed the press (a double click selecting it) must
+        // not also place the caret.
+        if window.default_prevented() {
+            return;
+        }
+        // A tap asks for the virtual keyboard. Focus alone does not when it
+        // moves from another input, or stays here, after the user hid it.
+        if event.button == MouseButton::Left
+            && crate::GlobalState::is_touch_press(cx)
+            && !self.disabled
+            && !self.readonly
+        {
+            window.request_virtual_keyboard();
+        }
         self.undo_manager.break_transaction_coalescing();
+        // Treat every press like a cursor move: take focus now rather than
+        // after GPUI's focus observer runs, show the caret at once and restart
+        // the idle delay, whatever phase the blink was in.
+        if !self.disabled {
+            self.focus(window, cx);
+            self.pause_blink_cursor(cx);
+        }
         // Input has its own text selection; suppress the window-level text
         // selection (Root) so it does not start a drag from here.
         crate::global_state::GlobalState::suppress_text_selection(cx);
 
         // Clear inline completion on any mouse interaction
         M::clear_inline_completion(self, cx);
+        // A tap on the touch selection asks for its menu back. Any other press
+        // places the caret or starts a new drag, and the handles and the menu
+        // no longer belong to what is selected.
+        if event.button == MouseButton::Left
+            && event.click_count == 1
+            && self.reopen_edit_menu_at(event.position, cx)
+        {
+            return;
+        }
+        self.dismiss_touch_selection(cx);
 
         // If there have IME marked range and is empty (Means pressed Esc to abort IME typing)
         // Clear the marked range.
@@ -2198,6 +2894,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         // Double click to select word
         if event.button == MouseButton::Left && event.click_count == 2 {
             self.select_word(offset, window, cx);
+            // A double tap is touch's other way to select a word, and it
+            // gets the handles and the menu like a long press does.
+            if crate::GlobalState::is_touch_press(cx) {
+                self.keep_touch_selection(cx);
+            }
             return;
         }
 
@@ -2260,9 +2961,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Check if mouse is within bounds
-        let within_bounds =
-            self.last_bounds.as_ref().map(|bounds| bounds.contains(&event.position)).unwrap_or(false);
+        // `last_bounds` is moved by the scroll offset; `input_bounds` is the visible area.
+        let within_bounds = self.input_bounds.contains(&event.position);
 
         if !within_bounds {
             // Clear hover when mouse leaves the input
@@ -2275,18 +2975,32 @@ impl<M: InputModeKind> InputBaseState<M> {
         M::on_mouse_move(self, offset, event, window, cx);
 
         if self.is_code_editor() {
-            if let Some(diagnostic) = self.mode.diagnostics().and_then(|set| set.for_offset(offset)) {
-                self.diagnostic_popover = Some(Rc::new(diagnostic.clone()));
-                cx.notify();
-            } else {
-                self.diagnostic_popover = None;
+            // Keep the current popover while the pointer stays on the same
+            // diagnostic, so moving over a squiggle neither repaints nor
+            // rebuilds the popover.
+            match self
+                .mode
+                .diagnostics()
+                .and_then(|set| set.for_offset(offset))
+            {
+                Some(diagnostic) => {
+                    if self.diagnostic_popover.as_deref() != Some(diagnostic) {
+                        self.diagnostic_popover = Some(Rc::new(diagnostic.clone()));
+                        cx.notify();
+                    }
+                }
+                None => {
+                    if self.diagnostic_popover.take().is_some() {
+                        cx.notify();
+                    }
+                }
             }
         }
     }
 
     pub(super) fn on_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2295,34 +3009,174 @@ impl<M: InputModeKind> InputBaseState<M> {
         let delta = event.delta.pixel_delta(line_height);
 
         let old_offset = self.scroll_handle.offset();
-        self.update_scroll_offset(Some(old_offset + delta), cx);
+        let old_y_f64 = self.effective_scroll_y_f64();
+        let precise = matches!(event.delta, gpui::ScrollDelta::Pixels(_));
+        if !precise || !self.scroll_bounce || cx.reduce_motion() || !self.overflows_vertically() {
+            let displaced = self.overscroll.offset() != 0.;
+            self.overscroll.reset();
+            if displaced {
+                cx.notify();
+            }
+        }
+        let bounces = self.scroll_bounce
+            && precise
+            && !cx.reduce_motion()
+            && delta.y.abs() >= delta.x.abs()
+            && self.overflows_vertically();
+        if bounces {
+            let mut overscroll = std::mem::take(&mut self.overscroll);
+            let stretched = overscroll.packet(
+                delta.y.as_f32(),
+                event.touch_phase,
+                self.input_bounds.size.height.as_f32(),
+                cx.background_executor().now(),
+                |dy| {
+                    let before_x = self.scroll_handle.offset().x;
+                    let before_y = self.effective_scroll_y_f64();
+                    self.update_scroll_offset_parts(
+                        before_x + delta.x,
+                        before_y + f64::from(dy),
+                        cx,
+                    );
+                    (self.scroll_y_f64 - before_y) as f32
+                },
+            );
+            self.overscroll = overscroll;
+            if stretched {
+                cx.notify();
+            }
+        } else {
+            self.overscroll
+                .touch_phase(event.touch_phase, cx.background_executor().now());
+            // Axis drift must not drop the end of a vertical drag.
+            if matches!(
+                event.touch_phase,
+                gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled
+            ) && self.overscroll.offset() != 0.
+            {
+                self.overscroll.packet(
+                    0.,
+                    event.touch_phase,
+                    self.input_bounds.size.height.as_f32(),
+                    cx.background_executor().now(),
+                    |_| 0.,
+                );
+                cx.notify();
+            }
+            self.update_scroll_offset_parts(
+                old_offset.x + delta.x,
+                old_y_f64 + f64::from(f32::from(delta.y)),
+                cx,
+            );
+        }
 
-        // Only stop propagation if the offset actually changed
-        if self.scroll_handle.offset() != old_offset {
+        // Text that has room to scroll keeps a scroll over it even where the
+        // text ends, so reaching the end does not scroll the region around the
+        // input; text that fits leaves the scroll to that region.
+        if self.scroll_handle.offset() != old_offset
+            || (self.scroll_y_f64 - old_y_f64).abs() > f64::EPSILON
+            || self.overflows_along(delta)
+        {
             cx.stop_propagation();
         }
 
         if self.diagnostic_popover.take().is_some() {
             cx.notify();
         }
+        // The handles follow the text; the menu would sit over whatever
+        // scrolls underneath it, so it steps aside until the finger lifts.
+        self.edit_menu_on_scroll(event.touch_phase, cx);
     }
 
-    pub(super) fn update_scroll_offset(&mut self, offset: Option<Point<Pixels>>, cx: &mut Context<Self>) {
-        let mut offset = offset.unwrap_or(self.scroll_handle.offset());
-        // In addition to left alignment, a cursor position will be reserved on the right side
-        let safe_x_offset = if self.text_align == TextAlign::Left { px(0.) } else { -CURSOR_WIDTH };
+    /// Whether the text takes a wheel event moving by `delta` from the
+    /// scroll areas around it: it has room to scroll along the axis the
+    /// event mostly moves on. Unlike [`Self::overflows_along`], an event that
+    /// moves on neither axis, such as a gesture's start or end, goes to text
+    /// that can scroll vertically.
+    pub(super) fn takes_scroll(&self, delta: Point<Pixels>) -> bool {
+        if delta.y.abs() >= delta.x.abs() {
+            self.overflows_vertically()
+        } else {
+            self.scroll_size.width > self.input_bounds.size.width
+        }
+    }
 
-        let safe_y_range = (-self.scroll_size.height + self.input_bounds.size.height).min(px(0.0))..px(0.);
-        let safe_x_range = (-self.scroll_size.width + self.input_bounds.size.width + safe_x_offset)
-            .min(safe_x_offset)..px(0.);
+    /// Whether the text has room to scroll along the axis `delta` mostly
+    /// moves on. A trackpad swipe drifts a little off its axis, so the drift
+    /// alone does not claim the scroll.
+    fn overflows_along(&self, delta: Point<Pixels>) -> bool {
+        if delta.y.abs() >= delta.x.abs() {
+            delta.y != px(0.) && self.overflows_vertically()
+        } else {
+            self.scroll_size.width > self.input_bounds.size.width
+        }
+    }
 
-        offset.y =
-            if self.is_single_line() { px(0.) } else { offset.y.clamp(safe_y_range.start, safe_y_range.end) };
-        offset.x = offset.x.clamp(safe_x_range.start, safe_x_range.end);
-        if self.scroll_handle.offset() != offset {
-            self.scroll_handle.set_offset(offset);
+    /// Whether multi-line text is taller than the input.
+    fn overflows_vertically(&self) -> bool {
+        self.is_multi_line()
+            && self.content_height_f64() > f64::from(f32::from(self.input_bounds.size.height))
+    }
+
+    pub(super) fn effective_scroll_y_f64(&self) -> f64 {
+        let handle_y = self.scroll_handle.offset().y;
+        if handle_y != self.last_synced_handle_y.get() {
+            f64::from(f32::from(handle_y))
+        } else {
+            self.scroll_y_f64
+        }
+    }
+
+    pub(super) fn update_scroll_offset_parts(
+        &mut self,
+        mut x: Pixels,
+        mut y_f64: f64,
+        cx: &mut Context<Self>,
+    ) {
+        let content_height_f64 = self.content_height_f64();
+        let viewport_height_f64 = f64::from(f32::from(self.input_bounds.size.height));
+        y_f64 = if self.is_single_line() {
+            0.0
+        } else {
+            super::element::clamp_vertical_scroll_offset_f64(
+                y_f64,
+                content_height_f64,
+                viewport_height_f64,
+            )
+        };
+        x = clamp_horizontal_scroll_offset(
+            x,
+            self.scroll_size.width,
+            self.input_bounds.size.width,
+            self.text_align,
+        );
+        let handle_y = px(y_f64 as f32);
+        let prev_handle = self.scroll_handle.offset();
+        let y_changed = (self.scroll_y_f64 - y_f64).abs() > f64::EPSILON
+            || self.last_synced_handle_y.get() != handle_y
+            || prev_handle.y != handle_y;
+        self.scroll_y_f64 = y_f64;
+        self.last_synced_handle_y.set(handle_y);
+        let next_handle = point(x, handle_y);
+        if prev_handle != next_handle || y_changed {
+            if prev_handle != next_handle {
+                self.scroll_handle.set_offset(next_handle);
+            }
             cx.notify();
         }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn update_scroll_offset(
+        &mut self,
+        offset: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let (x, y_f64) = match offset {
+            Some(offset) => (offset.x, f64::from(f32::from(offset.y))),
+            None => (self.scroll_handle.offset().x, self.effective_scroll_y_f64()),
+        };
+        self.update_scroll_offset_parts(x, y_f64, cx);
     }
 
     /// Scroll to make the given offset visible.
@@ -2356,29 +3210,37 @@ impl<M: InputModeKind> InputBaseState<M> {
         };
 
         let mut scroll_offset = self.scroll_handle.offset();
-        let was_offset = scroll_offset;
+        let was_y_f64 = self.effective_scroll_y_f64();
         let line_height = last_layout.line_height;
 
         let point = self.text.offset_to_point(offset);
 
         let row = point.row;
 
-        // Calculate row offset by multiplying the number of lines before it with the line height
-        let mut row_offset_y = line_height * self.display_map.buffer_line_to_display_row(row);
+        // Resolve the wrapped row even when the target is outside the last layout.
+        let display_row = self
+            .display_map
+            .offset_to_display_row(offset, self.line_end_affinity_at(offset));
+        let line_height_f64 = f64::from(f32::from(line_height));
+        let row_offset_y_f64 = line_height_f64 * (display_row as f64);
 
         // For Right alignment use 0 margin: the cursor indicator is clamped inside bounds
-        // in layout_cursor, so shifting the text here would cause a first-click visual jump.
+        // in layout_cursors, so shifting the text here would cause a first-click visual jump.
         let safety_margin = match last_layout.text_align {
             TextAlign::Left => RIGHT_MARGIN,
             TextAlign::Right => px(0.),
             TextAlign::Center => CURSOR_WIDTH,
         };
-        if let Some(line) = last_layout.lines.get(row.saturating_sub(last_layout.visible_range.start)) {
-            // Check to scroll horizontally and soft wrap lines
-            if let Some(pos) = line.position_for_index(point.column, last_layout, false) {
+        if let Some(vi) = last_layout
+            .visible_buffer_lines
+            .iter()
+            .position(|&line| line == row)
+        {
+            let line = &last_layout.lines[vi];
+            let local_offset = offset.saturating_sub(last_layout.visible_line_byte_offsets[vi]);
+            if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
                 let bounds_width = bounds.size.width - last_layout.line_number_width;
                 let col_offset_x = pos.x;
-                row_offset_y += pos.y;
                 if col_offset_x - safety_margin < -scroll_offset.x {
                     // If the position is out of the visible area, scroll to make it visible
                     scroll_offset.x = -col_offset_x + safety_margin;
@@ -2389,41 +3251,47 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
 
         // Scroll the row into view. Use the same edge clearance helper as
-        // `TextElement::layout_cursor` so both scroll-into-view paths agree
+        // `TextElement::layout_cursors` so both scroll-into-view paths agree
         // (a mismatch flickered on `Down` at end-of-buffer with a small
         // `cursor_surrounding_lines` override).
-        let edge_height = if matches!(padding, ScrollPadding::SurroundingLines) && self.is_code_editor() {
-            super::element::cursor_surrounding_padding(
-                self.mode.is_auto_grow(),
-                self.cursor_surrounding_lines,
-                last_layout.visible_range.len(),
-                line_height,
-            )
-        } else {
-            line_height
-        };
-        if row_offset_y - edge_height + line_height < -scroll_offset.y {
-            // Scroll up
-            scroll_offset.y = -row_offset_y + edge_height - line_height;
-        } else if row_offset_y + edge_height > -scroll_offset.y + bounds.size.height {
-            // Scroll down
-            scroll_offset.y = -(row_offset_y - bounds.size.height + edge_height);
-        }
+        let edge_height =
+            if matches!(padding, ScrollPadding::SurroundingLines) && self.is_code_editor() {
+                super::element::cursor_surrounding_padding(
+                    self.mode.is_auto_grow(),
+                    self.cursor_surrounding_lines,
+                    super::element::viewport_visible_lines(bounds.size.height, line_height),
+                    line_height,
+                )
+            } else {
+                px(0.)
+            };
+        let mut target_y_f64 = super::element::reveal_row_f64(
+            was_y_f64,
+            row_offset_y_f64,
+            line_height_f64,
+            f64::from(f32::from(bounds.size.height)),
+            f64::from(f32::from(edge_height)),
+        );
 
         // Avoid necessary scroll, when it was already in the correct position.
         if direction == Some(MoveDirection::Up) {
-            scroll_offset.y = scroll_offset.y.max(was_offset.y);
+            target_y_f64 = target_y_f64.max(was_y_f64);
         } else if direction == Some(MoveDirection::Down) {
-            scroll_offset.y = scroll_offset.y.min(was_offset.y);
+            target_y_f64 = target_y_f64.min(was_y_f64);
         }
 
         // Clamp the deferred target into the same safe range that
         // `update_scroll_offset` enforces on persist, so paint never shows an
         // over-scrolled frame before the post-paint clamp pulls it back.
-        let safe_y_min = (-self.scroll_size.height + self.input_bounds.size.height).min(px(0.));
+        target_y_f64 = super::element::clamp_vertical_scroll_offset_f64(
+            target_y_f64,
+            self.content_height_f64(),
+            f64::from(f32::from(self.input_bounds.size.height)),
+        );
         scroll_offset.x = scroll_offset.x.min(px(0.));
-        scroll_offset.y = scroll_offset.y.clamp(safe_y_min, px(0.));
+        scroll_offset.y = px(target_y_f64 as f32);
         self.deferred_scroll_offset = Some(scroll_offset);
+        self.deferred_scroll_y_f64 = Some(target_y_f64);
         cx.notify();
     }
 
@@ -2445,6 +3313,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selections.iter().all(|sel| sel.is_empty()) {
+            // Nothing selected here: let Root copy the window's text selection.
+            cx.propagate();
+            return;
+        }
         if !self.is_copyable() {
             return;
         }
@@ -2471,17 +3344,70 @@ impl<M: InputModeKind> InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
-        let Some(clipboard) = cx.read_from_clipboard() else {
+        if let Some(clipboard) = cx.read_from_clipboard() {
+            self.insert_clipboard(clipboard, window, cx);
+            return;
+        }
+        // The synchronous read is empty on platforms whose clipboard is
+        // asynchronous and permission-gated (the web), so fall back to the
+        // real read. It has to start here, still inside the user activation
+        // that dispatched `Paste`, or the browser refuses the read.
+        let read = cx.read_from_clipboard_async();
+        let target = self.paste_target();
+        cx.spawn_in(window, async move |this, cx| match read.await {
+            Ok(Some(clipboard)) => {
+                this.update_in(cx, |this, window, cx| {
+                    // The read can sit behind a permission prompt for as
+                    // long as the user likes. If they edited, moved the
+                    // caret or left the input meanwhile, the paste would
+                    // land where they no longer mean it to; drop it, as the
+                    // browser's own paste event only reaches the focused
+                    // input too.
+                    if this.is_editable()
+                        && this.focus_handle.is_focused(window)
+                        && this.paste_target() == target
+                    {
+                        this.insert_clipboard(clipboard, window, cx);
+                    }
+                })
+                .ok();
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!("failed to read the clipboard for paste: {error}"),
+        })
+        .detach();
+    }
+
+    /// Where a paste would go right now: the document as edited so far and
+    /// the selections it would replace. Two equal targets mean an edit made
+    /// for one still applies to the other.
+    fn paste_target(&self) -> PasteTarget {
+        PasteTarget {
+            document_revision: self.document_revision,
+            selections: self.selections.iter().copied().collect(),
+        }
+    }
+
+    /// Inserts the clipboard text the way `Paste` does: one atomic edit,
+    /// newlines dropped on a single-line input, one line per selection when
+    /// the counts match on a multi-line one. A clipboard without text (an
+    /// image, say) is left alone rather than replacing the selection with
+    /// nothing.
+    fn insert_clipboard(
+        &mut self,
+        clipboard: ClipboardItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut new_text) = clipboard.text().filter(|text| !text.is_empty()) else {
             return;
         };
-        let mut new_text = clipboard.text().unwrap_or_default();
         // A paste is one atomic edit, never part of a typing run.
         self.undo_manager.set_pending_intent(EditIntent::Atomic);
 
         if !self.is_multi_line() {
             new_text = new_text.replace('\n', "");
             self.replace_text_in_range_silent(None, &new_text, window, cx);
-            self.scroll_to(self.cursor(), None, cx);
             return;
         }
 
@@ -2535,6 +3461,23 @@ impl<M: InputModeKind> InputBaseState<M> {
         selection
     }
 
+    /// Whether an edit rewrites the character before a collapsed cursor, as the
+    /// macOS Korean IME does on each keystroke instead of marking text.
+    fn rewrites_typed_char(
+        &self,
+        selection: CursorSelection,
+        range: &Range<usize>,
+        old_text: &str,
+        new_text: &str,
+    ) -> bool {
+        !self.silent_replace_text
+            && selection.is_collapsed()
+            && selection.cursor_offset() == range.end
+            && old_text.chars().count() == 1
+            && !old_text.contains(['\n', '\r'])
+            && !new_text.contains(['\n', '\r'])
+    }
+
     fn push_history(
         &mut self,
         text: &Rope,
@@ -2544,6 +3487,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         selection_before: CursorSelection,
         selection_after: Option<CursorSelection>,
     ) -> bool {
+        self.document_revision = self.document_revision.wrapping_add(1);
+        let token_delta = self.edit_tokens(range, new_text.len());
         if self.undo_manager.is_ignoring() {
             return false;
         }
@@ -2557,6 +3502,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 && old_text.is_empty()
                 && !new_text.is_empty()
                 && !new_text.contains(['\n', '\r'])
+                || self.rewrites_typed_char(selection_before, &range, &old_text, new_text)
             {
                 EditIntent::Typing
             } else {
@@ -2568,8 +3514,9 @@ impl<M: InputModeKind> InputBaseState<M> {
         let selection_after = selection_after.unwrap_or_else(|| (new_range.end..new_range.end).into());
 
         let open_transaction = self.undo_manager.has_open_transaction();
-        let recorded =
-            self.undo_manager.record_transaction(Change::new(range, &old_text, new_range, new_text), intent);
+        let mut change = Change::new(range, &old_text, new_range, new_text);
+        change.token_delta = token_delta;
+        let recorded = self.undo_manager.record_transaction(change, intent);
         // A batch records its own cursor sets. This covers a change that is a
         // transaction on its own.
         if recorded && !open_transaction {
@@ -2579,36 +3526,71 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        self.undo_manager.set_ignoring(true);
-        // The manager hands the changes back in reverse application order.
-        if let Some(replay) = self.undo_manager.undo() {
-            for change in &replay.changes {
-                let range_utf16 = self.range_to_utf16(&change.new_range.into());
-                self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
-            }
-            self.restore_selections(replay.selections);
-            self.mode.restore_auto_closed_pairs(replay.auto_closed_pairs.unwrap_or_default());
-        }
-        self.undo_manager.set_ignoring(false);
+        self.replay_history(true, window, cx);
     }
 
     pub(super) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        self.replay_history(false, window, cx);
+    }
+
+    fn replay_history(&mut self, undo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_editable() {
+            return;
+        }
+        let replay = if undo {
+            self.undo_manager.undo()
+        } else {
+            self.undo_manager.redo()
+        };
+        let Some(replay) = replay else {
+            return;
+        };
+        let token_aware = self.inline_tokens.is_some()
+            || replay
+                .changes
+                .iter()
+                .any(|change| change.token_delta.is_some());
+        let emit_events = self.emit_events;
+        if token_aware {
+            self.emit_events = false;
+            self.last_input_edits.clear();
+        }
+        self.replaying_history = token_aware;
         self.undo_manager.set_ignoring(true);
-        // Redo replays in forward application order.
-        if let Some(replay) = self.undo_manager.redo() {
-            for change in &replay.changes {
-                let range_utf16 = self.range_to_utf16(&change.old_range.into());
-                self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
-            }
-            self.restore_selections(replay.selections);
-            self.mode.restore_auto_closed_pairs(replay.auto_closed_pairs.unwrap_or_default());
+        for change in &replay.changes {
+            let (range, text) = if undo {
+                (change.new_range.into(), &change.old_text)
+            } else {
+                (change.old_range.into(), &change.new_text)
+            };
+            let range_utf16 = self.range_to_utf16(&range);
+            self.replace_text_in_range_silent(Some(range_utf16), text, window, cx);
+            self.replay_tokens(&range, text.len(), change.token_delta.as_deref(), undo);
+        }
+        self.restore_selections(replay.selections);
+        self.mode
+            .restore_auto_closed_pairs(replay.auto_closed_pairs.unwrap_or_default());
+        if token_aware {
+            // Token replay bypasses IME normalization; a stale marked range
+            // would otherwise describe text that no longer exists.
+            self.ime_marked_range = None;
         }
         self.undo_manager.set_ignoring(false);
+        self.replaying_history = false;
+        self.emit_events = emit_events;
+        if token_aware {
+            if emit_events {
+                self.emit_change(cx);
+            } else {
+                self.last_input_edits.clear();
+            }
+        }
+        cx.notify();
     }
 
     /// Restore a set of selections captured in a transaction, clamping offsets
-    /// to the current text length. `None` leaves the current selections as the
-    /// replay left them.
+    /// to the current text length and out of tokens. `None` leaves the current
+    /// selections as the replay left them.
     fn restore_selections(&mut self, selections: Option<Vec<CursorSelection>>) {
         let Some(selections) = selections else {
             return;
@@ -2618,13 +3600,29 @@ impl<M: InputModeKind> InputBaseState<M> {
         let restored: Vec<CursorSelection> = selections
             .into_iter()
             .map(|mut sel| {
-                sel.start = sel.start.min(len);
-                sel.end = sel.end.min(len);
+                let (start, end) = (sel.start.min(len), sel.end.min(len));
+                let start_bias = if start == end {
+                    Bias::Right
+                } else {
+                    Bias::Left
+                };
+                sel.start = self.token_boundary(start, start_bias);
+                sel.end = self.token_boundary(end, Bias::Right);
                 sel
             })
             .collect();
         self.selections.replace_all(restored);
         self.selections.merge_overlapping();
+    }
+
+    /// Get byte offset of the text under the pointer at the right-click that last opened
+    /// the context menu.
+    ///
+    /// A right-click inside the selection keeps the selection and the cursor, so a custom
+    /// context menu reads this to find the word under the pointer. The offset is the
+    /// UTF-8 offset.
+    pub fn context_menu_offset(&self) -> Option<usize> {
+        self.context_menu_offset
     }
 
     /// Get byte offset of the cursor.
@@ -2651,6 +3649,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Sets the active selection to the given range, keeping its `reversed`
     /// and `column_anchor` state untouched.
     pub(super) fn set_selection(&mut self, start: usize, end: usize) {
+        let range = self.normalize_token_range(start..end);
+        let (start, end) = (range.start, range.end);
         let active = self.active_selection_mut();
         active.start = start;
         active.end = end;
@@ -2659,6 +3659,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Collapses the active selection to a cursor at the given offset,
     /// clearing `reversed`.
     pub(super) fn set_cursor_to(&mut self, offset: usize) {
+        let offset = self.token_boundary(offset, Bias::Right);
         let active = self.active_selection_mut();
         active.start = offset;
         active.end = offset;
@@ -2672,7 +3673,9 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     /// Current scroll offset of the editor viewport.
     pub fn scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
-        self.scroll_handle.offset()
+        let mut offset = self.scroll_handle.offset();
+        offset.y = px(self.effective_scroll_y_f64() as f32);
+        offset
     }
 
     /// Set scroll offset of the editor viewport.
@@ -2680,7 +3683,39 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// The offset will be clamped to the valid range, and applied after the next layout.
     pub fn set_scroll_offset(&mut self, offset: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
         self.deferred_scroll_offset = Some(offset);
+        self.deferred_scroll_y_f64 = Some(f64::from(f32::from(offset.y)));
         cx.notify();
+    }
+
+    /// Authoritative vertical scroll offset in `f64` pixels (`<= 0.0`).
+    pub fn scroll_y_f64(&self) -> f64 {
+        self.effective_scroll_y_f64()
+    }
+
+    /// Set vertical scroll offset in `f64` pixels without `f32` quantization.
+    pub fn set_scroll_y_f64(&mut self, y: f64, cx: &mut Context<Self>) {
+        let x = self
+            .deferred_scroll_offset
+            .map_or_else(|| self.scroll_handle.offset().x, |offset| offset.x);
+        self.deferred_scroll_offset = Some(point(x, px(y as f32)));
+        self.deferred_scroll_y_f64 = Some(y);
+        cx.notify();
+    }
+
+    /// Scroll vertically by `delta_y` in `f64` pixels without `f32` quantization.
+    pub fn scroll_by_y_f64(&mut self, delta_y: f64, cx: &mut Context<Self>) {
+        let current_x = self.scroll_handle.offset().x;
+        let next_y = self.effective_scroll_y_f64() + delta_y;
+        self.update_scroll_offset_parts(current_x, next_y, cx);
+    }
+
+    /// Authoritative vertical scrollable content height in `f64` pixels.
+    pub fn content_height_f64(&self) -> f64 {
+        if self.scroll_height_f64 > 0.0 {
+            self.scroll_height_f64
+        } else {
+            f64::from(f32::from(self.scroll_size.height))
+        }
     }
 
     /// Laid-out line height; `None` before first layout.
@@ -2699,6 +3734,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         (*self.selections.active()).into()
     }
 
+    /// Whether the active selection's caret is at the start of its range.
+    ///
+    /// Collapsed selections are not reversed. Use this with [`Self::selected_range`]
+    /// and [`Self::set_selected_range_with_direction`] to restore a selection.
+    pub fn is_selection_reversed(&self) -> bool {
+        let selection = self.selections.active();
+        !selection.is_empty() && selection.reversed
+    }
+
     pub fn select_all(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.break_transaction_coalescing();
         self.selections.remove_all_but_active();
@@ -2711,14 +3755,82 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Non-empty ranges expand to character boundaries. Empty ranges remain empty and are
     /// clipped to the preceding character boundary.
     pub fn set_selected_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
-        let end_bias = if range.start == range.end { Bias::Left } else { Bias::Right };
+        self.set_selected_range_with_direction(range, false, cx);
+    }
+
+    /// Set the selected UTF-8 byte range and the active caret direction.
+    ///
+    /// With `reversed`, the caret is at the start and the anchor is at the end.
+    /// Empty ranges collapse to a caret regardless of direction. Range clipping,
+    /// token boundaries and removal of additional cursors follow
+    /// [`Self::set_selected_range`].
+    pub fn set_selected_range_with_direction(
+        &mut self,
+        range: Range<usize>,
+        reversed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let range = self.normalize_token_range(range);
+        let end_bias = if range.start == range.end {
+            Bias::Left
+        } else {
+            Bias::Right
+        };
         let start = self.text.clip_offset(range.start, Bias::Left);
         let end = self.text.clip_offset(range.end, end_bias);
 
-        self.move_to(start, None, cx);
+        let (anchor, head) = if reversed { (end, start) } else { (start, end) };
+        self.move_to(anchor, None, cx);
         self.active_selection_mut().reversed = false;
         self.selected_word_range = None;
-        self.select_to(end, cx);
+        self.select_to(head, cx);
+    }
+
+    /// Add `range` as an additional selection, keeping the existing ones —
+    /// the programmatic equivalent of Alt-clicking another cursor into the
+    /// text.
+    ///
+    /// The range is clipped to the text and expanded to character
+    /// boundaries, like [`Self::set_selected_range`]. A range already
+    /// covered by a selection adds nothing. Overlapping selections are merged.
+    /// On a single-line input there is no second cursor to add, so the call
+    /// replaces the selection instead.
+    /// The view scrolls to the new selection.
+    pub fn add_selection(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        if !self.is_multi_line() {
+            self.set_selected_range(range, cx);
+            return;
+        }
+
+        let range = self.normalize_token_range(range);
+        let end_bias = if range.start == range.end {
+            Bias::Left
+        } else {
+            Bias::Right
+        };
+        let start = self.cursor_boundary(range.start, Bias::Left);
+        // Match set_selected_range: expand UTF-8 boundaries first, then place
+        // the selection endpoint without splitting a CRLF newline.
+        let end = self.cursor_boundary(self.text.clip_offset(range.end, end_bias), Bias::Left);
+
+        for sel in self.selections.iter() {
+            if sel.start <= start && end <= sel.end {
+                return;
+            }
+        }
+
+        self.undo_manager.break_transaction_coalescing();
+        self.selected_word_range = None;
+        self.pause_blink_cursor(cx);
+        M::hide_context_menu(self, cx);
+        M::clear_inline_completion(self, cx);
+        let id = self.selections.generate_id();
+        let mut selection = CursorSelection::new(id, start, end);
+        selection.column_anchor = self.preferred_column_for(end);
+        self.selections.add(selection);
+        self.selections.merge_overlapping();
+        self.scroll_to(end, None, cx);
+        cx.notify();
     }
 
     /// Resolve a mouse position to a byte offset in the text.
@@ -2747,7 +3859,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Only a columnar selection needs the third value; everywhere else a position past
     /// the end of a row means the end of that row, and
     /// [`Self::index_for_mouse_position`] is the call to make.
-    fn resolve_mouse_position(&self, position: Point<Pixels>) -> (usize, bool, usize) {
+    pub(super) fn resolve_mouse_position(&self, position: Point<Pixels>) -> (usize, bool, usize) {
         // If the text is empty, always return 0
         if self.text.len() == 0 {
             return (0, false, 0);
@@ -2772,7 +3884,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // - included the scroll offset.
         let inner_position = position - bounds.origin - point(line_number_width, px(0.));
 
-        let mut y_offset = last_layout.visible_top;
+        let mut row_offset: isize = 0;
         // Position relative to the last line walked, kept for a pointer that ends up
         // below every line.
         let mut last_line_pos = None;
@@ -2782,6 +3894,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             last_layout.lines.iter().zip(last_layout.visible_buffer_lines.iter()).enumerate()
         {
             let line_start_offset = last_layout.visible_line_byte_offsets[vi];
+            let y_offset = last_layout.local_row_y(row_offset);
 
             // Calculate line origin for this display row
             let line_origin = point(px(0.), y_offset);
@@ -2808,24 +3921,28 @@ impl<M: InputModeKind> InputBaseState<M> {
                 return (self.resolve_index(line_start_offset), false, 0);
             }
 
-            y_offset += line_layout.size(line_height).height;
+            row_offset += line_layout.wrapped_lines.len() as isize;
             last_line_pos = Some(pos);
         }
 
-        // Mouse is below all visible lines, return end of text. A columnar selection
-        // still needs how far right the pointer was, so measure it against the last
-        // line rather than reporting a block that collapses at the bottom edge.
-        let columns_past_line_end = last_layout
+        // Clamp to the last laid-out row. Returning the end of the whole document
+        // would select unseen text before drag autoscroll has reached it.
+        let last_position = last_layout
             .lines
             .last()
             .zip(last_line_pos)
-            .map(|(line_layout, pos)| {
+            .zip(last_layout.visible_line_byte_offsets.last())
+            .map(|((line_layout, pos), line_start)| {
                 let last_row_top = (line_layout.size(line_height).height - line_height).max(px(0.));
-                line_layout.columns_past_line_end(point(pos.x, last_row_top), last_layout)
-            })
-            .unwrap_or(0);
+                let pos = point(pos.x, last_row_top);
+                (
+                    self.resolve_index(line_start + line_layout.len()),
+                    false,
+                    line_layout.columns_past_line_end(pos, last_layout),
+                )
+            });
 
-        (self.text.len(), false, columns_past_line_end)
+        last_position.unwrap_or((self.text.len(), false, 0))
     }
 
     /// Map a display byte index back to a text offset, undoing the mask expansion when the input
@@ -2892,6 +4009,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         let offset = self.cursor_boundary(offset, Bias::Left);
         let word_range = self.selected_word_range;
         Self::extend_selection(self.active_selection_mut(), offset, word_range);
+        let range = self.normalize_token_range(self.selected_range());
+        self.set_selection(range.start, range.end);
 
         if self.active_selection().is_empty() {
             self.update_preferred_column();
@@ -2906,28 +4025,52 @@ impl<M: InputModeKind> InputBaseState<M> {
         f: impl Fn(&Self, &CursorSelection) -> usize,
         cx: &mut Context<Self>,
     ) {
+        self.select_all_cursors_to_with_affinity(|s, sel| (f(s, sel), false), false, cx);
+    }
+
+    /// Extend selections with caret affinity, preserving their column anchors even
+    /// when vertical movement collapses a selection to a cursor.
+    fn select_all_cursors_to_with_affinity(
+        &mut self,
+        f: impl Fn(&Self, &CursorSelection) -> (usize, bool),
+        preserve_column: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.pause_blink_cursor(cx);
         self.undo_manager.break_transaction_coalescing();
         M::clear_inline_completion(self, cx);
 
+        let mut active_affinity = false;
         let new_selections: Vec<CursorSelection> = self
             .selections
             .iter()
             .map(|sel| {
-                let offset = self.cursor_boundary(f(self, sel), Bias::Left);
+                let (offset, affinity) = f(self, sel);
+                if sel.id == self.active_selection().id {
+                    active_affinity = affinity;
+                }
+                let offset = self.cursor_boundary(offset, Bias::Left);
                 let mut new_sel = *sel;
                 Self::extend_selection(&mut new_sel, offset, None);
+                let range = self.normalize_token_range(new_sel.start..new_sel.end);
+                new_sel.start = range.start;
+                new_sel.end = range.end;
+                if !preserve_column {
+                    new_sel.column_anchor =
+                        self.preferred_column_for_with_affinity(new_sel.cursor_offset(), affinity);
+                } else if new_sel.column_anchor.is_none() {
+                    new_sel.column_anchor = self.preferred_column_for_with_affinity(
+                        sel.cursor_offset(),
+                        self.line_end_affinity_for(sel),
+                    );
+                }
                 new_sel
             })
             .collect();
-        // Resolve targets using the old caret affinity before clearing it.
-        self.cursor_line_end_affinity = false;
+        self.cursor_line_end_affinity = active_affinity;
         self.selections.replace_all(new_selections);
         self.selections.merge_overlapping();
 
-        if self.active_selection().is_empty() {
-            self.update_preferred_column();
-        }
         self.scroll_to(self.cursor(), None, cx);
         cx.notify()
     }
@@ -2989,7 +4132,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn cursor_boundary(&self, offset: usize, bias: Bias) -> usize {
-        let offset = self.text.clip_offset(offset, bias);
+        let offset = self.token_boundary(self.text.clip_offset(offset, bias), bias);
         let mut cursor = GraphemeCursor::new(offset, self.text.len(), true);
         let (mut chunk, mut start) = self.text.chunk(offset);
         let mut seeking = false;
@@ -3019,12 +4162,13 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn previous_boundary(&self, offset: usize) -> usize {
-        let offset = self.cursor_boundary(offset.saturating_sub(1), Bias::Left);
+        let offset =
+            self.cursor_boundary(previous_grapheme_boundary(&self.text, offset), Bias::Left);
         self.clamp_offset_to_visible_backward(offset)
     }
 
     pub(super) fn next_boundary(&self, offset: usize) -> usize {
-        let offset = self.cursor_boundary(offset.saturating_add(1), Bias::Right);
+        let offset = self.cursor_boundary(next_grapheme_boundary(&self.text, offset), Bias::Right);
         self.clamp_offset_to_visible_forward(offset)
     }
 
@@ -3088,10 +4232,13 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     fn on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_mouse_gesture(cx);
+        self.revealed_viewport = None;
         if M::is_context_menu_open(self, cx) {
             return;
         }
 
+        M::hide_context_menu(self, cx);
         self.undo_manager.break_transaction_coalescing();
 
         // NOTE: Do not cancel select, when blur.
@@ -3100,6 +4247,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         M::clear_hover_state(self, cx);
         self.diagnostic_popover = None;
         M::clear_inline_completion(self, cx);
+        self.dismiss_touch_selection(cx);
         self.blink_cursor.update(cx, |cursor, cx| {
             cursor.stop(cx);
         });
@@ -3150,12 +4298,26 @@ impl<M: InputModeKind> InputBaseState<M> {
         });
     }
 
+    pub(super) fn cancel_mouse_gesture(&mut self, cx: &mut Context<Self>) {
+        let was_dragging = self.selecting || self.column_select_start.is_some();
+        self.selecting = false;
+        self.column_select_start = None;
+        self.auto_scroll.stop();
+        if was_dragging {
+            cx.notify();
+        }
+    }
+
     pub(super) fn on_drag_move(
         &mut self,
         event: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.cancel_mouse_gesture(cx);
+            return;
+        }
         if self.text.len() == 0 {
             return;
         }
@@ -3186,8 +4348,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             // Input's ScrollHandle uses negative-y-is-down; negate the positive-towards-bottom delta.
             let scroll_delta = delta.map(|d| -d);
             self.auto_scroll.set(scroll_delta, cx, |delta, state, cx| {
-                let current = state.scroll_handle.offset();
-                state.update_scroll_offset(Some(point(current.x, current.y + delta)), cx);
+                state.scroll_by_y_f64(f64::from(f32::from(delta)), cx);
                 if let Some(pos) = state.auto_scroll.last_drag_position {
                     let (offset, line_end_affinity, columns_past_line_end) =
                         state.resolve_mouse_position(pos);
@@ -3207,15 +4368,18 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// For number inputs (with [`MaskPattern::Number`]), this converts
     /// full-width number characters into their ASCII equivalents,
     /// e.g. `12。5` -> `12.5`.
-    fn normalize_input<'a>(&self, new_text: &'a str) -> Cow<'a, str> {
+    ///
+    /// A single-line input drops line breaks and tabs: a one-line field has
+    /// no line to break and no column to indent, and a tab in it is invisible.
+    pub(super) fn normalize_input<'a>(&self, new_text: &'a str) -> Cow<'a, str> {
         let normalized = if matches!(self.mask_pattern, MaskPattern::Number { .. }) {
             normalize_number_input(new_text)
         } else {
             Cow::Borrowed(new_text)
         };
 
-        if self.is_single_line() && normalized.contains(['\n', '\r']) {
-            Cow::Owned(normalized.replace(['\n', '\r'], ""))
+        if self.is_single_line() && normalized.contains(['\n', '\r', '\t']) {
+            Cow::Owned(normalized.replace(['\n', '\r', '\t'], ""))
         } else {
             normalized
         }
@@ -3373,11 +4537,33 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
+        // Every edit invalidates provider responses for the previous document,
+        // including deletion and indentation which do not trigger completion.
+        M::hide_context_menu(self, cx);
+        M::clear_inline_completion(self, cx);
+
         // Sort descending by start so applying front-of-vec first edits the
         // highest offsets first, leaving lower offsets unchanged.
-        let mut sorted: Vec<(Range<usize>, &str)> =
-            edits.iter().map(|(range, text)| (range.clone(), text.as_str())).collect();
+        let mut sorted: Vec<(Range<usize>, &str)> = edits
+            .iter()
+            .map(|(range, text)| (self.normalize_token_range(range.clone()), text.as_str()))
+            .collect();
         sorted.sort_by_key(|edit| std::cmp::Reverse(edit.0.start));
+        if !self.token_spans().is_empty() {
+            let mut merged: Vec<(Range<usize>, &str)> = Vec::with_capacity(sorted.len());
+            for (range, text) in sorted {
+                if let Some(last) = merged
+                    .last_mut()
+                    .filter(|last| range.end > last.0.start || range == last.0)
+                {
+                    last.0.start = range.start.min(last.0.start);
+                    last.0.end = range.end.max(last.0.end);
+                } else {
+                    merged.push((range, text));
+                }
+            }
+            sorted = merged;
+        }
 
         #[cfg(debug_assertions)]
         for pair in sorted.windows(2) {
@@ -3414,6 +4600,16 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         let auto_closed_pairs_before = self.mode.auto_closed_pairs().clone();
         let mut recorded = false;
+        // Several edits reach the highlighter as one batch, so it reparses
+        // once for the change instead of once per edit.
+        let mut highlighter_edits = Vec::new();
+        // Token-aware history replay applies several replacements but emits one
+        // `Change` at the end, so its edits accumulate instead of being
+        // discarded with each silent replacement.
+        let accumulate_replay_edits = self.replaying_history && !self.emit_events;
+        if !accumulate_replay_edits {
+            self.last_input_edits.clear();
+        }
         for (range, new_text) in &sorted {
             let old_text = self.text.clone();
             self.mode.adjust_auto_closed_pair(range, new_text.len());
@@ -3424,25 +4620,55 @@ impl<M: InputModeKind> InputBaseState<M> {
                 self.push_history(&old_text, range, new_text, requested_intent, selection_before, None);
 
             // Incremental, single-range updates must run per edit.
-            self.display_map.adjust_folds_for_edit(&old_text, range, new_text);
-            self.display_map.on_text_changed(&self.text, range, &Rope::from(*new_text), cx);
+            self.display_map
+                .adjust_folds_for_edit(&old_text, range, new_text);
+            if *range == (0..old_text.len()) {
+                self.adopt_gutter_wrap_width(&old_text, window);
+            }
+            self.display_map
+                .on_text_changed(&self.text, range, &Rope::from(*new_text), cx);
 
-            self.mode.update_highlighter(
-                super::mode::HighlighterUpdate {
-                    selected_range: range,
-                    old_text: &old_text,
-                    new_text: &self.text,
-                    change_text: new_text,
-                    force: true,
-                },
-                window,
-                cx,
-            );
+            let edit = super::mode::replacement_input_edit(&old_text, &self.text, range, new_text);
+            if self.emit_events || self.replaying_history {
+                self.last_input_edits.push((edit, self.text.clone()));
+            }
 
-            self.update_fold_candidates_incremental(range, new_text);
+            if group {
+                if self.is_code_editor() {
+                    highlighter_edits.push((edit, self.text.clone()));
+                }
+            } else {
+                self.mode.update_highlighter(
+                    super::mode::HighlighterUpdate {
+                        selected_range: range,
+                        old_text: &old_text,
+                        new_text: &self.text,
+                        change_text: new_text,
+                        force: true,
+                        input_edit: Some(edit),
+                    },
+                    window,
+                    cx,
+                );
+
+                self.update_fold_candidates_incremental(range, new_text);
+            }
         }
 
         if group {
+            self.mode
+                .update_highlighter_batch::<M>(&highlighter_edits, window, cx);
+
+            // Fold candidates are read from the reparsed document, so each
+            // edit is located where it ended up once every edit was applied.
+            // `sorted` runs from the highest offset down.
+            let mut shift = 0isize;
+            for (range, new_text) in sorted.iter().rev() {
+                let start = (range.start as isize + shift) as usize;
+                self.update_fold_candidates_incremental(&(start..start), new_text);
+                shift += new_text.len() as isize - range.len() as isize;
+            }
+
             self.undo_manager.commit_transaction();
         }
 
@@ -3500,13 +4726,34 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         self.ime_marked_range.take();
         self.update_preferred_column();
+        self.dismiss_touch_selection(cx);
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
         }
         if self.emit_events {
-            cx.emit(InputEvent::Change);
+            self.emit_change(cx);
         }
         cx.notify();
+    }
+
+    /// Replacing the whole text can change how many digits the line-number gutter shows, and so
+    /// the wrap width the next layout picks. Adopting that width before the new text is wrapped
+    /// saves wrapping all of it again at that layout.
+    fn adopt_gutter_wrap_width(&mut self, old_text: &Rope, window: &mut Window) {
+        let Some(wrap_width) = self.display_map.wrap_width() else {
+            return;
+        };
+        let old_digits = line_number_len(old_text.lines_len());
+        let new_digits = line_number_len(self.text.lines_len());
+        if !self.mode.line_number() || old_digits == new_digits {
+            return;
+        }
+        let (font, font_size) = self.display_map.font();
+        let font = font.clone();
+        let old_width = line_number_digits_width(old_digits, font.clone(), font_size, window);
+        let new_width = line_number_digits_width(new_digits, font, font_size, window);
+        self.display_map
+            .prepare_wrap_width(wrap_width - (new_width - old_width));
     }
 
     /// Update fold candidates from tree-sitter syntax tree (full extraction).
@@ -3556,6 +4803,10 @@ impl<M: InputModeKind> InputBaseState<M> {
 }
 
 impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
+    fn accepts_text_input(&self, window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        self.focus_handle.is_focused(window)
+    }
+
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -3564,7 +4815,13 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         _cx: &mut Context<Self>,
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
-        adjusted_range.replace(self.range_to_utf16(&range));
+        let range_utf16 = self.range_to_utf16(&range);
+        let utf16_len = range_utf16.len();
+        adjusted_range.replace(range_utf16);
+        if self.masked {
+            // Keep the redacted text aligned with the platform's UTF-16 range.
+            return Some(MASK_CHAR.to_string().repeat(utf16_len));
+        }
         Some(self.text.slice(range).to_string())
     }
 
@@ -3574,16 +4831,78 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        Some(UTF16Selection { range: self.range_to_utf16(&self.selected_range()), reversed: false })
+        Some(UTF16Selection {
+            range: self.range_to_utf16(&self.selected_range()),
+            reversed: self.active_selection().reversed,
+        })
     }
 
-    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
-        self.ime_marked_range.map(|range| self.range_to_utf16(&range.into()))
+    /// The whole document's length in UTF-16 units.
+    ///
+    /// Platforms use this to learn that the handler has a document at all:
+    /// the iOS backend only makes the view first responder, and so only shows
+    /// the on-screen keyboard, when it can tell the document's range.
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.offset_to_utf16(self.text.len()))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    /// Select the given range, as the platform's own text UI asks when it
+    /// drives the selection: a native selection handle, or the macOS IME.
+    ///
+    /// The end that moved becomes the cursor, so dragging the start handle
+    /// leaves a reversed selection and keeps the moving end in view. Text and
+    /// undo history are left alone.
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.selected_range();
+        let was_reversed = self.active_selection().reversed;
+        let range = self.range_from_utf16(&range_utf16);
+        let range = range.start.min(range.end)..range.start.max(range.end);
+        self.set_selected_range(range, cx);
+
+        let range = self.selected_range();
+        let reversed = if range == previous {
+            was_reversed
+        } else if !range.is_empty() && range.end == previous.start {
+            true
+        } else if !range.is_empty() && range.start == previous.end {
+            false
+        } else {
+            !range.is_empty() && range.start != previous.start && range.end == previous.end
+        };
+        self.active_selection_mut().reversed = reversed;
+        self.scroll_to(self.cursor(), None, cx);
+        cx.notify();
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.ime_marked_range
+            .map(|range| self.range_to_utf16(&range.into()))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.ime_marked_range = None;
         self.undo_manager.commit_transaction();
+        // Unmarking keeps the preedit as committed text, which marked edits
+        // never reported. Android keyboards compose every word and often end
+        // with only this call (hiding the keyboard, moving the caret).
+        if self.ime_original_text.as_ref() == Some(&self.text) {
+            self.ime_original_text = None;
+        } else if self.ime_original_text.is_some() && self.emit_events {
+            self.emit_change(cx);
+        }
     }
 
     /// Replace text in range.
@@ -3611,7 +4930,11 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         // NOTE: The normalization keeps the UTF-16 length, but may change the
         // UTF-8 byte length, so all the byte-offset calculations below must
         // use the normalized text.
-        let new_text = self.normalize_input(new_text);
+        let new_text = if self.replaying_history {
+            Cow::Borrowed(new_text)
+        } else {
+            self.normalize_input(new_text)
+        };
         let new_text: &str = &new_text;
 
         let range = range_utf16
@@ -3622,6 +4945,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
                 self.range_from_utf16(&range)
             }))
             .unwrap_or(self.selected_range());
+        let range = self.normalize_token_range(range);
 
         // Skip-over as a pure cursor move: a typed closer that already follows
         // the cursor moves past it without touching text or history, so Undo
@@ -3695,6 +5019,13 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
 
         // Single-line path
         let old_text = self.text.clone();
+        // Token-aware history replay applies several replacements but emits one
+        // `Change` at the end, so its edits accumulate instead of being
+        // discarded with each silent replacement.
+        let accumulate_replay_edits = self.replaying_history && !self.emit_events;
+        if !accumulate_replay_edits {
+            self.last_input_edits.clear();
+        }
         self.mode.adjust_auto_closed_pair(&range, new_text.len());
         self.text.replace(range.clone(), new_text);
 
@@ -3711,12 +5042,16 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             // Only reject the edit if the old text was valid, to avoid
             // trapping a pre-existing invalid text (e.g. a `default_value`
             // that does not conform), the user can still edit to fix it.
-            if !self.is_valid_input(&pending_text, cx) && self.is_valid_input(&old_text.to_string(), cx) {
+            if !self.replaying_history
+                && !self.validated_token_edit
+                && !self.is_valid_input(&pending_text, cx)
+                && self.is_valid_input(&old_text.to_string(), cx)
+            {
                 self.text = old_text;
                 return;
             }
 
-            if !self.mask_pattern.is_none() {
+            if !self.replaying_history && !self.mask_pattern.is_none() {
                 let mask_text = self.mask_pattern.mask(&pending_text);
                 mask_changed = mask_text.as_str() != pending_text;
                 self.text = Rope::from(mask_text.as_str());
@@ -3754,6 +5089,15 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         self.display_map.adjust_folds_for_edit(&old_text, &range, new_text);
         self.display_map.on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
 
+        let edit = if mask_changed {
+            Self::full_input_edit(&old_text, &self.text)
+        } else {
+            super::mode::replacement_input_edit(&old_text, &self.text, &range, new_text)
+        };
+        if self.emit_events || self.replaying_history {
+            self.last_input_edits.push((edit, self.text.clone()));
+        }
+
         self.mode.update_highlighter::<M>(
             super::mode::HighlighterUpdate {
                 selected_range: &range,
@@ -3761,6 +5105,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
                 new_text: &self.text,
                 change_text: &new_text,
                 force: true,
+                input_edit: Some(edit),
             },
             window,
             cx,
@@ -3781,6 +5126,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
         self.update_preferred_column();
         self.update_search(cx);
+        self.dismiss_touch_selection(cx);
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
         }
@@ -3788,7 +5134,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             M::on_text_typed(self, &range, &new_text, window, cx);
         }
         if self.emit_events {
-            cx.emit(InputEvent::Change);
+            self.emit_change(cx);
         }
         cx.notify();
     }
@@ -3810,6 +5156,9 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
 
         let starts_composition = self.ime_marked_range.is_none();
         if starts_composition {
+            // Even a canceled preedit separates the typing gestures on either
+            // side; its no-op transaction must not reconnect those gestures.
+            self.undo_manager.break_transaction_coalescing();
             self.undo_manager.begin_transaction();
         }
 
@@ -3819,7 +5168,11 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         M::reset_language_features(self);
 
         // See the same NOTE in `replace_text_in_range`.
-        let new_text = self.normalize_input(new_text);
+        let new_text = if self.replaying_history {
+            Cow::Borrowed(new_text)
+        } else {
+            self.normalize_input(new_text)
+        };
         let new_text: &str = &new_text;
 
         let range = range_utf16
@@ -3830,16 +5183,24 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
                 self.range_from_utf16(&range)
             }))
             .unwrap_or(self.selected_range());
+        let range = self.normalize_token_range(range);
 
         let auto_closed_pairs_before = self.mode.auto_closed_pairs().clone();
         let old_text = self.text.clone();
+        // Marked text does not emit `InputEvent::Change`, so no edit belongs to
+        // the most recent change after it.
+        self.last_input_edits.clear();
         self.mode.adjust_auto_closed_pair(&range, new_text.len());
         self.text.replace(range.clone(), new_text);
 
         if self.is_single_line() {
             let pending_text = self.text.to_string();
             // See the same NOTE in `replace_text_in_range`.
-            if !self.is_valid_input(&pending_text, cx) && self.is_valid_input(&old_text.to_string(), cx) {
+            if !self.replaying_history
+                && !self.validated_token_edit
+                && !self.is_valid_input(&pending_text, cx)
+                && self.is_valid_input(&old_text.to_string(), cx)
+            {
                 self.text = old_text;
                 if starts_composition {
                     self.undo_manager.commit_transaction();
@@ -3848,6 +5209,9 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             }
         }
 
+        if self.ime_original_text.is_none() {
+            self.ime_original_text = Some(old_text.clone());
+        }
         M::adjust_annotations(self, &range, new_text.len());
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
@@ -3863,6 +5227,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
                 new_text: &self.text,
                 change_text: &new_text,
                 force: true,
+                input_edit: None,
             },
             window,
             cx,
@@ -3923,38 +5288,56 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         let mut start_origin = None;
         let mut end_origin = None;
         let line_number_origin = point(line_number_width, px(0.));
-        let mut y_offset = last_layout.visible_top;
+        let mut row_offset: isize = 0;
+
+        let start_row = self
+            .text
+            .offset_to_point(range.start.min(self.text.len()))
+            .row;
+        let end_row = self
+            .text
+            .offset_to_point(range.end.min(self.text.len()))
+            .row;
 
         for (vi, line) in last_layout.lines.iter().enumerate() {
             if start_origin.is_some() && end_origin.is_some() {
                 break;
             }
 
+            let y_offset = last_layout.local_row_y(row_offset);
+            let buffer_line = last_layout.visible_buffer_lines[vi];
             let index_offset = last_layout.visible_line_byte_offsets[vi];
 
-            if start_origin.is_none() {
-                if let Some(p) =
-                    line.position_for_index(range.start.saturating_sub(index_offset), last_layout, false)
-                {
-                    start_origin = Some(p + point(px(0.), y_offset));
-                }
+            if start_origin.is_none() && buffer_line == start_row {
+                let local_offset = range.start.saturating_sub(index_offset).min(line.len());
+                let p = line
+                    .position_for_index(local_offset, last_layout, false)
+                    .unwrap_or_else(|| point(px(0.), px(0.)));
+                start_origin = Some(p + point(px(0.), y_offset));
             }
 
-            if end_origin.is_none() {
-                if let Some(p) =
-                    line.position_for_index(range.end.saturating_sub(index_offset), last_layout, false)
-                {
-                    end_origin = Some(p + point(px(0.), y_offset));
-                }
+            if end_origin.is_none() && buffer_line == end_row {
+                let local_offset = range.end.saturating_sub(index_offset).min(line.len());
+                let p = line
+                    .position_for_index(local_offset, last_layout, false)
+                    .unwrap_or_else(|| point(px(0.), px(0.)));
+                end_origin = Some(p + point(px(0.), y_offset));
             }
 
-            y_offset += line.size(line_height).height;
+            row_offset += line.wrapped_lines.len() as isize;
         }
 
-        let start_origin = start_origin.unwrap_or_default();
-        let mut end_origin = end_origin.unwrap_or_default();
+        let start_origin = start_origin.or_else(|| {
+            let offset = self.last_cursor.or(Some(self.cursor()))?;
+            let (_, _, origin) = self.line_and_position_for_offset(offset);
+            origin.map(|origin| origin - line_number_origin)
+        })?;
+        let mut end_origin = end_origin.unwrap_or(start_origin);
         // Ensure at same line.
         end_origin.y = start_origin.y;
+        if end_origin.x <= start_origin.x {
+            end_origin.x = start_origin.x + px(1.);
+        }
 
         Some(Bounds::from_corners(
             bounds.origin + line_number_origin + start_origin,
@@ -3970,16 +5353,31 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let last_layout = self.last_layout.as_ref()?;
-        let line_point = self.last_bounds?.localize(&point)?;
+        // The same origin as `resolve_mouse_position`: past the gutter, at the first
+        // visible line.
+        let inner_point = self.last_bounds?.localize(&point)?
+            - gpui::point(last_layout.line_number_width, last_layout.visible_top);
 
+        let mut row_offset: usize = 0;
         for (vi, line) in last_layout.lines.iter().enumerate() {
             let offset = last_layout.visible_line_byte_offsets[vi];
+            let line_top = last_layout.line_height * (row_offset as f32);
+            let line_point = inner_point - gpui::point(px(0.), line_top);
             if let Some(utf8_index) = line.index_for_position(line_point, last_layout) {
-                return Some(self.offset_to_utf16(offset + utf8_index));
+                return Some(self.offset_to_utf16(self.resolve_index(offset + utf8_index)));
             }
+            row_offset += line.wrapped_lines.len();
         }
 
         None
+    }
+
+    fn text_input_configuration(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> TextInputConfiguration {
+        InputBaseState::text_input_configuration(self)
     }
 }
 
@@ -3991,10 +5389,31 @@ impl<M: InputModeKind> Focusable for InputBaseState<M> {
 
 impl<M: InputModeKind> Render for InputBaseState<M> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_with_line_numbers((), window, cx)
+    }
+}
+
+impl<M: InputModeKind> InputBaseState<M> {
+    pub(crate) fn render_with_line_numbers<R: EditorLineNumberRenderer>(
+        &mut self,
+        line_number_renderer: R,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Before anything reads it: the element resolves this style during
         // layout and paint, and both happen after this call in the same frame.
         self.editor_style = self.projected_editor_style.resolved(&crate::Theme::global(cx).tokens);
         let entity = cx.entity();
+        let exposed_text = self
+            .accessibility
+            .as_ref()
+            .is_some_and(|accessibility| {
+                accessibility.value_exposed
+                    && !self.masked
+                    && (window.is_a11y_active() || cfg!(feature = "test-support"))
+            })
+            .then(|| self.text.to_string());
+        let text_runs = self.accessibility_text_runs(exposed_text.as_deref(), window);
         if self._pending_update {
             self.mode.update_highlighter::<M>(
                 super::mode::HighlighterUpdate {
@@ -4003,6 +5422,7 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                     new_text: &self.text,
                     change_text: "",
                     force: false,
+                    input_edit: None,
                 },
                 window,
                 cx,
@@ -4014,9 +5434,42 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
         }
 
         let element = div()
-            .id("input-state")
+            .id(EDITOR_ELEMENT_ID)
             .key_context(CONTEXT)
-            .track_focus(&self.focus_handle)
+            .when_some(self.accessibility.as_ref(), |this, accessibility| {
+                this.when_some(accessibility.role, |this, role| this.role(role))
+                    .when_some(accessibility.label.clone(), |this, label| {
+                        this.aria_label(label)
+                    })
+                    .when_some(accessibility.placeholder.clone(), |this, placeholder| {
+                        this.aria_placeholder(placeholder)
+                    })
+                    .when_some(accessibility.accessibility_id.clone(), |this, id| {
+                        this.accessibility_id(id)
+                    })
+                    .when_some(exposed_text, |this, text| this.aria_value(text))
+                    .when_some(text_runs, |this, runs| {
+                        this.a11y_synthetic_children(move |builder| runs.push(builder))
+                    })
+                    .on_a11y_action(gpui::AccessibleAction::Focus, {
+                        let entity = entity.clone();
+                        move |_, window, cx| {
+                            entity.update(cx, |state, cx| {
+                                state.handle_accessibility_focus(window, cx)
+                            });
+                        }
+                    })
+                    .when(self.is_editable(), |this| {
+                        this.on_a11y_action(gpui::AccessibleAction::SetValue, {
+                            let entity = entity.clone();
+                            move |data, window, cx| {
+                                entity.update(cx, |state, cx| {
+                                    state.handle_accessibility_set_value(data, window, cx)
+                                });
+                            }
+                        })
+                    })
+            })
             .when(self.is_editable(), |this| {
                 this.on_action(window.listener_for(&entity, InputBaseState::backspace))
                     .on_action(window.listener_for(&entity, InputBaseState::delete))
@@ -4065,6 +5518,31 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
             .on_action(window.listener_for(&entity, InputBaseState::select_to_start))
             .on_action(window.listener_for(&entity, InputBaseState::select_to_end))
             .on_action(window.listener_for(&entity, InputBaseState::show_character_palette))
+            .on_action({
+                let entity = entity.clone();
+                move |_: &ActivateToken, window, cx| {
+                    let state = entity.read(cx);
+                    let activation = state
+                        .token_spans()
+                        .iter()
+                        .find(|span| span.range() == state.selected_range())
+                        .and_then(|span| {
+                            state.range_to_bounds(&span.range()).and_then(|bounds| {
+                                state.token_activation(
+                                    span.range().start,
+                                    bounds,
+                                    gpui::ClickEvent::Keyboard(gpui::KeyboardClickEvent {
+                                        bounds,
+                                        ..Default::default()
+                                    }),
+                                )
+                            })
+                        });
+                    if let Some((listener, event)) = activation {
+                        listener(&event, window, cx);
+                    }
+                }
+            })
             .on_action(window.listener_for(&entity, InputBaseState::copy))
             .on_action(window.listener_for(&entity, InputBaseState::on_action_search))
             .on_action(window.listener_for(&entity, InputBaseState::on_action_replace))
@@ -4073,7 +5551,7 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
             .on_mouse_up(MouseButton::Left, window.listener_for(&entity, InputBaseState::on_mouse_up))
             .on_mouse_up(MouseButton::Right, window.listener_for(&entity, InputBaseState::on_mouse_up))
             .on_mouse_move(window.listener_for(&entity, InputBaseState::on_mouse_move))
-            .on_scroll_wheel(window.listener_for(&entity, InputBaseState::on_scroll_wheel))
+            .on_scroll(window.listener_for(&entity, InputBaseState::on_scroll_wheel))
             .when(self.is_multi_line() && !self.disabled, |this| {
                 this.on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
             })
@@ -4085,7 +5563,18 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                 }
             })
             .flex_1()
-            .when(self.is_multi_line(), |this| this.h_full())
+            // A single line fills the frame and sits at its vertical center,
+            // so the frame needs no layout of its own to hold it. It is never
+            // shorter than its line, though: this root clips (overflow-x
+            // hidden clips both axes), and a frame whose padding leaves less
+            // than a line, like Component's Input, would cut off descenders.
+            .map(|this| {
+                if self.is_multi_line() {
+                    this.h_full()
+                } else {
+                    this.min_h_full().flex().items_center()
+                }
+            })
             .flex_grow_1()
             .overflow_x_hidden()
             .when(self.is_multi_line(), |this| {
@@ -4094,12 +5583,20 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                     .pb(self.editor_paddings.bottom)
                     .pl(self.editor_paddings.left)
             })
-            .child(TextElement::new(entity.clone()).placeholder(self.placeholder.clone()))
-            .when(self.shows_scrollbar(), |this| this.child(EditorScrollbar::new(entity.clone())));
+            .child(
+                TextElement::new(entity.clone())
+                    .with_line_number_renderer(line_number_renderer)
+                    .placeholder(self.placeholder.clone()),
+            )
+            .when(self.shows_scrollbar(), |this| {
+                this.child(EditorScrollbar::new(entity.clone()))
+            });
 
         // Actions only one mode handles are registered by that mode, where
         // `Self` is concrete enough to name its own entity type.
         M::register_actions(element, &entity, window)
+            .test_support()
+            .track_focus(&self.focus_handle)
     }
 }
 
@@ -4107,10 +5604,1207 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn test_set_value_waits_for_the_first_layout(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (state, cx) = cx.add_window_view(|window, cx| {
+            let mut state = crate::input::InputState::new(window, cx);
+            state.set_value("hello", window, cx);
+            // Made outside drawing, the state only has a placeholder font to shape with.
+            assert_eq!(state.display_map().wrap_row_count(), 0);
+            state
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.value(), "hello");
+            assert_eq!(state.display_map().wrap_row_count(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn accessibility_actions_recheck_live_editability(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (state, cx) = cx.add_window_view(|window, cx| {
+            crate::input::InputState::new(window, cx).default_value("initial")
+        });
+        let changes = Rc::new(Cell::new(0));
+        let observed = changes.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&state, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::Change) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.handle_accessibility_set_value(None, window, cx);
+                state.handle_accessibility_focus(window, cx);
+                assert!(state.focus_handle.is_focused(window));
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(state.read_with(cx, |state, _| state.value()), "initial");
+        assert_eq!(changes.get(), 0);
+
+        let action = gpui::accesskit::ActionData::Value("updated🦀".into());
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.handle_accessibility_set_value(Some(&action), window, cx)
+            });
+        });
+        assert_eq!(state.read_with(cx, |state, _| state.value()), "updated🦀");
+        assert_eq!(changes.get(), 1);
+        for disabled in [false, true] {
+            cx.update(|window, cx| {
+                window.blur(cx);
+                state.update(cx, |state, cx| {
+                    state.set_disabled(disabled, cx);
+                    state.set_readonly(!disabled, cx);
+                    state.handle_accessibility_focus(window, cx);
+                    assert_eq!(state.focus_handle.is_focused(window), !disabled);
+                    let rejected = gpui::accesskit::ActionData::Value("rejected".into());
+                    state.handle_accessibility_set_value(Some(&rejected), window, cx);
+                });
+            });
+            assert_eq!(state.read_with(cx, |state, _| state.value()), "updated🦀");
+            assert_eq!(changes.get(), 1);
+        }
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_disabled(false, cx);
+                state.set_readonly(false, cx);
+                state.handle_accessibility_focus(window, cx);
+            });
+            window.draw(cx).clear(cx);
+            window.dispatch_action(Box::new(Undo), cx);
+        });
+        assert_eq!(state.read_with(cx, |state, _| state.value()), "initial");
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_masked(true, window, cx);
+                state.handle_accessibility_set_value(Some(&action), window, cx);
+            });
+        });
+        assert_eq!(state.read_with(cx, |state, _| state.value()), "updated🦀");
+    }
+
+    #[gpui::test]
+    fn accessibility_set_value_preserves_exact_editor_text(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            crate::input::EditorState::new(window, cx).language("rust")
+        });
+        let action = gpui::accesskit::ActionData::Value("(".into());
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.handle_accessibility_set_value(Some(&action), window, cx)
+            });
+        });
+        assert_eq!(editor.read_with(cx, |editor, _| editor.value()), "(");
+    }
+
+    #[gpui::test]
+    fn revealing_a_password_keeps_text_assistance_disabled(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            let state = cx.new(|cx| crate::input::InputState::new(window, cx).masked(true));
+            let hidden = state.read(cx).text_input_configuration();
+            assert!(!hidden.autocorrect && !hidden.suggestions);
+            assert_eq!(hidden.autocapitalize, Autocapitalize::None);
+
+            // The component's reveal button uses this same state transition.
+            state.update(cx, |state, cx| state.toggle_masked(window, cx));
+            assert_eq!(state.read(cx).text_input_configuration(), hidden);
+            state.update(cx, |state, cx| state.toggle_masked(window, cx));
+            assert_eq!(state.read(cx).text_input_configuration(), hidden);
+            gpui::EmptyView
+        });
+    }
+
+    #[gpui::test]
+    fn text_input_configuration_follows_the_input(cx: &mut TestAppContext) {
+        use crate::input::{InputState, TextareaState};
+
+        cx.update(crate::init);
+        let mut states = None;
+        cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            states = Some((
+                cx.new(|cx| InputState::new(window, cx)),
+                cx.new(|cx| InputState::new(window, cx).masked(true)),
+                cx.new(|cx| TextareaState::new(window, cx)),
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .input_action(TextInputAction::Search)
+                        .autocorrect(true)
+                        .autocapitalize(Autocapitalize::Words)
+                }),
+            ));
+            gpui::EmptyView
+        });
+        let (plain, masked, textarea, search) = states.unwrap();
+
+        cx.read(|cx| {
+            assert_eq!(
+                plain.read(cx).text_input_configuration(),
+                TextInputConfiguration {
+                    input_action: TextInputAction::Done,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(
+                masked.read(cx).text_input_configuration(),
+                TextInputConfiguration {
+                    input_action: TextInputAction::Done,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(
+                textarea.read(cx).text_input_configuration(),
+                TextInputConfiguration {
+                    input_action: TextInputAction::Enter,
+                    ..Default::default()
+                }
+            );
+            let search = search.read(cx).text_input_configuration();
+            assert_eq!(search.input_action, TextInputAction::Search);
+            assert_eq!(search.autocapitalize, Autocapitalize::Words);
+            assert!(search.autocorrect);
+            assert!(search.suggestions);
+        });
+    }
+
+    #[gpui::test]
+    fn test_multicursor_unicode_completion_uses_post_edit_start(cx: &mut TestAppContext) {
+        use crate::input::{CompletionProvider, EditorState};
+        use gpui::Task;
+        use lsp_types::{CompletionContext, CompletionResponse};
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        struct Provider {
+            starts: RefCell<Vec<usize>>,
+            queries: RefCell<Vec<(usize, String)>>,
+        }
+
+        impl CompletionProvider for Provider {
+            fn is_completion_trigger(&self, offset: usize, _: &str, _: &mut App) -> bool {
+                self.starts.borrow_mut().push(offset);
+                true
+            }
+
+            fn completions(
+                &self,
+                _: &Rope,
+                offset: usize,
+                trigger: CompletionContext,
+                _: &mut Window,
+                _: &mut App,
+            ) -> Task<anyhow::Result<CompletionResponse>> {
+                self.queries
+                    .borrow_mut()
+                    .push((offset, trigger.trigger_character.unwrap()));
+                Task::ready(Ok(CompletionResponse::Array(vec![])))
+            }
+        }
+
+        cx.update(crate::init);
+        let mut editor = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            editor = Some(cx.new(|cx| EditorState::new(window, cx).default_value("aa")));
+            gpui::EmptyView
+        });
+        let editor = editor.unwrap();
+        let provider = Rc::new(Provider::default());
+        window
+            .update(cx, |_, window, cx| {
+                editor.update(cx, |state, cx| {
+                    state.extras.lsp.completion_provider = Some(provider.clone());
+                    state
+                        .extras
+                        .context_menu_content
+                        .completion
+                        .trigger_start_offset = Some(0);
+                    state.extras.context_menu_content.completion.query = "aa".into();
+                    state.set_cursor_to(1);
+                    state.add_cursor_at(0, cx);
+
+                    state.replace_text_in_range(None, "中", window, cx);
+
+                    assert_eq!(state.value(), "中a中a");
+                    assert_eq!(provider.starts.borrow().as_slice(), &[4]);
+                    assert_eq!(provider.queries.borrow().as_slice(), &[(7, "中".into())]);
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn selected_range_restores_unicode_direction_without_splitting_characters(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::input::EditorState;
+        cx.update(crate::init);
+        cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            let _state = cx.new(|cx| {
+                let mut state = EditorState::new(window, cx).default_value("中😀a");
+                state.set_selected_range_with_direction(3..8, true, cx);
+                let selected = state.selected_text_range(false, window, cx).unwrap();
+                assert_eq!(selected.range, 1..4);
+                assert!(selected.reversed);
+                assert_eq!(state.selected_range(), 3..8);
+                assert!(state.is_selection_reversed());
+                let range = state.selected_range();
+                let reversed = state.is_selection_reversed();
+                state.set_selected_range_with_direction(range, reversed, cx);
+                assert!(state.is_selection_reversed());
+                state.set_selected_range(3..8, cx);
+                let selected = state.selected_text_range(false, window, cx).unwrap();
+                assert_eq!(selected.range, 1..4);
+                assert!(!selected.reversed);
+                assert!(!state.is_selection_reversed());
+                // A reversed Rust Range remains empty for existing callers.
+                state.set_selected_range(Range { start: 8, end: 3 }, cx);
+                assert_eq!(state.selected_range(), 8..8);
+                assert!(!state.is_selection_reversed());
+                state.set_selected_range_with_direction(4..4, true, cx);
+                assert!(!state.is_selection_reversed());
+                assert_eq!(
+                    state.selected_text_range(false, window, cx).unwrap().range,
+                    1..1
+                );
+                state
+            });
+            gpui::EmptyView
+        });
+    }
+
+    #[gpui::test]
+    fn test_set_tokens_keeps_text_selection_and_history(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenError, InputContent};
+        let view = InputView::build_textarea(cx, |state| state.default_value("a **b** c"));
+        let bold = |text: &str| {
+            InputContent::new(text.to_string())
+                .with_token(2..7, InlineToken::new("bold", "**b**"))
+                .unwrap()
+        };
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.set_selected_range(9..9, cx);
+                    state.insert("!", window, cx);
+                    state.set_selected_range(9..9, cx);
+                    state.set_tokens(bold("a **b** c!"), cx).unwrap();
+                    assert_eq!(state.value(), "a **b** c!");
+                    assert_eq!(state.selected_range(), 9..9);
+                    assert_eq!(state.tokens().len(), 1);
+
+                    assert_eq!(
+                        state.set_tokens(bold("a **b** c"), cx),
+                        Err(InlineTokenError::TextMismatch)
+                    );
+                    state
+                        .set_tokens(InputContent::new("a **b** c!"), cx)
+                        .unwrap();
+                    assert!(state.tokens().is_empty());
+                    state.set_selected_range(4..4, cx);
+                    assert_eq!(
+                        state.set_tokens(bold("a **b** c!"), cx),
+                        Err(InlineTokenError::SplitsSelection)
+                    );
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), "a **b** c");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_set_tokens_rejects_a_token_through_any_cursor(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenError, InputContent};
+        let view = InputView::build_textarea(cx, |state| state.default_value("a **b** c"));
+        view.window_handle
+            .update(cx, |_, _, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.set_selected_range(9..9, cx);
+                    let id = state.selections.generate_id();
+                    state.selections.add(CursorSelection::new(id, 4, 4));
+                    let content = InputContent::new("a **b** c")
+                        .with_token(2..7, InlineToken::new("bold", "**b**"))
+                        .unwrap();
+                    assert_eq!(
+                        state.set_tokens(content, cx),
+                        Err(InlineTokenError::SplitsSelection)
+                    );
+                    assert!(state.tokens().is_empty());
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_set_tokens_undo_redo_replays_edits_inside_and_before_a_token(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InputContent};
+        let view = InputView::build_textarea(cx, |state| state.default_value("a **** c"));
+        let bold = |text: &str, range: Range<usize>| {
+            InputContent::new(text.to_string())
+                .with_token(range, InlineToken::new("bold", "**b**"))
+                .unwrap()
+        };
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.set_selected_range(4..4, cx);
+                    state.insert("b", window, cx);
+                    state.set_selected_range(9..9, cx);
+                    state.set_tokens(bold("a **b** c", 2..7), cx).unwrap();
+
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), "a **** c");
+                    assert!(state.tokens().is_empty());
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.value(), "a **b** c");
+                    assert!(state.tokens().is_empty());
+                    assert_eq!(state.selected_range(), 5..5);
+
+                    state.set_selected_range(0..0, cx);
+                    state.insert("z", window, cx);
+                    state.set_selected_range(10..10, cx);
+                    state.set_tokens(bold("za **b** c", 3..8), cx).unwrap();
+
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), "a **b** c");
+                    let ranges: Vec<_> = state.tokens().iter().map(|s| s.range()).collect();
+                    assert_eq!(ranges, vec![2..7]);
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.value(), "za **b** c");
+                    let ranges: Vec<_> = state.tokens().iter().map(|s| s.range()).collect();
+                    assert_eq!(ranges, vec![3..8]);
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_set_tokens_refreshes_the_token_layout(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InputContent};
+        let view = InputView::build_textarea(cx, |state| state.default_value("@a x @a y"));
+        let mention = || InlineToken::new("a", "@a");
+        view.window_handle
+            .update(cx, |_, _, cx| {
+                view.input.update(cx, |state, cx| {
+                    let content = InputContent::new("@a x @a y")
+                        .with_token(0..2, mention())
+                        .and_then(|content| content.with_token(5..7, mention()))
+                        .unwrap();
+                    state.set_tokens(content, cx).unwrap();
+                });
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        view.input.update(&mut visual, |state, cx| {
+            let content = InputContent::new("@a x @a y")
+                .with_token(5..7, mention())
+                .unwrap();
+            state.set_tokens(content, cx).unwrap();
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        view.input.read_with(&visual, |state, _| {
+            let cache = state.token_layout_cache.as_ref().unwrap();
+            let ranges: Vec<_> = cache
+                .metrics
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect();
+            assert_eq!(ranges, vec![5..7]);
+        });
+    }
+
+    #[gpui::test]
+    fn test_inline_token_wrap_and_size_refresh(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        let width = Rc::new(Cell::new(4000.));
+        let render_width = width.clone();
+        let view = InputView::build_textarea(cx, |state| state.rows(4).default_value("@a@b"));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(0..2, InlineToken::new("a", "@a"), window, cx)
+                        .unwrap();
+                    state
+                        .replace_range_with_token(2..4, InlineToken::new("b", "@b"), window, cx)
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default()
+                            .token(move |_, _, _| div().w(px(render_width.get()))),
+                    );
+                });
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        view.input.read_with(&visual, |state, _| {
+            assert_eq!(state.display_map.wrap_row_count(), 2);
+            let first = state.range_to_bounds(&(0..2)).unwrap();
+            let second = state.range_to_bounds(&(2..4)).unwrap();
+            assert!(second.origin.y > first.origin.y);
+            assert_eq!(
+                state.last_layout.as_ref().unwrap().lines[0].wrapped_lines[0].len,
+                2
+            );
+        });
+        width.set(100.);
+        view.input.update(&mut visual, |_, cx| cx.notify());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        view.input.read_with(&visual, |state, _| {
+            assert_eq!(state.display_map.wrap_row_count(), 1)
+        });
+    }
+
+    #[gpui::test]
+    fn test_inline_token_geometry_and_reentrant_activation(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        let view = InputView::build(cx, |state| state.default_value("before @alice after"));
+        let target = view.input.clone();
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(
+                            7..13,
+                            InlineToken::new("a", "@alice"),
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default()
+                            .token(|_, _, _| div().w(px(100.)).h(px(20.)))
+                            .on_token_click(move |_, window, cx| {
+                                target.update(cx, |state, cx| {
+                                    state.set_value("activated", window, cx)
+                                })
+                            }),
+                    );
+                    state.focus(window, cx);
+                    state.set_selected_range(7..13, cx);
+                });
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.update(|window, cx| {
+            let state = view.input.read(cx);
+            let bounds = state.range_to_bounds(&(7..13)).unwrap();
+            assert!((bounds.size.width - px(100.)).abs() < px(1.), "{bounds:?}");
+            let (left, _) = state.index_for_mouse_position(bounds.origin + point(px(10.), px(5.)));
+            let (right, _) = state.index_for_mouse_position(bounds.origin + point(px(90.), px(5.)));
+            assert_eq!((left, right), (7, 13));
+            window.dispatch_action(Box::new(ActivateToken), cx);
+        });
+        visual.run_until_parked();
+        view.input.read_with(&visual, |state, _| {
+            assert_eq!(state.value().as_ref(), "activated")
+        });
+    }
+
+    #[gpui::test]
+    fn test_inline_token_click_selects_it(cx: &mut TestAppContext) {
+        use crate::input::InlineToken;
+        cx.update(crate::init);
+        let view = InputView::build(cx, |state| state.default_value("before @alice after"));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(
+                            7..13,
+                            InlineToken::new("a", "@alice"),
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                    state.set_selected_range(0..0, cx);
+                });
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = view
+            .input
+            .read_with(&visual, |state, _| state.range_to_bounds(&(7..13)).unwrap());
+        visual.simulate_click(bounds.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        view.input.read_with(&visual, |state, _| {
+            assert_eq!(state.selected_range(), 7..13, "a click selects the token");
+        });
+    }
+
+    #[gpui::test]
+    fn test_inline_token_hover_reports_presence_without_selecting(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        use gpui::{Bounds, point, px, size};
+        cx.update(crate::init);
+        let view = InputView::build(cx, |state| state.default_value("before @alice after"));
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(20.)));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(
+                            7..13,
+                            InlineToken::new("a", "@alice"),
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default().on_token_hover(|_, _, _| {}),
+                    );
+                    state.set_selected_range(0..0, cx);
+                });
+            })
+            .unwrap();
+        view.window_handle
+            .update(cx, |_, _, cx| {
+                view.input.update(cx, |state, _| {
+                    let (_, entered) = state
+                        .token_hover(7, bounds, true, None)
+                        .expect("hover enters an enabled token");
+                    assert!(entered.is_hovered());
+                    assert_eq!(entered.token().id().as_ref(), "a");
+                    assert_eq!(entered.range(), 7..13);
+                    assert_eq!(entered.bounds(), bounds);
+                    let (_, left) = state
+                        .token_hover(7, bounds, false, None)
+                        .expect("hover leaves the same token");
+                    assert!(!left.is_hovered());
+                    assert_eq!(state.selected_range(), 0..0, "hover never selects");
+                    assert!(state.token_hover(99, bounds, true, None).is_none());
+                });
+            })
+            .unwrap();
+
+        // Disabled tokens suppress hover, matching click; readonly allows it.
+        view.window_handle
+            .update(cx, |_, _, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.set_disabled(true, cx);
+                });
+            })
+            .unwrap();
+        view.window_handle
+            .update(cx, |_, _, cx| {
+                view.input.update(cx, |state, _| {
+                    assert!(state.token_hover(7, bounds, true, None).is_none())
+                })
+            })
+            .unwrap();
+        view.window_handle
+            .update(cx, |_, _, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.set_disabled(false, cx);
+                    state.set_readonly(true, cx);
+                });
+            })
+            .unwrap();
+        view.window_handle
+            .update(cx, |_, _, cx| {
+                view.input.update(cx, |state, _| {
+                    assert!(state.token_hover(7, bounds, true, None).is_some())
+                })
+            })
+            .unwrap();
+
+        // Without a hover listener there is no hover activation.
+        view.window_handle
+            .update(cx, |_, _, cx| {
+                view.input.update(cx, |state, _| {
+                    state.set_token_presentation(InlineTokenPresentation::default());
+                });
+            })
+            .unwrap();
+        view.window_handle
+            .update(cx, |_, _, cx| {
+                view.input.update(cx, |state, _| {
+                    assert!(state.token_hover(7, bounds, true, None).is_none())
+                })
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_inline_token_hover_exit_delivered_when_token_removed(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        cx.update(crate::init);
+        let view = InputView::build(cx, |state| state.default_value("before @alice after"));
+        let events: Rc<RefCell<Vec<(SharedString, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(
+                            7..13,
+                            InlineToken::new("a", "@alice"),
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default()
+                            .token(|_, _, _| div().w(px(100.)).h(px(20.)))
+                            .on_token_hover(move |event, _, _| {
+                                sink.borrow_mut()
+                                    .push((event.token().id().clone(), event.is_hovered()));
+                            }),
+                    );
+                });
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let known_bounds = view.input.read_with(&visual, |state, _| {
+            state
+                .token_bounds
+                .get(&7)
+                .copied()
+                .expect("placed token bounds")
+        });
+        visual.simulate_mouse_move(known_bounds.center(), None, gpui::Modifiers::default());
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(events.borrow().as_slice(), &[("a".into(), true)]);
+
+        // Remove the token while the pointer is still over its stale row: the
+        // exit must fire even though the token element that owns the hover
+        // mask is gone.
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input
+                    .update(cx, |state, cx| state.set_value("no tokens", window, cx));
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[("a".into(), true), ("a".into(), false)]
+        );
+    }
+
+    #[gpui::test]
+    fn test_inline_token_hover_bounds_stay_single_row_at_wrap_boundary(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        cx.update(crate::init);
+        let view = InputView::build_textarea(cx, |state| {
+            state
+                .rows(4)
+                .default_value("aaaa bbbb cccc dddd @alice eeee ffff")
+        });
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(
+                            20..26,
+                            InlineToken::new("a", "@alice"),
+                            window,
+                            cx,
+                        )
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default()
+                            .token(|_, _, _| div().w(px(60.)).h(px(20.))),
+                    );
+                });
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let (placed, ranged, line_height) = view.input.read_with(&visual, |state, _| {
+            (
+                state
+                    .token_bounds
+                    .get(&20)
+                    .copied()
+                    .expect("placed token bounds"),
+                state.range_to_bounds(&(20..26)),
+                state.last_layout.as_ref().unwrap().line_height,
+            )
+        });
+        // The laid-out element always occupies exactly one row of height, even
+        // when the range-extent path resolves the same end boundary onto the
+        // next visual row at a soft-wrap edge.
+        assert!(placed.size.height <= line_height + px(1.), "{placed:?}");
+        assert!(
+            placed.size.width <= px(61.) && placed.size.width > px(0.),
+            "{placed:?}"
+        );
+        if let Some(ranged) = ranged {
+            assert!(
+                ranged.size.height >= placed.size.height - px(1.),
+                "{ranged:?} vs {placed:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_inline_token_hover_same_offset_replacement_exits_predecessor(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(crate::init);
+        let view = InputView::build(cx, |state| state.default_value("@alice!"));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(0..6, InlineToken::new("a", "@alice"), window, cx)
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default()
+                            .token(|_, _, _| div().w(px(100.)).h(px(20.)))
+                            .on_token_hover(move |event, _, _| {
+                                sink.borrow_mut()
+                                    .push((event.token().id().clone(), event.is_hovered()));
+                            }),
+                    );
+                });
+            })
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = view
+            .input
+            .read_with(&visual, |state, _| state.token_bounds[&0]);
+        visual.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(events.borrow().as_slice(), &[("a".into(), true)]);
+
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(0..6, InlineToken::new("b", "@alice"), window, cx)
+                        .unwrap();
+                });
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.simulate_mouse_move(
+            bounds.center() + gpui::point(px(1.), px(0.)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[("a".into(), true), ("a".into(), false), ("b".into(), true)]
+        );
+        // Disabling keeps the token mounted; re-enabling must reset GPUI's
+        // retained hover state even with a stationary pointer.
+        view.input
+            .update(&mut visual, |state, cx| state.set_disabled(true, cx));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.run_until_parked();
+        assert_eq!(events.borrow().last(), Some(&("b".into(), false)));
+        view.input
+            .update(&mut visual, |state, cx| state.set_disabled(false, cx));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual.run_until_parked();
+        visual.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+        visual.run_until_parked();
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                ("a".into(), true),
+                ("a".into(), false),
+                ("b".into(), true),
+                ("b".into(), false),
+                ("b".into(), true)
+            ]
+        );
+        visual.simulate_mouse_move(
+            bounds.bottom_right() + gpui::point(px(10.), px(10.)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        visual.run_until_parked();
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                ("a".into(), true),
+                ("a".into(), false),
+                ("b".into(), true),
+                ("b".into(), false),
+                ("b".into(), true),
+                ("b".into(), false)
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn test_inline_token_hover_older_exit_keeps_newer_snapshot(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        use gpui::{Bounds, point, px, size};
+        cx.update(crate::init);
+        let view = InputView::build(cx, |state| state.default_value("@a @b"));
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(20.)));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(0..2, InlineToken::new("a", "@a"), window, cx)
+                        .unwrap();
+                    state
+                        .replace_range_with_token(3..5, InlineToken::new("b", "@b"), window, cx)
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default().on_token_hover(|_, _, _| {}),
+                    );
+                    // The pointer moves A -> B; GPUI dispatches B's enter
+                    // before A's exit.
+                    state
+                        .token_hover(0, bounds, true, None)
+                        .expect("hover enters A");
+                    state
+                        .token_hover(3, bounds, true, None)
+                        .expect("hover enters B");
+                    let (_, exit_a) = state.token_hover(0, bounds, false, None).expect("A exits");
+                    assert!(!exit_a.is_hovered());
+                    // B's snapshot must survive A's late exit.
+                    assert_eq!(
+                        state
+                            .hovered_token
+                            .as_ref()
+                            .expect("B still hovered")
+                            .span
+                            .token()
+                            .id()
+                            .as_ref(),
+                        "b"
+                    );
+                    // Removing B afterwards still produces B's reconciled exit.
+                    state.set_value("no tokens", window, cx);
+                    state.token_bounds.clear();
+                    let (listener, exit_b) = state.reconcile_token_hover().expect("B must exit");
+                    assert!(!exit_b.is_hovered());
+                    assert_eq!(exit_b.token().id().as_ref(), "b");
+                    drop(listener);
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_inline_token_hover_late_exit_matches_replaced_token(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        cx.update(crate::init);
+        let view = InputView::build(cx, |state| state.default_value("@a"));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    let a = InlineToken::new("a", "@a");
+                    let b = InlineToken::new("b", "@a");
+                    state
+                        .replace_range_with_token(0..2, a.clone(), window, cx)
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default().on_token_hover(|_, _, _| {}),
+                    );
+                    let bounds = gpui::Bounds::default();
+                    state.token_hover(0, bounds, true, Some(&a)).unwrap();
+                    state
+                        .replace_range_with_token(0..2, b.clone(), window, cx)
+                        .unwrap();
+                    state.token_hover(0, bounds, true, Some(&b)).unwrap();
+                    let (_, exit_a) = state.token_hover(0, bounds, false, Some(&a)).unwrap();
+                    assert_eq!(exit_a.token().id().as_ref(), "a");
+                    assert_eq!(state.hovered_token.as_ref().unwrap().span.token(), &b);
+                    let (_, exit_b) = state.token_hover(0, bounds, false, Some(&b)).unwrap();
+                    assert_eq!(exit_b.token().id().as_ref(), "b");
+                    assert!(state.pending_token_hover_exits.is_empty());
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_inline_token_hover_exit_keeps_entry_utf16_after_edit(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        use gpui::EntityInputHandler as _;
+        cx.update(crate::init);
+        let view = InputView::build(cx, |state| state.default_value("🙂 @a"));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(5..7, InlineToken::new("a", "@a"), window, cx)
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default().on_token_hover(|_, _, _| {}),
+                    );
+                    let bounds = gpui::Bounds::default();
+                    let (_, enter) = state.token_hover(5, bounds, true, None).unwrap();
+                    assert_eq!(enter.range_utf16(), (3, 5));
+                    state.replace_text_in_range(Some(0..2), "abcd", window, cx);
+                    assert_eq!(state.token_spans()[0].range(), 5..7);
+                    let (_, exit) = state.token_hover(5, bounds, false, None).unwrap();
+                    assert_eq!(exit.range_utf16(), (3, 5));
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_text_length_utf16(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+        cx.update(crate::init);
+        // "🙂" is 2 UTF-16 units and 4 bytes; "й" is 1 UTF-16 unit and 2 bytes.
+        let view = InputView::build(cx, |state| state.default_value("🙂 й"));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    assert_eq!(state.text_length_utf16(window, cx), Some(4));
+                    state.replace_text_in_range(None, "ab", window, cx);
+                    assert_eq!(state.text_length_utf16(window, cx), Some(6));
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_set_selected_text_range(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+        cx.update(crate::init);
+        // "🙂" is 2 UTF-16 units and 4 bytes.
+        let view = InputView::build(cx, |state| state.default_value("🙂 hello world"));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    fn selection(
+                        state: &mut InputBaseState<InputMode>,
+                        window: &mut Window,
+                        cx: &mut Context<InputBaseState<InputMode>>,
+                    ) -> (Range<usize>, bool) {
+                        let selection = state.selected_text_range(false, window, cx).unwrap();
+                        (selection.range, selection.reversed)
+                    }
+
+                    state.set_selected_text_range(3..8, window, cx);
+                    assert_eq!(state.selected_range(), 5..10);
+                    assert_eq!(selection(state, window, cx), (3..8, false));
+
+                    // Dragging the end handle keeps the selection forward.
+                    state.set_selected_text_range(3..14, window, cx);
+                    assert_eq!(selection(state, window, cx), (3..14, false));
+                    assert_eq!(state.cursor(), 16);
+
+                    // Dragging the start handle reverses it, so the start is the cursor.
+                    state.set_selected_text_range(9..14, window, cx);
+                    assert_eq!(selection(state, window, cx), (9..14, true));
+                    assert_eq!(state.cursor(), 11);
+
+                    // A repeated range keeps its direction.
+                    state.set_selected_text_range(9..14, window, cx);
+                    assert_eq!(selection(state, window, cx), (9..14, true));
+
+                    // Out of range clamps; a backwards range is normalized.
+                    state.set_selected_text_range(100..9, window, cx);
+                    assert_eq!(selection(state, window, cx), (9..14, true));
+
+                    // Either handle can cross the stationary end.
+                    state.set_selected_text_range(3..8, window, cx);
+                    state.set_selected_text_range(2..3, window, cx);
+                    assert_eq!(selection(state, window, cx), (2..3, true));
+                    assert_eq!(state.cursor(), 4);
+                    state.set_selected_text_range(3..8, window, cx);
+                    state.set_selected_text_range(8..9, window, cx);
+                    assert_eq!(selection(state, window, cx), (8..9, false));
+                    assert_eq!(state.cursor(), 11);
+
+                    // Collapsing places a forward cursor and leaves the text alone.
+                    state.set_selected_text_range(2..2, window, cx);
+                    assert_eq!(selection(state, window, cx), (2..2, false));
+                    assert_eq!(state.value(), "🙂 hello world");
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_inline_token_hover_callback_edit_preserves_both_exits(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenPresentation};
+        cx.update(crate::init);
+        let view = InputView::build(cx, |state| state.default_value("@a @b"));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state
+                        .replace_range_with_token(0..2, InlineToken::new("a", "@a"), window, cx)
+                        .unwrap();
+                    state
+                        .replace_range_with_token(3..5, InlineToken::new("b", "@b"), window, cx)
+                        .unwrap();
+                    state.set_token_presentation(
+                        InlineTokenPresentation::default().on_token_hover(|_, _, _| {}),
+                    );
+                    let bounds = gpui::Bounds::default();
+                    state.token_hover(0, bounds, true, None).unwrap();
+                    state.token_hover(3, bounds, true, None).unwrap();
+                    // Model an edit in B's enter callback before A's queued exit.
+                    state.set_value("gone", window, cx);
+                    let (_, exit_a) = state.token_hover(0, bounds, false, None).unwrap();
+                    assert_eq!(exit_a.token().id().as_ref(), "a");
+                    let (_, exit_b) = state.reconcile_token_hover().unwrap();
+                    assert_eq!(exit_b.token().id().as_ref(), "b");
+                    assert!(state.token_hover(0, bounds, false, None).is_none());
+                    assert!(state.reconcile_token_hover().is_none());
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_inline_token_edit_history_and_validation(cx: &mut TestAppContext) {
+        let view = InputView::build(cx, |state| state.default_value("问 @alice!"));
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    let token =
+                        crate::input::InlineToken::new("alice-1", "@alice").with_label("Alice");
+                    state
+                        .replace_range_with_token(4..10, token.clone(), window, cx)
+                        .unwrap();
+                    assert_eq!(state.value().as_ref(), "问 @alice!");
+                    assert_eq!(state.tokens()[0].range(), 4..10);
+                    assert_eq!(state.next_end_of_word_at(4), 10);
+                    assert_eq!(state.previous_start_of_word_at(10), 4);
+                    state.undo(&Undo, window, cx);
+                    assert!(
+                        state.tokens().is_empty(),
+                        "identity-only association is undoable"
+                    );
+                    assert_eq!(state.value().as_ref(), "问 @alice!");
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.tokens()[0].token(), &token);
+                    state.set_selected_range(6..7, cx);
+                    assert_eq!(state.selected_range(), 4..10);
+                    state.replace("", window, cx);
+                    assert_eq!(state.value().as_ref(), "问 !");
+                    assert!(state.tokens().is_empty());
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.tokens()[0].token(), &token);
+                    state.set_selected_range(0..0, cx);
+                    state.replace("🙂", window, cx);
+                    assert_eq!(state.tokens()[0].range(), 8..14);
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.tokens()[0].range(), 4..10);
+                    let before = state.content();
+                    state
+                        .replace_range_with_token(0..0, token.clone(), window, cx)
+                        .expect("the same reference may occur twice");
+                    assert_eq!(state.value().as_ref(), "@alice问 @alice!");
+                    assert_eq!(state.tokens().len(), 2);
+                    assert_eq!(state.tokens()[1].token(), &token);
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.content(), before);
+                    state.set_value(before.text().clone(), window, cx);
+                    assert!(state.tokens().is_empty());
+                    assert!(!state.undo_manager.has_undos());
+                });
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_inline_token_textarea_ime_and_modes(cx: &mut TestAppContext) {
+        use crate::input::{InlineToken, InlineTokenError, InputContent};
+        let view = InputView::build_textarea(cx, |state| state);
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    let content = InputContent::new("@a@b\n后面")
+                        .with_token(0..2, InlineToken::new("a", "@a"))
+                        .unwrap()
+                        .with_token(2..4, InlineToken::new("b", "@b"))
+                        .unwrap();
+                    state.set_value(content.clone(), window, cx);
+                    state.set_selected_range(2..2, cx);
+                    assert_eq!(state.previous_boundary(2), 0);
+                    assert_eq!(state.next_boundary(2), 4);
+                    state.replace_and_mark_text_in_range(Some(1..2), "中", Some(1..1), window, cx);
+                    assert_eq!(state.value().as_ref(), "中@b\n后面");
+                    assert_eq!(state.tokens().len(), 1);
+                    assert_eq!(
+                        state.replace_with_token(InlineToken::new("x", "x"), window, cx),
+                        Err(InlineTokenError::CompositionActive)
+                    );
+                    state.replace_text_in_range(None, "中文", window, cx);
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.content(), content);
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.value().as_ref(), "中文@b\n后面");
+                    state.undo(&Undo, window, cx);
+                    state.replace_all("plain", window, cx);
+                    assert!(state.tokens().is_empty());
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.content(), content);
+                });
+            })
+            .unwrap();
+        let view = InputView::build(cx, |state| state);
+        view.window_handle
+            .update(cx, |_, window, cx| {
+                view.input.update(cx, |state, cx| {
+                    assert_eq!(
+                        InputContent::new("a\u{301}")
+                            .with_token(0..1, InlineToken::new("bad", "a"))
+                            .err(),
+                        Some(InlineTokenError::InvalidBoundary)
+                    );
+                    assert_eq!(
+                        InputContent::new("@a@a")
+                            .with_token(0..2, InlineToken::new("a", "@a"))
+                            .unwrap()
+                            .with_token(1..3, InlineToken::new("x", "a@"))
+                            .err(),
+                        Some(InlineTokenError::OverlappingTokens)
+                    );
+                    state
+                        .replace_with_token(InlineToken::new("a", "@a"), window, cx)
+                        .unwrap();
+                    let before = state.content();
+                    state.set_masked(true, window, cx);
+                    assert!(!state.tokens_visible());
+                    assert_eq!(
+                        state.replace_with_token(InlineToken::new("b", "b"), window, cx),
+                        Err(InlineTokenError::UnsupportedMode)
+                    );
+                    assert_eq!(state.content(), before);
+                    state.undo(&Undo, window, cx);
+                    assert!(state.tokens().is_empty());
+                    state.redo(&Redo, window, cx);
+                    assert_eq!(state.content(), before);
+                    assert!(!state.tokens_visible());
+                });
+            })
+            .unwrap();
+    }
+
     use crate::theme::Theme;
     use gpui::{TestAppContext, VisualTestContext, size};
 
-    use crate::input::{EditorMode, EditorState, InputMode, LanguageConfig, TextareaMode};
+    use crate::input::{EditorMode, EditorState, InputMode, LanguageConfig, TabSize, TextareaMode};
 
     fn set_test_syntax_provider(provider: Rc<dyn crate::input::SyntaxContextProvider>, cx: &mut App) {
         struct TestLanguages(Rc<dyn crate::input::SyntaxContextProvider>);
@@ -4160,7 +6854,10 @@ mod tests {
                 .unwrap()
             });
 
-            Self { input: input.clone().unwrap(), window_handle: window }
+            Self {
+                input: input.unwrap(),
+                window_handle: window,
+            }
         }
     }
 
@@ -4197,6 +6894,284 @@ mod tests {
         ) -> Self {
             Self::build_with(cx, move |window, cx| f(crate::input::InputState::new(window, cx)))
         }
+    }
+
+    /// Sends one trackpad packet straight to the input.
+    fn swipe<M: InputModeKind>(
+        view: &InputView<M>,
+        cx: &mut VisualTestContext,
+        dy: f32,
+        phase: gpui::TouchPhase,
+    ) {
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.on_scroll_wheel(
+                    &ScrollEvent {
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(dy))),
+                        touch_phase: phase,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+    }
+
+    fn long_text() -> String {
+        (0..60)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[gpui::test]
+    fn test_scroll_bounce_stretches_past_the_end_and_springs_back(cx: &mut TestAppContext) {
+        use gpui::TouchPhase::{Ended, Moved, Started};
+
+        let view = InputView::build_textarea(cx, |state| {
+            state.scroll_bounce(true).default_value(long_text())
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let drawn_at = |cx: &mut VisualTestContext| {
+            view.input
+                .read_with(cx, |state, _| state.last_bounds.unwrap().origin.y)
+        };
+
+        swipe(&view, &mut cx, -20., Started);
+        swipe(&view, &mut cx, -100_000., Moved);
+        let (end, stretch) = view.input.read_with(&cx, |state, _| {
+            (state.scroll_handle.offset().y, state.overscroll.offset())
+        });
+        assert!(end < px(0.), "the text scrolled to its end");
+        assert!(stretch < 0., "the rest stretched the edge: {stretch}");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let stretched_at = drawn_at(&mut cx);
+
+        swipe(&view, &mut cx, 0., Ended);
+        for _ in 0..120 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        view.input.read_with(&cx, |state, _| {
+            assert_eq!(state.overscroll.offset(), 0., "the edge sprang back");
+            assert_eq!(
+                state.scroll_handle.offset().y,
+                end,
+                "scrolling stayed exact"
+            );
+        });
+        let moved = (stretched_at - drawn_at(&mut cx)).as_f32();
+        assert!(
+            (moved - stretch).abs() < 0.001,
+            "the stretch only moved where the text was drawn: {moved} vs {stretch}"
+        );
+    }
+
+    /// Swipes far past the end of the text and returns where the text
+    /// scrolled to and how far its edge stretched.
+    fn swipe_past_the_end(
+        view: &InputView<TextareaMode>,
+        cx: &mut VisualTestContext,
+    ) -> (Pixels, f32) {
+        use gpui::TouchPhase::{Moved, Started};
+
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        swipe(view, cx, -20., Started);
+        swipe(view, cx, -100_000., Moved);
+        view.input.read_with(cx, |state, _| {
+            (state.scroll_handle.offset().y, state.overscroll.offset())
+        })
+    }
+
+    #[gpui::test]
+    fn test_scroll_bounce_stays_put_under_reduced_motion(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let view = InputView::build_textarea(cx, |state| {
+            state.scroll_bounce(true).default_value(long_text())
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let (end, stretch) = swipe_past_the_end(&view, &mut cx);
+        assert!(end < px(0.), "the text still scrolls");
+        assert_eq!(stretch, 0., "the edge does not stretch");
+    }
+
+    #[gpui::test]
+    fn test_scroll_bounce_follows_the_platform_by_default(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.default_value(long_text()));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let (end, stretch) = swipe_past_the_end(&view, &mut cx);
+        assert!(end < px(0.), "the text scrolls");
+        assert_eq!(
+            stretch != 0.,
+            crate::ScrollBounce::enabled_by_default(),
+            "the edge stretches where the platform's scroll views do"
+        );
+    }
+
+    #[gpui::test]
+    fn test_scroll_bounce_leaves_text_that_fits(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| {
+            state.scroll_bounce(true).default_value("one line")
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let (end, stretch) = swipe_past_the_end(&view, &mut cx);
+        assert_eq!((end, stretch), (px(0.), 0.));
+    }
+
+    #[gpui::test]
+    fn test_scroll_bounce_resets_when_replacement_text_fits(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| {
+            state.scroll_bounce(true).default_value(long_text())
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let (_, stretch) = swipe_past_the_end(&view, &mut cx);
+        assert!(stretch < 0.);
+        cx.update(|window, cx| {
+            view.input
+                .update(cx, |state, cx| state.set_value("short", window, cx));
+            window.draw(cx).clear(cx);
+        });
+        swipe(&view, &mut cx, 0., gpui::TouchPhase::Ended);
+        view.input.read_with(&cx, |state, _| {
+            assert_eq!(state.overscroll.offset(), 0.);
+            assert_eq!(state.scroll_handle.offset().y, px(0.));
+        });
+    }
+
+    #[gpui::test]
+    fn test_scroll_bounce_releases_when_the_end_packet_is_horizontal(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| {
+            state.scroll_bounce(true).default_value(long_text())
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let (_, stretch) = swipe_past_the_end(&view, &mut cx);
+        assert!(stretch < 0.);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.on_scroll_wheel(
+                    &ScrollEvent {
+                        delta: gpui::ScrollDelta::Pixels(point(px(1.), px(0.))),
+                        touch_phase: gpui::TouchPhase::Ended,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        for _ in 0..120 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert_eq!(
+            view.input
+                .read_with(&cx, |state, _| state.overscroll.offset()),
+            0.
+        );
+    }
+
+    #[gpui::test]
+    fn test_scroll_bounce_ordinary_mouse_wheel_does_not_stretch(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| {
+            state.scroll_bounce(true).default_value(long_text())
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            view.input.update(cx, |state, cx| {
+                state.on_scroll_wheel(
+                    &ScrollEvent {
+                        delta: gpui::ScrollDelta::Lines(point(0., -100_000.)),
+                        touch_phase: gpui::TouchPhase::Moved,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                assert!(state.scroll_handle.offset().y < px(0.));
+                assert_eq!(state.overscroll.offset(), 0.);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_scroll_bounce_new_wheel_input_interrupts_the_return(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| {
+            state.scroll_bounce(true).default_value(long_text())
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let (end, stretch) = swipe_past_the_end(&view, &mut cx);
+        assert!(stretch < 0.);
+        swipe(&view, &mut cx, 0., gpui::TouchPhase::Ended);
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(16));
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            view.input.update(cx, |state, cx| {
+                state.on_scroll_wheel(
+                    &ScrollEvent {
+                        delta: gpui::ScrollDelta::Lines(point(0., 2.)),
+                        touch_phase: gpui::TouchPhase::Moved,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                assert!(state.scroll_handle.offset().y > end);
+                assert_eq!(state.overscroll.offset(), 0.);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_turning_scroll_bounce_off_drops_the_stretch(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| {
+            state.scroll_bounce(true).default_value(long_text())
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let (_, stretch) = swipe_past_the_end(&view, &mut cx);
+        assert!(stretch < 0., "the edge stretched: {stretch}");
+        view.input
+            .update(&mut cx, |state, cx| state.set_scroll_bounce(false, cx));
+        assert_eq!(
+            view.input
+                .read_with(&cx, |state, _| state.overscroll.offset()),
+            0.
+        );
+    }
+
+    /// The frame is laid out by the application, which should not have to
+    /// center a single line inside it.
+    #[gpui::test]
+    fn single_line_is_centered_in_a_taller_frame(cx: &mut TestAppContext) {
+        struct Frame(Entity<InputBaseState<InputMode>>);
+        impl Render for Frame {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::input::InputBase::new("frame")
+                    .h(px(60.))
+                    .child(crate::input::Input::new(&self.0))
+            }
+        }
+
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            let state = cx.new(|cx| crate::input::InputState::new(window, cx).default_value("a"));
+            input = Some(state.clone());
+            Frame(state)
+        });
+        let input = input.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        input.read_with(&cx, |state, _| {
+            let line = state.input_bounds;
+            assert_eq!(line.center().y, px(30.), "line {line:?}");
+        });
     }
 
     #[test]
@@ -4436,7 +7411,7 @@ mod tests {
             .update(cx, |_, window, cx| {
                 input.update(cx, |state, cx| {
                     state.on_scroll_wheel(
-                        &ScrollWheelEvent {
+                        &ScrollEvent {
                             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
                             ..Default::default()
                         },
@@ -4457,7 +7432,7 @@ mod tests {
             .update(cx, |_, window, cx| {
                 input.update(cx, |state, cx| {
                     state.on_scroll_wheel(
-                        &ScrollWheelEvent {
+                        &ScrollEvent {
                             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
                             ..Default::default()
                         },
@@ -4468,6 +7443,112 @@ mod tests {
             })
             .unwrap();
         assert_eq!(notifications.get(), 1, "an unchanged input must stay quiet");
+    }
+
+    /// Replacing the text with one whose line numbers need another digit narrows the wrap width
+    /// by that digit up front, so the next layout does not wrap the new text a second time.
+    #[gpui::test]
+    fn replacing_the_text_wraps_at_the_width_its_line_numbers_leave(cx: &mut TestAppContext) {
+        struct Panel(Entity<crate::input::EditorState>);
+        impl Render for Panel {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.0.clone())
+            }
+        }
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(300.)), |window, cx| {
+            let state = cx.new(|cx| {
+                crate::input::EditorState::new(window, cx)
+                    .line_number(true)
+                    .soft_wrap(true)
+            });
+            input = Some(state.clone());
+            Panel(state)
+        });
+        cx.run_until_parked();
+        let input = input.unwrap();
+        let wrap_width = |cx: &mut TestAppContext| {
+            input.read_with(cx, |state, _| state.display_map.wrap_width())
+        };
+        let three_digits = wrap_width(cx).expect("a soft wrapped editor has a wrap width");
+
+        let predicted = window
+            .update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| {
+                    state.set_value("line\n".repeat(1_000), window, cx);
+                    state.display_map.wrap_width()
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert!(
+            predicted < three_digits,
+            "a fourth digit must narrow the text"
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            wrap_width(cx),
+            Some(predicted),
+            "the layout must keep the width the text was wrapped at"
+        );
+    }
+
+    /// Hover must reach the whole visible editor after scrolling, not only
+    /// the part that overlaps the unscrolled text bounds.
+    #[gpui::test]
+    fn test_hover_reaches_bottom_of_scrolled_editor(cx: &mut TestAppContext) {
+        use crate::input::{Diagnostic, Position};
+        struct Frame(Entity<crate::input::EditorState>);
+        impl Render for Frame {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::input::InputBase::new("frame")
+                    .h(px(100.))
+                    .child(crate::input::Editor::new(&self.0))
+            }
+        }
+
+        cx.update(crate::init);
+        let text = (0..100).map(|i| format!("line {i}\n")).collect::<String>();
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            let state = cx.new(|cx| crate::input::EditorState::new(window, cx).default_value(text));
+            input = Some(state.clone());
+            Frame(state)
+        });
+        let input = input.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        input.update(&mut cx, |state, _| {
+            state.diagnostics_mut().unwrap().push(Diagnostic::new(
+                Position::new(0, 0)..Position::new(100, 0),
+                "everywhere",
+            ));
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.on_scroll_wheel(
+                    &ScrollEvent {
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-400.))),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let bounds = input.read_with(&cx, |state, _| state.input_bounds);
+        cx.simulate_mouse_move(
+            point(bounds.center().x, bounds.bottom() - px(5.)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        assert!(
+            input.read_with(&cx, |state, _| state.diagnostic_popover().is_some()),
+            "no hover at the bottom of a scrolled editor, bounds {bounds:?}"
+        );
     }
 
     #[gpui::test]
@@ -4504,6 +7585,12 @@ mod tests {
         cx.run_until_parked();
         let input = input.unwrap();
         let before = input.read_with(cx, |state, _| state.cursor_layout());
+        // The caret geometry only exists once the input has painted, and a
+        // notify sent from inside a draw marks the view dirty without asking
+        // for another frame, so the consumer reads the geometry on the next
+        // invalidation rather than during the paint that produced it.
+        input.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
         assert_eq!(observed.get(), before);
         window
             .update(cx, |_, _, cx| {
@@ -4560,6 +7647,82 @@ mod tests {
             assert_eq!(state.scroll_handle.offset(), point(px(-10.), px(0.)));
         });
         assert_eq!(notifications.get(), 3, "a smaller scroll range must clamp and notify");
+    }
+
+    #[gpui::test]
+    fn test_set_line_number_notifies_only_on_change(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            input = Some(cx.new(|cx| crate::input::EditorState::new(window, cx)));
+            gpui::EmptyView
+        });
+        let input = input.unwrap();
+        let shown = input.read_with(cx, |state, _| state.mode.line_number());
+        let notifications = Rc::new(Cell::new(0));
+        let count = notifications.clone();
+        let _subscription =
+            cx.update(|cx| cx.observe(&input, move |_, _| count.set(count.get() + 1)));
+
+        window
+            .update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| state.set_line_number(shown, window, cx))
+            })
+            .unwrap();
+        assert_eq!(notifications.get(), 0);
+
+        window
+            .update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| state.set_line_number(!shown, window, cx))
+            })
+            .unwrap();
+        assert_eq!(notifications.get(), 1);
+        assert_eq!(
+            input.read_with(cx, |state, _| state.mode.line_number()),
+            !shown
+        );
+    }
+
+    #[gpui::test]
+    fn test_set_value_on_unfocused_input_stays_quiet(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            input = Some(cx.new(|cx| crate::input::InputState::new(window, cx)));
+            gpui::EmptyView
+        });
+        let input = input.unwrap();
+        cx.run_until_parked();
+
+        let notifications = Rc::new(Cell::new(0));
+        let count = notifications.clone();
+        let _subscription =
+            cx.update(|cx| cx.observe(&input, move |_, _| count.set(count.get() + 1)));
+        cx.run_until_parked();
+
+        // Seeding a form is a write, so it notifies once. The input is not
+        // focused and draws no caret, so nothing may notify after that.
+        window
+            .update(cx, |_, window, cx| {
+                input.update(cx, |state, cx| state.set_value("seeded", window, cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let settled = notifications.get();
+
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(3));
+        cx.run_until_parked();
+
+        assert_eq!(
+            notifications.get(),
+            settled,
+            "an unfocused input is blinking, and every blink repaints the view it is in"
+        );
     }
 
     #[gpui::test]
@@ -4681,20 +7844,45 @@ mod tests {
         let input = input_view.input;
         let calls = Rc::new(Cell::new(0usize));
         let items = Rc::new(Cell::new(0usize));
+        let menu_focus = cx.update(|_, cx| cx.focus_handle());
 
         cx.update(|window, cx| {
             input.update(cx, |state, cx| {
                 let calls2 = calls.clone();
                 let items2 = items.clone();
-                state.on_context_menu(Rc::new(move |menu, _, _, _, _| {
+                let menu_focus = menu_focus.clone();
+                state.on_context_menu(Rc::new(move |menu, _, _, window, cx| {
                     calls2.set(calls2.get() + 1);
                     items2.set(menu.items.len());
+                    menu_focus.focus(window, cx);
                 }));
                 state.handle_right_click_menu(point(px(0.), px(0.)), 0, window, cx);
             })
         });
         assert_eq!(calls.get(), 1);
         assert_eq!(items.get(), 0);
+        input.read_with(&cx, |state, _| {
+            assert_eq!(
+                state
+                    .selection_focus
+                    .as_ref()
+                    .and_then(WeakFocusHandle::upgrade)
+                    .as_ref(),
+                Some(&menu_focus),
+                "the menu callback must retain selection without reborrowing its input"
+            );
+        });
+
+        // A custom handler may keep using the same, already-focused menu.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.handle_right_click_menu(point(px(0.), px(0.)), 0, window, cx);
+            });
+        });
+        assert_eq!(calls.get(), 2);
+        cx.update(|window, cx| {
+            assert!(input.read(cx).has_selection_focus(window, cx));
+        });
 
         cx.update(|window, cx| {
             input.update(cx, |state, cx| {
@@ -4702,7 +7890,59 @@ mod tests {
                 state.handle_right_click_menu(point(px(0.), px(0.)), 0, window, cx);
             })
         });
-        assert_eq!(calls.get(), 1);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[gpui::test]
+    fn context_menu_handler_can_read_its_input(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        cx.update(crate::init);
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let cursor = Rc::new(Cell::new(None));
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("hello", window, cx);
+                let weak = cx.weak_entity();
+                let cursor = cursor.clone();
+                state.on_context_menu(Rc::new(move |_, _, _, _, cx| {
+                    cursor.set(weak.upgrade().map(|input| input.read(cx).cursor()));
+                }));
+                state.handle_right_click_menu(point(px(0.), px(0.)), 2, window, cx);
+            })
+        });
+        assert_eq!(cursor.get(), Some(2));
+    }
+
+    #[gpui::test]
+    fn context_menu_handler_can_read_the_offset_under_the_pointer(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        cx.update(crate::init);
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let seen = Rc::new(Cell::new(None));
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("hello world", window, cx);
+                assert_eq!(state.context_menu_offset(), None);
+                state.select_all(window, cx);
+                let weak = cx.weak_entity();
+                let seen = seen.clone();
+                state.on_context_menu(Rc::new(move |_, _, _, _, cx| {
+                    seen.set(weak.upgrade().map(|input| {
+                        let input = input.read(cx);
+                        (input.cursor(), input.context_menu_offset())
+                    }));
+                }));
+                // A right-click inside the selection keeps the cursor at its end.
+                state.handle_right_click_menu(point(px(0.), px(0.)), 2, window, cx);
+            })
+        });
+        assert_eq!(seen.get(), Some((11, Some(2))));
     }
 
     #[gpui::test]
@@ -4761,6 +8001,105 @@ mod tests {
                 assert_eq!(state.value(), "!changed");
             });
         });
+    }
+
+    /// Regression test: editing at a caret that sits far outside the viewport
+    /// must reveal it in one frame. The cursor-follow in `layout_cursors` runs
+    /// only on the frame the selection changes, so its old one-line step left
+    /// the caret offscreen after typing at the end of a long paste.
+    #[gpui::test]
+    fn test_edit_reveals_far_offscreen_caret(cx: &mut TestAppContext) {
+        let mut input = None;
+        let window = cx.open_window(size(px(720.), px(400.)), |window, cx| {
+            cx.set_global(Theme::default());
+            super::super::init(cx);
+            let state = cx.new(|cx| crate::input::TextareaState::new(window, cx).auto_grow(1, 6));
+            input = Some(state.clone());
+            TestRoot(state)
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let input = input.unwrap();
+
+        let text: String = (1..=100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                let end = state.text.len();
+                state.set_selection(end, end);
+            });
+        });
+        cx.run_until_parked();
+
+        // The user scrolled back to the top to read the pasted text.
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.scroll_handle.set_offset(point(px(0.), px(0.)));
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_range(None, "X", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert!(state.value().ends_with("line 100X"));
+                let (caret, _) = state.cursor_layout().expect("caret painted");
+                let viewport = state.input_bounds();
+                let scroll_y = state.scroll_handle.offset().y;
+                let top = caret.origin.y + scroll_y - viewport.origin.y;
+                assert!(
+                    top >= px(0.) && top + caret.size.height <= viewport.size.height,
+                    "caret top {top:?} outside viewport height {:?} (scroll {scroll_y:?})",
+                    viewport.size.height,
+                );
+            });
+        });
+    }
+
+    /// Regression test: changing the auto-grow limits keeps the rows fitted to
+    /// the text. `set_auto_grow` used to start over at `min_rows`, and the rows
+    /// were counted again only on the next edit or wrap width change.
+    #[gpui::test]
+    fn test_set_auto_grow_keeps_rows_fitted(cx: &mut TestAppContext) {
+        let mut input = None;
+        let window = cx.open_window(size(px(720.), px(400.)), |window, cx| {
+            cx.set_global(Theme::default());
+            super::super::init(cx);
+            let state = cx.new(|cx| crate::input::TextareaState::new(window, cx).auto_grow(1, 10));
+            input = Some(state.clone());
+            TestRoot(state)
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let input = input.unwrap();
+
+        let text: String = (1..=8)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.set_value(text, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_eq!(state.mode.rows(), 8)));
+
+        // A larger maximum keeps all eight rows.
+        cx.update(|_, cx| input.update(cx, |state, cx| state.set_auto_grow(1, 12, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_eq!(state.mode.rows(), 8)));
+
+        // A smaller maximum caps them.
+        cx.update(|_, cx| input.update(cx, |state, cx| state.set_auto_grow(1, 4, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_eq!(state.mode.rows(), 4)));
     }
 
     /// Regression test: `scroll_to` at end-of-buffer must produce a deferred
@@ -4897,6 +8236,167 @@ mod tests {
         });
     }
 
+    /// A host that wants the search shortcut for its own search UI.
+    struct SearchHost {
+        editor: Entity<InputBaseState<EditorMode>>,
+        search_requests: Rc<Cell<usize>>,
+    }
+
+    impl Render for SearchHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let search_requests = self.search_requests.clone();
+            div()
+                .size_full()
+                .on_action(cx.listener(move |_, _: &Search, _, _| {
+                    search_requests.set(search_requests.get() + 1);
+                }))
+                .child(self.editor.clone())
+        }
+    }
+
+    /// Opens an editor inside [`SearchHost`], focused, and presses the search
+    /// shortcut once. Returns the editor and the host's request count.
+    fn press_search_shortcut(
+        cx: &mut TestAppContext,
+        searchable: bool,
+    ) -> (Entity<InputBaseState<EditorMode>>, Rc<Cell<usize>>) {
+        let search_requests = Rc::new(Cell::new(0));
+        let mut editor = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                cx.set_global(Theme::default());
+                super::super::init(cx);
+                let state =
+                    cx.new(|cx| crate::input::EditorState::new(window, cx).searchable(searchable));
+                editor = Some(state.clone());
+                cx.new(|_| SearchHost {
+                    editor: state,
+                    search_requests: search_requests.clone(),
+                })
+            })
+            .unwrap()
+        });
+        let editor = editor.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+        #[cfg(target_os = "macos")]
+        cx.simulate_keystrokes("cmd-f");
+        #[cfg(not(target_os = "macos"))]
+        cx.simulate_keystrokes("ctrl-f");
+        cx.run_until_parked();
+        (editor, search_requests)
+    }
+
+    #[gpui::test]
+    fn test_search_shortcut_reaches_the_host_when_not_searchable(cx: &mut TestAppContext) {
+        let (editor, search_requests) = press_search_shortcut(cx, false);
+        assert_eq!(search_requests.get(), 1);
+        editor.read_with(cx, |state, _| {
+            assert!(!state.search_session().open);
+            assert!(!state.search_session().is_active());
+        });
+    }
+
+    #[gpui::test]
+    fn test_search_shortcut_opens_the_panel_when_searchable(cx: &mut TestAppContext) {
+        let (editor, search_requests) = press_search_shortcut(cx, true);
+        assert_eq!(search_requests.get(), 0);
+        editor.read_with(cx, |state, _| {
+            assert!(state.search_session().open);
+            assert!(state.search_session().is_active());
+        });
+    }
+
+    #[gpui::test]
+    fn test_set_search_query_highlights_without_the_panel(cx: &mut TestAppContext) {
+        let input_view = InputView::build_editor(cx, |state| state.searchable(false));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("foo bar foo", window, cx);
+                state.set_search_query("foo", true, cx);
+            });
+        });
+        cx.run_until_parked();
+        input.read_with(&cx, |state, _| {
+            let session = state.search_session();
+            assert!(session.is_active());
+            assert!(!session.open);
+            assert_eq!(session.matcher.len(), 2);
+        });
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| state.close_search(cx));
+        });
+        input.read_with(&cx, |state, _| {
+            assert!(!state.search_session().is_active());
+        });
+    }
+
+    /// A closed search skips rescanning on edits, so every path that reads
+    /// the matches again must see the edited text, not the text at close.
+    #[gpui::test]
+    fn test_closed_search_resyncs_matches_after_edits(cx: &mut TestAppContext) {
+        let input_view = InputView::build_editor(cx, |state| state.searchable(false));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("foo bar foo", window, cx);
+                state.set_search_query("foo", true, cx);
+                state.close_search(cx);
+
+                state.set_value("bar foo", window, cx);
+                assert_eq!(state.next_search_match(cx), Some(4..7));
+
+                state.set_value("foo foo foo", window, cx);
+                state.set_search_query("foo", true, cx);
+                assert_eq!(state.search_session().matcher.len(), 3);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_search_reveals_offscreen_wrapped_match(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let text = format!(
+            "match\n{}\n{}match\n{}",
+            "line\n".repeat(80),
+            "wrapped text ".repeat(500),
+            "line\n".repeat(80)
+        );
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_cursor_surrounding_lines(Some(3), window, cx);
+                state.set_value(text, window, cx);
+                state.set_search_query("match", true, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.next_search_match(cx).unwrap();
+            });
+        });
+        cx.run_until_parked();
+        input.read_with(&cx, |state, _| {
+            let range = state.search_session.matcher.matched_ranges()[1].clone();
+            let layout = state.last_layout.as_ref().unwrap();
+            let (_, _, position) = state.line_and_position_for_offset(range.end);
+            let y = position.expect("wrapped match must be laid out").y;
+            assert!(y >= layout.line_height * 2. - px(0.1));
+            assert!(
+                y + layout.line_height * 3. <= state.last_bounds.unwrap().size.height + px(0.1),
+                "wrapped match must retain surrounding display rows"
+            );
+        });
+    }
+
     #[gpui::test]
     fn test_number_step(cx: &mut TestAppContext) {
         let input = InputView::build(cx, |state| state).input;
@@ -4974,6 +8474,25 @@ mod tests {
                 assert_eq!(state.value(), ".");
                 let cursor: Range<usize> = state.selected_range();
                 assert_eq!(cursor, 1..1);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_mask_pattern_accepts_non_ascii_text(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state.mask_pattern("9999年99月"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_range(None, "2024年12月", window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.value(), "2024年12月");
             });
         });
     }
@@ -5302,6 +8821,29 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_textarea_secondary_enter_does_not_insert_newline(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_range(None, "hello", window, cx);
+                state.set_selection(0, 0);
+                state.enter(
+                    &Enter {
+                        secondary: true,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "hello");
+            });
+        });
+    }
+
+    #[gpui::test]
     fn test_undo_manager_single_line_return_commits_the_typing_session(cx: &mut TestAppContext) {
         let input_view = InputView::build(cx, |state| state);
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
@@ -5491,6 +9033,29 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_masked_input_redacts_ime_text(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state.masked(true).default_value("a🦀b"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            input_view.input.update(cx, |state, cx| {
+                let mut adjusted = None;
+                assert_eq!(
+                    state.text_for_range(1..5, &mut adjusted, window, cx),
+                    Some("•••".into())
+                );
+                assert_eq!(adjusted, Some(1..4));
+
+                state.set_masked(false, window, cx);
+                assert_eq!(
+                    state.text_for_range(1..5, &mut adjusted, window, cx),
+                    Some("🦀b".into())
+                );
+                assert_eq!(adjusted, Some(1..4));
+            });
+        });
+    }
+
+    #[gpui::test]
     fn test_masked_input_collapses_word_boundaries(cx: &mut TestAppContext) {
         let input_view = InputView::build(cx, |state| state);
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
@@ -5526,6 +9091,43 @@ mod tests {
                 state.set_value("aaa bbb ccc", window, cx);
                 state.select_word(9, window, cx);
                 assert_eq!(state.selected_range(), 8..11);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_ctrl_delete_stops_at_whitespace(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                // Indentation goes on its own, the word after it stays.
+                state.set_value("    four leading spaces", window, cx);
+                assert_eq!(state.next_word_delete_end_at(0, true), 4);
+                assert_eq!(state.next_word_delete_end_at(4, true), 8);
+                assert_eq!(state.next_word_delete_end_at(8, true), 9);
+                // macOS Option+Delete still takes the blanks and the word.
+                assert_eq!(state.next_word_delete_end_at(0, false), 8);
+
+                // At a line end only the line break goes, not the next
+                // line's indentation or first word.
+                state.set_value("one\n    two", window, cx);
+                assert_eq!(state.next_word_delete_end_at(3, true), 4);
+                state.set_value("one\r\n  two", window, cx);
+                assert_eq!(state.next_word_delete_end_at(3, true), 5);
+                // Trailing blanks stop at the line break.
+                state.set_value("one  \ntwo", window, cx);
+                assert_eq!(state.next_word_delete_end_at(3, true), 5);
+
+                state.set_value("    four leading spaces", window, cx);
+                state.set_selected_range(0..0, cx);
+                state.delete_next_word(&DeleteToNextWordEnd, window, cx);
+                #[cfg(not(target_os = "macos"))]
+                assert_eq!(state.value(), "four leading spaces");
+                #[cfg(target_os = "macos")]
+                assert_eq!(state.value(), " leading spaces");
             });
         });
     }
@@ -5837,6 +9439,43 @@ mod tests {
         });
     }
 
+    /// Pasting past the right edge of a single-line input scrolls the caret
+    /// into view in the paint that lays the pasted text out.
+    #[gpui::test]
+    fn test_paste_reveals_caret_single_line(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        cx.run_until_parked();
+
+        let value = format!("https://example.com/v1/users?{}", "x=1&".repeat(120));
+        cx.update(|window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
+            input.update(cx, |state, cx| state.paste(&Paste, window, cx));
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert!(
+                    state.scroll_size.width > state.input_bounds.size.width,
+                    "value must overflow the input width or this test is vacuous"
+                );
+                let caret = state
+                    .last_layout
+                    .as_ref()
+                    .and_then(|layout| layout.cursor_bounds)
+                    .expect("a caret");
+                assert!(
+                    caret.left() >= state.input_bounds.left()
+                        && caret.right() <= state.input_bounds.right(),
+                    "the caret at {caret:?} should be inside {:?}",
+                    state.input_bounds
+                );
+            });
+        });
+    }
+
     #[gpui::test]
     fn test_single_line_removes_newlines(cx: &mut TestAppContext) {
         let input_view = InputView::build(cx, |state| state.default_value("default\nvalue"));
@@ -5864,6 +9503,33 @@ mod tests {
         });
 
         cx.run_until_parked();
+    }
+
+    /// Tab is bound to `IndentInline`, which a single-line input propagates.
+    /// Unhandled, the keystroke reaches the input as text, so the field
+    /// drops the tab as it drops a newline. See issue #4069.
+    #[gpui::test]
+    fn test_single_line_removes_tabs(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        cx.run_until_parked();
+
+        cx.simulate_input("a");
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input("b");
+        input.read_with(&cx, |state, _| assert_eq!(state.value(), "ab"));
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("c\td\ne", window, cx);
+                assert_eq!(state.value(), "cde");
+            });
+        });
     }
 
     /// `replace_all` on a multi-line (non-code-editor) input clears the
@@ -6026,6 +9692,368 @@ mod tests {
                 assert_eq!(s.value(), "X bbb Y");
             });
         });
+    }
+
+    /// A multi-edit change reaches the highlighter once, with every edit in
+    /// application order and the text right after each, which is what the
+    /// default `update_batch` replays through `update` one edit at a time.
+    #[gpui::test]
+    fn test_replace_text_in_ranges_drives_the_highlighter_once(cx: &mut TestAppContext) {
+        use crate::input::{FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter};
+        use gpui::HighlightStyle;
+        use std::cell::RefCell;
+
+        struct RecordingHighlighter(Rc<RefCell<Vec<Vec<String>>>>);
+
+        impl InputHighlighter for RecordingHighlighter {
+            fn language(&self) -> SharedString {
+                "recording".into()
+            }
+
+            fn update(
+                &mut self,
+                _: Option<InputEdit>,
+                text: &Rope,
+                _: bool,
+                _: &mut Window,
+                _: &mut Context<EditorState>,
+            ) {
+                self.0.borrow_mut().push(vec![text.to_string()]);
+            }
+
+            fn update_batch(
+                &mut self,
+                edits: &[(InputEdit, Rope)],
+                _: bool,
+                _: &mut Window,
+                _: &mut Context<EditorState>,
+            ) {
+                let texts = edits.iter().map(|(_, text)| text.to_string()).collect();
+                self.0.borrow_mut().push(texts);
+            }
+
+            fn styles(
+                &self,
+                range: &Range<usize>,
+                _: &dyn HighlightStyleResolver,
+            ) -> Vec<(Range<usize>, HighlightStyle)> {
+                vec![(range.clone(), HighlightStyle::default())]
+            }
+
+            fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
+                Vec::new()
+            }
+        }
+
+        let updates = Rc::new(RefCell::new(Vec::new()));
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.set_value("aaa bbb ccc", window, cx);
+                let recorded = updates.clone();
+                s.set_highlighter_factory(
+                    Rc::new(move |_: &str| {
+                        let highlighter: Box<dyn InputHighlighter> =
+                            Box::new(RecordingHighlighter(recorded.clone()));
+                        Some(highlighter)
+                    }),
+                    cx,
+                );
+                s.replace_text_in_ranges(
+                    &[(0..3, "X".to_string()), (8..11, "Y".to_string())],
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        assert_eq!(
+            *updates.borrow(),
+            vec![vec!["aaa bbb Y".to_string(), "X bbb Y".to_string()]]
+        );
+    }
+
+    /// One keypress records a single edit with the text right after it.
+    #[gpui::test]
+    fn test_last_input_edits_single_insert(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("hello world"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_ranges(&[(5..5, " big".to_string())], window, cx);
+
+                let edits = state.last_input_edits.as_slice();
+                assert_eq!(edits.len(), 1);
+                let (edit, text_after) = &edits[0];
+                assert_eq!(edit.start_byte, 5);
+                assert_eq!(edit.old_end_byte, 5);
+                assert_eq!(edit.new_end_byte, 9);
+                assert_eq!(edit.start_position, crate::input::Point::new(0, 5));
+                assert_eq!(edit.old_end_position, crate::input::Point::new(0, 5));
+                assert_eq!(edit.new_end_position, crate::input::Point::new(0, 9));
+                assert_eq!(text_after.to_string(), "hello big world");
+            });
+        });
+    }
+
+    /// Deletion and a multi-line paste each describe their whole replacement.
+    #[gpui::test]
+    fn test_last_input_edits_delete_and_paste(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("hello world"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_ranges(&[(5..11, String::new())], window, cx);
+                assert_eq!(state.value(), "hello");
+
+                let edits = state.last_input_edits.as_slice();
+                assert_eq!(edits.len(), 1);
+                let (edit, text_after) = &edits[0];
+                assert_eq!(edit.start_byte, 5);
+                assert_eq!(edit.old_end_byte, 11);
+                assert_eq!(edit.new_end_byte, 5);
+                assert_eq!(text_after.to_string(), "hello");
+
+                state.replace_text_in_ranges(&[(5..5, "\nnext".to_string())], window, cx);
+                assert_eq!(state.value(), "hello\nnext");
+
+                let edits = state.last_input_edits.as_slice();
+                assert_eq!(edits.len(), 1);
+                let (edit, text_after) = &edits[0];
+                assert_eq!(edit.start_byte, 5);
+                assert_eq!(edit.old_end_byte, 5);
+                assert_eq!(edit.new_end_byte, 10);
+                assert_eq!(edit.start_position, crate::input::Point::new(0, 5));
+                assert_eq!(edit.old_end_position, crate::input::Point::new(0, 5));
+                assert_eq!(edit.new_end_position, crate::input::Point::new(1, 4));
+                assert_eq!(text_after.to_string(), "hello\nnext");
+            });
+        });
+    }
+
+    /// A grouped change records every applied edit in application order.
+    #[gpui::test]
+    fn test_last_input_edits_grouped_change(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("aaa bbb ccc"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_ranges(
+                    &[(0..3, "X".to_string()), (8..11, "Y".to_string())],
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "X bbb Y");
+
+                let edits = state.last_input_edits.as_slice();
+                assert_eq!(edits.len(), 2);
+                // The higher offset is applied first, before the lower one.
+                assert_eq!(edits[0].0.start_byte, 8);
+                assert_eq!(edits[0].0.old_end_byte, 11);
+                assert_eq!(edits[0].0.new_end_byte, 9);
+                assert_eq!(edits[0].0.start_position, crate::input::Point::new(0, 8));
+                assert_eq!(edits[0].0.old_end_position, crate::input::Point::new(0, 11));
+                assert_eq!(edits[0].0.new_end_position, crate::input::Point::new(0, 9));
+                assert_eq!(edits[0].1.to_string(), "aaa bbb Y");
+
+                assert_eq!(edits[1].0.start_byte, 0);
+                assert_eq!(edits[1].0.old_end_byte, 3);
+                assert_eq!(edits[1].0.new_end_byte, 1);
+                assert_eq!(edits[1].0.start_position, crate::input::Point::new(0, 0));
+                assert_eq!(edits[1].0.old_end_position, crate::input::Point::new(0, 3));
+                assert_eq!(edits[1].0.new_end_position, crate::input::Point::new(0, 1));
+                assert_eq!(edits[1].1.to_string(), "X bbb Y");
+            });
+        });
+    }
+
+    /// Edits are recorded even when no highlighter can be installed.
+    #[gpui::test]
+    fn test_last_input_edits_without_a_highlighter(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("fn main() {}", window, cx);
+                let no_highlighter: InputHighlighterFactory = Rc::new(|_: &str| None);
+                state.set_highlighter_factory(no_highlighter, cx);
+                assert!(state.last_input_edits.as_slice().is_empty());
+
+                state.replace_text_in_ranges(&[(12..12, "\n".to_string())], window, cx);
+                assert_eq!(state.value(), "fn main() {}\n");
+
+                let edits = state.last_input_edits.as_slice();
+                assert_eq!(edits.len(), 1);
+                let (edit, text_after) = &edits[0];
+                assert_eq!(edit.start_byte, 12);
+                assert_eq!(edit.old_end_byte, 12);
+                assert_eq!(edit.new_end_byte, 13);
+                assert_eq!(edit.start_position, crate::input::Point::new(0, 12));
+                assert_eq!(edit.old_end_position, crate::input::Point::new(0, 12));
+                assert_eq!(edit.new_end_position, crate::input::Point::new(1, 0));
+                assert_eq!(text_after.to_string(), "fn main() {}\n");
+            });
+        });
+    }
+
+    /// `set_value` is silent and leaves no edits behind for the next change.
+    #[gpui::test]
+    fn test_last_input_edits_cleared_by_set_value(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state.default_value("hello"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_ranges(&[(5..5, "!".to_string())], window, cx);
+                assert_eq!(state.last_input_edits.as_slice().len(), 1);
+
+                state.set_value("replaced", window, cx);
+                assert!(state.last_input_edits.as_slice().is_empty());
+
+                state.replace_text_in_ranges(&[(8..8, "?".to_string())], window, cx);
+                let edits = state.last_input_edits.as_slice();
+                assert_eq!(edits.len(), 1);
+                assert_eq!(edits[0].1.to_string(), "replaced?");
+            });
+        });
+    }
+
+    /// Apply an emitted batch as an incremental consumer would and verify every snapshot.
+    fn replay_input_edits(text: &mut String, event: &InputEditsEvent) {
+        for (edit, after) in event.edits() {
+            let replacement = after.slice(edit.start_byte..edit.new_end_byte).to_string();
+            text.replace_range(edit.start_byte..edit.old_end_byte, &replacement);
+            assert_eq!(*text, after.to_string());
+        }
+    }
+
+    #[gpui::test]
+    fn input_edits_events_preserve_queued_changes_and_undo(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.default_value("hello"));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let observed = Rc::new(std::cell::RefCell::new(Vec::<InputEditsEvent>::new()));
+        let seen = observed.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event: &InputEditsEvent, _| {
+                seen.borrow_mut().push(event.clone());
+            })
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_ranges(&[(5..5, "!".into())], window, cx);
+                state.replace_text_in_ranges(&[(6..6, "?".into())], window, cx);
+                state.undo(&Undo, window, cx);
+            });
+        });
+        let events = observed.borrow();
+        assert!(events.len() >= 3);
+        let mut text = "hello".to_string();
+        for event in events.iter() {
+            replay_input_edits(&mut text, event);
+        }
+        assert_eq!(
+            text,
+            input.read_with(&cx, |state, _| state.value().to_string())
+        );
+        assert_eq!(events[0].edits()[0].1.to_string(), "hello!");
+        assert_eq!(events[1].edits()[0].1.to_string(), "hello!?");
+    }
+
+    #[gpui::test]
+    fn input_edits_event_replays_ime_commit(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.default_value(""));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let observed = Rc::new(std::cell::RefCell::new(Vec::<InputEditsEvent>::new()));
+        let seen = observed.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event: &InputEditsEvent, _| {
+                seen.borrow_mut().push(event.clone());
+            })
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
+                state.replace_and_mark_text_in_range(None, "ni", Some(2..2), window, cx);
+                state.replace_text_in_range(None, "你", window, cx);
+            });
+        });
+        let events = observed.borrow();
+        assert_eq!(events.len(), 1);
+        let mut text = String::new();
+        replay_input_edits(&mut text, &events[0]);
+        assert_eq!(text, "你");
+    }
+
+    #[gpui::test]
+    fn input_edits_event_replays_after_cancelled_composition(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.default_value(""));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let observed = Rc::new(std::cell::RefCell::new(Vec::<InputEditsEvent>::new()));
+        let seen = observed.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event: &InputEditsEvent, _| {
+                seen.borrow_mut().push(event.clone());
+            })
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
+                state.replace_and_mark_text_in_range(None, "", None, window, cx);
+                state.replace_text_in_range(None, "x", window, cx);
+            });
+        });
+        let events = observed.borrow();
+        assert_eq!(events.len(), 1);
+        let mut text = String::new();
+        replay_input_edits(&mut text, &events[0]);
+        assert_eq!(text, "x");
+    }
+
+    #[gpui::test]
+    fn input_edits_event_replays_mask_rewrite(cx: &mut TestAppContext) {
+        let view = InputView::build(cx, |state| {
+            state
+                .mask_pattern(MaskPattern::Number {
+                    separator: Some(','),
+                    fraction: None,
+                })
+                .default_value("999")
+        });
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let observed = Rc::new(std::cell::RefCell::new(Vec::<InputEditsEvent>::new()));
+        let seen = observed.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&input, move |_, event: &InputEditsEvent, _| {
+                seen.borrow_mut().push(event.clone());
+            })
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_cursor_to(3);
+                state.replace_text_in_range(None, "9", window, cx)
+            });
+        });
+        let events = observed.borrow();
+        assert_eq!(events.len(), 1);
+        let mut text = "999".to_string();
+        replay_input_edits(&mut text, &events[0]);
+        assert_eq!(text, "9,999");
     }
 
     /// An IME composition (marking then commit) undoes as a single unit.
@@ -6245,6 +10273,61 @@ mod tests {
         });
     }
 
+    /// The macOS Korean IME rewrites the character it just inserted.
+    #[gpui::test]
+    fn test_undo_manager_ime_rewrites_of_typed_char_are_one_group(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("é ", window, cx);
+                state.set_selected_range(3..3, cx);
+                // g k s r m f: "ㅎ" -> "하" -> "한", then "ㄱ" -> "그" -> "글"
+                state.replace_text_in_range(None, "ㅎ", window, cx);
+                state.replace_text_in_range(Some(2..3), "하", window, cx);
+                state.replace_text_in_range(Some(2..3), "한", window, cx);
+                state.replace_text_in_range(None, "ㄱ", window, cx);
+                state.replace_text_in_range(Some(3..4), "그", window, cx);
+                state.replace_text_in_range(Some(3..4), "글", window, cx);
+                assert_eq!(state.value(), "é 한글");
+                assert_eq!(state.undo_manager.undo_count(), 1);
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "é ");
+                assert_eq!(state.selected_range(), 3..3);
+
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "é 한글");
+                assert_eq!(state.selected_range(), 9..9);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_undo_manager_rewrite_after_cursor_movement_is_separate(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_range(None, "c", window, cx);
+                state.replace_text_in_range(None, "e", window, cx);
+                state.left(&MoveLeft, window, cx);
+                state.right(&MoveRight, window, cx);
+                state.replace_text_in_range(Some(1..2), "é", window, cx);
+                assert_eq!(state.value(), "cé");
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "ce");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "");
+            });
+        });
+    }
+
     #[gpui::test]
     fn test_undo_manager_selection_restored_by_undo_and_redo(cx: &mut TestAppContext) {
         let input_view = InputView::build(cx, |state| state);
@@ -6394,6 +10477,71 @@ mod tests {
         });
     }
 
+    /// fold_all, fold_at_level and unfold_all change only the folded set; the
+    /// candidates stay. A level counts the candidates that contain a range.
+    #[gpui::test]
+    fn test_fold_all_and_fold_at_level(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        // Level 1: 0..=9; level 2: 1..=4 and 5..=8; level 3: 2..=3.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("a\nb\nc\nd\ne\nf\ng\nh\ni\nj", window, cx);
+                state.apply_highlighter_fold_candidates(
+                    vec![
+                        FoldRange::new(0, 9),
+                        FoldRange::new(1, 4),
+                        FoldRange::new(2, 3),
+                        FoldRange::new(5, 8),
+                    ],
+                    cx,
+                );
+            });
+        });
+        let folded = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                input.read_with(cx, |state, _| {
+                    state
+                        .display_map
+                        .folded_ranges()
+                        .iter()
+                        .map(|f| f.start_line)
+                        .collect::<Vec<_>>()
+                })
+            })
+        };
+
+        cx.update(|_, cx| input.update(cx, |state, cx| state.fold_all(cx)));
+        assert_eq!(folded(&mut cx), vec![0, 1, 2, 5]);
+
+        cx.update(|_, cx| input.update(cx, |state, cx| state.fold_at_level(2, cx)));
+        assert_eq!(folded(&mut cx), vec![1, 5]);
+
+        cx.update(|_, cx| input.update(cx, |state, cx| state.fold_at_level(1, cx)));
+        assert_eq!(folded(&mut cx), vec![0]);
+
+        cx.update(|_, cx| input.update(cx, |state, cx| state.fold_at_level(3, cx)));
+        assert_eq!(folded(&mut cx), vec![2]);
+
+        cx.update(|_, cx| input.update(cx, |state, cx| state.unfold_all(cx)));
+        assert!(folded(&mut cx).is_empty());
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| assert_eq!(state.fold_candidates().len(), 4));
+        });
+
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                assert!(state.set_folded(5, true, cx));
+                assert!(!state.set_folded(6, true, cx));
+            })
+        });
+        assert_eq!(folded(&mut cx), vec![5]);
+    }
+
     /// Unfolding at a position opens exactly the folds hiding it.
     ///
     /// A fold keeps its own first and last line visible, so a position on
@@ -6525,6 +10673,180 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn test_textarea_prewrap_prepares_content_rows_before_layout(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        for (value, expected_rows) in [("", 1), ("one\ntwo", 2)] {
+            cx.open_window(size(px(400.), px(100.)), |window, cx| {
+                let font = window.text_style().font();
+                cx.new(|cx| {
+                    let mut state = crate::input::TextareaState::new(window, cx)
+                        .rows(12)
+                        .default_value(value);
+                    assert_eq!(state.display_map().wrap_row_count(), 0);
+                    state.prewrap(font, px(14.), px(120.), cx);
+                    assert_eq!(state.display_map().wrap_row_count(), expected_rows);
+                    assert_eq!(state.value(), value);
+                    state
+                });
+                gpui::EmptyView
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn test_textarea_prewrap_respects_soft_wrap_before_layout(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let value = "select id, name, email, phone from users where active\nlimit 10";
+        for soft_wrap in [true, false] {
+            cx.open_window(size(px(400.), px(100.)), |window, cx| {
+                let font = window.text_style().font();
+                cx.new(|cx| {
+                    let mut state = crate::input::TextareaState::new(window, cx)
+                        .rows(1)
+                        .soft_wrap(soft_wrap)
+                        .default_value(value);
+                    state.prewrap(font, px(14.), px(120.), cx);
+                    let rows = state.display_map().wrap_row_count();
+                    if soft_wrap {
+                        assert!(rows > 2, "the first logical line must wrap");
+                    } else {
+                        assert_eq!(rows, 2);
+                    }
+                    assert_eq!(state.value(), value);
+                    state
+                });
+                gpui::EmptyView
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn test_prewrap_counts_wrapped_rows_before_the_first_paint(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text = "select id, name, email, phone from users where active\nlimit 10";
+        for (soft_wrap, wraps) in [(true, true), (false, false)] {
+            let mut input = None;
+            cx.open_window(size(px(400.), px(100.)), |window, cx| {
+                let font = window.text_style().font();
+                let editor = cx.new(|cx| {
+                    let mut state = crate::input::EditorState::new(window, cx)
+                        .soft_wrap(soft_wrap)
+                        .default_value(text);
+                    state.prewrap(font, px(14.), px(120.), cx);
+                    state
+                });
+                input = Some(editor);
+                gpui::EmptyView
+            });
+            let rows = input
+                .unwrap()
+                .read_with(cx, |state, _| state.display_map().wrap_row_count());
+            // Two lines; at 120px the first wraps unless soft wrap is off.
+            assert_eq!(rows > 2, wraps, "soft_wrap({soft_wrap}): {rows} rows");
+            if !wraps {
+                assert_eq!(rows, 2);
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn test_prewrap_uses_the_configured_tab_stops(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            let font = window.text_style().font();
+            let font_size = px(14.);
+            let font_id = window.text_system().resolve_font(&font);
+            let space_width = window.text_system().layout_width(font_id, font_size, ' ');
+            cx.new(|cx| {
+                let mut state = crate::input::EditorState::new(window, cx)
+                    .tab_size(TabSize {
+                        tab_size: 4,
+                        hard_tabs: true,
+                    })
+                    .default_value("\t\t");
+                for (tab_size, expected_rows) in [(4, 2), (2, 1), (8, 2)] {
+                    state.set_tab_size(
+                        TabSize {
+                            tab_size,
+                            hard_tabs: true,
+                        },
+                        cx,
+                    );
+                    state.prewrap(font.clone(), font_size, space_width * 5. + RIGHT_MARGIN, cx);
+                    assert_eq!(state.display_map().wrap_row_count(), expected_rows);
+                }
+                state
+            });
+            gpui::EmptyView
+        });
+    }
+
+    /// Prewrap counts with the state's wrapping indent, as the first layout
+    /// does: continuation rows indented as deep as their line take more rows.
+    #[gpui::test]
+    fn test_prewrap_wraps_with_the_wrapping_indent(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let text = "            select id, name, email, phone from users where active";
+        let mut rows = Vec::new();
+        for indent in [WrappingIndent::Same, WrappingIndent::None] {
+            let mut input = None;
+            cx.open_window(size(px(400.), px(100.)), |window, cx| {
+                let font = window.text_style().font();
+                input = Some(cx.new(|cx| {
+                    let mut state = crate::input::EditorState::new(window, cx)
+                        .wrapping_indent(indent)
+                        .default_value(text);
+                    state.prewrap(font, px(14.), px(200.), cx);
+                    state
+                }));
+                gpui::EmptyView
+            });
+            rows.push(
+                input
+                    .unwrap()
+                    .read_with(cx, |state, _| state.display_map().wrap_row_count()),
+            );
+        }
+        assert!(rows[0] > rows[1], "rows with Same, None: {rows:?}");
+    }
+
+    /// Once the editor is laid out, layout owns the wrap and prewrap leaves it.
+    #[gpui::test]
+    fn test_prewrap_does_nothing_once_laid_out(cx: &mut TestAppContext) {
+        struct Frame(Entity<crate::input::EditorState>);
+        impl Render for Frame {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                crate::input::InputBase::new("frame")
+                    .h(px(100.))
+                    .child(crate::input::Editor::new(&self.0))
+            }
+        }
+
+        cx.update(crate::init);
+        let text = "select id, name, email, phone from users where active\nlimit 10";
+        let mut input = None;
+        let window = cx.open_window(size(px(400.), px(100.)), |window, cx| {
+            let state = cx.new(|cx| crate::input::EditorState::new(window, cx).default_value(text));
+            input = Some(state.clone());
+            Frame(state)
+        });
+        let input = input.unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let laid_out = input.read_with(&cx, |state, _| state.display_map().wrap_row_count());
+        assert!(laid_out >= 2, "laid out to {laid_out} rows");
+        let font = cx.update(|window, _| window.text_style().font());
+        input.update(&mut cx, |state, cx| {
+            state.prewrap(font, px(14.), px(60.), cx)
+        });
+        assert_eq!(
+            input.read_with(&cx, |state, _| state.display_map().wrap_row_count()),
+            laid_out
+        );
+    }
+
     /// Soft wrap is on by default, for every mode that can wrap.
     ///
     /// The default lives in the shared constructor, where a mode-specific
@@ -6648,6 +10970,9 @@ mod tests {
                 };
                 (position(0, 1), position(2, 3))
             });
+            // Land inside the third column instead of exactly on its trailing
+            // glyph boundary, where pixel rounding can select the next column.
+            let end = point(end.x - px(0.5), end.y);
             // A cached Ctrl-hover definition must not steal a column gesture.
             cx.update(|_, cx| {
                 view.input.update(cx, |state, _| {
@@ -6734,6 +11059,34 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_lost_mouse_release_ends_selection_on_plain_motion(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        setup_cursors(&mut cx, &view.input, "|alpha bravo charlie delta");
+        let (start, end, beyond) = view.input.read_with(&cx, |state, _| {
+            (
+                state.range_to_bounds(&(0..1)).unwrap().center(),
+                state.range_to_bounds(&(6..7)).unwrap().center(),
+                state.range_to_bounds(&(18..19)).unwrap().center(),
+            )
+        });
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::default());
+        let selected = view.input.read_with(&cx, |state, _| {
+            assert!(state.selecting);
+            let text = state.selected_value();
+            assert!(!text.is_empty());
+            text
+        });
+        cx.simulate_mouse_move(beyond, None, gpui::Modifiers::default());
+        view.input.read_with(&cx, |state, _| {
+            assert!(!state.selecting);
+            assert_eq!(state.selected_value(), selected);
+        });
+    }
+
+    #[gpui::test]
     fn test_alt_mouse_release_outside_editor_ends_column_selection(cx: &mut TestAppContext) {
         cx.update(crate::init);
         let view = InputView::<EditorMode>::new(cx);
@@ -6786,17 +11139,71 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_mouse_down_shows_cursor_like_a_cursor_move(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        setup_cursors(&mut cx, &view.input, "abcd|efgh");
+        let position = |offset: Pixels, cx: &mut VisualTestContext| {
+            view.input.read_with(cx, |state, _| {
+                let layout = state.last_layout.as_ref().unwrap();
+                state.last_bounds.unwrap().origin
+                    + point(layout.line_number_width + offset, layout.line_height * 0.5)
+            })
+        };
+        let visible = |cx: &mut VisualTestContext| {
+            view.input
+                .read_with(cx, |state, cx| state.blink_cursor.read(cx).visible())
+        };
+
+        // The press itself shows the caret, without waiting for the focus
+        // observer, and the idle delay holds it there like a cursor move.
+        let first = position(px(2.), &mut cx);
+        cx.simulate_mouse_down(first, MouseButton::Left, Default::default());
+        assert!(visible(&mut cx));
+        cx.simulate_mouse_up(first, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+
+        // Pressing elsewhere in the focused input, in the hidden phase of the
+        // blink, shows the caret again at the press.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.run_until_parked();
+        assert!(!visible(&mut cx));
+        let second = position(px(30.), &mut cx);
+        cx.simulate_mouse_down(second, MouseButton::Left, Default::default());
+        assert!(visible(&mut cx));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(250));
+        cx.run_until_parked();
+        assert!(visible(&mut cx));
+        cx.simulate_mouse_up(second, MouseButton::Left, Default::default());
+    }
+
+    #[gpui::test]
     fn test_multi_cursor_actions_reveal_hidden_carets(cx: &mut TestAppContext) {
         let view = InputView::<EditorMode>::new(cx);
         let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
         setup_cursors(&mut cx, &view.input, "ab\na|b\nab");
-        cx.update(|window, cx| {
-            view.input.update(cx, |state, cx| {
-                // Start each action in the hidden phase without depending on a
-                // key-down listener: actions and text input also arrive directly.
-                for action in 0..6 {
-                    state.blink_cursor = cx.new(|_| BlinkCursor::new());
-                    assert!(!state.blink_cursor.read(cx).visible());
+        // Start each action in the hidden phase without depending on a
+        // key-down listener: actions and text input also arrive directly.
+        for action in 0..6 {
+            cx.update(|_, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.blink_cursor = cx.new(BlinkCursor::new);
+                    state.blink_cursor.update(cx, |cursor, cx| cursor.start(cx));
+                });
+            });
+            cx.run_until_parked();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(500));
+            cx.run_until_parked();
+            view.input.read_with(&cx, |state, cx| {
+                assert!(!state.blink_cursor.read(cx).visible(), "action {action}");
+            });
+
+            cx.update(|window, cx| {
+                view.input.update(cx, |state, cx| {
                     match action {
                         0 => state.add_cursor_above(&AddCursorAbove, window, cx),
                         1 => state.add_cursor_below(&AddCursorBelow, window, cx),
@@ -6806,9 +11213,9 @@ mod tests {
                         _ => state.backspace(&Backspace, window, cx),
                     }
                     assert!(state.blink_cursor.read(cx).visible(), "action {action}");
-                }
+                });
             });
-        });
+        }
     }
 
     #[gpui::test]
@@ -6910,6 +11317,179 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_add_selection(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_value("foo bar foo", window, cx);
+                state.set_selected_range(0..3, cx);
+                // The programmatic second cursor: the next occurrence.
+                state.add_selection(8..11, cx);
+                // Adding a range that is already selected changes nothing.
+                state.add_selection(0..3, cx);
+            });
+        });
+        view.input.read_with(&cx, |state, _| {
+            let mut ranges: Vec<Range<usize>> =
+                state.selections.iter().map(|s| s.start..s.end).collect();
+            ranges.sort_by_key(|r| r.start);
+            assert_eq!(ranges, vec![0..3, 8..11]);
+        });
+        // Typing replaces every selection at once.
+        cx.simulate_keystrokes("x");
+        view.input.read_with(&cx, |state, _| {
+            assert_eq!(state.text.to_string(), "x bar x")
+        });
+    }
+
+    #[gpui::test]
+    fn test_add_selection_preserves_crlf_boundaries(cx: &mut TestAppContext) {
+        let view = InputView::build_textarea(cx, |state| state.default_value("a\r\nb"));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_selected_range(4..4, cx);
+                state.add_selection(2..2, cx);
+                let ranges: Vec<_> = state.selections.iter().map(|s| s.start..s.end).collect();
+                assert_eq!(ranges, vec![4..4, 1..1]);
+            });
+        });
+        cx.simulate_keystrokes("x");
+        view.input.read_with(&cx, |state, _| {
+            assert_eq!(state.value(), "ax\r\nbx");
+        });
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.set_value("a\r\nb", window, cx);
+                state.set_selected_range(4..4, cx);
+                state.add_selection(2..3, cx);
+                state.cut(&Cut, window, cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "\r\n");
+                assert_eq!(state.value(), "ab");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_add_selection_merges_overlaps_before_copy_and_cut(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                // Cover partial overlaps, a containing range, and a bridge
+                // between two previously disjoint selections.
+                for additions in [vec![2..5], vec![0..5], vec![4..5, 2..4]] {
+                    state.set_value("abcdef", window, cx);
+                    state.set_selected_range(0..3, cx);
+                    let active_id = state.active_selection().id;
+                    for range in additions {
+                        state.add_selection(range, cx);
+                    }
+                    assert_eq!(state.active_selection().id, active_id);
+                    assert_eq!(state.selected_range(), 0..5);
+                    assert_eq!(state.selections.len(), 1);
+                    state.copy(&Copy, window, cx);
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "abcde");
+                    state.cut(&Cut, window, cx);
+                    assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), "abcde");
+                    assert_eq!(state.value(), "f");
+                    state.undo(&Undo, window, cx);
+                    assert_eq!(state.value(), "abcdef");
+                    assert_eq!(state.selected_range(), 0..5);
+                }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_add_selection_clears_inline_completion(cx: &mut TestAppContext) {
+        use crate::input::CompletionProvider;
+        use gpui::Task;
+        use lsp_types::{
+            CompletionContext, CompletionResponse, InlineCompletionContext, InlineCompletionItem,
+            InlineCompletionResponse,
+        };
+        use std::time::Duration;
+
+        struct Provider(Rc<Cell<usize>>);
+
+        impl CompletionProvider for Provider {
+            fn is_completion_trigger(&self, _: usize, _: &str, _: &mut App) -> bool {
+                false
+            }
+
+            fn completions(
+                &self,
+                _: &Rope,
+                _: usize,
+                _: CompletionContext,
+                _: &mut Window,
+                _: &mut App,
+            ) -> Task<anyhow::Result<CompletionResponse>> {
+                Task::ready(Ok(CompletionResponse::Array(vec![])))
+            }
+
+            fn inline_completion(
+                &self,
+                _: &Rope,
+                _: usize,
+                _: InlineCompletionContext,
+                _: &mut Window,
+                _: &mut App,
+            ) -> Task<anyhow::Result<InlineCompletionResponse>> {
+                self.0.set(self.0.get() + 1);
+                Task::ready(Ok(InlineCompletionResponse::Array(vec![])))
+            }
+        }
+
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let calls = Rc::new(Cell::new(0));
+        cx.update(|window, cx| {
+            view.input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.set_value("aa\naa", window, cx);
+                state.set_selected_range(2..2, cx);
+                state.extras.inline_completion.item = Some(InlineCompletionItem {
+                    insert_text: "suggestion".into(),
+                    filter_text: None,
+                    range: None,
+                    command: None,
+                    insert_text_format: None,
+                });
+                state.add_selection(5..5, cx);
+                assert!(!state.has_inline_completion());
+                state.indent_inline(&IndentInline, window, cx);
+                assert_eq!(state.value(), "aa  \naa  ");
+                assert_eq!(state.selections.len(), 2);
+
+                // The active cursor stays put, so only canceling the task
+                // prevents this pending request from fetching a suggestion.
+                state.set_value("aa\naa", window, cx);
+                state.set_selected_range(2..2, cx);
+                state.extras.lsp.completion_provider = Some(Rc::new(Provider(calls.clone())));
+                state.schedule_inline_completion(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.input
+                .update(cx, |state, cx| state.add_selection(5..5, cx));
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(calls.get(), 0);
+        view.input.read_with(&cx, |state, _| {
+            assert!(!state.has_inline_completion());
+            assert_eq!(state.selections.len(), 2);
+            assert_eq!(state.value(), "aa\naa");
+        });
+    }
+
+    #[gpui::test]
     fn test_word_delete_undo_restores_caret(cx: &mut TestAppContext) {
         let view = multi_line(cx);
         let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
@@ -6983,6 +11563,50 @@ mod tests {
                     assert!(text.is_char_boundary(sel.end));
                 }
                 state.replace_text_in_range(None, "X", window, cx);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_cursor_moves_and_deletes_whole_graphemes(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        let graphemes = ["a", "\u{267B}\u{FE0F}", "👍🏽", "👨‍👩‍👧", "🇸🇪", "e\u{301}", "b"];
+        let text = graphemes.concat();
+        let ends: Vec<usize> = graphemes
+            .iter()
+            .scan(0, |end, g| {
+                *end += g.len();
+                Some(*end)
+            })
+            .collect();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(text.clone(), window, cx);
+                state.set_selected_range(0..0, cx);
+                for &end in &ends {
+                    state.right(&MoveRight, window, cx);
+                    assert_eq!(state.cursor(), end);
+                }
+                for &end in ends.iter().rev().skip(1).chain([&0]) {
+                    state.left(&MoveLeft, window, cx);
+                    assert_eq!(state.cursor(), end);
+                }
+
+                state.set_selected_range(ends[3]..ends[3], cx);
+                state.backspace(&Backspace, window, cx);
+                assert_eq!(
+                    state.value(),
+                    ["a", graphemes[1], graphemes[2]].concat() + &graphemes[4..].concat()
+                );
+                state.delete(&Delete, window, cx);
+                assert_eq!(
+                    state.value(),
+                    ["a", graphemes[1], graphemes[2]].concat() + &graphemes[5..].concat()
+                );
             });
         });
     }
@@ -8403,6 +13027,69 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_rtl_arrow_keys_move_visually(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        // Each Arabic letter is two bytes.
+        let text = "مرحبا عالم";
+        let place = |cx: &mut VisualTestContext, offset: usize| {
+            cx.update(|window, cx| {
+                input.update(cx, |state, cx| {
+                    state.set_value(text, window, cx);
+                    let id = state.selections.generate_id();
+                    state
+                        .selections
+                        .replace_all(vec![CursorSelection::new(id, offset, offset)]);
+                });
+            });
+        };
+        let selection = |cx: &mut VisualTestContext| {
+            input.read_with(cx, |state, _| {
+                let sel = state.active_selection();
+                (sel.start, sel.end, sel.cursor_offset())
+            })
+        };
+
+        cx.update(|_, cx| crate::LayoutDirection::Rtl.set_global(cx));
+
+        // Right moves toward the start of a right-to-left paragraph.
+        place(&mut cx, 4);
+        cx.update(|window, cx| input.update(cx, |s, cx| s.right(&MoveRight, window, cx)));
+        assert_eq!(selection(&mut cx).2, 2);
+        cx.update(|window, cx| input.update(cx, |s, cx| s.left(&MoveLeft, window, cx)));
+        assert_eq!(selection(&mut cx).2, 4);
+
+        // Shift-arrows extend the selection the same way.
+        cx.update(|window, cx| input.update(cx, |s, cx| s.select_right(&SelectRight, window, cx)));
+        assert_eq!(selection(&mut cx), (2, 4, 2));
+        place(&mut cx, 4);
+        cx.update(|window, cx| input.update(cx, |s, cx| s.select_left(&SelectLeft, window, cx)));
+        assert_eq!(selection(&mut cx), (4, 6, 6));
+
+        // Word movement: Right goes to the previous word start.
+        let second_word = text.find('ع').unwrap();
+        place(&mut cx, text.len());
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| s.move_to_next_word(&MoveToNextWord, window, cx))
+        });
+        assert_eq!(selection(&mut cx).2, second_word);
+        place(&mut cx, 0);
+        cx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                s.move_to_previous_word(&MoveToPreviousWord, window, cx)
+            })
+        });
+        assert_eq!(selection(&mut cx).2, text.find(' ').unwrap());
+
+        // Left to right keeps the logical meaning.
+        cx.update(|_, cx| crate::LayoutDirection::Ltr.set_global(cx));
+        place(&mut cx, 4);
+        cx.update(|window, cx| input.update(cx, |s, cx| s.right(&MoveRight, window, cx)));
+        assert_eq!(selection(&mut cx).2, 6);
+    }
+
+    #[gpui::test]
     fn test_multi_cursor_selection_commands(cx: &mut TestAppContext) {
         let view = multi_line(cx);
         let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
@@ -8523,6 +13210,201 @@ mod tests {
         });
         // One clipboard line per cursor.
         assert_cursors(&mut cx, &input, "x|1\ny|2\nz|3");
+    }
+
+    #[gpui::test]
+    fn test_paste_without_text_leaves_the_selection_alone(cx: &mut TestAppContext) {
+        use gpui::{ClipboardEntry, Image, ImageFormat};
+
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("hello world", window, cx);
+                state.select_all(window, cx);
+                cx.write_to_clipboard(ClipboardItem {
+                    entries: vec![ClipboardEntry::Image(Image::from_bytes(
+                        ImageFormat::Png,
+                        vec![0x89, b'P', b'N', b'G'],
+                    ))],
+                });
+
+                // An image-only clipboard must not replace the selection
+                // with nothing.
+                state.paste(&Paste, window, cx);
+                assert_eq!(state.value(), "hello world");
+                assert_eq!(state.selected_range(), 0..11);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_paste_target_tracks_edits_and_selections(cx: &mut TestAppContext) {
+        let view = multi_line(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        setup_cursors(&mut cx, &input, "ab|c");
+        let target = input.read_with(&cx, |state, _| state.paste_target());
+        // Nothing happened: a paste asked for then still applies.
+        assert_eq!(
+            input.read_with(&cx, |state, _| state.paste_target()),
+            target
+        );
+
+        // Moving the caret changes where the paste would go.
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let id = state.selections.generate_id();
+                state
+                    .selections
+                    .replace_all(vec![CursorSelection::new(id, 1, 1)]);
+                cx.notify();
+            });
+        });
+        let moved = input.read_with(&cx, |state, _| state.paste_target());
+        assert_ne!(moved, target);
+
+        // Editing the text changes it too, even with the caret put back.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_range_silent(None, "x", window, cx);
+                let id = state.selections.generate_id();
+                state
+                    .selections
+                    .replace_all(vec![CursorSelection::new(id, 1, 1)]);
+            });
+        });
+        assert_ne!(input.read_with(&cx, |state, _| state.paste_target()), moved);
+    }
+
+    #[gpui::test]
+    fn character_index_for_point_finds_each_letter_where_it_is_drawn(cx: &mut TestAppContext) {
+        // With a gutter and without, on the first line and on the lines after it.
+        for line_number in [true, false] {
+            let input_view = InputView::build_editor(cx, move |state| {
+                state
+                    .line_number(line_number)
+                    .default_value("Teh quick\nbrown fox\njumps")
+            });
+            let mut visual = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+
+            visual.update(|window, cx| {
+                input_view.input.update(cx, |state, cx| {
+                    let bounds = state.text_bounds().unwrap();
+                    for index in [0, 5, 8, 10, 14, 18, 20, 24] {
+                        let middle = state
+                            .bounds_for_range(index..index + 1, bounds, window, cx)
+                            .unwrap()
+                            .center();
+                        assert_eq!(
+                            state.character_index_for_point(middle, window, cx),
+                            Some(index),
+                            "line numbers: {line_number}"
+                        );
+                    }
+                });
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn test_ime_candidate_bounds_fallback_before_repaint(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| {
+            state.default_value("这是一段已经输入的中文文字")
+        });
+        let mut visual = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        visual.update(|window, cx| {
+            input_view.input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                let len = state.text.len();
+                state.set_cursor_to(len);
+            });
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        visual.update(|window, cx| {
+            input_view.input.update(cx, |state, cx| {
+                let bounds = state.text_bounds().unwrap_or_default();
+                let before = state.selected_text_range(false, window, cx).unwrap().range;
+                let previous = state
+                    .bounds_for_range(before.end..before.end, bounds, window, cx)
+                    .unwrap();
+
+                state.replace_and_mark_text_in_range(None, "n", None, window, cx);
+
+                let after = state.selected_text_range(false, window, cx).unwrap().range;
+                let pending = state
+                    .bounds_for_range(after.end..after.end, bounds, window, cx)
+                    .unwrap();
+
+                assert!(
+                    (pending.origin.x - previous.origin.x).abs() < px(40.0),
+                    "pending origin.x {:?} must remain close to previous origin.x {:?}",
+                    pending.origin.x,
+                    previous.origin.x
+                );
+
+                let range_bounds = state
+                    .bounds_for_range(before.end..after.end, bounds, window, cx)
+                    .unwrap();
+                assert!(
+                    (range_bounds.origin.x - previous.origin.x).abs() < px(40.0),
+                    "range_bounds origin.x {:?} must remain close to previous origin.x {:?}",
+                    range_bounds.origin.x,
+                    previous.origin.x
+                );
+                assert!(range_bounds.size.width >= px(0.0));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn test_ime_candidate_bounds_multiline_line_end(cx: &mut TestAppContext) {
+        let input_view =
+            InputView::build_textarea(cx, |state| state.default_value("First line\nSecond line"));
+        let mut visual = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        visual.update(|window, cx| {
+            input_view.input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                // Position at end of first line ("First line".len() == 10)
+                state.set_cursor_to(10);
+            });
+        });
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        visual.update(|window, cx| {
+            input_view.input.update(cx, |state, cx| {
+                let bounds = state.text_bounds().unwrap_or_default();
+                let candidate_bounds = state.bounds_for_range(10..10, bounds, window, cx).unwrap();
+
+                // Candidate bounds for end of line 0 must be positioned at the end of line 0,
+                // and must not jump to the start of the next line (column 0).
+                let line_number_width = state
+                    .last_layout
+                    .as_ref()
+                    .map(|l| l.line_number_width)
+                    .unwrap_or_default();
+                assert!(
+                    candidate_bounds.origin.x > bounds.origin.x + line_number_width,
+                    "candidate bounds at line end must be past the line start, got {:?}",
+                    candidate_bounds.origin.x
+                );
+
+                let (line_idx, sub_line, pos) = state.line_and_position_for_offset(10);
+                assert_eq!(line_idx, 0);
+                assert_eq!(sub_line, 0);
+                assert!(pos.is_some());
+                assert!(pos.unwrap().x > line_number_width);
+            });
+        });
     }
 }
 
@@ -8651,15 +13533,64 @@ impl InputBaseState<crate::input::InputMode> {
 /// Methods shared by the two multi-line modes, and reachable on neither a
 /// single-line input nor anything else.
 impl<M: crate::input::MultiLineMode> InputBaseState<M> {
-    /// Set this input is searchable, default is false (Default true for Code Editor).
-    #[doc(hidden)]
+    /// Set whether text taller than the input stretches past its top and
+    /// bottom and springs back when precise trackpad or Magic Mouse scrolling
+    /// or its momentum runs into an end. Ordinary line-wheel scrolling does
+    /// not bounce. The default follows
+    /// [`crate::ScrollBounce::enabled_by_default`]: on on iOS, Android and
+    /// macOS, off elsewhere. Under reduced motion the text stops at its ends
+    /// without stretching.
+    pub fn scroll_bounce(mut self, scroll_bounce: bool) -> Self {
+        self.scroll_bounce = scroll_bounce;
+        self
+    }
+
+    /// Update whether the text stretches past its ends, see
+    /// [`InputBaseState::scroll_bounce`]. Turning it off drops a stretch in
+    /// progress.
+    pub fn set_scroll_bounce(&mut self, scroll_bounce: bool, cx: &mut Context<Self>) {
+        if self.scroll_bounce != scroll_bounce {
+            self.scroll_bounce = scroll_bounce;
+            self.overscroll.reset();
+            cx.notify();
+        }
+    }
+
+    /// Whether the built-in search panel and its shortcut are enabled. Off by
+    /// default, on for the code editor.
+    ///
+    /// This only concerns the panel. An input that is not searchable still
+    /// answers [`InputBaseState::set_search_query`] and the other search
+    /// methods, and lets `Ctrl-F` / `Cmd-F` bubble up to its ancestors, so an
+    /// application can put its own search UI on top of the same engine.
     pub fn searchable(mut self, searchable: bool) -> Self {
         self.searchable = searchable;
         self
     }
 
+    /// See [`InputBaseState::searchable`].
     pub fn set_searchable(&mut self, searchable: bool, cx: &mut Context<Self>) {
         self.searchable = searchable;
+        cx.notify();
+    }
+
+    /// The placement of the scrollbars, default is [`ScrollbarPlacement::BottomRight`].
+    ///
+    /// On the left, the vertical scrollbar sits on the input's left edge, over
+    /// the line numbers. At the top, the horizontal scrollbar overlays the
+    /// first line, as at the bottom it overlays the last.
+    pub fn scrollbar_placement(mut self, placement: ScrollbarPlacement) -> Self {
+        self.scrollbar_placement = placement;
+        self
+    }
+
+    /// See [`InputBaseState::scrollbar_placement`].
+    pub fn set_scrollbar_placement(
+        &mut self,
+        placement: ScrollbarPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        self.scrollbar_placement = placement;
         cx.notify();
     }
 
@@ -8721,14 +13652,16 @@ impl InputBaseState<crate::input::TextareaMode> {
 
     pub fn set_auto_grow(&mut self, min_rows: usize, max_rows: usize, cx: &mut Context<Self>) {
         self.mode = LayoutMode::auto_grow(min_rows, max_rows.max(min_rows));
+        self.mode.update_auto_grow(&self.display_map);
         cx.notify();
     }
 
     /// Set the number of rows for the multi-line Textarea.
     ///
-    /// This is only used when `multi_line` is set to true.
+    /// This is only used when `multi_line` is set to true. The input is at least
+    /// this many lines tall.
     ///
-    /// default: 2
+    /// default: 1
     #[doc(hidden)]
     pub fn rows(mut self, rows: usize) -> Self {
         match &mut self.mode {
@@ -8823,6 +13756,72 @@ impl InputBaseState<crate::input::EditorMode> {
         cx.notify();
     }
 
+    /// Fold or unfold the fold candidate that starts at `start_line`
+    /// (a 0-based buffer line). Returns false when no candidate starts there
+    /// or folding is disabled.
+    pub fn set_folded(&mut self, start_line: usize, folded: bool, cx: &mut Context<Self>) -> bool {
+        if !self.mode.is_folding() || !self.display_map.is_fold_candidate(start_line) {
+            return false;
+        }
+        self.display_map.set_folded(start_line, folded);
+        cx.notify();
+        true
+    }
+
+    /// Fold every fold candidate.
+    pub fn fold_all(&mut self, cx: &mut Context<Self>) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        let lines: Vec<usize> = self
+            .display_map
+            .fold_candidates()
+            .iter()
+            .map(|c| c.start_line)
+            .collect();
+        self.display_map.set_folded_lines(lines);
+        cx.notify();
+    }
+
+    /// Unfold every folded range. Fold candidates are kept.
+    pub fn unfold_all(&mut self, cx: &mut Context<Self>) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        self.display_map.clear_folds();
+        cx.notify();
+    }
+
+    /// Fold the candidates at one nesting level and unfold all others, as
+    /// Zed's `editor::FoldAtLevel`. Level 1 is a candidate that no other
+    /// candidate contains; level 2 is one inside a level-1 candidate, and so on.
+    pub fn fold_at_level(&mut self, level: usize, cx: &mut Context<Self>) {
+        if !self.mode.is_folding() {
+            return;
+        }
+        // One pass: the candidates are sorted by start line with unique starts,
+        // so the stack holds the end lines of the candidates that contain the
+        // current one, and its length is the depth.
+        let mut open: Vec<usize> = Vec::new();
+        let mut lines = Vec::new();
+        for c in self.display_map.fold_candidates() {
+            while open.last().is_some_and(|&end| end < c.end_line) {
+                open.pop();
+            }
+            if open.len() + 1 == level {
+                lines.push(c.start_line);
+            }
+            open.push(c.end_line);
+        }
+        self.display_map.set_folded_lines(lines);
+        cx.notify();
+    }
+
+    /// The fold candidates, as reported by the highlighter.
+    pub fn fold_candidates(&self) -> &[crate::input::FoldRange] {
+        self.display_map.fold_candidates()
+    }
+
     /// Unfold any folded ranges that hide the given position.
     ///
     /// Use this to reveal a position before acting on it (e.g. before
@@ -8858,6 +13857,22 @@ impl InputBaseState<crate::input::EditorMode> {
         true
     }
 
+    /// Horizontal offset from the content area's left edge to unscrolled source text.
+    ///
+    /// Includes the laid-out gap, line numbers, folding controls, and gutter
+    /// decorations. Excludes input-frame padding, horizontal scrolling, and
+    /// text alignment. For left-aligned text, add this to the content area's
+    /// origin and the horizontal scroll offset to recover the text origin.
+    ///
+    /// Returns `None` before the first layout. Like [`Self::range_to_bounds`],
+    /// this describes the most recent layout; render again after changing
+    /// gutter settings or typography before using it to align a static view.
+    pub fn text_origin_offset(&self) -> Option<Pixels> {
+        self.last_layout
+            .as_ref()
+            .map(|layout| layout.line_number_width)
+    }
+
     /// Set enable/disable line number.
     #[doc(hidden)]
     pub fn line_number(mut self, line_number: bool) -> Self {
@@ -8870,7 +13885,45 @@ impl InputBaseState<crate::input::EditorMode> {
     /// Set line number.
     pub fn set_line_number(&mut self, line_number: bool, _: &mut Window, cx: &mut Context<Self>) {
         if let LayoutMode::CodeEditor { line_number: l, .. } = &mut self.mode {
+            if *l == line_number {
+                return;
+            }
             *l = line_number;
+        }
+        cx.notify();
+    }
+
+    /// Set enable/disable showing the active line only while focused.
+    ///
+    /// Default: false
+    #[doc(hidden)]
+    pub fn active_line_only_when_focused(mut self, active_line_only_when_focused: bool) -> Self {
+        if let LayoutMode::CodeEditor {
+            active_line_only_when_focused: a,
+            ..
+        } = &mut self.mode
+        {
+            *a = active_line_only_when_focused;
+        }
+        self
+    }
+
+    /// Set showing the active line only while focused.
+    pub fn set_active_line_only_when_focused(
+        &mut self,
+        active_line_only_when_focused: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let LayoutMode::CodeEditor {
+            active_line_only_when_focused: a,
+            ..
+        } = &mut self.mode
+        {
+            if *a == active_line_only_when_focused {
+                return;
+            }
+            *a = active_line_only_when_focused;
         }
         cx.notify();
     }

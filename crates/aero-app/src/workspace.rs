@@ -2126,8 +2126,6 @@ impl Render for Workspace {
             .text_color(foreground)
             .child(self.render_title_bar(window, cx))
             .child(body)
-            .children(gpui_kit::component::Root::render_dialog_layer(window, cx))
-            .children(gpui_kit::component::Root::render_notification_layer(window, cx))
             .when_some(self.quick_open.as_ref().map(|(p, _)| p.clone()), |el, picker| {
                 // 遮罩 + 居中弹层（3.2）；点遮罩关闭
                 el.child(deferred(

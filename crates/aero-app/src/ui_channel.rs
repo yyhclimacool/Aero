@@ -133,15 +133,16 @@ fn run(cmd: &str, rest: &[&str], pressed: &mut bool, window: &mut Window, cx: &m
         "scroll" => {
             let dx = nums.get(3).copied().unwrap_or(0.);
             let dy = nums.get(2).copied().unwrap_or(0.);
-            let event = ScrollWheelEvent {
+            let event = ScrollEvent {
                 position: at(),
                 delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
                 modifiers,
                 touch_phase: TouchPhase::Moved,
+                source: ScrollSource::Pointer,
             };
-            window.dispatch_event(PlatformInput::ScrollWheel(event), cx);
+            window.dispatch_event(PlatformInput::Scroll(event), cx);
         }
-        "key" => match rest.first().map(|key| Keystroke::parse(key)) {
+        "key" => match rest.first().map(|key| Keystroke::parse_with_os(key, OperatingSystem::Mac)) {
             Some(Ok(keystroke)) => {
                 window.dispatch_keystroke(keystroke, cx);
             }

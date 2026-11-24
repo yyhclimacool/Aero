@@ -22,7 +22,7 @@ aero-embedding = { path = "crates/aero-embedding" }
 
 # UI 层唯一入口。gpui-kit 自带与之匹配的 GPUI（crates.io 上的 gpui-pre），
 # 所以不再需要 git 依赖；精确锁定版本，升级作为独立任务（见 project_plan.md 3.1）。
-gpui-kit = "=0.6.1"
+gpui-kit = "=0.11.0"
 
 # 全文 + 向量索引引擎。crates.io 上的 0.7.0 预编译包不带 jieba 词典，v0.7.1 tag 才有，
 # 因此暂时锁 git tag；上游发布到 crates.io 后改回版本号。

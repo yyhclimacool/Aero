@@ -82,7 +82,7 @@ fn main() {
 
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
+            window_bounds: Some(WindowBounds::centered(None, size(px(1280.), px(820.)), cx)),
             window_min_size: Some(size(px(760.), px(480.))),
             ..TitleBar::window_options()
         };

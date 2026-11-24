@@ -17,6 +17,9 @@ pub(crate) struct HighlighterUpdate<'a> {
     pub(super) old_text: &'a Rope,
     pub(super) new_text: &'a Rope,
     pub(super) change_text: &'a str,
+    /// An edit already computed for this replacement. When absent, the
+    /// highlighter derives one from the fields above.
+    pub(super) input_edit: Option<InputEdit>,
     pub(super) force: bool,
 }
 
@@ -44,6 +47,7 @@ pub(crate) enum LayoutMode {
         language: Box<EditorLanguage>,
         indent_guides: bool,
         folding: bool,
+        active_line_only_when_focused: bool,
         highlighter: Rc<RefCell<Option<Box<dyn InputHighlighter>>>>,
         highlighter_factory: Option<InputHighlighterFactory>,
         diagnostics: DiagnosticSet,
@@ -83,6 +87,7 @@ impl LayoutMode {
             line_number: true,
             indent_guides: true,
             folding: true,
+            active_line_only_when_focused: false,
             diagnostics: DiagnosticSet::new(&Rope::new()),
             auto_closed_pairs: Default::default(),
             auto_close: true,
@@ -142,6 +147,16 @@ impl LayoutMode {
             self,
             Self::CodeEditor {
                 smart_indent: true,
+                ..
+            }
+        )
+    }
+
+    pub(super) fn is_active_line_only_when_focused(&self) -> bool {
+        matches!(
+            self,
+            Self::CodeEditor {
+                active_line_only_when_focused: true,
                 ..
             }
         )
@@ -222,8 +237,12 @@ impl LayoutMode {
     /// Grow the row count to fit the content.
     ///
     /// Callers gate this on the input being multi-line; a single-line field
-    /// keeps its one row.
+    /// keeps its one row. Only auto grow follows the content: in the other
+    /// modes `rows` is the configured height.
     pub(super) fn update_auto_grow(&mut self, display_map: &DisplayMap) {
+        if !self.is_auto_grow() {
+            return;
+        }
         let wrapped_lines = display_map.wrap_row_count();
         self.set_rows(wrapped_lines);
     }
@@ -284,30 +303,46 @@ impl LayoutMode {
                 if !update.force && highlighter.borrow().is_some() {
                     return;
                 }
-
-                let mut highlighter_ref = highlighter.borrow_mut();
-                if highlighter_ref.is_none() {
-                    let Some(factory) = highlighter_factory else {
-                        return;
-                    };
-                    *highlighter_ref = factory(&language.name());
-                }
-
-                if highlighter_ref.is_none() {
+                if !ensure_highlighter(highlighter, highlighter_factory.as_ref(), language) {
                     return;
                 }
-                drop(highlighter_ref);
 
-                let edit = replacement_input_edit(
-                    update.old_text,
-                    update.new_text,
-                    update.selected_range,
-                    update.change_text,
-                );
+                let edit = update.input_edit.unwrap_or_else(|| {
+                    replacement_input_edit(
+                        update.old_text,
+                        update.new_text,
+                        update.selected_range,
+                        update.change_text,
+                    )
+                });
                 M::drive_highlighter(highlighter, edit, update.new_text, *folding, window, cx);
             }
             _ => {}
         }
+    }
+
+    /// Drive the highlighter once for several edits applied as one change,
+    /// each paired with the text right after it, in application order.
+    pub(crate) fn update_highlighter_batch<M: InputModeKind>(
+        &mut self,
+        edits: &[(InputEdit, Rope)],
+        window: &mut Window,
+        cx: &mut Context<crate::input::InputBaseState<M>>,
+    ) {
+        let LayoutMode::CodeEditor {
+            language,
+            highlighter,
+            highlighter_factory,
+            folding,
+            ..
+        } = &self
+        else {
+            return;
+        };
+        if !ensure_highlighter(highlighter, highlighter_factory.as_ref(), language) {
+            return;
+        }
+        M::drive_highlighter_batch(highlighter, edits, *folding, window, cx);
     }
 
     #[allow(unused)]
@@ -358,11 +393,27 @@ impl LayoutMode {
     }
 }
 
+/// Create the highlighter from the factory if there is none yet. Returns
+/// whether one is installed.
+fn ensure_highlighter(
+    highlighter: &RefCell<Option<Box<dyn InputHighlighter>>>,
+    highlighter_factory: Option<&InputHighlighterFactory>,
+    language: &EditorLanguage,
+) -> bool {
+    let mut highlighter = highlighter.borrow_mut();
+    if highlighter.is_none()
+        && let Some(factory) = highlighter_factory
+    {
+        *highlighter = factory(&language.name());
+    }
+    highlighter.is_some()
+}
+
 /// Builds the tree-sitter edit for a text replacement.
 ///
 /// Byte offsets and positions for `start`/`old_end` come from `old_text`;
 /// `new_end` byte/position come from the post-edit `text`.
-fn replacement_input_edit(
+pub(super) fn replacement_input_edit(
     old_text: &Rope,
     new_text: &Rope,
     selected_range: &Range<usize>,
@@ -411,11 +462,13 @@ mod tests {
         assert_eq!(mode.max_rows(), usize::MAX);
         assert_eq!(mode.min_rows(), 1);
         assert_eq!(mode.is_folding(), true);
+        assert_eq!(mode.is_active_line_only_when_focused(), false);
 
         let mode = LayoutMode::CodeEditor {
             line_number: false,
             indent_guides: false,
             folding: false,
+            active_line_only_when_focused: true,
             rows: 0,
             tab: Default::default(),
             language: Box::default(),
@@ -430,6 +483,7 @@ mod tests {
         assert_eq!(mode.has_indent_guides(), false);
         assert_eq!(mode.min_rows(), 1);
         assert_eq!(mode.is_folding(), false);
+        assert_eq!(mode.is_active_line_only_when_focused(), true);
         assert_eq!(mode.is_auto_close(), false);
         assert_eq!(mode.is_smart_indent(), false);
     }
