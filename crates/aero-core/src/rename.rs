@@ -179,10 +179,10 @@ impl RenamePlan {
         } else {
             self.vault.validate_local_path(&self.from)?;
         }
-        if let Some(stamp) = self.source_stamp {
-            if self.vault.read_bytes(&self.from)?.1.hash != stamp.hash {
-                return Err(RenameError::Changed(self.from.to_string()));
-            }
+        if let Some(stamp) = self.source_stamp
+            && self.vault.read_bytes(&self.from)?.1.hash != stamp.hash
+        {
+            return Err(RenameError::Changed(self.from.to_string()));
         }
         let paths: Vec<_> = self.observed.iter().map(|(p, _)| p.clone()).collect();
         self.vault.validate_local_path(&VaultPath::new(".aero")?)?;

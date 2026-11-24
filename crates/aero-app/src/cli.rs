@@ -137,7 +137,8 @@ pub fn run(args: &[String]) -> i32 {
             return code;
         }
     };
-    match execute(&cli, &app_data_dir()) {
+    let env_vault = std::env::var_os("AERO_VAULT").map(PathBuf::from);
+    match execute(&cli, &app_data_dir(), env_vault) {
         Ok(text) => {
             if !text.is_empty() {
                 println!("{text}");
@@ -151,7 +152,7 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-fn execute(cli: &Cli, data_dir: &Path) -> Result<String, String> {
+fn execute(cli: &Cli, data_dir: &Path, env_vault: Option<PathBuf>) -> Result<String, String> {
     if let Cmd::Diagnostics { action } = &cli.command {
         return match action {
             DiagnosticCmd::Export { output } => crate::diagnostics::export(output)
@@ -183,7 +184,10 @@ fn execute(cli: &Cli, data_dir: &Path) -> Result<String, String> {
         },
         Default::default(),
     );
-    let result = operation.scope(|| execute_vault(cli, data_dir));
+    let result = operation.scope(|| {
+        let root = vault_root(cli.vault.as_deref(), env_vault, data_dir)?;
+        execute_vault(cli, &root, data_dir)
+    });
     operation.finish(if result.is_ok() {
         crate::diagnostics::Outcome::Ok
     } else {
@@ -192,9 +196,8 @@ fn execute(cli: &Cli, data_dir: &Path) -> Result<String, String> {
     result
 }
 
-fn execute_vault(cli: &Cli, data_dir: &Path) -> Result<String, String> {
-    let root = vault_root(cli.vault.as_deref(), data_dir)?;
-    let vault = Arc::new(Vault::open(&root).map_err(|e| e.to_string())?);
+fn execute_vault(cli: &Cli, root: &Path, data_dir: &Path) -> Result<String, String> {
+    let vault = Arc::new(Vault::open(root).map_err(|e| e.to_string())?);
     match &cli.command {
         Cmd::Read { note, block } => {
             if let Some(path) = existing_note(&vault, note) {
@@ -242,12 +245,13 @@ fn execute_vault(cli: &Cli, data_dir: &Path) -> Result<String, String> {
     }
 }
 
-fn vault_root(flag: Option<&Path>, data_dir: &Path) -> Result<PathBuf, String> {
+/// Prefer an explicit flag, then the caller's environment value, then a recent vault on disk.
+fn vault_root(flag: Option<&Path>, env_vault: Option<PathBuf>, data_dir: &Path) -> Result<PathBuf, String> {
     if let Some(path) = flag {
         return Ok(path.to_path_buf());
     }
-    if let Some(path) = std::env::var_os("AERO_VAULT") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = env_vault {
+        return Ok(path);
     }
     PersistedState::load(data_dir)
         .recent_vaults
@@ -358,7 +362,7 @@ fn search(
     }
     let hits = indexer.search(&text, limit.max(1)).map_err(|e| e.to_string())?;
     if json {
-        return Ok(serde_json::to_string_pretty(&json!(
+        return serde_json::to_string_pretty(&json!(
             hits.iter()
                 .map(|hit| json!({
                     "path": hit.path.as_str(),
@@ -369,7 +373,7 @@ fn search(
                 }))
                 .collect::<Vec<_>>()
         ))
-        .map_err(|e| e.to_string())?);
+        .map_err(|e| e.to_string());
     }
     if hits.is_empty() {
         return Ok("没有结果".into());
@@ -397,19 +401,19 @@ fn read(
 }
 
 fn read_at(vault: &Vault, path: &VaultPath, block: Option<&str>, json: bool) -> Result<String, String> {
-    let (doc, _) = vault.read(&path).map_err(|e| e.to_string())?;
+    let (doc, _) = vault.read(path).map_err(|e| e.to_string())?;
     let (text, block_id) = match block {
         Some(id) => (block_text(&doc, id)?, Some(id.trim().trim_start_matches('^').to_owned())),
         None => (doc.to_string(), None),
     };
     if json {
-        return Ok(serde_json::to_string_pretty(&json!({
+        return serde_json::to_string_pretty(&json!({
             "path": path.as_str(),
             "title": doc.title_or(path.stem()),
             "block": block_id,
             "text": text,
         }))
-        .map_err(|e| e.to_string())?);
+        .map_err(|e| e.to_string());
     }
     Ok(text.trim_end().to_owned())
 }
@@ -439,7 +443,7 @@ fn backlinks(
     });
     let page = indexer.backlinks(&path, fragment.as_deref(), limit.max(1)).map_err(|e| e.to_string())?;
     if json {
-        return Ok(serde_json::to_string_pretty(&json!({
+        return serde_json::to_string_pretty(&json!({
             "path": path.as_str(),
             "total": page.total,
             "matched": page.matched,
@@ -450,7 +454,7 @@ fn backlinks(
                 "body": hit.body,
             })).collect::<Vec<_>>(),
         }))
-        .map_err(|e| e.to_string())?);
+        .map_err(|e| e.to_string());
     }
     let mut lines = vec![format!("{} 条反向链接", page.total)];
     if fragment.is_some() {
@@ -582,12 +586,12 @@ fn status(indexer: &Indexer, vault: &Vault, json: bool) -> Result<String, String
     let (notes, blocks) = indexer.stats();
     let on_disk = vault.notes().map_err(|e| e.to_string())?.len();
     if json {
-        return Ok(serde_json::to_string_pretty(&json!({
+        return serde_json::to_string_pretty(&json!({
             "notes": notes,
             "blocks": blocks,
             "on_disk": on_disk,
         }))
-        .map_err(|e| e.to_string())?);
+        .map_err(|e| e.to_string());
     }
     let mut text = format!("已索引笔记 {notes}\n块 {blocks}\n磁盘上的笔记 {on_disk}");
     if notes as usize != on_disk {
@@ -603,12 +607,12 @@ fn rebuild(indexer: &mut Indexer, json: bool) -> Result<String, String> {
     }
     indexer.flush().map_err(|e| e.to_string())?;
     if json {
-        return Ok(serde_json::to_string_pretty(&json!({
+        return serde_json::to_string_pretty(&json!({
             "indexed": report.indexed,
             "unchanged": report.unchanged,
             "removed": report.removed,
         }))
-        .map_err(|e| e.to_string())?);
+        .map_err(|e| e.to_string());
     }
     Ok(format!("已重建：写入 {}，未变化 {}，删除 {}", report.indexed, report.unchanged, report.removed))
 }
@@ -625,7 +629,7 @@ fn export_note(
 }
 
 fn export_at(vault: &Vault, path: &VaultPath, format: ExportFormat, json: bool) -> Result<String, String> {
-    let (doc, _) = vault.read(&path).map_err(|e| e.to_string())?;
+    let (doc, _) = vault.read(path).map_err(|e| e.to_string())?;
     let markdown = doc.to_string();
     let title = doc.title_or(path.stem());
     let pretty = |value: serde_json::Value| serde_json::to_string_pretty(&value).map_err(|e| e.to_string());
@@ -673,7 +677,7 @@ fn export_at(vault: &Vault, path: &VaultPath, format: ExportFormat, json: bool) 
 fn execute_args(args: &[&str], data_dir: &Path) -> Result<String, String> {
     let cli = Cli::try_parse_from(std::iter::once("aero").chain(args.iter().copied()))
         .map_err(|e| e.to_string())?;
-    execute(&cli, data_dir)
+    execute(&cli, data_dir, None)
 }
 
 #[cfg(test)]
@@ -758,13 +762,7 @@ mod tests {
         let mut state = PersistedState::default();
         state.touch_vault(dir.path());
         state.save(data.path());
-        let previous = std::env::var_os("AERO_VAULT");
-        unsafe { std::env::remove_var("AERO_VAULT") };
-        let text = execute_args(&["read", "a"], data.path());
-        if let Some(value) = previous {
-            unsafe { std::env::set_var("AERO_VAULT", value) };
-        }
-        assert_eq!(text.unwrap(), "正文");
+        assert_eq!(execute_args(&["read", "a"], data.path()).unwrap(), "正文");
     }
 
     #[test]

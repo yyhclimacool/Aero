@@ -236,7 +236,7 @@ proptest! {
         // (d) 全部撤销：文本恢复；重解析后，(c) 中保住 id 的块 id 仍是原来的
         while doc.undo().is_some() {}
         prop_assert_eq!(doc.to_string(), base.clone());
-        prop_assert_eq!(doc.word_count(), aero_core::text::word_count(&base));
+        prop_assert_eq!(doc.word_count(), aero_core::text::word_count(base));
         doc.reparse();
         let ids_after: Vec<BlockId> = doc.blocks().iter().map(|(_, b)| b.id).collect();
         prop_assert_eq!(ids_after.len(), original.len());

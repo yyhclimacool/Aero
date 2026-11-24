@@ -828,16 +828,19 @@ mod tests {
     }
     #[global_allocator]
     static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
+    // SAFETY: Accounting uses a thread-local counter without allocating. System owns the allocations.
     unsafe impl std::alloc::GlobalAlloc for MeasuredAllocator {
         unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
             let _ = ALLOCATED.try_with(|count| {
                 if let Some(n) = count.get() {
-                    count.set(Some(n + layout.size()));
+                    count.set(Some(n.saturating_add(layout.size())));
                 }
             });
+            // SAFETY: GlobalAlloc's caller supplies a valid allocation layout.
             unsafe { std::alloc::System.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            // SAFETY: The caller supplies the live pointer and layout from the corresponding allocation.
             unsafe { std::alloc::System.dealloc(ptr, layout) }
         }
     }

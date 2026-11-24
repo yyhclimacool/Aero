@@ -540,7 +540,7 @@ fn main() {
         vocab.en.len(),
         ms(t.elapsed())
     );
-    println!("  sample: {}", &notes[7][2].body.chars().take(70).collect::<String>());
+    println!("  sample: {}", notes[7][2].body.chars().take(70).collect::<String>());
     let rss_corpus = rss_mb();
     println!("  RSS with corpus in memory: {rss_corpus:.1} MB");
 
@@ -710,7 +710,7 @@ fn main() {
         let old_pks: Vec<&str> = current[ni].iter().map(|b| b.pk.as_str()).collect();
         col.delete_by_filter(&format!("note_id = '{}'", note_id(ni))).unwrap();
         let fetched = col.fetch(&old_pks).unwrap().len();
-        let q = fts_query("body", &vocab.zh(&mut rng).to_string(), 50, Some(&format!("note_id = '{}'", note_id(ni))));
+        let q = fts_query("body", vocab.zh(&mut rng), 50, Some(&format!("note_id = '{}'", note_id(ni))));
         let hits = col.query(&q).unwrap().len();
         println!("  after delete_by_filter: fetch(old pks) -> {fetched}, filtered query hits -> {hits} (expect 0 / 0)");
         let docs: Vec<Doc> = current[ni].iter().map(make_doc).collect();

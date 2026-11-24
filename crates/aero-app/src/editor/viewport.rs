@@ -279,11 +279,11 @@ impl Editor {
                 None
             };
             self.viewport.rebuild(&self.doc, &self.units, &pending);
-            if let Some((key, before)) = anchor {
-                if let Some(row) = self.viewport.rows.iter().position(|row| row.key == key) {
-                    let delta = self.viewport.prefix[row] - before;
-                    self.scroll.set_offset(point(offset.x, (offset.y - delta).min(px(0.))));
-                }
+            if let Some((key, before)) = anchor
+                && let Some(row) = self.viewport.rows.iter().position(|row| row.key == key)
+            {
+                let delta = self.viewport.prefix[row] - before;
+                self.scroll.set_offset(point(offset.x, (offset.y - delta).min(px(0.))));
             }
         }
         let mut pinned = Vec::with_capacity(2);
@@ -560,6 +560,6 @@ mod tests {
         assert_eq!(viewport.rows[1].units, 1..4);
         assert_eq!(viewport.unit_rows, [0, 1, 1, 1, 2]);
         viewport.mount(px(0.), px(100.), &[2]);
-        assert_eq!(viewport.unit_ranges, [0..5]);
+        assert_eq!(viewport.unit_ranges.as_slice(), std::slice::from_ref(&(0..5)));
     }
 }

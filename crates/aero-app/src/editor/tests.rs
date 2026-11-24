@@ -5382,7 +5382,7 @@ fn pasting_a_bitmap_imports_it_and_leaves_text_paste_alone(cx: &mut TestAppConte
         .split_once("![[")
         .and_then(|(_, rest)| rest.split_once("]]"))
         .map(|(name, _)| name.to_owned())
-        .expect(&format!("粘贴应插入图片嵌入，实际是 {body:?}"));
+        .unwrap_or_else(|| panic!("粘贴应插入图片嵌入，实际是 {body:?}"));
     assert!(name.ends_with(".png"), "{name}");
     let file = dir.path().join("a.assets").join(&name);
     assert_eq!(std::fs::read(&file).unwrap(), image_bytes(40, 20), "原始字节写进 .assets/");

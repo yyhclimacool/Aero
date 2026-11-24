@@ -98,7 +98,7 @@ fn main() {
                 })
                 .expect("failed to open window");
             #[cfg(debug_assertions)]
-            let _ = cx.update(|cx| ui_channel::spawn(window.into(), cx));
+            cx.update(|cx| ui_channel::spawn(window.into(), cx));
             #[cfg(not(debug_assertions))]
             let _ = window;
         })

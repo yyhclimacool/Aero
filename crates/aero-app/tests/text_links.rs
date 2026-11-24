@@ -66,6 +66,8 @@ use gpui_kit::{
 const LINK: u32 = 0xab3456;
 type Events = Arc<Mutex<Vec<(SharedString, bool, Bounds<Pixels>)>>>;
 
+type PreviewTimer = Arc<Mutex<(Option<gpui_kit::Task<()>>, bool)>>;
+
 struct Links {
     source: String,
     events: Events,
@@ -80,7 +82,7 @@ struct Links {
     selectable: bool,
     clicks: Arc<Mutex<Vec<(SharedString, gpui_kit::ClickEvent)>>>,
     occluder_moves: Option<Arc<Mutex<usize>>>,
-    preview: Option<Arc<Mutex<(Option<gpui_kit::Task<()>>, bool)>>>,
+    preview: Option<PreviewTimer>,
 }
 
 impl Links {

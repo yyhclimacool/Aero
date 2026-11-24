@@ -38,58 +38,54 @@ fn parse_callout(source: &str, ancestor_quotes: usize, offset: usize) -> Option<
     Some(Callout { kind, title, fold, body, offset })
 }
 
+/// `origin` supplies the source note for PDF and nested note embeds.
+/// `block` still belongs to the host editor and identifies its interactive elements.
+#[derive(Clone)]
+pub(super) struct PreviewContext {
+    pub(super) state: Entity<PreviewState>,
+    pub(super) editor: Entity<super::Editor>,
+    pub(super) block: aero_core::BlockId,
+    pub(super) reveal: u64,
+    pub(super) origin: Option<aero_core::VaultPath>,
+}
+
+#[derive(Default)]
+struct EmbedStack {
+    depth: u8,
+    chain: Vec<(aero_core::VaultPath, Option<String>)>,
+}
+
 pub(super) fn markdown(
     id: SharedString,
     text: SharedString,
     style: TextViewStyle,
-    reveal: u64,
-    state: Entity<PreviewState>,
-    editor: Entity<super::Editor>,
-    block: aero_core::BlockId,
-    depth: u8,
+    preview: PreviewContext,
 ) -> TextView {
-    markdown_from(id, text, style, reveal, state, editor, block, depth, None)
+    markdown_nested(id, text, style, preview, EmbedStack::default())
 }
 
-pub(super) fn markdown_from(
+fn markdown_nested(
     id: SharedString,
     text: SharedString,
     style: TextViewStyle,
-    reveal: u64,
-    state: Entity<PreviewState>,
-    editor: Entity<super::Editor>,
-    block: aero_core::BlockId,
-    depth: u8,
-    origin: Option<aero_core::VaultPath>,
+    preview: PreviewContext,
+    stack: EmbedStack,
 ) -> TextView {
-    markdown_chain(id, text, style, reveal, state, editor, block, depth, origin, Vec::new())
-}
-
-fn markdown_chain(
-    id: SharedString,
-    text: SharedString,
-    style: TextViewStyle,
-    reveal: u64,
-    state: Entity<PreviewState>,
-    editor: Entity<super::Editor>,
-    block: aero_core::BlockId,
-    depth: u8,
-    origin: Option<aero_core::VaultPath>,
-    chain: Vec<(aero_core::VaultPath, Option<String>)>,
-) -> TextView {
+    let editor = preview.editor.clone();
+    let block = preview.block;
     let rich_editor = editor.clone();
-    let rich_origin = origin.clone();
-    let block_editor = editor.clone();
-    let embed_editor = editor.clone();
+    let rich_origin = preview.origin.clone();
+    let embed_preview = preview.clone();
+    let depth = stack.depth;
     let embed_style = style.clone();
     let embed_id = id.clone();
-    let embed_origin = origin.clone();
     let highlight_editor = editor.clone();
     let highlight_style = style.clone();
     let highlight_id = id.clone();
     let image_editor = editor.clone();
     let image_style = style.clone();
     let image_id = id.clone();
+    let file_chip_editor = editor.clone();
     with_links(TextView::markdown(id.clone(), text), &editor)
         .style(style.clone())
         .selectable(false)
@@ -129,13 +125,10 @@ fn markdown_chain(
             let chip = file_chip(source)?;
             Some(MarkdownNode::new("file-chip", chip).markdown(source.to_owned()))
         })
-        .markdown_block_renderer("file-chip", {
-            let editor = editor.clone();
-            move |node, _, cx| {
-                let (label, path, fragment) =
-                    node.data::<(String, String, Option<String>)>().expect("file chip data");
-                render_file_chip(label, path, fragment.clone(), &editor, cx)
-            }
+        .markdown_block_renderer("file-chip", move |node, _, cx| {
+            let (label, path, fragment) =
+                node.data::<(String, String, Option<String>)>().expect("file chip data");
+            render_file_chip(label, path, fragment.clone(), &file_chip_editor, cx)
         })
         .markdown_block_parser(|node, cx| {
             if !matches!(node, markdown_ast::Node::Paragraph(_)) {
@@ -167,17 +160,7 @@ fn markdown_chain(
         .markdown_block_renderer("note-embed", move |node, _, cx| {
             let (offset, embed) = node.data::<(usize, NoteEmbed)>().expect("note embed parser data");
             let id: SharedString = format!("{embed_id}-embed-{offset}").into();
-            render_note_embed(
-                id,
-                embed,
-                &embed_style,
-                &embed_editor,
-                block,
-                depth,
-                embed_origin.as_ref(),
-                &chain,
-                cx,
-            )
+            render_note_embed(id, embed, &embed_style, &embed_preview, &stack, cx)
         })
         .markdown_block_parser(|node, cx| {
             if !matches!(node, markdown_ast::Node::Blockquote(_)) {
@@ -193,18 +176,7 @@ fn markdown_chain(
         .markdown_block_renderer("callout", move |node, _, cx| {
             let callout = node.data::<Callout>().expect("callout parser data");
             let id: SharedString = format!("{id}-callout-{}", callout.offset).into();
-            render_callout(
-                id,
-                callout,
-                style.clone(),
-                reveal,
-                &state,
-                &block_editor,
-                block,
-                depth,
-                origin.clone(),
-                cx,
-            )
+            render_callout(id, callout, style.clone(), &preview, depth, cx)
         })
         .markdown_block_parser(|node, cx| {
             if !matches!(
@@ -328,10 +300,10 @@ struct NoteEmbed {
     source: String,
 }
 
-/// 嵌入里还能再嵌入，但只渲染一层：再深就显示源码，免得互相嵌入转不出来。
+/// 嵌入最多展开三跳，深度上限也约束不同片段之间的递归引用。
 const EMBED_DEPTH: u8 = 3;
 
-/// 整段只有一个笔记嵌入时才渲染内容；附件交给图片渲染器，PDF 暂时保持源码。
+/// 只匹配独占段落的笔记嵌入。图片、PDF 等附件由各自的渲染器处理。
 fn note_embed(source: &str) -> Option<NoteEmbed> {
     let trimmed = source.trim();
     let embeds = aero_core::links::scan_embeds(trimmed);
@@ -351,15 +323,14 @@ fn render_note_embed(
     id: SharedString,
     embed: &NoteEmbed,
     style: &TextViewStyle,
-    editor: &Entity<super::Editor>,
-    block: aero_core::BlockId,
-    depth: u8,
-    origin: Option<&aero_core::VaultPath>,
-    chain: &[(aero_core::VaultPath, Option<String>)],
+    preview: &PreviewContext,
+    stack: &EmbedStack,
     cx: &mut App,
 ) -> AnyElement {
     use super::embeds_ui::EmbedView;
 
+    let editor = &preview.editor;
+    let origin = preview.origin.as_ref();
     let theme = cx.theme();
     let selector = {
         let (target, fragment) = (embed.target.clone(), embed.fragment.clone());
@@ -368,7 +339,7 @@ fn render_note_embed(
             None => format!("embed-{target}"),
         }
     };
-    if depth >= EMBED_DEPTH {
+    if stack.depth >= EMBED_DEPTH {
         return div()
             .text_xs()
             .text_color(theme.muted_foreground)
@@ -395,10 +366,10 @@ fn render_note_embed(
             )
             .into_any_element(),
         EmbedView::Ready { path, fragment, title, source } => {
-            if chain.contains(&(path.clone(), fragment.clone())) {
+            if stack.chain.iter().any(|(ancestor, anchor)| ancestor == &path && anchor == &fragment) {
                 return div().text_xs().text_color(theme.danger).child("同步引用形成循环").into_any_element();
             }
-            let mut chain = chain.to_vec();
+            let mut chain = stack.chain.clone();
             chain.push((path.clone(), fragment.clone()));
             let click = {
                 let (editor, target, fragment) = (editor.clone(), path.as_str().to_owned(), fragment.clone());
@@ -420,27 +391,18 @@ fn render_note_embed(
                 Some(f) if !f.is_empty() => format!("{title} › {f}"),
                 _ => title,
             };
-            let content: AnyElement = if depth < EMBED_DEPTH {
-                markdown_chain(
-                    format!("{id}-body").into(),
-                    aero_core::links::to_markdown(&source).into(),
-                    style.clone(),
-                    0,
-                    editor.read(cx).preview.clone(),
-                    editor.clone(),
-                    block,
-                    depth + 1,
-                    Some(path),
-                    chain,
-                )
-                .into_any_element()
-            } else {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("同步引用已达到 3 跳展开上限")
-                    .into_any_element()
-            };
+            let content = markdown_nested(
+                format!("{id}-body").into(),
+                aero_core::links::to_markdown(&source).into(),
+                style.clone(),
+                PreviewContext {
+                    state: editor.read(cx).preview.clone(),
+                    origin: Some(path),
+                    reveal: 0,
+                    ..preview.clone()
+                },
+                EmbedStack { depth: stack.depth + 1, chain },
+            );
             v_flex()
                 .id(id.clone())
                 .gap_1()
@@ -492,7 +454,8 @@ fn render_images(
         let Some(embed) = embeds.first() else {
             return div().into_any_element();
         };
-        return render_image(id, embed, 0, None, style, editor, block, window, cx);
+        let placement = ImagePlacement { block, index: 0, slot: None };
+        return render_image(id, embed, placement, style, editor, window, cx);
     }
     let slots = image_row_slots(embeds, editor, block, window, cx);
     h_flex()
@@ -504,11 +467,9 @@ fn render_images(
             div().w(px(slot)).flex_shrink(1.).min_w(px(0.)).child(render_image(
                 SharedString::from(format!("{id}-{index}")),
                 embed,
-                index,
-                Some(slot),
+                ImagePlacement { block, index, slot: Some(slot) },
                 style,
                 editor,
-                block,
                 window,
                 cx,
             ))
@@ -567,21 +528,26 @@ fn image_natural_width(
     }
 }
 
-/// 位图 / 占位 / 源码 + 错误 + 重试（9.9 的统一表现）；渲染永远不改文件。
-/// `slot` 是并排时分到的宽度；单独一张时按原图尺寸，不超过默认行宽。
+struct ImagePlacement {
+    block: aero_core::BlockId,
+    index: usize,
+    /// 并排图片分到的宽度。单独一张时按原图尺寸，受默认行宽约束。
+    slot: Option<f32>,
+}
+
+/// 根据附件状态显示位图、占位或可重试的错误。
 fn render_image(
     id: SharedString,
     embed: &ImageEmbed,
-    index: usize,
-    slot: Option<f32>,
+    placement: ImagePlacement,
     style: &TextViewStyle,
     editor: &Entity<super::Editor>,
-    block: aero_core::BlockId,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     use crate::render::{Attachment, State};
 
+    let ImagePlacement { block, index, slot } = placement;
     let (source, service) = {
         let editor = editor.read(cx);
         (editor.path.clone(), editor.images.clone())
@@ -1093,14 +1059,12 @@ fn render_callout(
     id: SharedString,
     callout: &Callout,
     style: TextViewStyle,
-    reveal: u64,
-    state: &Entity<PreviewState>,
-    editor: &Entity<super::Editor>,
-    block: aero_core::BlockId,
+    preview: &PreviewContext,
     depth: u8,
-    origin: Option<aero_core::VaultPath>,
     cx: &mut App,
 ) -> AnyElement {
+    let state = &preview.state;
+    let reveal = preview.reveal;
     let (label, icon, color) = appearance(&callout.kind, cx);
     let title = callout.title.clone().unwrap_or_else(|| label.to_owned());
     let fold = callout.fold;
@@ -1184,16 +1148,12 @@ fn render_callout(
         .child(header)
         .when(open && !callout.body.is_empty(), |el| {
             el.child(div().debug_selector(move || format!("callout-body-{title}")).w_full().min_w_0().child(
-                markdown_from(
+                markdown_nested(
                     format!("{id}-body").into(),
                     aero_core::links::to_markdown(&callout.body).into(),
                     style,
-                    reveal,
-                    state.clone(),
-                    editor.clone(),
-                    block,
-                    depth,
-                    origin,
+                    preview.clone(),
+                    EmbedStack { depth, ..Default::default() },
                 ),
             ))
         })

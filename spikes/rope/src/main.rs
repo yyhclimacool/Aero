@@ -29,13 +29,16 @@ use comrak::{Arena, Options, parse_document};
 struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
+// SAFETY: The atomic counter only records sizes. Every allocation is owned by System.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         LIVE.fetch_add(l.size(), Ordering::Relaxed);
+        // SAFETY: GlobalAlloc's caller supplies a valid allocation layout.
         unsafe { System.alloc(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         LIVE.fetch_sub(l.size(), Ordering::Relaxed);
+        // SAFETY: The caller supplies the live pointer and layout returned by the matching allocation.
         unsafe { System.dealloc(p, l) }
     }
 }
@@ -468,7 +471,7 @@ fn pct(v: &mut [f64], q: f64) -> f64 {
     v[((v.len() as f64 - 1.0) * q).round() as usize]
 }
 
-fn row(label: &str, samples: &mut Vec<f64>, unit: &str, extra: &str) {
+fn row(label: &str, samples: &mut [f64], unit: &str, extra: &str) {
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
     let p50 = pct(samples, 0.5);
     let p99 = pct(samples, 0.99);

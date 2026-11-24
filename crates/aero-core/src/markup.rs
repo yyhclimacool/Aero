@@ -319,16 +319,17 @@ fn color_marks(src: &str, code: &[Range<usize>], out: &mut Analysis) {
             .filter(|class| Slot::Text.owns(class) || Slot::Background.owns(class))
             .cloned()
             .collect();
-        if open > 0 && src.as_bytes()[open - 1] == b']' {
-            if let Some(bracket) = colors::bracket_start(src, open - 1, colors::line_start(src, open)) {
-                out.conceal.push(bracket..bracket + 1);
-                out.conceal.push(open - 1..end);
-                let content = bracket + 1..open - 1;
-                if content.start < content.end && !classes.is_empty() {
-                    out.styles.push((content, Mark::Palette(classes)));
-                }
-                continue;
+        if open > 0
+            && src.as_bytes()[open - 1] == b']'
+            && let Some(bracket) = colors::bracket_start(src, open - 1, colors::line_start(src, open))
+        {
+            out.conceal.push(bracket..bracket + 1);
+            out.conceal.push(open - 1..end);
+            let content = bracket + 1..open - 1;
+            if content.start < content.end && !classes.is_empty() {
+                out.styles.push((content, Mark::Palette(classes)));
             }
+            continue;
         }
         out.conceal.push(open..end);
     }

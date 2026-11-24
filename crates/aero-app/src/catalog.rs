@@ -66,10 +66,11 @@ impl Catalog {
         loop {
             let (version, full, dirty, previous) = {
                 let state = self.state.lock().unwrap();
-                if !state.full && state.dirty.is_empty() {
-                    if let Some(snapshot) = &state.snapshot {
-                        return Ok(snapshot.clone());
-                    }
+                if !state.full
+                    && state.dirty.is_empty()
+                    && let Some(snapshot) = &state.snapshot
+                {
+                    return Ok(snapshot.clone());
                 }
                 (state.version, state.full, state.dirty.clone(), state.snapshot.clone())
             };

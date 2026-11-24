@@ -125,6 +125,15 @@ struct QueuedOperation {
     diagnostic: crate::diagnostics::Operation,
 }
 
+/// A validated rename and the paths the open editors must follow when it finishes.
+struct PreparedRename {
+    plan: aero_core::rename::RenamePlan,
+    old: VaultPath,
+    target: VaultPath,
+    directory: bool,
+    description: String,
+}
+
 impl PendingOperation {
     fn name(&self) -> &'static str {
         match self {
@@ -399,7 +408,7 @@ impl Workspace {
                 })
                 .await;
             if let Some(report) = report {
-                let _ = tree.update(cx, |tree, cx| tree.set_references(report, cx));
+                tree.update(cx, |tree, cx| tree.set_references(report, cx));
             }
             let _ = this.update(cx, |this, cx| {
                 this.references_task = None;
@@ -686,10 +695,10 @@ impl Workspace {
         let editor = open.editor().cloned();
         if target.trim().is_empty() {
             // `[[#标题]]` / `[[#^id]]`：同篇锚点
-            if let (Some(fragment), Some(editor)) = (fragment, editor) {
-                if let Err(error) = editor.update(cx, |e, cx| e.reveal_fragment(&fragment, cx)) {
-                    window.push_notification(Notification::info(error).title("Aero"), cx);
-                }
+            if let (Some(fragment), Some(editor)) = (fragment, editor)
+                && let Err(error) = editor.update(cx, |e, cx| e.reveal_fragment(&fragment, cx))
+            {
+                window.push_notification(Notification::info(error).title("Aero"), cx);
             }
             return;
         }
@@ -1290,7 +1299,8 @@ impl Workspace {
                     );
                     return;
                 }
-                this.execute_change_name(diagnostic, plan, old, target, directory, description, window, cx);
+                let prepared = PreparedRename { plan, old, target, directory, description };
+                this.execute_change_name(diagnostic, prepared, window, cx);
             });
         })
         .detach();
@@ -1299,14 +1309,11 @@ impl Workspace {
     fn execute_change_name(
         &mut self,
         diagnostic: crate::diagnostics::Operation,
-        plan: aero_core::rename::RenamePlan,
-        old: VaultPath,
-        target: VaultPath,
-        directory: bool,
-        description: String,
+        prepared: PreparedRename,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let PreparedRename { plan, old, target, directory, description } = prepared;
         let Some(open) = self.open.as_ref() else {
             self.rename_pending = false;
             return;
@@ -2274,7 +2281,7 @@ mod tests {
     use aero_core::{Vault, VaultPath};
     use gpui_kit::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 
-    use super::{SidebarTab, Tab, VaultSession, Workspace};
+    use super::{PreparedRename, SidebarTab, Tab, VaultSession, Workspace};
     use crate::actions::NewTab;
     use crate::backlinks::BacklinksView;
     use crate::editor::{Editor, SaveState};
@@ -3996,11 +4003,7 @@ mod tests {
                 aero_core::rename::RenamePlan::prepare(&open.vault, old.clone(), target.clone()).unwrap();
             w.execute_change_name(
                 crate::diagnostics::Operation::new("rename", Default::default()),
-                plan,
-                old,
-                target,
-                false,
-                "test rename".into(),
+                PreparedRename { plan, old, target, directory: false, description: "test rename".into() },
                 window,
                 cx,
             );
@@ -4036,11 +4039,13 @@ mod tests {
             let plan = aero_core::rename::RenamePlan::prepare(&vault, old.clone(), target.clone()).unwrap();
             w.execute_change_name(
                 crate::diagnostics::Operation::new("rename", Default::default()),
-                plan,
-                old.clone(),
-                target.clone(),
-                false,
-                "test rename".into(),
+                PreparedRename {
+                    plan,
+                    old: old.clone(),
+                    target: target.clone(),
+                    directory: false,
+                    description: "test rename".into(),
+                },
                 window,
                 cx,
             );
@@ -4578,8 +4583,7 @@ mod tests {
         let text = body(cx);
         assert!(text.contains("[[a]]"), "{text}");
         assert!(!text.contains("![[a]]"), "{text}");
-        let mut alt = Modifiers::default();
-        alt.alt = true;
+        let alt = Modifiers { alt: true, ..Default::default() };
         drag(cx, alt);
         let text = body(cx);
         assert!(text.contains("![[a]]"), "{text}");

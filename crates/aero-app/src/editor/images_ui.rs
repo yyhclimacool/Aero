@@ -335,7 +335,7 @@ impl super::Editor {
                     }
                 }
             }
-            let _ = editor.update(cx, |this, cx| {
+            editor.update(cx, |this, cx| {
                 this.imports.pending -= 1;
                 cx.emit(super::EditorEvent::Changed);
                 cx.notify();
@@ -358,10 +358,10 @@ impl super::Editor {
         }
         let focused = self.focus_handle.is_focused(window)
             || self.focused.as_ref().is_some_and(|f| f.textarea.focus_handle(cx).is_focused(window));
-        if let Some(at) = self.apply_import(imported, range, padding, cx) {
-            if focused {
-                self.focus_at(at, None, window, cx);
-            }
+        if let Some(at) = self.apply_import(imported, range, padding, cx)
+            && focused
+        {
+            self.focus_at(at, None, window, cx);
         }
     }
 

@@ -73,7 +73,8 @@ fn commit_restoring(
 pub(crate) enum Operation {
     Paste {
         token: String,
-        payload: aero_core::clipboard::Payload,
+        // Keep clipboard metadata off the stack for unrelated file operation events.
+        payload: Box<aero_core::clipboard::Payload>,
         source: String,
         destination: VaultPath,
         before: Vec<u8>,
@@ -440,15 +441,15 @@ impl Workspace {
             _ => None,
         };
         let editors = Editor::live_editors(vault.id(), cx);
-        if let Operation::Transaction { token, direction: Some(redo), changes, .. } = &operation {
-            if editors.iter().any(|editor| {
+        if let Operation::Transaction { token, direction: Some(redo), changes, .. } = &operation
+            && editors.iter().any(|editor| {
                 let e = editor.read(cx);
                 changes.iter().any(|c| &c.path == e.path())
                     && e.history_transaction(*redo) != Some(token.as_str())
-            }) {
-                window.push_notification(Notification::warning("请先撤销参与文档中的后续编辑。"), cx);
-                return;
-            }
+            })
+        {
+            window.push_notification(Notification::warning("请先撤销参与文档中的后续编辑。"), cx);
+            return;
         }
         set_busy(vault.id(), true, cx);
         for editor in &editors {
@@ -642,13 +643,13 @@ mod tests {
         let token = aero_core::identity::new_block_id();
         let operation = Operation::Paste {
             token: token.clone(),
-            payload: Payload {
+            payload: Box::new(Payload {
                 version: 1,
                 vault: vault.id().into(),
                 path: source.to_string(),
                 document: Some(id),
                 cut: Some(token),
-            },
+            }),
             source: moved,
             destination: target.clone(),
             before: b"destination\n".to_vec(),

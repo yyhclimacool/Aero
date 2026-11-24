@@ -119,7 +119,7 @@ fn lock(file: &File) -> bool {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        // Each worker holds a separate descriptor for its entire session lifetime.
+        // SAFETY: The borrowed File keeps the descriptor open throughout the flock call.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
     }
     #[cfg(not(unix))]
@@ -313,10 +313,10 @@ impl Writer {
             let command = if let Ok(command) = control.try_recv() {
                 // Flush/stop bypass a full event queue, then drain its bounded snapshot.
                 for event in receiver.try_iter().take(self.limits.queue) {
-                    if let Command::Record(record) = event {
-                        if self.write(&record).is_err() {
-                            self.errors.fetch_add(1, Ordering::Relaxed);
-                        }
+                    if let Command::Record(record) = event
+                        && self.write(&record).is_err()
+                    {
+                        self.errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 for record in important.try_iter().take(64) {
@@ -346,13 +346,14 @@ impl Writer {
                 Ok(Command::Stop(done, normal_exit)) => {
                     self.health(true);
                     let flushed = self.file.flush().and_then(|_| self.file.get_ref().sync_all()).is_ok();
-                    if flushed && normal_exit {
-                        if let Ok(mut file) = create_file(&self.dir.join("complete.json")) {
-                            let body = serde_json::json!({"schema": 1, "time": chrono::Utc::now().to_rfc3339(),
+                    if flushed
+                        && normal_exit
+                        && let Ok(mut file) = create_file(&self.dir.join("complete.json"))
+                    {
+                        let body = serde_json::json!({"schema": 1, "time": chrono::Utc::now().to_rfc3339(),
                                 "dropped": self.dropped.load(Ordering::Relaxed), "write_errors": self.errors.load(Ordering::Relaxed)});
-                            let _ = serde_json::to_writer(&mut file, &body);
-                            let _ = file.sync_all();
-                        }
+                        let _ = serde_json::to_writer(&mut file, &body);
+                        let _ = file.sync_all();
                     }
                     let _ = done.send(());
                     break;
@@ -463,16 +464,16 @@ pub(super) fn export(root: &Path, destination: &Path) -> io::Result<()> {
             let mut reader = BufReader::new(file.take(length));
             let mut line = Vec::new();
             while reader.read_until(b'\n', &mut line)? > 0 {
-                if line.len() <= 16 * 1024 && line.last() == Some(&b'\n') {
-                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) {
-                        if valid_record(&value) {
-                            if !first_record {
-                                output.write_all(b",")?;
-                            }
-                            first_record = false;
-                            serde_json::to_writer(&mut output, &value)?;
-                        }
+                if line.len() <= 16 * 1024
+                    && line.last() == Some(&b'\n')
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line)
+                    && valid_record(&value)
+                {
+                    if !first_record {
+                        output.write_all(b",")?;
                     }
+                    first_record = false;
+                    serde_json::to_writer(&mut output, &value)?;
                 }
                 line.clear();
             }
@@ -536,8 +537,11 @@ fn kernel_version() -> String {
     #[cfg(unix)]
     {
         let mut name = std::mem::MaybeUninit::<libc::utsname>::uninit();
+        // SAFETY: name points to properly aligned storage for one utsname.
         if unsafe { libc::uname(name.as_mut_ptr()) } == 0 {
+            // SAFETY: uname initialized the structure on success.
             let name = unsafe { name.assume_init() };
+            // SAFETY: uname supplies a NUL-terminated release string within name.
             return unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) }.to_string_lossy().into_owned();
         }
     }

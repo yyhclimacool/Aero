@@ -249,7 +249,7 @@ fn wrap_formula(mut laid_out: ratex_layout::LayoutBox, max_em: f64) -> ratex_lay
                         std::mem::replace(inner.as_mut(), ratex_layout::LayoutBox::new_empty()),
                         max_em,
                     );
-                    *inner = Box::new(wrapped);
+                    **inner = wrapped;
                 }
             }
             return make_vbox(std::mem::take(children));
@@ -841,7 +841,7 @@ fn produced(rgba: RgbaImage, origin: Origin) -> Produced {
     let pixels = size(rgba.width(), rgba.height());
     let mut rgba = rgba;
     // GPUI 的 RenderImage 吃 BGRA
-    for pixel in rgba.as_flat_samples_mut().samples.chunks_exact_mut(4) {
+    for pixel in rgba.as_flat_samples_mut().samples.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Produced { frame: Frame::new(rgba), pixels, origin, pages: None }
@@ -1066,7 +1066,7 @@ mod tests {
 
         // 文件改了：缓存项丢弃，重新渲染出新尺寸
         std::fs::write(vault.fs_path(&path), png(800, 800, [9, 9, 9, 255])).unwrap();
-        service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+        service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&path), cx));
         assert!(matches!(
             service.update(cx, |s, cx| s.image(path.clone(), 200, 2., cx)),
             State::Pending { pixels: None }
@@ -1285,7 +1285,7 @@ mod tests {
         let service = cx.new(|_| RenderService::new(Arc::new(vault), cache.path().to_path_buf()));
         for _ in 0..100 {
             service.update(cx, |s, cx| {
-                s.invalidate(&[path.clone()], cx);
+                s.invalidate(std::slice::from_ref(&path), cx);
                 s.image(path.clone(), 128, 1., cx);
             });
             service.update(cx, |s, _| {
@@ -1402,10 +1402,10 @@ mod tests {
         let imported = VaultPath::new("other/note.assets/new.png").unwrap();
         std::fs::create_dir_all(dir.path().join("other/note.assets")).unwrap();
         std::fs::write(dir.path().join(imported.as_str()), png(4, 4, [5, 5, 5, 255])).unwrap();
-        service.update(cx, |s, cx| s.invalidate(&[imported.clone()], cx));
+        service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&imported), cx));
         assert_eq!(resolve(cx, "new.png", &note), Attachment::Found(imported.clone()));
         std::fs::remove_file(dir.path().join(imported.as_str())).unwrap();
-        service.update(cx, |s, cx| s.invalidate(&[imported.clone()], cx));
+        service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&imported), cx));
         assert_eq!(resolve(cx, "new.png", &note), Attachment::Missing);
     }
 
@@ -1547,7 +1547,7 @@ mod tests {
         let untouched = ready_info(service.update(cx, |s, cx| s.pdf_info(other.clone(), cx)));
         let replacement = super::rich::pages_pdf(&["/MediaBox [0 0 300 700] /Rotate 90"]);
         std::fs::write(vault.fs_path(&path), replacement).unwrap();
-        service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+        service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&path), cx));
         assert!(Arc::ptr_eq(
             &untouched,
             &ready_info(service.update(cx, |s, cx| s.pdf_info(other.clone(), cx)))
@@ -1561,7 +1561,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&updated, &old));
         for broken in [b"broken PDF".to_vec(), super::rich::pages_pdf(&[])] {
             std::fs::write(vault.fs_path(&path), broken).unwrap();
-            service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+            service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&path), cx));
             assert!(matches!(
                 service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)),
                 PdfInfoState::Pending
@@ -1583,7 +1583,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(ready_info(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx))).pages.len(), 2);
         std::fs::remove_file(vault.fs_path(&path)).unwrap();
-        service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+        service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&path), cx));
         service.update(cx, |s, cx| s.pdf_info(path.clone(), cx));
         cx.run_until_parked();
         assert!(matches!(service.update(cx, |s, cx| s.pdf_info(path.clone(), cx)), PdfInfoState::Failed(_)));
@@ -1612,7 +1612,7 @@ mod tests {
         let vault = Arc::new(vault);
         let service = cx.new(|_| RenderService::new(vault.clone(), cache.path().to_path_buf()));
         for (retry, broken) in [(false, false), (true, false), (false, true), (true, true)] {
-            service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+            service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&path), cx));
             let bytes = if broken { b"broken PDF".to_vec() } else { super::two_page_pdf() };
             std::fs::write(vault.fs_path(&path), bytes).unwrap();
             service.update(cx, |s, cx| s.pdf_info(path.clone(), cx));
@@ -1631,7 +1631,7 @@ mod tests {
                 if retry {
                     s.retry(cx);
                 } else {
-                    s.invalidate(&[path.clone()], cx);
+                    s.invalidate(std::slice::from_ref(&path), cx);
                 }
                 assert!(matches!(s.pdf_info(path.clone(), cx), PdfInfoState::Pending));
             });
@@ -1658,7 +1658,7 @@ mod tests {
         let service = cx.new(|_| RenderService::new(vault.clone(), cache.path().to_path_buf()));
         let request = pdf_request(&path, 1, 100);
         for rerequest in [false, true] {
-            service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+            service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&path), cx));
             std::fs::write(vault.fs_path(&path), super::rich::pages_pdf(&["/MediaBox [0 0 200 100]"; 26]))
                 .unwrap();
             service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx));
@@ -1821,7 +1821,7 @@ mod tests {
         let again = service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx));
         let State::Ready { image: cached, .. } = again else { panic!("{again:?}") };
         assert!(Arc::ptr_eq(&image, &cached), "内存命中复用 RenderImage");
-        service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+        service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&path), cx));
         for page in [1, 2] {
             assert!(matches!(
                 service.update(cx, |s, cx| s.pdf(path.clone(), page, 200, 1., cx)),
@@ -1830,7 +1830,7 @@ mod tests {
         }
         cx.run_until_parked();
         std::fs::remove_file(vault.fs_path(&path)).unwrap();
-        service.update(cx, |s, cx| s.invalidate(&[path.clone()], cx));
+        service.update(cx, |s, cx| s.invalidate(std::slice::from_ref(&path), cx));
         service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx));
         cx.run_until_parked();
         assert!(matches!(service.update(cx, |s, cx| s.pdf(path.clone(), 1, 200, 1., cx)), State::Failed(_)));

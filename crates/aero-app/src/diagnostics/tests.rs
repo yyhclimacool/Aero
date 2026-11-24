@@ -217,7 +217,9 @@ fn process_probe() {
     let Ok(mode) = std::env::var("AERO_DIAGNOSTIC_PROBE") else { return };
     if let Some(fd) = mode.strip_prefix("descriptor-") {
         let fd: i32 = fd.parse().unwrap();
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        // SAFETY: F_GETFD takes only a descriptor and rejects an invalid one.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(flags, -1);
         return;
     }
     let guard = init("probe").expect("probe diagnostics available");
@@ -234,6 +236,7 @@ fn process_probe() {
     } else if mode == "abrupt" {
         RECORDER.get().unwrap().flush();
         #[cfg(unix)]
+        // SAFETY: This deliberately terminates the child process after flushing its recorder.
         unsafe {
             libc::_exit(19);
         }
@@ -287,6 +290,8 @@ fn probe(data: &Path, mode: &str) -> std::process::Output {
     let null = CString::new("/dev/null").unwrap();
     let mut pid = 0;
     let mut status = 0;
+    // SAFETY: Initialization is checked before using the spawn structs. All C strings and
+    // sentinel-terminated pointer arrays remain live through spawn, and waitpid writes to status.
     unsafe {
         let mut attributes = std::mem::MaybeUninit::uninit();
         let mut actions = std::mem::MaybeUninit::uninit();
@@ -334,12 +339,12 @@ fn process_probes_do_not_inherit_native_descriptors() {
     use std::os::fd::AsRawFd;
     let dir = tempfile::tempdir().unwrap();
     let file = fs::File::create(dir.path().join("lock")).unwrap();
+    // SAFETY: The File keeps its descriptor open and F_DUPFD takes an integer lower bound.
     let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 512) };
     assert!(fd >= 512);
     let result = probe(dir.path(), &format!("descriptor-{fd}"));
-    unsafe {
-        libc::close(fd);
-    }
+    // SAFETY: F_DUPFD returned a new descriptor that this test owns.
+    unsafe { libc::close(fd) };
     assert!(result.status.success());
 }
 

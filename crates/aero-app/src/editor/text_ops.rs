@@ -268,11 +268,7 @@ mod tests {
     fn emoji_deletion_keeps_hidden_markers_and_graphemes_intact() {
         assert_eq!(run("a\r\n> b", "a\r\n> ".len(), true), "ab");
         assert_eq!(run("a\r\n> b", 1, false), "ab");
-        for emoji in [
-            "\u{1F44D}\u{1F3FD}",
-            "\u{1F469}\u{200D}\u{1F4BB}",
-            "\u{1F1E8}\u{1F1F3}",
-        ] {
+        for emoji in ["\u{1F44D}\u{1F3FD}", "\u{1F469}\u{200D}\u{1F4BB}", "\u{1F1E8}\u{1F1F3}"] {
             let source = format!("a **{emoji}** z");
             let end = source.find(" z").unwrap();
             assert_eq!(run(&source, end, true), "a  z");

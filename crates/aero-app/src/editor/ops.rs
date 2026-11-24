@@ -792,8 +792,8 @@ pub fn convert(doc: &Document, units: &[Unit], ix: usize, target: BlockType) -> 
 /// Keyboard and slash commands address the first paragraph's item, while
 /// continuation paragraphs and nested containers retain their own scope.
 pub fn conversion_target(doc: &Document, unit: &Unit) -> BlockId {
-    if matches!(unit.kind, BlockKind::Paragraph) {
-        if let Some(item) = unit.list.as_ref().and_then(|ctx| {
+    if matches!(unit.kind, BlockKind::Paragraph)
+        && let Some(item) = unit.list.as_ref().and_then(|ctx| {
             doc.blocks().iter().map(|(_, b)| b).find(|b| {
                 matches!(b.kind, BlockKind::ListItem { .. })
                     && doc.range_of(b) == ctx.item_range
@@ -802,9 +802,9 @@ pub fn conversion_target(doc: &Document, unit: &Unit) -> BlockId {
                         .find(|c| c.kind != BlockKind::Marker)
                         .is_some_and(|c| c.id == unit.id)
             })
-        }) {
-            return item.id;
-        }
+        })
+    {
+        return item.id;
     }
     unit.id
 }

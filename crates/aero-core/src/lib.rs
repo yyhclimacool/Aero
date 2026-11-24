@@ -7,7 +7,7 @@
 //! 模块对应方案章节：
 //! - [`text`] / [`anchors`]：Rope 与 Anchor（7.2，ADR 0004）
 //! - [`block`]：Block 模型（7.1–7.3）
-//! - [`parse`]：整篇解析为带区间的块树（8.2，ADR 0002）
+//! - [`parse()`]：整篇解析为带区间的块树（8.2，ADR 0002）
 //! - [`document`]：Document，编辑管线的同步段与异步段（7.4）
 //! - [`index`]：`FullTextIndex` / `VectorIndex` trait（10.3 / 10.4，ADR 0003）
 //! - [`vault`]：vault 路径、枚举、原子读写（第 5 节）

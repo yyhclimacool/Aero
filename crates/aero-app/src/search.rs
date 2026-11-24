@@ -141,11 +141,14 @@ pub(crate) struct SearchShutdown {
 }
 
 impl SearchShutdown {
+    /// Callers hold the close lock until the startup thread exits.
     fn join_startup(&self) {
-        if let Some(thread) = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            if let Err(error) = thread.join() {
-                log::error!("index sync thread panicked: {error:?}");
-            }
+        // Taking the handle releases the mutex before the potentially blocking join.
+        let thread = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(thread) = thread
+            && let Err(error) = thread.join()
+        {
+            log::error!("index sync thread panicked: {error:?}");
         }
     }
 }
@@ -163,11 +166,11 @@ impl Drop for SearchShutdown {
         log::debug!("index shutdown: joined after {:?}", started.elapsed());
         let mut guard = self.indexer.lock().unwrap_or_else(|p| p.into_inner());
         let mut failed = false;
-        if let Some(ix) = guard.as_mut() {
-            if let Err(error) = ix.flush() {
-                failed = true;
-                log::warn!("index flush: {error}");
-            }
+        if let Some(ix) = guard.as_mut()
+            && let Err(error) = ix.flush()
+        {
+            failed = true;
+            log::warn!("index flush: {error}");
         }
         log::debug!("index shutdown: flushed after {:?}", started.elapsed());
         operation.stage("flushed", Default::default());

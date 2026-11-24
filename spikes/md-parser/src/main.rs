@@ -68,15 +68,11 @@ fn collect_md(dir: &Path, out: &mut Vec<Doc>) {
         }
         if p.is_dir() {
             collect_md(&p, out);
-        } else if p.extension().is_some_and(|e| e == "md") {
-            if let Ok(text) = fs::read_to_string(&p) {
-                if text.len() <= 5 * 1024 * 1024 {
-                    out.push(Doc {
-                        name: p.to_string_lossy().into_owned(),
-                        text,
-                    });
-                }
-            }
+        } else if p.extension().is_some_and(|e| e == "md")
+            && let Ok(text) = fs::read_to_string(&p)
+            && text.len() <= 5 * 1024 * 1024
+        {
+            out.push(Doc { name: p.to_string_lossy().into_owned(), text });
         }
     }
 }
@@ -147,11 +143,7 @@ struct NodeInfo {
 }
 
 fn kind_name(debug: &str) -> String {
-    debug
-        .split(|c: char| c == '(' || c == ' ' || c == '{')
-        .next()
-        .unwrap_or(debug)
-        .to_string()
+    debug.split(['(', ' ', '{']).next().unwrap_or(debug).to_string()
 }
 
 fn slice_ok(text: &str, (s, e): (usize, usize)) -> bool {
@@ -650,7 +642,7 @@ fn main() {
         collect_md(d, &mut notes);
     }
 
-    println!("# comrak {} vs markdown-rs {} · {}\n", "0.55", "1.0", chrono_free_now());
+    println!("# comrak 0.55 vs markdown-rs 1.0 · {}\n", chrono_free_now());
     println!(
         "profile: {} · spec 用例 {} · 真实笔记 {}（{}）\n",
         if cfg!(debug_assertions) { "debug" } else { "release" },

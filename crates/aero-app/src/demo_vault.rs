@@ -68,19 +68,18 @@ fn initialize(data_dir: &Path, root: &Path) -> Result<(), String> {
             manifest.record(path, stamp.hash);
         }
         manifest.save(&staging)?;
-        if !existing_directory(root)? {
-            if let Err(error) = fs::rename(&staging, root) {
-                if !existing_directory(root)? {
-                    return Err(error.to_string());
-                }
-            }
+        if !existing_directory(root)?
+            && let Err(error) = fs::rename(&staging, root)
+            && !existing_directory(root)?
+        {
+            return Err(error.to_string());
         }
         Ok(())
     })();
-    if let Err(error) = fs::remove_dir_all(&staging) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            log::warn!("demo staging cleanup {}: {error}", staging.display());
-        }
+    if let Err(error) = fs::remove_dir_all(&staging)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!("demo staging cleanup {}: {error}", staging.display());
     }
     result
 }

@@ -27,6 +27,10 @@ pub struct LocalEmbedder {
 impl LocalEmbedder {
     /// Only opens the versioned local installation. Missing/corrupt files are
     /// errors, never an implicit download. SHA-256 is checked once per load.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if verification fails or the local runtime, model, or tokenizer cannot initialize.
     pub fn load(root: &Path) -> Result<Self, String> {
         let dir = verify_local(root)?;
         RUNTIME
@@ -83,7 +87,11 @@ impl LocalEmbedder {
 
     /// At most four texts, each at most 32 KiB before tokenization, truncated to
     /// 256 tokens INCLUDING special tokens. Returns finite, unit-length 384-vectors.
-    /// Empty input returns empty output; oversized batches/texts return an error.
+    /// Empty input returns empty output. `query` selects the model's query prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for oversized inputs, inference failures, or invalid model outputs.
     pub fn embed(&mut self, texts: &[String], query: bool) -> Result<Vec<Vec<f32>>, String> {
         let encodings = tokenize(&self.tokenizer, texts, query)?;
         if encodings.is_empty() {

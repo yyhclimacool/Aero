@@ -313,7 +313,7 @@ impl Meta {
 
     /// 重建一篇笔记的全部链接行：先删旧行，再按扫描区间插入。解析在调用方（`Indexer`）做，
     /// 这里只存 `(span, 解析到的 note_id)`；没解析到的行 `resolved_note_id` 为 NULL，
-    /// 由 [`Self::pending_links`] + [`Self::set_link_resolved`] 在目标入库后补上。
+    /// 由 [`Self::pending_links`] + [`Self::set_links_resolved`] 在目标入库后补上。
     pub fn replace_links<'a>(
         &mut self,
         source_note_id: &str,

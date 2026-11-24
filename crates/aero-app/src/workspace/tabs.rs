@@ -209,10 +209,10 @@ impl Workspace {
             open.active + 1
         };
         self.activate_tab(ix, window, cx);
-        if close_after_save {
-            if let Some(ix) = self.open.as_ref().and_then(|o| o.tabs.iter().position(|t| t.id == old_id)) {
-                self.close_tab(ix, window, cx);
-            }
+        if close_after_save
+            && let Some(ix) = self.open.as_ref().and_then(|o| o.tabs.iter().position(|t| t.id == old_id))
+        {
+            self.close_tab(ix, window, cx);
         }
     }
 

@@ -282,7 +282,7 @@ pub fn rewrite_references(
         edits.sort_by_key(|range| std::cmp::Reverse(range.start));
         edits.dedup();
         for range in edits {
-            text.replace_range(range, &new_name);
+            text.replace_range(range, new_name);
         }
         vault.write_bytes(&note, text.as_bytes())?;
         updated.push(note);

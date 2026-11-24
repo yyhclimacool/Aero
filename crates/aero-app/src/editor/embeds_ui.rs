@@ -11,10 +11,15 @@ use aero_core::links::Resolution;
 use aero_core::{Document, VaultPath};
 use gpui_kit::*;
 
-/// 嵌入内容缓存。键是源码里的写法（目标 + 片段），因为解析本身也可能还没就绪。
+struct EmbeddedSource {
+    title: String,
+    markdown: String,
+}
+
+/// 两级缓存。`entries` 按链接原文查找，`resolved` 按解析出的实际路径和片段复用读盘结果。
 #[derive(Default)]
 pub(super) struct Embeds {
-    resolved: HashMap<(VaultPath, Option<String>), Result<(String, String), String>>,
+    resolved: HashMap<(VaultPath, Option<String>), Result<EmbeddedSource, String>>,
     pub(super) resolver: Option<aero_core::links::Resolver>,
     entries: HashMap<(String, Option<String>), Entry>,
     targets: HashSet<(String, Option<String>)>,
@@ -95,11 +100,11 @@ impl super::Editor {
             }
             if let Some(result) = self.embeds.resolved.get(&(path.clone(), fragment.clone())) {
                 return match result {
-                    Ok((title, source)) => EmbedView::Ready {
+                    Ok(EmbeddedSource { title, markdown }) => EmbedView::Ready {
                         path: path.clone(),
                         fragment: fragment.clone(),
                         title: title.clone(),
-                        source: source.clone(),
+                        source: markdown.clone(),
                     },
                     Err(error) => EmbedView::Failed(error.clone().into()),
                 };
@@ -237,11 +242,13 @@ impl super::Editor {
                                 .map(Ok)
                                 .unwrap_or_else(|| super::source_cache::read(&vault, &path));
                             let result = doc.and_then(|doc| {
-                                slice(&doc, fragment.as_deref())
-                                    .map(|source| (doc.title_or(path.stem()), source))
+                                slice(&doc, fragment.as_deref()).map(|markdown| EmbeddedSource {
+                                    title: doc.title_or(path.stem()),
+                                    markdown,
+                                })
                             });
-                            if let Ok((_, source)) = &result {
-                                queue.push_back((path, source.clone(), depth + 1));
+                            if let Ok(source) = &result {
+                                queue.push_back((path, source.markdown.clone(), depth + 1));
                             }
                             resolved.insert(key, result);
                         }
@@ -304,8 +311,8 @@ impl super::Editor {
             }
             if let Some(result) = self.embeds.resolved.get(&(path.clone(), fragment.clone())) {
                 let entry = match result {
-                    Ok((title, source)) => {
-                        Entry::Ready { path, title: title.clone(), source: source.clone() }
+                    Ok(EmbeddedSource { title, markdown }) => {
+                        Entry::Ready { path, title: title.clone(), source: markdown.clone() }
                     }
                     Err(error) => Entry::Failed { path, error: error.clone().into() },
                 };

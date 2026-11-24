@@ -49,6 +49,7 @@ struct Manifest {
     files: Vec<Record>,
 }
 
+/// A prepared journal with the byte images needed to commit or recover a multi-file operation.
 pub struct Transaction {
     directory: PathBuf,
     manifest: Manifest,
@@ -139,12 +140,21 @@ fn apply(
 }
 
 impl Transaction {
+    /// Check the observed versions and persist a journal before changing participant files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when participants repeat, their disk versions differ, or the journal cannot be written.
     pub fn prepare(vault: &Vault, root: &Path, changes: Vec<FileChange>) -> Result<Self, String> {
         Self::prepare_restoring(vault, root, changes, HashMap::new())
     }
 
     /// Pending cuts already changed their source before this transaction.
     /// Their recovery image therefore differs from the version being validated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors from [`Self::prepare`] and rejects a restoration without a matching participant.
     pub fn prepare_restoring(
         vault: &Vault,
         root: &Path,
@@ -203,6 +213,7 @@ impl Transaction {
         Ok(transaction)
     }
 
+    /// Directory containing the durable manifest and the participant byte images.
     pub fn directory(&self) -> &Path {
         &self.directory
     }
@@ -219,10 +230,20 @@ impl Transaction {
         sync_directory(&self.directory)
     }
 
+    /// Recheck all participants, publish the writes, and return the changes for undo.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on validation, write, or journal failure. A failed rollback leaves its journal for recovery.
     pub fn commit(self, vault: &Vault) -> Result<Vec<FileChange>, String> {
         self.commit_with(vault, |_| Ok(()))
     }
 
+    /// Restore pending cuts and discard a prepared journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a cut source has changed again or the rollback or cleanup fails.
     pub fn cancel(mut self, vault: &Vault) -> Result<(), String> {
         self.rollback(vault)
     }
@@ -267,19 +288,24 @@ impl Transaction {
     }
 
     fn rollback(&mut self, vault: &Vault) -> Result<(), String> {
-        self.phase(Phase::RollingBack)?;
+        // Before commit starts, only pending cuts may have changed the vault.
+        // Keep the Prepared phase so an interrupted cancellation follows the same rule on recovery.
+        let prepared = self.manifest.phase == Phase::Prepared;
+        if !prepared {
+            self.phase(Phase::RollingBack)?;
+        }
         let mut conflicts = Vec::new();
         for change in self.changes.iter().rev() {
-            let restore = self.restorations.get(&change.path).cloned().or_else(|| change.before.clone());
+            let restoration = self.restorations.get(&change.path);
+            if prepared && restoration.is_none() {
+                continue;
+            }
+            let restore = restoration.cloned().or_else(|| change.before.clone());
             match current(vault, &change.path) {
                 Ok(value) if value == restore => {}
-                Ok(value) if value == change.after || value == change.before => {
-                    let recovery = FileChange {
-                        path: change.path.clone(),
-                        before: value.clone(),
-                        after: restore.clone(),
-                    };
-                    if let Err(error) = apply(vault, &recovery, &value, &restore) {
+                Ok(value) if value == change.before || (!prepared && value == change.after) => {
+                    let recovery = FileChange { path: change.path.clone(), before: value, after: restore };
+                    if let Err(error) = apply(vault, &recovery, &recovery.before, &recovery.after) {
                         conflicts.push(error);
                     }
                 }
@@ -317,20 +343,22 @@ impl Transaction {
                 }
                 Ok(Some(bytes))
             };
-            changes.push(FileChange {
-                path,
-                before: read("before", &record.before)?,
-                after: read("after", &record.after)?,
-            });
+            let before = read("before", &record.before)?;
+            let after = read("after", &record.after)?;
             if let Some(bytes) = read("restore", &record.restore)? {
-                restorations.insert(changes.last().unwrap().path.clone(), bytes);
+                restorations.insert(path.clone(), bytes);
             }
+            changes.push(FileChange { path, before, after });
         }
         Ok(Self { directory, manifest, changes, observations: Vec::new(), restorations })
     }
 }
 
 /// Must finish before opening writable editors. Conflicts retain all journal versions.
+///
+/// # Errors
+///
+/// Returns journal read and validation errors, rollback conflicts, or failures removing completed journals.
 pub fn recover(vault: &Vault, root: &Path) -> Result<(), String> {
     if !root.exists() {
         return Ok(());
@@ -428,6 +456,43 @@ mod tests {
             for change in changes {
                 assert_eq!(current(&vault, &change.path).unwrap(), change.before);
             }
+        }
+    }
+
+    #[test]
+    fn prepared_transaction_preserves_external_files_and_restores_pending_cut() {
+        #[derive(Debug)]
+        enum Action {
+            Cancel,
+            Commit,
+            Recover,
+        }
+        for action in [Action::Cancel, Action::Commit, Action::Recover] {
+            let (_temp, vault, root, mut changes) = fixture();
+            let destination = changes[1].path.clone();
+            let source = VaultPath::new("cut.md").unwrap();
+            vault.create_bytes(&source, b"cut state").unwrap();
+            changes.push(FileChange {
+                path: source.clone(),
+                before: Some(b"cut state".to_vec()),
+                after: Some(b"cut state".to_vec()),
+            });
+            let tx = Transaction::prepare_restoring(
+                &vault,
+                &root,
+                changes,
+                HashMap::from([(source.clone(), b"original".to_vec())]),
+            )
+            .unwrap();
+            // Another writer publishes the same bytes planned for this create-only change.
+            vault.create_bytes(&destination, b"created").unwrap();
+            match action {
+                Action::Cancel => tx.cancel(&vault).unwrap(),
+                Action::Commit => assert!(tx.commit(&vault).is_err()),
+                Action::Recover => recover(&vault, &root).unwrap(),
+            }
+            assert_eq!(vault.read_bytes(&destination).unwrap().0, b"created", "{action:?}");
+            assert_eq!(vault.read_bytes(&source).unwrap().0, b"original", "{action:?}");
         }
     }
 

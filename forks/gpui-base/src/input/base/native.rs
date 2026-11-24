@@ -38,6 +38,8 @@ mod macos {
             Retained::as_ptr(value).cast_mut().cast::<AnyObject>()
         });
 
+        // SAFETY: The method lookup found the AppKit setter or the installed equivalent.
+        // The argument is nil or points to an NSString retained for the duration of the send.
         unsafe {
             let _: () = msg_send![view, setContentType: ns_content_type];
         }
@@ -49,13 +51,17 @@ mod macos {
             return None;
         };
 
-        Some(unsafe { &*(handle.ns_view.as_ptr() as *const AnyObject) })
+        // SAFETY: An AppKit handle borrows a non-null NSView for the lifetime of the window borrow.
+        let view = unsafe { &*(handle.ns_view.as_ptr() as *const AnyObject) };
+        Some(view)
     }
 
     fn install_text_content(view: &AnyObject) {
         let class = view.class();
         let class = class as *const _ as *mut _;
 
+        // SAFETY: class is the live Objective-C class of view. The IMP casts follow the
+        // Objective-C runtime convention, and the registered encodings match both callbacks.
         unsafe {
             let protocol = AnyProtocol::get(c"NSTextContent");
             if let Some(protocol) = protocol {
@@ -79,6 +85,9 @@ mod macos {
         }
     }
 
+    /// # Safety
+    ///
+    /// The receiver must be a live view passed to the registered Objective-C getter.
     unsafe extern "C-unwind" fn content_type(this: &AnyObject, _: Sel) -> *mut AnyObject {
         let key = this as *const _ as usize;
         CONTENT_TYPES.with(|content_types| {
@@ -91,13 +100,20 @@ mod macos {
         })
     }
 
+    /// # Safety
+    ///
+    /// The receiver must be a live view, and `value` must be nil or a live `NSString`.
     unsafe extern "C-unwind" fn set_content_type(this: &AnyObject, _: Sel, value: *mut AnyObject) {
         let key = this as *const _ as usize;
         CONTENT_TYPES.with(|content_types| {
             let mut content_types = content_types.borrow_mut();
             if value.is_null() {
                 content_types.remove(&key);
-            } else if let Some(value) = unsafe { Retained::retain(value.cast::<NSString>()) } {
+                return;
+            }
+            // SAFETY: The setter contract supplies a live NSString for a non-null value.
+            let retained = unsafe { Retained::retain(value.cast::<NSString>()) };
+            if let Some(value) = retained {
                 content_types.insert(key, value);
             }
         });

@@ -21,6 +21,8 @@ pub fn install_window_hit_test_forwarder(window: &Window) {
         return;
     };
 
+    // SAFETY: view.window() returned a live NSWindow, and the forwarder matches its
+    // accessibilityHitTest: selector's receiver, point argument, and object return type.
     unsafe {
         let class = object_getClass((&*window as *const NSWindow).cast::<AnyObject>());
         if !class.is_null() {
@@ -34,8 +36,9 @@ pub fn install_window_hit_test_forwarder(window: &Window) {
 }
 
 extern "C" fn hit_test_forwarder(this: &NSWindow, _cmd: Sel, point: NSPoint) -> *mut AnyObject {
-    this.contentView().map_or_else(null_mut, |view| unsafe {
-        msg_send![&*view, accessibilityHitTest: point]
+    this.contentView().map_or_else(null_mut, |view| {
+        // SAFETY: The retained NSView implements the AppKit selector with this ABI.
+        unsafe { msg_send![&*view, accessibilityHitTest: point] }
     })
 }
 
@@ -44,9 +47,14 @@ fn ns_view(window: &Window) -> Option<&NSView> {
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
         return None;
     };
+    // SAFETY: AppKit handles borrow an NSView for the lifetime of the window borrow.
     unsafe { (handle.ns_view.as_ptr() as *const NSView).as_ref() }
 }
 
+/// # Safety
+///
+/// `class` must point to a live Objective-C class. `func` must accept that class's
+/// receivers and match the selector's calling convention and signature.
 unsafe fn add_method<T, F>(class: *mut AnyClass, sel: Sel, func: F)
 where
     T: Message + ?Sized,
@@ -60,6 +68,8 @@ where
     );
 
     let types = method_type_encoding(&F::Return::ENCODING_RETURN, encs);
+    // SAFETY: The caller guarantees the class and implementation match, and types
+    // keeps the NUL-terminated encoding alive through registration.
     let success = unsafe { class_addMethod(class, sel, func.__imp(), types.as_ptr()) };
     let _ = success.as_bool();
 }

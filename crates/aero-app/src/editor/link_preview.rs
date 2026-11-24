@@ -602,7 +602,7 @@ impl Editor {
             };
             return cx.background_spawn(async move {
                 Popup {
-                    title: title.into(),
+                    title,
                     body: "库内链接。单击打开笔记，或在访达中定位文件。".into(),
                     rich: false,
                     origin: None,
@@ -744,16 +744,17 @@ impl Editor {
             let style = self.text_view_style(cx).with_foreground(cx.theme().popover_foreground);
             frame
                 .debug_selector(|| "link-preview-rich".into())
-                .child(preview::markdown_from(
+                .child(preview::markdown(
                     format!("link-preview-{}", cx.entity_id()).into(),
                     aero_core::links::to_markdown(body).into(),
                     style,
-                    0,
-                    self.preview.clone(),
-                    cx.entity(),
-                    BlockId(u64::MAX),
-                    0,
-                    origin,
+                    preview::PreviewContext {
+                        state: self.preview.clone(),
+                        editor: cx.entity(),
+                        block: BlockId(u64::MAX),
+                        reveal: 0,
+                        origin,
+                    },
                 ))
                 .into_any_element()
         } else {

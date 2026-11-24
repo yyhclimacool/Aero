@@ -180,7 +180,7 @@ impl Editor {
         }
         cx.emit(EditorEvent::TransactionRequested(crate::workspace::files::Operation::Paste {
             token,
-            payload,
+            payload: Box::new(payload),
             source,
             destination: self.path.clone(),
             before: self.doc.to_bytes(),

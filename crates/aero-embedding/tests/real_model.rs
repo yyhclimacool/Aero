@@ -74,6 +74,7 @@ fn download_and_rank_real_model() {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         // SAFETY: getrusage initializes the pointed-to structure on success.
         assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }, 0);
+        // SAFETY: The preceding assertion checked that getrusage initialized usage.
         let peak = unsafe { usage.assume_init() }.ru_maxrss;
         eprintln!("peak RSS={peak} bytes");
         assert!(peak < 640 * 1024 * 1024, "embedding worker exceeded 640 MiB peak RSS");

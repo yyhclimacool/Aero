@@ -129,11 +129,11 @@ impl Editor {
                     focused.enter_newline = self.units[id].enter_inserts_newline();
                 }
             }
-            if let Some(window) = window {
-                if !self.input_composing(window, cx) {
-                    self.promote_typed_prefix(window, cx);
-                    self.refresh_markup(cx);
-                }
+            if let Some(window) = window
+                && !self.input_composing(window, cx)
+            {
+                self.promote_typed_prefix(window, cx);
+                self.refresh_markup(cx);
             }
             cx.notify();
         } else {

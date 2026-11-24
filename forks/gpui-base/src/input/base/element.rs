@@ -1483,10 +1483,10 @@ impl<M: InputModeKind> TextElement<M> {
             run.background_color = style.background_color;
         }
         if style.underline.is_some() {
-            run.underline = style.underline.clone();
+            run.underline = style.underline;
         }
         if style.strikethrough.is_some() {
-            run.strikethrough = style.strikethrough.clone();
+            run.strikethrough = style.strikethrough;
         }
     }
 

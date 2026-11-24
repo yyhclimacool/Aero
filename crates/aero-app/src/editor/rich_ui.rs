@@ -308,23 +308,15 @@ impl Editor {
         if interactive && self.pdf_root_source(block).as_deref() == Some(source) {
             match service.update(cx, |s, cx| s.attachment(&embed.target, origin, cx)) {
                 Attachment::Found(path) => {
+                    use super::pdf_reader::{PdfReader, PdfSource};
+
+                    let source = PdfSource { path, markdown: source.to_owned(), page, width };
                     let mut readers = self.rich.pdf_readers.borrow_mut();
                     let reader = readers.entry(block).or_insert_with(|| {
                         let editor = cx.weak_entity();
-                        cx.new(|cx| {
-                            super::pdf_reader::PdfReader::new(
-                                editor,
-                                block,
-                                path.clone(),
-                                source.to_owned(),
-                                page,
-                                width,
-                                service.clone(),
-                                cx,
-                            )
-                        })
+                        cx.new(|cx| PdfReader::new(editor, block, source.clone(), service.clone(), cx))
                     });
-                    reader.update(cx, |reader, cx| reader.sync(path, source.to_owned(), page, width, cx));
+                    reader.update(cx, |reader, cx| reader.sync(source, cx));
                     return reader.clone().into_any_element();
                 }
                 Attachment::Loading => {

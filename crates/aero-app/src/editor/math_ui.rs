@@ -70,17 +70,16 @@ impl super::Editor {
         &self,
         text: &str,
         base: usize,
-        block: aero_core::BlockId,
-        style: TextViewStyle,
-        view_id: SharedString,
-        editing: Option<std::ops::Range<usize>>,
+        view: InlineMathView,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let formulas = aero_core::highlight::inline_formulas(text);
         if formulas.is_empty() {
             return None;
         }
-        let Some(service) = self.images.clone() else { return None };
+        let service = self.images.as_ref()?;
+        let block = view.block;
+        let view_id = &view.id;
         let em = super::BODY_FONT_SIZE;
         let foreground = cx.theme().foreground;
         let scale = self.scale;
@@ -91,10 +90,8 @@ impl super::Editor {
                 parts.push(self.inline_text_piece(
                     &text[at..formula.range.start],
                     base + at..base + formula.range.start,
-                    block,
-                    style.clone(),
                     format!("{view_id}-t-{ix}").into(),
-                    editing.clone(),
+                    &view,
                     cx,
                 ));
             }
@@ -142,10 +139,8 @@ impl super::Editor {
             parts.push(self.inline_text_piece(
                 &text[at..],
                 base + at..base + text.len(),
-                block,
-                style,
                 format!("{view_id}-t-end").into(),
-                editing,
+                &view,
                 cx,
             ));
         }
@@ -157,13 +152,13 @@ impl super::Editor {
         &self,
         text: &str,
         abs: std::ops::Range<usize>,
-        block: aero_core::BlockId,
-        style: TextViewStyle,
         view_id: SharedString,
-        editing: Option<std::ops::Range<usize>>,
+        view: &InlineMathView,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if editing.as_ref() == Some(&abs) {
+        if view.editing.as_ref() == Some(&abs)
+            && let Some(focused) = &self.focused
+        {
             // 文本框默认是宽高 100%。父级没有确定宽度时会变成 0。
             // 高度交给文本框自己按行数长，不要用字数去估，估矮了会把行尾的字切到下一行。
             return div()
@@ -171,10 +166,11 @@ impl super::Editor {
                 .text_size(px(super::BODY_FONT_SIZE))
                 .line_height(relative(super::BODY_LINE_HEIGHT))
                 .debug_selector(|| "math-text".into())
-                .child(gpui_kit::base::input::Textarea::new(&self.focused.as_ref().unwrap().textarea))
+                .child(gpui_kit::base::input::Textarea::new(&focused.textarea))
                 .into_any_element();
         }
-        let range = abs.clone();
+        let range = abs;
+        let block = view.block;
         let wide = text.chars().count() as f32 * super::BODY_FONT_SIZE > super::COLUMN_WIDTH * 0.85;
         div()
             .id(view_id.clone())
@@ -190,9 +186,17 @@ impl super::Editor {
                 let len = range.end.saturating_sub(range.start);
                 this.focus_range(range.clone(), Some(block), false, len, window, cx);
             }))
-            .child(inline_text(view_id, text, style))
+            .child(inline_text(view_id, text, view.style.clone()))
             .into_any_element()
     }
+}
+
+pub(super) struct InlineMathView {
+    pub(super) block: aero_core::BlockId,
+    pub(super) style: TextViewStyle,
+    pub(super) id: SharedString,
+    /// 正在编辑的文字片段在整篇笔记中的 UTF-8 字节范围。
+    pub(super) editing: Option<std::ops::Range<usize>>,
 }
 
 /// 光标所在的、公式以外的文字区间（相对 `text`）。光标在公式里时，取它前面最近的一段文字。

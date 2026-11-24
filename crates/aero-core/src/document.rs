@@ -32,7 +32,7 @@ impl Snapshot {
         &self.text
     }
 
-    /// 物化 + 解析。10 MB 文档物化 ≈ 0.7 ms，解析按 ~18 ms/MB 估（ADR 0002 / 0004）。
+    /// 将快照物化为连续字符串并解析。调用方按 [`Self::version`] 校验解析结果是否仍可使用。
     pub fn parse(&self) -> ParseOutput {
         parse_text(&String::from(&self.text))
     }
@@ -245,6 +245,7 @@ impl Document {
     }
 
     /// Try a bounded local parse without falling back to the whole document.
+    /// `false` leaves a full parse to the caller, usually using [`Self::snapshot`].
     pub fn try_reparse_local(&mut self, max_bytes: usize) -> bool {
         if !self.is_parse_stale() {
             return true;
@@ -272,6 +273,11 @@ impl Document {
         self.parsed_version != self.version
     }
 
+    /// 借用规范化文本的 UTF-8 字节区间。
+    ///
+    /// # Panics
+    ///
+    /// 区间反向、越界或端点不在字符边界上时 panic。
     pub fn slice(&self, r: Range<usize>) -> RopeSlice<'_> {
         self.text.slice(r)
     }
@@ -360,12 +366,20 @@ impl Document {
     // ---- 写 ----
 
     /// 应用一次编辑，作为独立的 undo 组。
+    ///
+    /// # Errors
+    ///
+    /// 编辑区间反向、越界或端点不在 UTF-8 字符边界上时返回 [`EditError`]。
     pub fn edit(&mut self, edit: Edit) -> Result<(), EditError> {
         self.edit_group(vec![edit])
     }
 
     /// 顺序应用一组编辑（后一个的坐标基于前一个应用之后的文本），作为一个 undo 组。
-    /// 任一编辑非法时整组回滚，文档不变。
+    ///
+    /// # Errors
+    ///
+    /// 任一编辑区间非法时恢复文本和字数，撤销与重做历史保留原状。已应用的编辑及其逆操作
+    /// 仍推进文本版本，因此调用方应重新检查缓存的解析结果。
     pub fn edit_group(&mut self, edits: Vec<Edit>) -> Result<(), EditError> {
         let mut inverses = Vec::with_capacity(edits.len());
         for e in &edits {
@@ -389,6 +403,10 @@ impl Document {
 
     /// 应用一次编辑并并入上一个 undo 组（9.5：相邻字符输入合并为一组），没有上一组时新开一组。
     /// 由调用方决定何时合并（例如 300 ms 内的连续输入）。
+    ///
+    /// # Errors
+    ///
+    /// 编辑区间非法时返回 [`EditError`]，文本与历史原样保留。
     pub fn edit_coalescing(&mut self, edit: Edit) -> Result<(), EditError> {
         text::check_edit(&self.text, &edit)?;
         let inverse = self.apply_raw(&edit);
@@ -407,6 +425,10 @@ impl Document {
 
     /// One participant in a workspace transaction. An empty participant still
     /// has a history boundary (for example a newly created child document).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same range errors as [`Self::edit_group`].
     pub fn edit_transaction(&mut self, edits: Vec<Edit>, token: &str) -> Result<(), EditError> {
         let empty = edits.is_empty();
         self.edit_group(edits)?;

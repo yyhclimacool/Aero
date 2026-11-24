@@ -4,7 +4,8 @@
 //! - 文档真身是 `aero_core::Document`（Rope + 块树 + undo 栈）；
 //! - 浏览态：每个编辑单位（[`units::Unit`]）用 `TextView::markdown` 渲染；
 //! - 编辑态：只有聚焦单位换成一个 `TextareaState`，它的文本与文档中 `focused.range` 这一段一一对应。
-//!   控件每次 `Change` 都被收缩成一次最小 `Edit` 写回 Document，再同步重解析。
+//!   控件每次 `Change` 都被收缩成一次最小 `Edit` 写回 Document。解析优先更新局部段落，
+//!   长文档的结构变化通过后台快照重解析，回写时校验文档版本和编辑器会话。
 //!
 //! 聚焦的"真相"是 `focused.range`（随编辑漂移的字节区间），而不是块 id：这样把段落删空、
 //! 或粘贴出多个块时，控件仍然有归属，不会因为块消失而失焦。
@@ -1197,7 +1198,7 @@ impl Editor {
             if this.focused.as_ref().is_some_and(|f| f.textarea == textarea)
                 && (this.wiki.is_some() || this.tag_menu.is_some())
                 && let Some(f) = &this.focused
-                && textarea.read(cx).value().as_ref() == this.doc.slice(f.range.clone()).to_string()
+                && textarea.read(cx).value().as_ref() == this.doc.slice(f.range.clone())
             {
                 if this.wiki.is_some() && !this.wiki_is_current(cx) {
                     this.wiki = None;
@@ -1370,7 +1371,7 @@ impl Editor {
         }
         let start = self.units[ix].range.start;
         let end = self.units[ix].range.end;
-        if self.doc.slice(start..end).to_string() != text {
+        if self.doc.slice(start..end) != text {
             return false;
         }
         let rewritten_len = rewritten.len();
@@ -1954,15 +1955,14 @@ impl Editor {
         let before = self.doc.slice(menu.block_start..menu.anchor).to_string();
         let start = menu.anchor - (before.len() - before.trim_end_matches(' ').len());
         let command = start..menu.anchor + 1 + menu.query.len();
-        if let SlashAction::Convert(target) = action {
-            if let Some(reason) = unit_at(&self.units, menu.block_start).and_then(|ix| {
+        if let SlashAction::Convert(target) = action
+            && let Some(reason) = unit_at(&self.units, menu.block_start).and_then(|ix| {
                 ops::conversion_reason(&self.doc, ops::conversion_target(&self.doc, &self.units[ix]), target)
-            }) {
-                use gpui_kit::component::WindowExt as _;
-                window
-                    .push_notification(gpui_kit::component::notification::Notification::warning(reason), cx);
-                return;
-            }
+            })
+        {
+            use gpui_kit::component::WindowExt as _;
+            window.push_notification(gpui_kit::component::notification::Notification::warning(reason), cx);
+            return;
         }
         match action {
             SlashAction::SyncReference => self.open_sync_picker(command, false, window, cx),
@@ -2749,19 +2749,34 @@ impl Editor {
         if !self.dirty || self.io.writing || self.io.suspended || self.is_deleted() {
             return;
         }
-        self.start_checked_write(false, cx);
+        self.start_checked_write(io::MissingFile::Skip, cx);
     }
 
     fn start_write(&mut self, cx: &mut Context<Self>) {
-        self.start_checked_write(true, cx);
+        self.start_checked_write(io::MissingFile::Recreate, cx);
     }
 
-    fn start_checked_write(&mut self, allow_missing: bool, cx: &mut Context<Self>) {
+    fn save_request(&self, missing_file: io::MissingFile) -> io::SaveRequest {
+        io::SaveRequest {
+            vault: self.vault.clone(),
+            path: self.path.clone(),
+            known: self.stamp,
+            conflict_base: self.conflict_path(),
+            snapshot: self.doc.snapshot(),
+            bom: self.doc.bom,
+            ending: self.doc.line_ending,
+            epoch: self.io.epoch,
+            missing_file,
+        }
+    }
+
+    fn start_checked_write(&mut self, missing_file: io::MissingFile, cx: &mut Context<Self>) {
         if self.io.writing || self.io.suspended {
             return;
         }
-        let snapshot = self.doc.snapshot();
-        let version = snapshot.version();
+        let request = self.save_request(missing_file);
+        let version = request.snapshot.version();
+        let epoch = request.epoch;
         let operation = crate::diagnostics::Operation::new(
             "note_save",
             crate::diagnostics::Facts {
@@ -2772,21 +2787,14 @@ impl Editor {
                 ..Default::default()
             },
         );
-        let (bom, ending) = (self.doc.bom, self.doc.line_ending);
-        let (vault, path, stamp) = (self.vault.clone(), self.path.clone(), self.stamp);
-        let expected_path = path.clone();
-        let conflict_base = self.conflict_path();
-        let epoch = self.io.epoch;
+        let expected_path = request.path.clone();
         self.io.checking = None;
         self.io.check_generation += 1;
         self.io.writing = true;
         self.save_state = SaveState::Saving;
         cx.emit(EditorEvent::Changed);
-        let job = operation.scope(|| {
-            io::WriteJob::spawn(path.clone(), epoch, version, move || {
-                io::save(&vault, &path, stamp, conflict_base, snapshot, bom, ending, allow_missing)
-            })
-        });
+        let job = operation
+            .scope(|| io::WriteJob::spawn(request.path.clone(), epoch, version, move || request.save()));
         self.io.pending = Some(job.clone());
         let write = cx.background_spawn(async move { job.wait() });
         cx.spawn(async move |this, cx| {
@@ -2902,17 +2910,7 @@ impl Editor {
         self.save_task = None;
         self.io.checking = None;
         self.io.check_generation += 1;
-        let request = io::SaveRequest {
-            vault: self.vault.clone(),
-            path: self.path.clone(),
-            known: self.stamp,
-            conflict_base: self.conflict_path(),
-            snapshot: self.doc.snapshot(),
-            bom: self.doc.bom,
-            ending: self.doc.line_ending,
-            epoch: self.io.epoch,
-            allow_missing: false,
-        };
+        let request = self.save_request(io::MissingFile::Skip);
         let guard = request.finish(
             self.io.pending.clone(),
             self.dirty && !self.io.suspended && !self.is_deleted(),
@@ -3718,7 +3716,8 @@ impl Editor {
         let body: AnyElement = if content.is_empty() {
             let id = item.id;
             let key = presenter::Key::unit(id);
-            let body = if let Some(text) = self.render_presenter(key, cx) {
+
+            if let Some(text) = self.render_presenter(key, cx) {
                 self.unit_frame(id, false, Paint::default(), text, cx)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -3743,8 +3742,7 @@ impl Editor {
                         cx.listener(move |this, _, window, cx| this.focus_block(id, window, cx)),
                     )
                     .into_any_element()
-            };
-            body
+            }
         } else {
             let els: Vec<AnyElement> = content
                 .iter()
@@ -4039,11 +4037,13 @@ impl Editor {
                         SharedString::from(format!("callout-body-{}", id.0)),
                         aero_core::links::to_markdown(&parts.body_text).into(),
                         self.text_view_style(cx),
-                        if revealing { self.reveal_generation } else { 0 },
-                        self.preview.clone(),
-                        cx.entity(),
-                        id,
-                        0,
+                        preview::PreviewContext {
+                            state: self.preview.clone(),
+                            editor: cx.entity(),
+                            block: id,
+                            reveal: if revealing { self.reveal_generation } else { 0 },
+                            origin: None,
+                        },
                     ))
                     .into_any_element(),
             )
@@ -4152,10 +4152,12 @@ impl Editor {
                 && let Some(mixed) = self.render_with_inline_math(
                     &full,
                     range.start,
-                    b.id,
-                    self.text_view_style(cx),
-                    SharedString::from(format!("blk-{}-{}", cx.entity_id(), b.id.0)),
-                    self.focused.as_ref().map(|focused| focused.range.clone()),
+                    math_ui::InlineMathView {
+                        block: b.id,
+                        style: self.text_view_style(cx),
+                        id: format!("blk-{}-{}", cx.entity_id(), b.id.0).into(),
+                        editing: self.focused.as_ref().map(|focused| focused.range.clone()),
+                    },
                     cx,
                 )
             {
@@ -4284,20 +4286,30 @@ impl Editor {
                 if matches!(
                     b.kind,
                     BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::ListItem { .. }
-                ) && let Some(mixed) =
-                    self.render_with_inline_math(&text, base, id, style.clone(), view_id.clone(), None, cx)
-                {
+                ) && let Some(mixed) = self.render_with_inline_math(
+                    &text,
+                    base,
+                    math_ui::InlineMathView {
+                        block: id,
+                        style: style.clone(),
+                        id: view_id.clone(),
+                        editing: None,
+                    },
+                    cx,
+                ) {
                     mixed
                 } else {
                     preview::markdown(
                         view_id,
                         rendered,
                         style,
-                        reveal,
-                        self.preview.clone(),
-                        cx.entity(),
-                        id,
-                        0,
+                        preview::PreviewContext {
+                            state: self.preview.clone(),
+                            editor: cx.entity(),
+                            block: id,
+                            reveal,
+                            origin: None,
+                        },
                     )
                     .into_any_element()
                 }

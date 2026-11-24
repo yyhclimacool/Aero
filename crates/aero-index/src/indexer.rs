@@ -107,7 +107,7 @@ struct LinkUniverse {
 }
 
 impl LinkUniverse {
-    fn from_rows(rows: Vec<NoteRow>) -> Self {
+    fn from_rows(rows: &[NoteRow]) -> Self {
         let mut u = LinkUniverse {
             resolver: Resolver::new(),
             id_by_path: HashMap::with_capacity(rows.len()),
@@ -141,7 +141,10 @@ impl LinkUniverse {
         }
         keys.sort();
         self.resolver.register_identity(path, doc);
-        self.identities.insert(path.clone(), keys.clone()).as_ref() != Some(&keys)
+        let previous = self.identities.entry(path.clone()).or_default();
+        let changed = *previous != keys;
+        *previous = keys;
+        changed
     }
 
     /// 解析到的目标的 `note_id`；歧义 / 不存在都是 None。
@@ -332,13 +335,21 @@ impl Indexer {
 
     /// 全量同步收尾（`plan_sync` + 若干 `sync_step` / `remove_step` 之后调）：写完攒批的链接行，
     /// 补挂靠标题解析的行、重判名字有竞争的行（路径 / 文件名解析在 `plan_sync` 预登记后已是最终结果）。
+    ///
+    /// # Errors
+    ///
+    /// 元数据读写失败时返回错误。尚未提交的链接更新保留在当前索引器中，可在恢复后重试。
     pub fn finish_sync(&mut self) -> Result<usize, IndexerError> {
         self.bulk = false;
         self.reconcile_links()
     }
 
     /// 全量同步的计划：磁盘上每篇笔记与其已知元数据，以及元数据里有、磁盘上没有的。
-    /// 同时把磁盘上的全部路径登记进链接解析表（新文件预分配 `note_id`），见 [`LinkUniverse`]。
+    /// 同时把磁盘上的全部路径登记进链接解析表，为新文件预分配 `note_id`。
+    ///
+    /// # Errors
+    ///
+    /// 目录枚举、元数据读写或链接解析表加载失败时返回错误。
     pub fn plan_sync(&mut self) -> Result<SyncPlan, IndexerError> {
         Ok(self.plan_sync_cancellable(|| false)?.expect("uncancellable sync plan"))
     }
@@ -379,7 +390,7 @@ impl Indexer {
         Ok(Some(SyncPlan { notes, removed: known.into_values().collect() }))
     }
 
-    /// 同步一篇（`plan_sync` 的一项），结果计入 `report`。每写满 [`FLUSH_EVERY_BLOCKS`] 块 flush 一次。
+    /// 同步一篇（`plan_sync` 的一项），结果计入 `report`。写入的块会定期批量 flush。
     /// 全部步骤走完后调一次 [`Self::reconcile_links`]。
     pub fn sync_step(&mut self, path: &VaultPath, row: Option<&NoteRow>, report: &mut SyncReport) {
         match self.sync_one(path, row) {
@@ -423,8 +434,9 @@ impl Indexer {
         if self.link_batch.is_empty() {
             return Ok(());
         }
-        let batch = std::mem::take(&mut self.link_batch);
-        self.meta.replace_links_many(batch.iter().map(|(id, rows)| (id.as_str(), rows.as_slice())))?;
+        self.meta
+            .replace_links_many(self.link_batch.iter().map(|(id, rows)| (id.as_str(), rows.as_slice())))?;
+        self.link_batch.clear();
         Ok(())
     }
 
@@ -510,6 +522,10 @@ impl Indexer {
         doc: &Document,
         stamp: FileStamp,
     ) -> Result<usize, IndexerError> {
+        // Retry failed batches before they grow or overwrite a newer non-bulk edit.
+        if !self.bulk || self.link_batch.len() >= LINK_BATCH_NOTES {
+            self.flush_link_batch()?;
+        }
         let existing = self.meta.note_by_path(path.as_str())?;
         let formal = aero_core::identity::read(doc).map_err(IndexerError::Identity)?.id;
         if let Some(id) = &formal
@@ -667,10 +683,14 @@ impl Indexer {
     /// 重判两类链接行（哈希查找，不遍历笔记）：还没解析到目标的（目标可能刚入库），
     /// 以及指向"判定可能受本次改动影响"的笔记的（唯一可能变歧义、标题可能让位给文件名）——
     /// 单篇场景是改动笔记的邻域，全量同步收尾是全部名字有竞争的笔记。返回改写的行数。
+    ///
+    /// # Errors
+    ///
+    /// 元数据查询或写入失败时返回错误，待重判的笔记集合会保留到下次调用。
     pub fn reconcile_links(&mut self) -> Result<usize, IndexerError> {
         self.flush_link_batch()?;
         self.universe()?;
-        let touched = std::mem::take(&mut self.touched);
+        let touched = &self.touched;
         let universe = self.links.as_ref().expect("universe built above");
         // (当前 resolved_note_id, 行)：结果没变的行不写
         let mut rows: Vec<(Option<String>, crate::meta::PendingLink)> =
@@ -702,19 +722,24 @@ impl Indexer {
         if !updates.is_empty() {
             self.meta.set_links_resolved(updates.iter().copied())?;
         }
+        self.touched = Touched::default();
         Ok(updates.len())
     }
 
-    /// 给预览点击用的解析表：已索引的笔记（带标题）加上磁盘上还没索引到的（刚新建、全量同步进行中）。
     /// 把命令行里的笔记参数解析成路径：内部 `note_id`、相对路径、唯一文件名、标题或别名。
+    ///
+    /// # Errors
+    ///
+    /// 索引读取、笔记路径转换或目录枚举失败时返回错误。歧义和缺失用 [`Resolution`] 表示。
     pub fn resolve_note(&mut self, target: &str) -> Result<Resolution, IndexerError> {
         let target = target.trim();
-        if let Some(row) = self.meta.all_notes()?.into_iter().find(|row| row.note_id == target) {
+        if let Some(row) = self.meta.note_by_id(target)? {
             return Ok(Resolution::Resolved { path: VaultPath::new(&row.path)?, fragment: None });
         }
         Ok(self.link_resolver()?.resolve(target, None, ""))
     }
 
+    /// 给预览点击用的解析表：已索引的笔记（带标题）加上磁盘上还没索引到的（刚新建、全量同步进行中）。
     pub fn link_resolver(&mut self) -> Result<Resolver, IndexerError> {
         let mut resolver = self.universe()?.resolver.clone();
         for path in self.vault.notes()? {
@@ -738,7 +763,7 @@ impl Indexer {
     fn universe(&mut self) -> Result<&mut LinkUniverse, IndexerError> {
         if self.links.is_none() {
             let rows = self.meta.all_notes()?;
-            let mut universe = LinkUniverse::from_rows(rows.clone());
+            let mut universe = LinkUniverse::from_rows(&rows);
             for row in rows {
                 let path = VaultPath::new(&row.path)?;
                 if let Ok((doc, _)) = self.vault.read(&path) {
@@ -899,7 +924,7 @@ impl Indexer {
                 let Some(escaped) = aero_core::links::escape_target(&replacement) else { continue };
                 edits.push((range, escaped));
             }
-            edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+            edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
             for (range, replacement) in edits {
                 if range.end <= text.len() && range.start <= range.end {
                     text.replace_range(range, &replacement);
@@ -995,6 +1020,62 @@ mod tests {
         assert!(!ix.bulk, "cancelled enumeration must not start a bulk update");
         ix.index_note(&VaultPath::new("b.md").unwrap()).unwrap();
         assert_eq!(ix.backlinks(&VaultPath::new("b.md").unwrap(), None, 10).unwrap().total, 1);
+    }
+
+    #[test]
+    fn failed_link_batch_is_retried_after_sqlite_recovers() {
+        let (vault, mut ix) =
+            setup(&[("a.md", "[[target]]\n"), ("b.md", "[[target]]\n"), ("target.md", "body\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let database_path = data.path().join("meta.sqlite");
+        ix.meta = Meta::open(&database_path).unwrap();
+        let target = VaultPath::new("target.md").unwrap();
+        ix.index_note(&target).unwrap();
+        let plan = ix.plan_sync().unwrap();
+        let mut report = SyncReport::default();
+        for (path, row) in &plan.notes {
+            ix.sync_step(path, row.as_ref(), &mut report);
+        }
+        assert!(report.errors.is_empty(), "{report:?}");
+
+        let db = rusqlite::Connection::open(&database_path).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_links BEFORE INSERT ON links BEGIN SELECT RAISE(ABORT, 'test'); END;",
+        )
+        .unwrap();
+        assert!(ix.finish_sync().is_err());
+        db.execute_batch("DROP TRIGGER reject_links").unwrap();
+
+        std::fs::write(vault.path().join("a.md"), "edited without a link\n").unwrap();
+        ix.index_note(&VaultPath::new("a.md").unwrap()).unwrap();
+        let page = ix.backlinks(&target, None, 10).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits[0].path.as_str(), "b.md");
+    }
+
+    #[test]
+    fn failed_link_reconciliation_retries_affected_names() {
+        let (vault, mut ix) =
+            setup(&[("source.md", "[[shared]]\n"), ("target.md", "---\ntitle: shared\n---\n")]);
+        let data = tempfile::tempdir().unwrap();
+        let database_path = data.path().join("meta.sqlite");
+        ix.meta = Meta::open(&database_path).unwrap();
+        let report = ix.sync_all(|_, _| {});
+        assert!(report.errors.is_empty(), "{report:?}");
+        let target = VaultPath::new("target.md").unwrap();
+        assert_eq!(ix.backlinks(&target, None, 10).unwrap().total, 1);
+
+        let db = rusqlite::Connection::open(&database_path).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER reject_link_updates BEFORE UPDATE ON links BEGIN SELECT RAISE(ABORT, 'test'); END;",
+        )
+        .unwrap();
+        std::fs::write(vault.path().join("other.md"), "---\ntitle: shared\n---\n").unwrap();
+        assert!(ix.index_note(&VaultPath::new("other.md").unwrap()).is_err());
+        db.execute_batch("DROP TRIGGER reject_link_updates").unwrap();
+
+        ix.reconcile_links().unwrap();
+        assert_eq!(ix.backlinks(&target, None, 10).unwrap().total, 0);
     }
 
     #[test]

@@ -122,23 +122,30 @@ pub(super) struct PdfReader {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Values from the Markdown embed. Scrolling and local page jumps live in the reader.
+#[derive(Clone)]
+pub(super) struct PdfSource {
+    pub(super) path: VaultPath,
+    pub(super) markdown: String,
+    pub(super) page: u32,
+    pub(super) width: u32,
+}
+
 impl PdfReader {
     pub(super) fn new(
         editor: WeakEntity<super::Editor>,
         block: BlockId,
-        path: VaultPath,
-        source: String,
-        page: u32,
-        width: u32,
+        source: PdfSource,
         service: Entity<RenderService>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let PdfSource { path, markdown, page, width } = source;
         let subscription = cx.observe(&service, |_, _, cx| cx.notify());
         Self {
             editor,
             block,
             path,
-            source,
+            source: markdown,
             prop_page: page,
             width: width.clamp(24, 4096),
             actual_width: width.clamp(24, 680) as f32,
@@ -160,23 +167,18 @@ impl PdfReader {
         }
     }
 
-    pub(super) fn sync(
-        &mut self,
-        path: VaultPath,
-        source: String,
-        page: u32,
-        width: u32,
-        cx: &mut Context<Self>,
-    ) {
+    /// Width-only updates preserve the local page. A different source or requested page resets it.
+    pub(super) fn sync(&mut self, source: PdfSource, cx: &mut Context<Self>) {
+        let PdfSource { path, markdown, page, width } = source;
         let path_changed = self.path != path;
-        let navigation_changed = path_changed || self.source != source || self.prop_page != page;
+        let navigation_changed = path_changed || self.source != markdown || self.prop_page != page;
         let width = width.clamp(24, 4096);
         let width_changed = self.width != width;
         if !navigation_changed && !width_changed {
             return;
         }
         self.path = path;
-        self.source = source;
+        self.source = markdown;
         self.prop_page = page;
         self.width = width;
         if path_changed {
@@ -732,7 +734,7 @@ impl Render for PdfReader {
 mod tests {
     use super::super::Editor;
     use super::{
-        DEFAULT_HEIGHT, MAX_HEIGHT, MIN_HEIGHT, PageLayout, PdfReader, ResizeDrag, parse_page,
+        DEFAULT_HEIGHT, MAX_HEIGHT, MIN_HEIGHT, PageLayout, PdfReader, PdfSource, ResizeDrag, parse_page,
         viewport_height,
     };
     use crate::render::RenderService;
@@ -743,7 +745,7 @@ mod tests {
     fn reader_fixture(
         cx: &mut TestAppContext,
     ) -> (tempfile::TempDir, tempfile::TempDir, Entity<PdfReader>, Entity<RenderService>) {
-        cx.update(|cx| gpui_kit::init(cx));
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let source = "![[paper.pdf#page=1|400]]\n";
@@ -759,10 +761,12 @@ mod tests {
             PdfReader::new(
                 editor.downgrade(),
                 block,
-                VaultPath::new("paper.pdf").unwrap(),
-                source.into(),
-                1,
-                400,
+                PdfSource {
+                    path: VaultPath::new("paper.pdf").unwrap(),
+                    markdown: source.into(),
+                    page: 1,
+                    width: 400,
+                },
                 service.clone(),
                 cx,
             )
@@ -788,7 +792,15 @@ mod tests {
                 assert_eq!(reader.page_count(), Some(2));
                 assert_eq!(reader.current_page(), 2);
                 assert_eq!(reader.offset, reader.layout.tops[1]);
-                reader.sync(reader.path.clone(), reader.source.clone(), 1, 400, cx);
+                reader.sync(
+                    PdfSource {
+                        path: reader.path.clone(),
+                        markdown: reader.source.clone(),
+                        page: 1,
+                        width: 400,
+                    },
+                    cx,
+                );
                 assert_eq!(
                     reader.current_page(),
                     2,
@@ -798,8 +810,17 @@ mod tests {
                 assert_eq!(reader.current_page(), 2);
                 assert_eq!(reader.offset, reader.layout.tops[1]);
                 let source = reader.source.clone();
-                reader.sync(reader.path.clone(), source.replace("page=1", "page=2"), 2, 200, cx);
-                reader.sync(reader.path.clone(), source, 1, 200, cx);
+                reader.sync(
+                    PdfSource {
+                        path: reader.path.clone(),
+                        markdown: source.replace("page=1", "page=2"),
+                        page: 2,
+                        width: 200,
+                    },
+                    cx,
+                );
+                reader
+                    .sync(PdfSource { path: reader.path.clone(), markdown: source, page: 1, width: 200 }, cx);
                 reader.refresh_info(cx);
                 assert_eq!(reader.current_page(), 1, "external undo must apply its page");
                 assert_eq!(reader.offset, 0.);

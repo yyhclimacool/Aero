@@ -92,21 +92,45 @@ pub(super) struct SaveRequest {
     pub bom: bool,
     pub ending: aero_core::LineEnding,
     pub epoch: u64,
-    pub allow_missing: bool,
+    pub missing_file: MissingFile,
+}
+
+/// Automatic saves respect a deletion. An explicit save may recreate the file.
+#[derive(Clone, Copy)]
+pub(super) enum MissingFile {
+    Skip,
+    Recreate,
 }
 
 impl SaveRequest {
+    /// Back up the disk contents when their fingerprint differs from the known version.
     pub(super) fn save(self) -> SaveOutcome {
-        save(
-            &self.vault,
-            &self.path,
-            self.known,
-            self.conflict_base,
-            self.snapshot,
-            self.bom,
-            self.ending,
-            self.allow_missing,
-        )
+        let mut conflict = None;
+        let result = (|| {
+            crate::diagnostics::stage_current("disk_check", Default::default());
+            let (state, _) = disk_state(&self.vault, &self.path, self.known)
+                .map_err(|e| format!("无法校验磁盘版本，已停止保存：{e}"))?;
+            match state {
+                Disk::Missing if matches!(self.missing_file, MissingFile::Skip) => return Ok(None),
+                Disk::Changed(bytes) => {
+                    conflict = Some(
+                        backup(&self.vault, self.conflict_base, &bytes)
+                            .map_err(|e| format!("无法保存冲突副本，已停止保存：{e}"))?,
+                    );
+                }
+                Disk::Unchanged | Disk::Missing => {}
+            }
+            let bytes =
+                aero_core::SourceText::encode(&String::from(self.snapshot.text()), self.bom, self.ending);
+            crate::diagnostics::stage_current(
+                "write_begin",
+                crate::diagnostics::Facts { bytes: bytes.len() as u64, ..Default::default() },
+            );
+            let result = self.vault.write_bytes(&self.path, &bytes).map(Some).map_err(|e| e.to_string());
+            crate::diagnostics::stage_current("write_done", Default::default());
+            result
+        })();
+        SaveOutcome { result, conflict }
     }
 
     pub(super) fn finish(
@@ -140,12 +164,11 @@ impl SaveRequest {
             if outcome.conflict.is_none() {
                 outcome.conflict = conflict;
             }
-            if matches!(outcome.result, Ok(Some(_))) {
-                if let Some(path) = remove {
-                    if let Err(error) = std::fs::remove_file(vault.fs_path(&path)) {
-                        log::warn!("remove conflict copy: {error}");
-                    }
-                }
+            if matches!(outcome.result, Ok(Some(_)))
+                && let Some(path) = remove
+                && let Err(error) = std::fs::remove_file(vault.fs_path(&path))
+            {
+                log::warn!("remove conflict copy: {error}");
             }
             outcome
         }))
@@ -207,45 +230,9 @@ pub(super) fn backup(vault: &Vault, base: VaultPath, bytes: &[u8]) -> Result<Vau
     Err(VaultError::AlreadyExists(base.to_string()))
 }
 
-pub(super) fn save(
-    vault: &Vault,
-    path: &VaultPath,
-    known: FileStamp,
-    conflict_base: VaultPath,
-    snapshot: aero_core::Snapshot,
-    bom: bool,
-    ending: aero_core::LineEnding,
-    allow_missing: bool,
-) -> SaveOutcome {
-    let mut conflict = None;
-    let result = (|| {
-        crate::diagnostics::stage_current("disk_check", Default::default());
-        match disk_state(vault, path, known).map_err(|e| format!("无法校验磁盘版本，已停止保存：{e}"))?.0
-        {
-            Disk::Missing if !allow_missing => return Ok(None),
-            Disk::Changed(bytes) => {
-                conflict = Some(
-                    backup(vault, conflict_base, &bytes)
-                        .map_err(|e| format!("无法保存冲突副本，已停止保存：{e}"))?,
-                );
-            }
-            Disk::Unchanged | Disk::Missing => {}
-        }
-        let bytes = aero_core::SourceText::encode(&String::from(snapshot.text()), bom, ending);
-        crate::diagnostics::stage_current(
-            "write_begin",
-            crate::diagnostics::Facts { bytes: bytes.len() as u64, ..Default::default() },
-        );
-        let result = vault.write_bytes(path, &bytes).map(Some).map_err(|e| e.to_string());
-        crate::diagnostics::stage_current("write_done", Default::default());
-        result
-    })();
-    SaveOutcome { result, conflict }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{SaveOutcome, SaveRequest, WriteJob};
+    use super::{MissingFile, SaveOutcome, SaveRequest, WriteJob};
     use aero_core::{Document, Edit, Vault, VaultPath};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -266,7 +253,7 @@ mod tests {
             bom: true,
             ending: aero_core::LineEnding::CrLf,
             epoch: 7,
-            allow_missing: false,
+            missing_file: MissingFile::Skip,
         };
         (dir, request)
     }
@@ -337,7 +324,7 @@ mod tests {
         use gpui_kit::AppContext as _;
         let (dir, request) = request();
         let (doc, stamp) = request.vault.read(&request.path).unwrap();
-        cx.update(|cx| gpui_kit::init(cx));
+        cx.update(gpui_kit::init);
         let editor = cx.new(|cx| super::Editor::new(request.vault, request.path, doc, stamp, cx));
         let (guard, wait) = editor.update(cx, |e, cx| {
             e.doc.edit(Edit::insert(0, "first ")).unwrap();
@@ -365,7 +352,7 @@ mod tests {
         use gpui_kit::AppContext as _;
         let (dir, request) = request();
         let (doc, stamp) = request.vault.read(&request.path).unwrap();
-        cx.update(|cx| gpui_kit::init(cx));
+        cx.update(gpui_kit::init);
         let editor = cx.new(|cx| super::Editor::new(request.vault, request.path, doc, stamp, cx));
         editor.update(cx, |e, cx| {
             e.check_external(cx);

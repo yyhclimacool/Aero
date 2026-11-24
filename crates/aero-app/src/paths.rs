@@ -122,6 +122,15 @@ pub fn file_url(path: &Path) -> String {
     url
 }
 
+/// `~/Knowledge` 显示为 `~/Knowledge` 而不是绝对路径。
+pub fn display_path(p: &Path) -> String {
+    let home = home();
+    match p.strip_prefix(&home) {
+        Ok(rest) if home != Path::new(".") => format!("~/{}", rest.display()),
+        _ => p.display().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,14 +154,5 @@ mod tests {
         assert_eq!(PersistedState::load(dir.path()).link_preview, LinkPreviewMode::Command);
         fs::write(dir.path().join("state.toml"), "recent_vaults = []\n").unwrap();
         assert_eq!(PersistedState::load(dir.path()).link_preview, LinkPreviewMode::Hover);
-    }
-}
-
-/// `~/Knowledge` 显示为 `~/Knowledge` 而不是绝对路径。
-pub fn display_path(p: &Path) -> String {
-    let home = home();
-    match p.strip_prefix(&home) {
-        Ok(rest) if home != Path::new(".") => format!("~/{}", rest.display()),
-        _ => p.display().to_string(),
     }
 }

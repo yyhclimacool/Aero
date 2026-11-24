@@ -17,6 +17,11 @@ use crate::document::Document;
 pub struct VaultPath(String);
 
 impl VaultPath {
+    /// 将分隔符规范化为 `/`，并移除可选的前导 `./`。
+    ///
+    /// # Errors
+    ///
+    /// 拒绝空路径、带前导或尾随分隔符的路径，以及空段、`.` 或 `..` 路径段。
     pub fn new(s: &str) -> Result<Self, VaultError> {
         let s = s.replace('\\', "/");
         let s = s.strip_prefix("./").unwrap_or(&s);
@@ -128,7 +133,11 @@ pub struct Vault {
 }
 
 impl Vault {
-    /// 打开一个 vault；没有 `.aero/vault.toml` 时创建（这是打开已有文件夹时唯一会写入的东西）。
+    /// 打开已有文件夹。首次打开时写入 `.aero/vault.toml`，以便后续定位同一个索引。
+    ///
+    /// # Errors
+    ///
+    /// 根目录不存在、配置格式不受支持，或读取、创建配置失败时返回错误。
     pub fn open(root: impl AsRef<Path>) -> Result<Vault, VaultError> {
         let root = root.as_ref();
         if !root.is_dir() {
@@ -171,6 +180,10 @@ impl Vault {
 
     /// 枚举全部笔记（`*.md`），按路径排序。跳过隐藏目录（含 `.aero/`、`.git/`）、`*.assets/`，
     /// 尊重 `.gitignore` 与 `.aero/ignore`。
+    ///
+    /// # Errors
+    ///
+    /// 目录遍历失败、忽略规则无法读取或笔记路径无法转换时返回错误。
     pub fn notes(&self) -> Result<Vec<VaultPath>, VaultError> {
         Ok(self.notes_cancellable(|| false)?.expect("uncancellable enumeration"))
     }
@@ -234,6 +247,11 @@ impl Vault {
         Ok(folders)
     }
 
+    /// 读取磁盘原始字节，指纹中的哈希对应这些字节。
+    ///
+    /// # Errors
+    ///
+    /// 文件不存在或无法读取内容、文件元数据时返回 [`VaultError::Io`]。
     pub fn read_bytes(&self, p: &VaultPath) -> Result<(Vec<u8>, FileStamp), VaultError> {
         let path = self.fs_path(p);
         let bytes = fs::read(&path).map_err(io_err(&path))?;
@@ -246,6 +264,11 @@ impl Vault {
         Ok((bytes, stamp))
     }
 
+    /// 解析笔记，保留磁盘字节的指纹以供后续变更检查。
+    ///
+    /// # Errors
+    ///
+    /// 传播 [`Self::read_bytes`] 的错误。文件内容不是 UTF-8 时返回 [`VaultError::Utf8`]。
     pub fn read(&self, p: &VaultPath) -> Result<(Document, FileStamp), VaultError> {
         let (bytes, stamp) = self.read_bytes(p)?;
         let doc = Document::from_bytes(&bytes).map_err(|_| VaultError::Utf8 { path: self.fs_path(p) })?;
@@ -259,12 +282,20 @@ impl Vault {
         Ok((meta.modified().map_err(io_err(&path))?, meta.len()))
     }
 
-    /// 原子写入（临时文件 + rename），保留原文件权限。父目录不存在时创建。
+    /// 用同目录临时文件原子替换目标，尽可能沿用原文件权限。父目录不存在时创建。
+    ///
+    /// # Errors
+    ///
+    /// 创建目录、写入、替换或读取写入后的文件元数据失败时返回错误。
     pub fn write_bytes(&self, p: &VaultPath, bytes: &[u8]) -> Result<FileStamp, VaultError> {
         self.write_bytes_impl(p, bytes, true)
     }
 
-    /// 原子创建新文件；目标存在（含符号链接）时失败，绝不覆盖已有冲突副本。
+    /// 原子创建新文件，常用于保留冲突副本。
+    ///
+    /// # Errors
+    ///
+    /// 目标已存在、路径经过符号链接，或写入和读取元数据失败时返回错误。
     pub fn create_bytes(&self, p: &VaultPath, bytes: &[u8]) -> Result<FileStamp, VaultError> {
         self.validate_local_path(p)?;
         self.write_bytes_impl(p, bytes, false)
@@ -295,6 +326,10 @@ impl Vault {
 
     /// 重命名 / 移动一篇笔记；`<note>.assets/` 存在时一起搬（5.4）。目标已存在时拒绝，绝不覆盖。
     /// 这里只动文件；包含链接更新的操作使用 [`crate::rename::RenamePlan`]。
+    ///
+    /// # Errors
+    ///
+    /// 源或目标路径无效、目标已存在，或移动文件及其附件失败时返回错误。
     pub fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<(), VaultError> {
         if from == to {
             return Ok(());
@@ -315,11 +350,11 @@ impl Vault {
             .zip(to.assets_dir())
             .map(|(a, b)| (self.fs_path(&a), self.fs_path(&b)))
             .filter(|(a, _)| a.is_dir());
-        if let Some((a, b)) = &assets {
-            if let Err(error) = move_path(a, b, true) {
-                let _ = fs::remove_file(&dst);
-                return Err(io_err(a)(error));
-            }
+        if let Some((a, b)) = &assets
+            && let Err(error) = move_path(a, b, true)
+        {
+            let _ = fs::remove_file(&dst);
+            return Err(io_err(a)(error));
         }
         if let Err(error) = fs::remove_file(&src) {
             if let Some((a, b)) = assets {
@@ -457,10 +492,11 @@ fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
                 flags: u32,
             ) -> c_int;
         }
-        // RENAME_EXCL / RENAME_NOREPLACE refuses even a concurrently created empty directory.
         #[cfg(target_os = "macos")]
+        // SAFETY: Both C strings are valid for the call. RENAME_EXCL refuses an existing destination.
         let result = unsafe { renamex_np(from.as_ptr(), to.as_ptr(), 0x4) };
         #[cfg(target_os = "linux")]
+        // SAFETY: Both C strings are valid for the call. AT_FDCWD and RENAME_NOREPLACE are valid arguments.
         let result = unsafe { renameat2(-100, from.as_ptr(), -100, to.as_ptr(), 1) };
         if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
     }

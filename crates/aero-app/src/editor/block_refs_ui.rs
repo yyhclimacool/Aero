@@ -57,7 +57,7 @@ impl Editor {
         }
         let mut edits = vec![Edit::replace(range, replacement.clone())];
         edits.extend(id_edit);
-        edits.sort_by(|a, b| b.range.start.cmp(&a.range.start));
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
         if let Err(err) = self.doc.edit_group(edits) {
             // 范围已由菜单和 prepare 验证；保留错误以防未来调用方破坏这一前提。
             self.wiki.as_mut().unwrap().error = Some(err.to_string());

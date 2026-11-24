@@ -66,6 +66,11 @@ pub fn model_available(root: &Path) -> bool {
 /// Cancellation is checked between reads/redirects and before atomic publication;
 /// socket stalls time out after 3s, DNS/connect/header phases have short timeouts.
 /// Progress is bytes received, at most once per 64 KiB (plus file boundaries).
+///
+/// # Errors
+///
+/// Returns an error for cancellation, a concurrent download, failed asset verification,
+/// or failures fetching or publishing the pinned files.
 pub fn download_model(root: &Path, cancel: &AtomicBool, progress: impl Fn(u64, u64)) -> Result<(), String> {
     let _guard = DOWNLOADING.try_lock().map_err(|_| "model download already in progress")?;
     check_cancel(cancel)?;
@@ -385,10 +390,11 @@ fn publish(source: &Path, destination: &Path) -> io::Result<()> {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
         let source = CString::new(source.as_os_str().as_bytes())?;
         let destination = CString::new(destination.as_os_str().as_bytes())?;
-        // SAFETY: both C strings remain valid for the call; EXCL/NOREPLACE forbids replacement.
         #[cfg(target_os = "macos")]
+        // SAFETY: The C strings remain valid through the call. RENAME_EXCL forbids replacement.
         let result = unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
         #[cfg(target_os = "linux")]
+        // SAFETY: The C strings remain valid through the call. AT_FDCWD and RENAME_NOREPLACE are valid arguments.
         let result = unsafe {
             libc::renameat2(
                 libc::AT_FDCWD,

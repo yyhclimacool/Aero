@@ -284,9 +284,10 @@ pub fn init(mode: &'static str) -> Option<Guard> {
         return Some(Guard { recorder, worker: Some(worker) });
     }
     let _ = RECORDER.set(recorder.clone());
+    // NSApplication terminates through exit(), which bypasses the Rust guard in main.
     #[cfg(unix)]
+    // SAFETY: The static C callback accesses only the process-wide recorder.
     unsafe {
-        // NSApplication terminate calls exit(), so main's Rust guard is not dropped.
         libc::atexit(native_exit);
     }
     let _ = log::set_boxed_logger(Box::new(LegacyLogger));
