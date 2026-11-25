@@ -26,8 +26,25 @@ pub fn split(doc: &Document, unit: Option<&Unit>, range: &Range<usize>, cursor: 
     if text.is_empty() {
         let container = unit.and_then(|u| doc.blocks().find(u.id)).or_else(|| doc.block_at(range.start));
         if let Some(container) = container.filter(|b| aero_core::containers::is_editable(&b.kind)) {
-            let at = aero_core::properties::owned_range(doc, container.id).unwrap().end;
+            let at_end = container
+                .children
+                .iter()
+                .filter(|block| block.kind != BlockKind::Marker)
+                .all(|block| doc.range_of(block).end <= range.start);
             let prefix = aero_core::containers::continuation(doc, container.id);
+            if !at_end {
+                let prefix = if matches!(container.kind, BlockKind::BlockQuote) {
+                    format!("{prefix}> ")
+                } else {
+                    prefix
+                };
+                let separator = format!("\n{prefix}\n{prefix}");
+                return Plan {
+                    focus_offset: range.start + separator.len(),
+                    edit: Edit::insert(range.start, separator),
+                };
+            }
+            let at = aero_core::properties::owned_range(doc, container.id).unwrap().end;
             let separator = format!("\n{prefix}\n{prefix}");
             return Plan { focus_offset: at + separator.len(), edit: Edit::insert(at, separator) };
         }
@@ -189,7 +206,11 @@ pub fn backspace_at_start(doc: &Document, units: &[Unit], ix: usize) -> Backspac
         .find(|b| aero_core::containers::is_editable(&b.kind))
         && !units[..ix].iter().any(|u| u.range.start >= doc.range_of(container).start)
     {
-        return Backspace::SelectContainer(container.id);
+        return if unit.range.is_empty() {
+            Backspace::SelectContainer(container.id)
+        } else {
+            Backspace::MoveTo { unit: ix, cursor: 0 }
+        };
     }
 
     if let Some(ctx) = &unit.list {
@@ -509,6 +530,11 @@ pub fn move_node(
     if range.start < at && at < range.end {
         return None;
     }
+    let fence_edits = if into && matches!(&to.kind, BlockKind::Directive { name } if name == "highlight") {
+        aero_core::containers::extend_nested_fences(doc, target, &piece).ok()?
+    } else {
+        Vec::new()
+    };
     let piece = piece.trim_end_matches('\n').replace('\n', &format!("\n{prefix}"));
     let separator = format!("\n{}\n{prefix}", prefix.trim_end_matches([' ', '\t']));
     let (insertion, leading) = if into || after || task_header {
@@ -518,6 +544,7 @@ pub fn move_node(
         (format!("{piece}{separator}"), 0)
     };
     let mut edits = vec![delete, Edit::insert(at, insertion)];
+    edits.extend(fence_edits);
     edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
     let mut probe = doc.clone();
     probe.edit_group(edits).ok()?;
@@ -535,6 +562,12 @@ pub fn move_node(
     };
     if identities(doc) != identities(&probe) {
         return None;
+    }
+    if into {
+        let moved = probe.blocks().find(source)?;
+        if !aero_core::containers::ancestors(&probe, moved.id).iter().any(|block| block.id == target) {
+            return None;
+        }
     }
     let focus_offset = if at >= range.end { at - range.len() } else { at } + leading;
     let text = probe.to_string();
@@ -1350,6 +1383,83 @@ mod tests {
     }
 
     #[test]
+    fn moving_highlight_into_equal_length_fence_extends_the_outer_fence() {
+        let source = ":::highlight\nouter ^outer\n:::\n\n:::highlight\ninner ^inner\n:::\n";
+        let mut doc = Document::from_text(source);
+        let outer = doc.blocks().roots[0].id;
+        let inner = doc.blocks().roots[1].id;
+        let plan = move_node(&doc, inner, outer, false, true).expect("equal fences can nest after extension");
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        assert_eq!(doc.blocks().roots.len(), 1, "{}", doc);
+        assert!(doc.to_string().starts_with("::::highlight\n"), "{}", doc);
+        assert_eq!(doc.blocks().roots[0].children.len(), 2, "{}", doc);
+        assert!(
+            doc.blocks().roots[0]
+                .children
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Directive { .. })),
+            "{}",
+            doc
+        );
+        assert!(aero_core::block_refs::resolve(&doc, "outer").is_ok());
+        assert!(aero_core::block_refs::resolve(&doc, "inner").is_ok());
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn moving_highlight_between_list_items_preserves_nested_structure() {
+        let source = "- :::highlight\n  outer ^outer\n  :::\n\n- :::highlight\n  inner ^inner\n  :::\n";
+        let mut doc = Document::from_text(source);
+        let directives: Vec<_> = doc
+            .blocks()
+            .iter()
+            .filter(|(_, block)| matches!(block.kind, BlockKind::Directive { .. }))
+            .map(|(_, block)| block.id)
+            .collect();
+        let (outer, inner) = (directives[0], directives[1]);
+        let plan = move_node(&doc, inner, outer, false, true).expect("list containers can nest");
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let inner_block = doc.blocks().find(inner).expect("moved container keeps its ID");
+        assert!(
+            aero_core::containers::ancestors(&doc, inner_block.id).iter().any(|block| block.id == outer),
+            "{}",
+            doc
+        );
+        assert!(aero_core::block_refs::resolve(&doc, "outer").is_ok());
+        assert!(aero_core::block_refs::resolve(&doc, "inner").is_ok());
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn moving_identified_highlight_preserves_container_and_body_identities() {
+        let source = ":::highlight\nouter ^outer\n:::\n\n^outer-box\n\n:::highlight\ninner ^inner\n:::\n\n^inner-box\n";
+        let mut doc = Document::from_text(source);
+        let identified = |doc: &Document, id: &str| {
+            doc.blocks()
+                .iter()
+                .find(|(_, block)| block.persisted_id.as_deref() == Some(id))
+                .map(|(_, block)| block.id)
+                .unwrap()
+        };
+        let outer = identified(&doc, "outer-box");
+        let inner = identified(&doc, "inner-box");
+        let plan = move_node(&doc, inner, outer, false, true).expect("identified containers can nest");
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let inner = identified(&doc, "inner-box");
+        let outer = identified(&doc, "outer-box");
+        assert!(aero_core::containers::ancestors(&doc, inner).iter().any(|block| block.id == outer));
+        assert!(aero_core::block_refs::resolve(&doc, "inner").is_ok());
+        assert!(aero_core::block_refs::resolve(&doc, "outer").is_ok());
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
     fn moving_list_body_keeps_other_children_in_their_original_item() {
         let source =
             "before\n\n- first ^first\n\n  continuation ^cont\n\n  - nested ^nested\n- sibling\n\nend\n";
@@ -1478,6 +1588,36 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_trailing_empty_container_slot_exits_one_level() {
+        let mut doc = Document::from_text(":::highlight\n:::\n\nafter\n");
+        let us = units(&doc);
+        let plan = split(&doc, Some(&us[0]), &us[0].range, 0);
+        let (text, _) = apply(&mut doc, plan);
+        assert_eq!(text, ":::highlight\n:::\n\n\n\nafter\n");
+        assert_eq!(doc.blocks().roots.len(), 2);
+        assert_eq!(doc.blocks().roots[0].children.len(), 0);
+    }
+
+    #[test]
+    fn enter_on_internal_empty_container_slot_stays_inside() {
+        let mut doc = Document::from_text(":::highlight\nfirst\n\nsecond\n:::\n\nafter\n");
+        let us = units(&doc);
+        let first = split(&doc, Some(&us[0]), &us[0].range, us[0].range.len());
+        let at = first.focus_offset;
+        doc.edit(first.edit).unwrap();
+        doc.reparse();
+        let before = doc.to_string();
+        let container = &doc.blocks().roots[0];
+        let empty = Unit { id: container.id, kind: BlockKind::Paragraph, range: at..at, list: None };
+        let plan = split(&doc, Some(&empty), &empty.range, 0);
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        assert_eq!(doc.to_string(), format!("{}\n\n{}", &before[..at], &before[at..]));
+        assert_eq!(doc.blocks().roots[0].children.len(), 2);
+        assert_eq!(doc.blocks().roots[1].children.len(), 0);
+    }
+
+    #[test]
     fn enter_in_list_item_continues_list() {
         let mut doc = Document::from_text("- a\n- b\n");
         let us = units(&doc);
@@ -1528,6 +1668,19 @@ mod tests {
         let (text, focused) = apply(&mut doc, plan);
         assert_eq!(text, "- a\n  - b\n- \n");
         assert_eq!(focused.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn nonempty_first_container_child_backspace_stays_at_boundary() {
+        let doc = Document::from_text(":::highlight\nfirst\n\nsecond\n:::\n");
+        let us = units(&doc);
+        assert_eq!(backspace_at_start(&doc, &us, 0), Backspace::MoveTo { unit: 0, cursor: 0 });
+        assert_eq!(doc.to_string(), ":::highlight\nfirst\n\nsecond\n:::\n");
+
+        let doc = Document::from_text(":::highlight\n:::\n");
+        let us = units(&doc);
+        let container = doc.blocks().roots[0].id;
+        assert_eq!(backspace_at_start(&doc, &us, 0), Backspace::SelectContainer(container));
     }
 
     #[test]

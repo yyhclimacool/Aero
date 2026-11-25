@@ -267,6 +267,9 @@ impl Editor {
             .map(|slot| slot.range.start)
             .collect();
         pending.extend(self.focused.as_ref().filter(|f| f.id.is_none()).map(|f| f.range.start));
+        pending.retain(|&offset| {
+            !self.doc.blocks().iter().any(|(_, block)| empty_slots::in_container_gap(&self.doc, block, offset))
+        });
         pending.sort_unstable();
         pending.dedup();
         if self.viewport.dirty || self.viewport.pending != pending {

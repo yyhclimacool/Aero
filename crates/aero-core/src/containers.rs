@@ -172,6 +172,68 @@ pub fn unwrap(doc: &Document, id: BlockId) -> Result<Edit, String> {
     Ok(Edit::replace(range, body.replace('\n', &format!("\n{external}"))))
 }
 
+fn closing_fence(text: &str, span: std::ops::Range<usize>) -> Option<(usize, usize)> {
+    let body = &text[span.clone()];
+    if let Some(at) = body.rfind('\n') {
+        let start = span.start + at + 1;
+        let line = &text[start..span.end];
+        if line.trim_start().starts_with(':') {
+            let start = start + line.find(':')?;
+            let length = text[start..span.end].chars().take_while(|c| *c == ':').count();
+            return Some((start, length));
+        }
+    }
+    let closing = span.end + text[span.end..].find('\n')? + 1;
+    let end = text[closing..].find('\n').map_or(text.len(), |at| closing + at);
+    let line = &text[closing..end];
+    let start = closing + line.find(':')?;
+    let length = text[start..end].chars().take_while(|c| *c == ':').count();
+    (length > 0).then_some((start, length))
+}
+
+fn fence_edits<'a>(
+    doc: &Document,
+    containers: impl IntoIterator<Item = &'a Block>,
+    inner: &str,
+) -> Result<Vec<Edit>, String> {
+    let mut required = inner
+        .lines()
+        .map(|line| {
+            let indent = line.chars().take(3).take_while(|c| *c == ' ').count();
+            line[indent..].chars().take_while(|c| *c == ':').count()
+        })
+        .max()
+        .unwrap_or(3);
+    let text = doc.to_string();
+    let mut edits = Vec::new();
+    for container in containers.into_iter().filter(|b| matches!(b.kind, BlockKind::Directive { .. })) {
+        let span = doc.range_of(container);
+        let (closing, closing_len) = closing_fence(&text, span.clone()).ok_or("容器结束围栏不完整")?;
+        let opening = &text[span.clone()];
+        let count = opening.chars().take_while(|c| *c == ':').count();
+        if count > required {
+            required = count;
+            continue;
+        }
+        required += 1;
+        let fence = ":".repeat(required);
+        edits.push(Edit::replace(span.start..span.start + count, fence.clone()));
+        edits.push(Edit::replace(closing..closing + closing_len, fence));
+    }
+    edits.sort_unstable_by_key(|edit| std::cmp::Reverse(edit.range.start));
+    Ok(edits)
+}
+
+/// Extend a target and its directive ancestors so `inner` can nest without changing identities.
+/// Edits use original document coordinates and are ordered from the end to the start.
+///
+/// # Errors
+/// Returns an error if the target is missing or a directive has no closing fence.
+pub fn extend_nested_fences(doc: &Document, target: BlockId, inner: &str) -> Result<Vec<Edit>, String> {
+    let target = doc.blocks().find(target).ok_or("目标容器已不存在")?;
+    fence_edits(doc, std::iter::once(target).chain(ancestors(doc, target.id).into_iter().rev()), inner)
+}
+
 pub fn wrap(doc: &Document, id: BlockId, highlight: bool) -> Result<Edit, String> {
     let block = doc.blocks().find(id).ok_or("目标块已不存在")?;
     let range = crate::properties::owned_range(doc, id).ok_or("目标块已不存在")?;
@@ -224,29 +286,7 @@ pub fn wrap(doc: &Document, id: BlockId, highlight: bool) -> Result<Edit, String
     let replacement = wrapped.replace('\n', &format!("\n{external}"));
     let mut edits = vec![Edit::replace(range, replacement)];
     if highlight {
-        let mut required =
-            wrapped.lines().map(|l| l.chars().take_while(|c| *c == ':').count()).max().unwrap_or(3);
-        let text = doc.to_string();
-        for ancestor in
-            ancestors(doc, id).into_iter().rev().filter(|b| matches!(b.kind, BlockKind::Directive { .. }))
-        {
-            let span = doc.range_of(ancestor);
-            let opening = &text[span.clone()];
-            let count = opening.chars().take_while(|c| *c == ':').count();
-            if count > required {
-                required = count;
-                continue;
-            }
-            required += 1;
-            let fence = ":".repeat(required);
-            edits.push(Edit::replace(span.start..span.start + count, fence.clone()));
-            if let Some(at) = opening.rfind('\n') {
-                let closing = span.start + at + 1;
-                let start = text[closing..span.end].find(':').ok_or("容器结束围栏不完整")? + closing;
-                let length = text[start..span.end].chars().take_while(|c| *c == ':').count();
-                edits.push(Edit::replace(start..start + length, fence));
-            }
-        }
+        edits.extend(fence_edits(doc, ancestors(doc, id).into_iter().rev(), &wrapped)?);
     }
     if edits.len() == 1 {
         return Ok(edits.remove(0));

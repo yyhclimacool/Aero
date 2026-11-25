@@ -69,12 +69,33 @@ pub(super) fn styled_input(
     Ok((doc.to_string(), cursor))
 }
 
+pub(super) fn in_container_gap(doc: &Document, container: &Block, offset: usize) -> bool {
+    if !aero_core::containers::is_editable(&container.kind)
+        || !container.children.iter().any(|block| block.kind != BlockKind::Marker)
+    {
+        return false;
+    }
+    let range = doc.range_of(container);
+    let at_quote_end = offset == range.end && matches!(container.kind, BlockKind::BlockQuote);
+    range.start < offset
+        && (offset < range.end || at_quote_end)
+        && container.children.iter().filter(|block| block.kind != BlockKind::Marker).all(|child| {
+            let range = doc.range_of(child);
+            offset < range.start
+                || offset >= range.end
+                    && !(offset == range.end && matches!(child.kind, BlockKind::BlockQuote))
+        })
+}
+
 impl Editor {
     pub(super) fn available_empty_slot(&self, slot: &EmptySlot) -> bool {
         if !slot.range.is_empty() || unit_at(&self.units, slot.range.start).is_some() {
             return false;
         }
         let at = slot.range.start;
+        if self.doc.blocks().iter().any(|(_, block)| in_container_gap(&self.doc, block, at)) {
+            return true;
+        }
         // Undoing creation can collapse an annotation onto the previous
         // paragraph. Only an actual reserved blank line gets a viewport row.
         let before = self.doc.slice(0..at);

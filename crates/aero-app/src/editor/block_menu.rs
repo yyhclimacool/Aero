@@ -170,6 +170,13 @@ impl Editor {
                     return None;
                 }
                 let container = aero_core::containers::is_editable(&block.kind);
+                let ancestors = aero_core::containers::ancestors(&self.doc, *id);
+                if !container
+                    && cursor.x < bounds.left()
+                    && ancestors.iter().any(|block| aero_core::containers::is_editable(&block.kind))
+                {
+                    return None;
+                }
                 let structural = container
                     || matches!(
                         block.kind,
@@ -178,7 +185,7 @@ impl Editor {
                 if cursor.x < bounds.left() - px(if structural { 96. } else { 48. }) {
                     return None;
                 }
-                Some((*id, *bounds, container, aero_core::containers::ancestors(&self.doc, *id).len()))
+                Some((*id, *bounds, container, ancestors.len()))
             })
             .max_by_key(|(_, _, _, depth)| *depth);
         if let Some((id, bounds, container, _)) = node {
@@ -320,10 +327,31 @@ impl Editor {
     pub(super) fn render_block_drop_line(&self, cx: &App) -> Option<AnyElement> {
         let hint = self.block_drop?;
         let color = cx.theme().accent;
+        let into = matches!(hint.target, BlockDropTarget::Node { into: true, .. });
         Some(
             deferred(
                 anchored().position(hint.origin).child(
-                    div().debug_selector(|| "block-drop-line".into()).w(hint.width).h(px(2.)).bg(color),
+                    v_flex()
+                        .child(
+                            div()
+                                .debug_selector(|| "block-drop-line".into())
+                                .w(hint.width)
+                                .h(px(2.))
+                                .bg(color),
+                        )
+                        .when(into, |el| {
+                            el.child(
+                                div()
+                                    .debug_selector(|| "block-drop-into".into())
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(4.))
+                                    .bg(color.opacity(0.16))
+                                    .text_color(color)
+                                    .text_xs()
+                                    .child("移入容器"),
+                            )
+                        }),
                 ),
             )
             .into_any_element(),
@@ -544,7 +572,34 @@ impl Editor {
         rows.push(row("block-menu-layout", "对齐与缩进 ▸".into(), "layout"));
         rows.push(row("block-menu-highlight", "包裹为高亮块".into(), "highlight"));
         if self.doc.blocks().find(block).is_some_and(|b| aero_core::containers::is_editable(&b.kind)) {
-            rows.push(row("block-menu-unwrap", "解除容器".into(), "unwrap"));
+            let identified = has_id.is_some()
+                || self
+                    .doc
+                    .blocks()
+                    .find(block)
+                    .is_some_and(|b| aero_core::block_refs::aliases(b).next().is_some());
+            if identified {
+                rows.push(
+                    div()
+                        .id("block-menu-unwrap")
+                        .debug_selector(|| "block-menu-unwrap".into())
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.))
+                        .text_sm()
+                        .opacity(0.4)
+                        .child("解除容器")
+                        .child(
+                            div()
+                                .debug_selector(|| "block-menu-unwrap-disabled-reason".into())
+                                .text_xs()
+                                .child("有引用身份，解除会破坏引用范围"),
+                        ),
+                );
+            } else {
+                rows.push(row("block-menu-unwrap", "解除容器".into(), "unwrap"));
+            }
         }
         rows.extend([
             row("block-menu-link", "复制块链接".into(), "link"),

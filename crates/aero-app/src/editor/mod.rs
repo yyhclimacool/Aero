@@ -3716,11 +3716,30 @@ impl Editor {
             // 列表项自己的颜色由 `render_list_item` 画：它要把标记列也包进背景里
             BlockKind::ListItem { .. } => Some(self.render_list_item(b, None, depth, inherited, cx)),
             kind if aero_core::containers::is_editable(kind) => {
-                let mut els: Vec<AnyElement> = b
-                    .children
+                let mut pending: Vec<_> = self
+                    .empty_slots
                     .iter()
-                    .filter_map(|child| self.render_block(child, depth + 1, None, cx))
+                    .filter(|slot| self.available_empty_slot(slot))
+                    .map(|slot| slot.range.start)
+                    .chain(self.focused.as_ref().filter(|f| f.id.is_none()).map(|f| f.range.start))
+                    .filter(|&offset| empty_slots::in_container_gap(&self.doc, b, offset))
                     .collect();
+                pending.sort_unstable();
+                pending.dedup();
+                let mut pending = pending.into_iter().peekable();
+                let mut els = Vec::new();
+                for child in &b.children {
+                    let start = self.doc.range_of(child).start;
+                    while let Some(offset) = pending.next_if(|offset| *offset <= start) {
+                        els.push(self.render_empty_slot(offset, cx));
+                    }
+                    if let Some(body) = self.render_block(child, depth + 1, None, cx) {
+                        els.push(body);
+                    }
+                }
+                for offset in pending {
+                    els.push(self.render_empty_slot(offset, cx));
+                }
                 if els.is_empty() {
                     let key = presenter::Key::unit(b.id);
                     if let Some(text) = self.render_presenter(key, cx) {

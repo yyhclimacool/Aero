@@ -1730,6 +1730,96 @@ fn block_menu_opens_with_command_slash_and_reaches_colors(cx: &mut TestAppContex
     assert!(color_menu_open(&editor, cx), "颜色 ▸ 打开颜色菜单");
 }
 
+#[gpui_kit::test]
+fn enter_places_an_empty_row_between_container_children(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, ":::highlight\nfirst {.red}\n\nsecond\n:::\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    let (first, second) = cx.update(|_, cx| {
+        (editor.read(cx).units[0].id, editor.read(cx).units[1].id)
+    });
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("enter escape");
+    settle(cx);
+    let offset = cx.update(|_, cx| editor.read(cx).empty_slots[0].range.start);
+    let empty = cx.debug_bounds(Box::leak(format!("empty-paragraph-{offset}").into_boxed_str())).unwrap();
+    let first = cx.debug_bounds(Box::leak(format!("unit-{first}", first = first.0).into_boxed_str())).unwrap();
+    let second = cx.debug_bounds(Box::leak(format!("unit-{second}", second = second.0).into_boxed_str())).unwrap();
+    assert!(first.bottom() <= empty.top(), "空行应在第一段之后: {first:?} {empty:?}");
+    assert!(empty.bottom() <= second.top(), "空行不能排到容器或第二段之后: {empty:?} {second:?}");
+}
+
+#[gpui_kit::test]
+fn trailing_empty_row_stays_inside_its_quote(cx: &mut TestAppContext) {
+    for source in ["> first\n>\n> second {.red}\n", ":::highlight\n> first\n>\n> second {.red}\n:::\n"] {
+        let (_dir, _vault, _path, editor) = open(cx, source);
+        let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+        settle(cx);
+        let (second, quote) = cx.update(|_, cx| {
+            let e = editor.read(cx);
+            let quote = e
+                .doc
+                .blocks()
+                .iter()
+                .find(|(_, block)| matches!(block.kind, aero_core::BlockKind::BlockQuote))
+                .map(|(_, block)| block.id)
+                .unwrap();
+            (e.units[1].id, quote)
+        });
+        focus_unit(&editor, 1, cx);
+        cx.simulate_keystrokes("enter escape");
+        settle(cx);
+        let offset = cx.update(|_, cx| editor.read(cx).empty_slots[0].range.start);
+        let empty = cx.debug_bounds(Box::leak(format!("empty-paragraph-{offset}").into_boxed_str())).unwrap();
+        let second = cx.debug_bounds(Box::leak(format!("unit-{}", second.0).into_boxed_str())).unwrap();
+        let quote = cx.debug_bounds(Box::leak(format!("block-body-{}", quote.0).into_boxed_str())).unwrap();
+        assert!(second.bottom() <= empty.top(), "空行应在引用正文之后: {second:?} {empty:?}");
+        assert!(empty.bottom() <= quote.bottom(), "空行不能落到引用框外: {empty:?} {quote:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn identified_container_unwrap_is_disabled_with_an_explanation(cx: &mut TestAppContext) {
+    for marker in ["^box\n", "{aero-aliases=old}\n"] {
+        let source = format!(":::highlight\nbody\n:::\n\n{marker}");
+        let (_dir, _vault, _path, editor) = open(cx, &source);
+        let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                let id = e.doc.blocks().roots[0].id;
+                e.open_block_menu(id, gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(40.)), window, cx);
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let unwrap = cx.debug_bounds("block-menu-unwrap").unwrap();
+        assert!(cx.debug_bounds("block-menu-unwrap-disabled-reason").is_some());
+        cx.simulate_click(unwrap.center(), gpui_kit::Modifiers::default());
+        settle(cx);
+        assert_eq!(text(&editor, cx), source);
+        cx.update(|_, cx| assert!(editor.read(cx).block_menu.is_some(), "禁用入口不能执行解除或关闭菜单"));
+    }
+}
+
+#[gpui_kit::test]
+fn unidentified_container_unwrap_remains_enabled(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, ":::highlight\nbody\n:::\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let id = e.doc.blocks().roots[0].id;
+            e.open_block_menu(id, gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(40.)), window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("block-menu-unwrap-disabled-reason").is_none());
+    let unwrap = cx.debug_bounds("block-menu-unwrap").unwrap();
+    cx.simulate_click(unwrap.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    assert_eq!(text(&editor, cx), "body\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), ":::highlight\nbody\n:::\n");
+}
+
 /// 拖动 `⠿` 把块插到另一块前面，并画出插入线。点击手柄只选中块。
 #[gpui_kit::test]
 fn dragging_a_block_handle_reorders_it(cx: &mut TestAppContext) {
@@ -1763,6 +1853,36 @@ fn dragging_a_block_handle_reorders_it(cx: &mut TestAppContext) {
         assert!(editor.read(cx).block_menu.is_none(), "拖完不打开块菜单");
         assert_eq!(editor.read(cx).highlighted_block(), Some(editor.read(cx).units[0].id));
     });
+}
+
+#[gpui_kit::test]
+fn dragging_into_a_highlight_shows_a_distinct_into_indicator(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, point, px};
+    let source = "first\n\n:::highlight\ninside\n:::\n\nlast\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    let (first, highlight) = cx.update(|_, cx| {
+        let roots = &editor.read(cx).doc.blocks().roots;
+        (roots[0].id, roots[1].id)
+    });
+    hover_block(first, cx);
+    let handle = Box::leak(format!("gutter-handle-{}", first.0).into_boxed_str());
+    let body = Box::leak(format!("block-body-{}", highlight.0).into_boxed_str());
+    let from = cx.debug_bounds(handle).unwrap().center();
+    let body = cx.debug_bounds(body).unwrap();
+    let to = body.origin + point(px(4.), body.size.height / 2.);
+    cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(from + point(px(12.), px(0.)), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("block-drop-line").is_some());
+    assert!(cx.debug_bounds("block-drop-into").is_some(), "Into 必须有区别于同级插入线的反馈");
+    cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+    settle(cx);
+    assert_eq!(text(&editor, cx), ":::highlight\ninside\n\nfirst\n:::\n\nlast\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
 }
 
 #[gpui_kit::test]
