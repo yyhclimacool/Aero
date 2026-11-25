@@ -3368,12 +3368,15 @@ impl Editor {
             .with_inline_code(HighlightStyle { background_color: Some(theme.accent), ..Default::default() })
             .with_code_block(StyleRefinement::default().rounded(radius))
             .with_paragraph_gap(rems(0.5))
-            .with_heading_base_font_size(px(BODY_FONT_SIZE))
-            .with_heading_font_size(|level, base| match level {
-                1 => base * 1.75,
-                2 => base * 1.4,
-                3 => base * 1.2,
-                _ => base,
+            .with_heading(|level| {
+                let base = px(BODY_FONT_SIZE);
+                let size = match level {
+                    1 => base * 1.75,
+                    2 => base * 1.4,
+                    3 => base * 1.2,
+                    _ => base,
+                };
+                StyleRefinement::default().text_size(size)
             })
             .with_dark(theme.mode.is_dark())
             .with_table(StyleRefinement {
@@ -4606,7 +4609,7 @@ impl Render for Editor {
             // 横向滑动留给宽表格自己滚，不折算成正文的上下滚动
             .restrict_scroll_to_axis()
             .track_scroll(&self.scroll)
-            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+            .on_scroll(cx.listener(|this, _, _, cx| {
                 let facts = crate::diagnostics::Facts {
                     doc_id: crate::diagnostics::document_id(&this.vault, &this.path),
                     version: this.doc.version(),

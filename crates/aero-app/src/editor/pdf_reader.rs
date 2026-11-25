@@ -358,7 +358,7 @@ impl PdfReader {
         cx.notify();
     }
 
-    fn scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Deliberately handle scrolling ourselves: native edge chaining must not move the note.
         cx.stop_propagation();
         if self.info.is_none() {
@@ -447,7 +447,7 @@ impl PdfReader {
                         .on_mouse_move(cx.listener(Self::drag_resize))
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::finish_resize))
                         .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_resize))
-                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
+                        .on_scroll(|_, _, cx| cx.stop_propagation()),
                 ),
             )
             .with_priority(20)
@@ -678,7 +678,7 @@ impl Render for PdfReader {
                     .h(px(self.height))
                     .flex_none()
                     .overflow_hidden()
-                    .on_scroll_wheel(cx.listener(Self::scroll))
+                    .on_scroll(cx.listener(Self::scroll))
                     .child(self.pages(window, cx)),
             );
         v_flex()
@@ -691,7 +691,7 @@ impl Render for PdfReader {
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(|this, _: &BlurEditor, window, cx| this.escape(&Escape, window, cx)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_scroll_wheel(cx.listener(Self::scroll))
+            .on_scroll(cx.listener(Self::scroll))
             .child(self.resize_handle(true, cx))
             .child(self.toolbar(cx))
             .child(viewport)

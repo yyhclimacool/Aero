@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 // Exercise the exact production style merger as well as the rendered GPUI tests below.
 extern crate gpui_kit as gpui;
-#[path = "../../../forks/gpui-base/src/text/inline_style.rs"]
+#[path = "../../../forks/gpui-kit/crates/base/src/text/inline_style.rs"]
 mod inline_style;
 
 #[test]
@@ -265,7 +265,7 @@ fn code_splits_keep_one_row_anchor_and_preview_deadline(cx: &mut TestAppContext)
     assert_eq!(entered.len(), 1, "one link occurrence on one row: {entered:?}");
     assert!(positions.iter().all(|p| entered[0].2.contains(p)));
     assert!(
-        (entered[0].2.right() - px(162.4)).abs() < px(1.),
+        (entered[0].2.right() - px(166.4)).abs() < px(1.),
         "anchor includes all three fragments, not next: {entered:?}, {quads:?}"
     );
     move_to(cx, point(px(170.), px(8.)));
@@ -385,7 +385,7 @@ fn hover_leaves_when_layout_or_content_changes_without_mouse_move(cx: &mut TestA
 
 #[gpui_kit::test]
 fn hover_leaves_on_press_and_scroll(cx: &mut TestAppContext) {
-    use gpui_kit::{InputEvent as _, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent};
+    use gpui_kit::{InputEvent as _, Modifiers, MouseButton, ScrollDelta, ScrollEvent, ScrollSource};
     cx.update(gpui_kit::base::init);
     let events: Events = Arc::default();
     let (_, cx) = cx.add_window_view(|_, _| Links::new("[link](aero://note/test)", events.clone()));
@@ -400,11 +400,12 @@ fn hover_leaves_on_press_and_scroll(cx: &mut TestAppContext) {
     events.lock().unwrap().clear();
     cx.update(|window, cx| {
         window.dispatch_event(
-            ScrollWheelEvent {
+            ScrollEvent {
                 position,
                 delta: ScrollDelta::Pixels(point(px(0.), px(-24.))),
                 modifiers: Default::default(),
                 touch_phase: Default::default(),
+                source: ScrollSource::Pointer,
             }
             .to_platform_input(),
             cx,

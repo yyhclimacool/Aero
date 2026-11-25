@@ -427,7 +427,7 @@ aero:
 | 引用与同步 | 扩展 [持久化块标识](../../crates/aero-core/src/block_refs.rs#L60)、[块链接复制](../../crates/aero-app/src/editor/toolbar.rs#L202) 和 [只读嵌入](../../crates/aero-app/src/editor/embeds_ui.rs#L1)，新增身份目标、别名与旧引用升级；跨文档订阅内存源修订，不能继续只读磁盘冒充实时同步 |
 | 子文档 | 将逻辑父子关系与顺序作为 Markdown 元数据，侧栏提供逻辑文档树与磁盘文件树，身份索引改为以文件内 ID 为真相 |
 | 排版与命中 | 现有输入层只有左／中／右对齐，两端对齐需要字形级排版与命中改造；浏览、输入、选区、链接、IME 坐标共用布局结果 |
-| 表情 | 复用 [系统字符面板调用](../../forks/gpui-base/src/input/base/state.rs#L2418)，接入现有文本输入与撤销路径 |
+| 表情 | 复用 [系统字符面板调用](../../forks/gpui-kit/crates/base/src/input/base/state.rs#L2418)，接入现有文本输入与撤销路径 |
 
 主要工作量集中在可独立编辑的嵌套容器、四种对齐下统一的排版与命中，以及移动／复制／转换过程中的身份维护，不应把它们仅估算为增加菜单按钮。
 

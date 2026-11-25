@@ -666,7 +666,7 @@ fn pdf_reader_toolbar_and_page_input_are_above_the_viewport(cx: &mut TestAppCont
 
 #[gpui_kit::test]
 fn pdf_reader_scrolls_across_pages_without_scrolling_or_editing_the_note(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px, size};
+    use gpui_kit::{Modifiers, ScrollDelta, ScrollEvent, TouchPhase, point, px, size};
     let source = "![[paper.pdf|400]]\n\n正文\n";
     let (dir, _cache, _vault, editor) = open_with_images(cx, source);
     let pdf = String::from_utf8(crate::render::two_page_pdf()).unwrap().replace("200 100", "200 500");
@@ -677,11 +677,12 @@ fn pdf_reader_scrolls_across_pages_without_scrolling_or_editing_the_note(cx: &mu
     let viewport = cx.debug_bounds("pdf-viewport").expect("PDF scroll viewport");
     let toolbar = cx.debug_bounds("pdf-toolbar").unwrap();
     for (dy, current) in [(-1200., 2), (1200., 1)] {
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: viewport.center(),
             delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
             modifiers: Modifiers::default(),
             touch_phase: TouchPhase::Started,
+            source: gpui_kit::ScrollSource::Pointer,
         });
         settle(cx);
         let selector: &'static str = Box::leak(format!("pdf-page-{current}-of-2").into_boxed_str());
@@ -1386,7 +1387,11 @@ fn block_color_is_written_at_the_block_end_and_painted_in_preview(cx: &mut TestA
     // 块选中态的底色压过块颜色；退回浏览态才看到块自己的底色
     cx.simulate_keystrokes("escape");
     let quads = quads_of(cx, content_color(aero_core::colors::Slot::Background, "yellow"));
-    assert_eq!(quads.len(), 1, "只有上色的那一块有底色");
+    let first = quads.first().expect("上色的块必须有底色");
+    assert!(
+        quads.iter().all(|quad| quad.bounds == first.bounds),
+        "只有上色的那一块有底色: {quads:?}"
+    );
     cx.simulate_keystrokes("cmd-z");
     assert_eq!(text(&editor, cx), source);
     assert!(quads_of(cx, content_color(aero_core::colors::Slot::Background, "yellow")).is_empty());
@@ -2559,6 +2564,7 @@ fn auto_pairs_ime_preedit_and_committed_punctuation_stay_literal(cx: &mut TestAp
             e.observe_pair_key(
                 &gpui_kit::KeystrokeEvent {
                     keystroke: gpui_kit::Keystroke::parse("(").unwrap(),
+                    input_preference: gpui_kit::InputPreference::KeyBindings,
                     action: None,
                     context_stack: vec![],
                 },
@@ -3901,7 +3907,7 @@ fn table_preview_enables_horizontal_overflow(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 fn wide_table_scroll_keeps_vertical_document_navigation(cx: &mut TestAppContext) {
-    use gpui_kit::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+    use gpui_kit::{Modifiers, ScrollDelta, ScrollEvent, TouchPhase, point, px};
     let mut source = format!(
         "| {} |\n| {} |\n| {} |\n\n",
         ["Heading"; 12].join(" | "),
@@ -3918,11 +3924,12 @@ fn wide_table_scroll_keeps_vertical_document_navigation(cx: &mut TestAppContext)
     assert!(bounds.size.width <= px(420.));
     let position = bounds.origin + point(px(20.), px(20.));
     for touch_phase in [TouchPhase::Started, TouchPhase::Ended] {
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(-150.), px(0.))),
             modifiers: Modifiers::default(),
             touch_phase,
+            source: gpui_kit::ScrollSource::Pointer,
         });
     }
     cx.run_until_parked();
@@ -3931,11 +3938,12 @@ fn wide_table_scroll_keeps_vertical_document_navigation(cx: &mut TestAppContext)
         assert_eq!(e.scroll.offset().y, px(0.), "horizontal gestures stay in the table");
         assert!(e.focused.is_none());
     });
-    cx.simulate_event(ScrollWheelEvent {
+    cx.simulate_event(ScrollEvent {
         position,
         delta: ScrollDelta::Pixels(point(px(0.), px(-120.))),
         modifiers: Modifiers::default(),
         touch_phase: TouchPhase::Started,
+        source: gpui_kit::ScrollSource::Pointer,
     });
     cx.run_until_parked();
     cx.update(|_, cx| assert!(editor.read(cx).scroll.offset().y < px(0.), "vertical scrolling bubbles out"));

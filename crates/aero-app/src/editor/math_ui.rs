@@ -34,7 +34,7 @@ impl super::Editor {
                     .debug_selector(|| "math-scroll".to_owned())
                     .w_full()
                     .overflow_x_scroll()
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .on_scroll(|_, _, cx| cx.stop_propagation())
                     .child(
                         div()
                             .debug_selector(|| "math-block".to_owned())

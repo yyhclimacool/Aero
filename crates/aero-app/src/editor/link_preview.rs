@@ -739,7 +739,7 @@ impl Editor {
             .max_h(max_h)
             .w_full()
             .overflow_y_scroll()
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
+            .on_scroll(|_, _, cx| cx.stop_propagation());
         if rich && !body.is_empty() {
             let style = self.text_view_style(cx).with_foreground(cx.theme().popover_foreground);
             frame

@@ -564,7 +564,7 @@ fn title_panel_stays_aligned_with_many_long_tabs_across_window_sizes(cx: &mut Te
 
 #[gpui_kit::test]
 fn title_tabs_scroll_and_controls_work_while_the_panel_is_resized(cx: &mut TestAppContext) {
-    use gpui_kit::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+    use gpui_kit::{ScrollDelta, ScrollEvent, TouchPhase};
 
     let (_dir, _data, workspace) = open_long_title_tabs(cx);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
@@ -573,11 +573,12 @@ fn title_tabs_scroll_and_controls_work_while_the_panel_is_resized(cx: &mut TestA
     assert_title_alignment(cx, "before scrolling");
     let tabs = cx.debug_bounds("tabs-viewport").unwrap();
     for (dx, selector) in [(-5000., "tab:11"), (5000., "tab:0")] {
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: tabs.center(),
             delta: ScrollDelta::Pixels(point(px(dx), px(0.))),
             modifiers: Modifiers::default(),
             touch_phase: TouchPhase::Started,
+            source: gpui_kit::ScrollSource::Pointer,
         });
         draw(cx);
         let tab = cx.debug_bounds(selector).expect("scrolled tab is rendered");
