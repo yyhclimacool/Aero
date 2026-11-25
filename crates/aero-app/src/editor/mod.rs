@@ -987,8 +987,8 @@ impl Editor {
         // 表格和 callout 按格子 / 标题与正文分别编辑，键盘进来时落到光标所在的那一格
         if self.hides_markers(cx) && !self.block_shows_source(unit_id) {
             match kind {
-                BlockKind::CodeFence { .. } if aero_core::rich_content::mermaid_source(&text).is_none() => {
-                    if let Some(inner) = presenter::fence_body(&text) {
+                BlockKind::CodeFence { info } => {
+                    if let Some(inner) = self.editable_fence_body(unit_id, &info, &text) {
                         let local = cursor.clamp(inner.start, inner.end) - inner.start;
                         let abs = range.start + inner.start..range.start + inner.end;
                         self.focus_range(abs, id, true, local, window, cx);
@@ -1957,7 +1957,11 @@ impl Editor {
         let command = start..menu.anchor + 1 + menu.query.len();
         if let SlashAction::Convert(target) = action
             && let Some(reason) = unit_at(&self.units, menu.block_start).and_then(|ix| {
-                ops::conversion_reason(&self.doc, ops::conversion_target(&self.doc, &self.units[ix]), target)
+                ops::conversion_reason(
+                    &self.doc,
+                    ops::conversion_target(&self.doc, &self.units[ix], target),
+                    target,
+                )
             })
         {
             use gpui_kit::component::WindowExt as _;
@@ -2035,7 +2039,7 @@ impl Editor {
             Some(ix) => {
                 if let Some(reason) = ops::conversion_reason(
                     &self.doc,
-                    ops::conversion_target(&self.doc, &self.units[ix]),
+                    ops::conversion_target(&self.doc, &self.units[ix], target),
                     target,
                 ) {
                     use gpui_kit::component::WindowExt as _;
@@ -3524,7 +3528,7 @@ impl Editor {
                             unit_at(&self.units, menu.block_start).and_then(|ix| {
                                 ops::conversion_reason(
                                     &self.doc,
-                                    ops::conversion_target(&self.doc, &self.units[ix]),
+                                    ops::conversion_target(&self.doc, &self.units[ix], target),
                                     target,
                                 )
                             })

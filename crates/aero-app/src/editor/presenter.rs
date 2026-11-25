@@ -100,8 +100,6 @@ impl Editor {
                 continue;
             }
             let text = self.doc.slice(unit.range.clone()).to_string();
-            let local =
-                aero_core::containers::local_source(&self.doc, unit.id).unwrap_or_else(|| text.clone());
             let key = Key::unit(unit.id);
             let range = unit.range.clone();
             match &unit.kind {
@@ -115,8 +113,8 @@ impl Editor {
                 BlockKind::BlockQuote if simple_quote(&text) => {
                     specs.push(spec(key, range, true, Extra::default()))
                 }
-                BlockKind::CodeFence { .. } if aero_core::rich_content::mermaid_source(&local).is_none() => {
-                    if let Some(inner) = fence_body(&text) {
+                BlockKind::CodeFence { info } => {
+                    if let Some(inner) = self.editable_fence_body(unit.id, info, &text) {
                         let inner = unit.range.start + inner.start..unit.range.start + inner.end;
                         specs.push(spec(key, inner, true, Extra { code: true, ..Default::default() }));
                     }
@@ -454,6 +452,17 @@ impl Editor {
         unit.is_some_and(|u| matches!(u.kind, BlockKind::CodeFence { .. }) && u.range != f.range)
     }
 
+    pub(super) fn editable_fence_body(&self, id: BlockId, info: &str, text: &str) -> Option<Range<usize>> {
+        if info.split_whitespace().next() == Some("mermaid")
+            && let Some(local) = aero_core::containers::local_source(&self.doc, id)
+            && aero_core::rich_content::mermaid_source(&local).is_some()
+        {
+            return None;
+        }
+        let prefix = aero_core::containers::continuation(&self.doc, id);
+        fence_body(text, &prefix)
+    }
+
     /// 这个区间是不是某个控件正在画的那一段。
     pub(super) fn presenter_for(&self, id: Option<BlockId>, range: &Range<usize>) -> Option<Key> {
         let id = id?;
@@ -643,7 +652,7 @@ impl Editor {
 
 /// 围栏代码块里代码本身的区间（不含开头的 ```` ```lang ```` 行与结尾的围栏）。没有代码行时为 `None`：
 /// 那时一打字就会写到结尾围栏的同一行上，仍用源码编辑。
-pub(super) fn fence_body(src: &str) -> Option<Range<usize>> {
+fn fence_body(src: &str, prefix: &str) -> Option<Range<usize>> {
     let src = src.trim_end_matches(['\n', '\r']);
     let first = src.find('\n')?;
     let open = src[..first].trim_start();
@@ -652,7 +661,7 @@ pub(super) fn fence_body(src: &str) -> Option<Range<usize>> {
     let start = first + 1;
     let rest = &src[start..];
     let closing = rest.rfind('\n').map_or(0, |i| i + 1);
-    let last = rest[closing..].trim();
+    let last = super::text_ops::strip_continuation(&rest[closing..], prefix).trim();
     let closed = last.len() >= fence_len && last.chars().all(|c| c == fence);
     let end = if !closed {
         src.len()
@@ -722,10 +731,14 @@ mod tests {
 
     #[test]
     fn fence_body_is_the_code_between_the_fences() {
-        let body = |src: &str| fence_body(src).map(|range| src[range].to_owned());
+        let body = |src: &str| fence_body(src, "").map(|range| src[range].to_owned());
         assert_eq!(body("```rust\nfn main() {\n}\n```").as_deref(), Some("fn main() {\n}"));
         assert_eq!(body("~~~~\na\n~~~~\n").as_deref(), Some("a"));
         assert_eq!(body("```\nunclosed").as_deref(), Some("unclosed"));
         assert_eq!(body("```\n```"), None, "no code line to type into");
+
+        let quoted = "```\n> first\n> second\n>```";
+        let range = fence_body(quoted, "> ").unwrap();
+        assert_eq!(&quoted[range], "> first\n> second");
     }
 }

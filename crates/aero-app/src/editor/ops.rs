@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use aero_core::{BlockId, BlockKind, Document, Edit};
 
-use super::text_ops::{ListMarker, heading_prefix_len, line_start};
+use super::text_ops::{ListMarker, heading_prefix_len, line_start, strip_continuation};
 use super::units::Unit;
 
 /// 一次编辑，以及编辑后光标应落到的文档偏移。
@@ -425,18 +425,13 @@ pub fn move_unit(doc: &Document, units: &[Unit], from: usize, place: DropPlace) 
     }
     let text = doc.to_string();
     let span = units_span(doc, units, from, from);
-    let mut cut_end = span.end;
-    while cut_end < text.len() && text.as_bytes()[cut_end] == b'\n' {
-        cut_end += 1;
+    // Take the source line ending and at most one adjacent blank line.
+    let separator = text[span.end..].bytes().take(2).take_while(|&b| b == b'\n').count();
+    let mut cut = span.start..span.end + separator;
+    if cut.end == text.len() && text[..cut.start].ends_with("\n\n") {
+        cut.start -= 1;
     }
-    let mut cut_start = span.start;
-    if cut_end == text.len() {
-        while cut_start >= 2 && text[..cut_start].ends_with("\n\n") {
-            cut_start -= 1;
-        }
-    }
-    let raw = text[span].to_string();
-    let mut piece = adapt_moved_block(&raw, &units[from], units, place, &text);
+    let piece = adapt_moved_block(&text[span], &units[from], units, place, &text);
     let insert_at = if let Some(parent) = place.parent {
         let mut at =
             units[parent].list.as_ref().map(|ctx| ctx.item_range.end).unwrap_or(units[parent].range.end);
@@ -450,22 +445,11 @@ pub fn move_unit(doc: &Document, units: &[Unit], from: usize, place: DropPlace) 
     } else {
         line_start(&text, units_span(doc, units, place.before, place.before).start)
     };
-    if place.parent.is_some()
-        && !piece.starts_with('\n')
-        && insert_at > 0
-        && !text[..insert_at].ends_with('\n')
-    {
-        piece.insert(0, '\n');
-    }
-    if place.parent.is_none() && insert_at > cut_start && insert_at < cut_end {
+    if place.parent.is_none() && insert_at > cut.start && insert_at < cut.end {
         return None;
     }
-    let assembled = assemble_move(&text, cut_start..cut_end, insert_at, &piece);
-    if assembled == text {
-        return None;
-    }
-    let focus = assembled.find(piece.trim_end()).unwrap_or(0);
-    Some(Plan { edit: Edit::replace(0..text.len(), assembled), focus_offset: focus })
+    let plan = assemble_move(&text, cut, insert_at, &piece);
+    (text[plan.edit.range.clone()] != plan.edit.text).then_some(plan)
 }
 
 fn contains_unit(units: &[Unit], ancestor: usize, index: usize) -> bool {
@@ -556,21 +540,11 @@ pub fn move_node(
 }
 
 fn adapt_moved_block(raw: &str, source: &Unit, units: &[Unit], place: DropPlace, text: &str) -> String {
-    let body = strip_list_marker(raw);
-    let style = destination_style(source, units, place, text);
-    let plain = style.is_none();
-    let mut rendered = match style {
+    let body = if source.list.is_some() { strip_list_marker(raw) } else { raw.to_owned() };
+    match destination_style(source, units, place, text) {
         Some(style) => prefix_list(&body, &style),
         None => body,
-    };
-    if !rendered.ends_with('\n') {
-        rendered.push('\n');
     }
-    // 段落之间留空行；列表项只换行，避免把列表拆开
-    if plain {
-        rendered.push('\n');
-    }
-    rendered
 }
 
 struct ListStyle {
@@ -602,16 +576,17 @@ fn destination_style(source: &Unit, units: &[Unit], place: DropPlace, text: &str
 }
 
 fn strip_list_marker(piece: &str) -> String {
-    let Some(first) = piece.lines().next() else { return piece.to_owned() };
+    let mut lines = piece.split('\n');
+    let first = lines.next().unwrap_or_default();
     let indent_len = first.chars().take_while(|c| *c == ' ' || *c == '\t').map(char::len_utf8).sum();
-    let Some(marker_len) = list_marker_len(&first[indent_len..]) else { return piece.trim_end().to_owned() };
+    let Some(marker_len) = list_marker_len(&first[indent_len..]) else { return piece.to_owned() };
     let indent = &first[..indent_len];
     let mut body = first[indent_len + marker_len..].to_owned();
-    for line in piece.lines().skip(1) {
+    for line in lines {
         body.push('\n');
         body.push_str(line.strip_prefix(indent).unwrap_or(line));
     }
-    body.trim_end().to_owned()
+    body
 }
 
 fn list_marker_len(rest: &str) -> Option<usize> {
@@ -637,7 +612,7 @@ fn list_marker_len(rest: &str) -> Option<usize> {
 }
 
 fn prefix_list(body: &str, style: &ListStyle) -> String {
-    let mut lines = body.lines();
+    let mut lines = body.split('\n');
     let first = lines.next().unwrap_or("");
     let mut out = format!("{}{}{first}", style.indent, style.marker);
     for line in lines {
@@ -650,33 +625,35 @@ fn prefix_list(body: &str, style: &ListStyle) -> String {
     out
 }
 
-fn assemble_move(text: &str, cut: Range<usize>, insert_at: usize, piece: &str) -> String {
-    let piece = if piece.ends_with('\n') { piece.to_owned() } else { format!("{piece}\n") };
-    let mut out = String::with_capacity(text.len() + piece.len());
-    let push_piece = |out: &mut String, left_ends: bool, piece: &str| {
-        if left_ends && !piece.starts_with('\n') && !is_list_piece(piece) && !out.ends_with("\n\n") {
-            out.push('\n');
-        }
-        out.push_str(piece);
-    };
-    if insert_at <= cut.start {
-        out.push_str(&text[..insert_at]);
-        let gap = !out.is_empty();
-        push_piece(&mut out, gap, &piece);
+fn assemble_move(text: &str, cut: Range<usize>, insert_at: usize, piece: &str) -> Plan {
+    let move_up = insert_at <= cut.start;
+    let (range, between, left, right) = if move_up {
         let between = &text[insert_at..cut.start];
-        if !between.chars().all(|ch| ch == '\n') {
-            out.push_str(between);
-        }
-        out.push_str(&text[cut.end..]);
+        let right = if between.is_empty() { &text[cut.end..] } else { between };
+        (insert_at..cut.end, between, &text[..insert_at], right)
     } else {
         let at = insert_at.max(cut.end);
-        out.push_str(&text[..cut.start]);
-        out.push_str(&text[cut.end..at]);
-        let gap = !out.is_empty();
-        push_piece(&mut out, gap, &piece);
-        out.push_str(&text[at..]);
+        let between = &text[cut.end..at];
+        let left = if between.is_empty() { &text[..cut.start] } else { between };
+        (cut.start..at, between, left, &text[at..])
+    };
+    let separator = if is_list_piece(piece) { 1 } else { 2 };
+    let leading = if left.is_empty() { 0 } else { missing_line_breaks(left, piece, separator) };
+    let end_separator = if right.is_empty() { usize::from(text.ends_with('\n')) } else { separator };
+    let trailing = missing_line_breaks(piece, right, end_separator);
+
+    let mut replacement = String::with_capacity(between.len() + leading + piece.len() + trailing);
+    if !move_up {
+        replacement.push_str(between);
     }
-    squash_blank_lines(&out, text.ends_with('\n'))
+    replacement.push_str(&"\n\n"[..leading]);
+    let focus_offset = range.start + replacement.len();
+    replacement.push_str(piece);
+    replacement.push_str(&"\n\n"[..trailing]);
+    if move_up {
+        replacement.push_str(between);
+    }
+    Plan { edit: Edit::replace(range, replacement), focus_offset }
 }
 
 fn is_list_piece(piece: &str) -> bool {
@@ -685,24 +662,10 @@ fn is_list_piece(piece: &str) -> bool {
     list_marker_len(&line[indent..]).is_some()
 }
 
-fn squash_blank_lines(text: &str, trailing_newline: bool) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut newlines = 0u8;
-    for ch in text.chars() {
-        if ch == '\n' {
-            newlines = newlines.saturating_add(1);
-            if newlines <= 2 {
-                out.push('\n');
-            }
-        } else {
-            newlines = 0;
-            out.push(ch);
-        }
-    }
-    if trailing_newline && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+fn missing_line_breaks(left: &str, right: &str, separator: usize) -> usize {
+    let left_breaks = left.bytes().rev().take(separator).take_while(|&b| b == b'\n').count();
+    let right_breaks = right.bytes().take(separator).take_while(|&b| b == b'\n').count();
+    separator.saturating_sub(left_breaks + right_breaks)
 }
 
 /// 段首刚打完的列表标记。光标还没走出这段标记时不认。标题和引用的标记留在单位源码里，不在这里。
@@ -778,21 +741,18 @@ pub fn block_type(unit: &Unit) -> Option<BlockType> {
 /// 已经是目标类型、或单位不是文本类时返回 `None`。
 pub fn convert(doc: &Document, units: &[Unit], ix: usize, target: BlockType) -> Option<Plan> {
     let unit = &units[ix];
-    let id = conversion_target(doc, unit);
-    let mut current = unit.clone();
-    if id == unit.id && !matches!(unit.kind, BlockKind::ListItem { .. }) {
-        current.list = None;
-    }
-    if block_type(&current) == Some(target) {
+    let id = conversion_target(doc, unit, target);
+    if conversion_type(unit, id) == Some(target) {
         return None;
     }
     convert_node(doc, id, target).ok().flatten()
 }
 
-/// Keyboard and slash commands address the first paragraph's item, while
-/// continuation paragraphs and nested containers retain their own scope.
-pub fn conversion_target(doc: &Document, unit: &Unit) -> BlockId {
-    if matches!(unit.kind, BlockKind::Paragraph)
+/// Keyboard and slash commands can address the first paragraph's list item.
+/// Converting body text to code keeps the paragraph in its item.
+pub fn conversion_target(doc: &Document, unit: &Unit, target: BlockType) -> BlockId {
+    if target != BlockType::Code
+        && matches!(unit.kind, BlockKind::Paragraph)
         && let Some(item) = unit.list.as_ref().and_then(|ctx| {
             doc.blocks().iter().map(|(_, b)| b).find(|b| {
                 matches!(b.kind, BlockKind::ListItem { .. })
@@ -810,12 +770,16 @@ pub fn conversion_target(doc: &Document, unit: &Unit) -> BlockId {
 }
 
 pub fn conversion_available(doc: &Document, unit: &Unit, target: BlockType) -> bool {
-    let id = conversion_target(doc, unit);
-    let mut current = unit.clone();
-    if id == unit.id && !matches!(unit.kind, BlockKind::ListItem { .. }) {
-        current.list = None;
+    let id = conversion_target(doc, unit, target);
+    conversion_type(unit, id).is_some_and(|kind| kind != target)
+        && conversion_reason(doc, id, target).is_none()
+}
+
+fn conversion_type(unit: &Unit, scope: BlockId) -> Option<BlockType> {
+    if scope == unit.id && matches!(unit.kind, BlockKind::Paragraph) {
+        return Some(BlockType::Text);
     }
-    block_type(&current).is_some_and(|kind| kind != target) && conversion_reason(doc, id, target).is_none()
+    block_type(unit)
 }
 
 pub fn conversion_reason(doc: &Document, id: BlockId, target: BlockType) -> Option<&'static str> {
@@ -864,43 +828,47 @@ pub fn conversion_reason(doc: &Document, id: BlockId, target: BlockType) -> Opti
     None
 }
 
-fn convert_leaf(doc: &Document, units: &[Unit], ix: usize, target: BlockType) -> Option<Plan> {
-    let unit = &units[ix];
-    if target == BlockType::Highlight || target == BlockType::Quote {
-        let edit = aero_core::containers::wrap(doc, unit.id, target == BlockType::Highlight).ok()?;
-        let focus_offset = edit.range.start + edit.text.find('\n').map_or(0, |n| n + 1);
-        return Some(Plan { edit, focus_offset });
-    }
-    let current = block_type(unit)?;
+fn convert_leaf(doc: &Document, unit: &Unit, scope: BlockId, target: BlockType) -> Option<Plan> {
+    let current = conversion_type(unit, scope)?;
     if current == target {
         return None;
     }
     let doc_text = doc.to_string();
-    // 替换区间的起点：列表项是标记所在行的行首（吃掉缩进与标记），其余是单位起点
-    let start = match &unit.list {
-        Some(ctx) => line_start(&doc_text, ctx.item_range.start),
-        None => unit.range.start,
-    };
-    let src = &doc_text[unit.range.clone()];
+    let start = doc.range_of(doc.blocks().find(scope)?).start;
+    let end = aero_core::properties::owned_range(doc, unit.id)?.end;
+    let mut source_prefix = aero_core::containers::continuation(doc, unit.id);
+    // A task checkbox is first-line syntax. Its continuation uses only the list marker's indent.
+    let task_header = unit.list.as_ref().filter(|ctx| ctx.task).and_then(|ctx| {
+        let marker = doc_text.get(ctx.item_range.start..unit.range.start)?;
+        if marker.contains('\n') || !matches!(unit.kind, BlockKind::Paragraph) {
+            return None;
+        }
+        let checkbox = marker.find('[')?;
+        source_prefix.truncate(source_prefix.len().checked_sub(marker.len() - checkbox)?);
+        Some(())
+    });
+    let scope_prefix = (scope != unit.id).then(|| aero_core::containers::continuation(doc, scope));
+    let prefix = scope_prefix.as_deref().unwrap_or(&source_prefix);
+    let src = doc_text[unit.range.clone()]
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| if i == 0 { line } else { strip_continuation(line, &source_prefix) })
+        .collect::<Vec<_>>()
+        .join("\n");
     let content: String = match current {
-        BlockType::Heading(_) => src[heading_prefix_len(src)..].to_owned(),
-        BlockType::Quote | BlockType::Highlight => return None,
+        BlockType::Heading(_) => src[heading_prefix_len(&src)..].to_owned(),
         BlockType::Code if matches!(unit.kind, BlockKind::CodeBlock) => {
             src.lines().map(|l| l.strip_prefix("    ").unwrap_or(l)).collect::<Vec<_>>().join("\n")
         }
-        BlockType::Code => strip_fence(src).to_owned(),
+        BlockType::Code => strip_fence(&src).to_owned(),
         BlockType::Divider => String::new(),
-        _ => src.to_owned(),
+        _ => src,
     };
     let content = content.trim_end_matches('\n').to_owned();
 
-    if target == BlockType::Divider {
-        return Some(if content.trim().is_empty() {
-            Plan { focus_offset: start + 3, edit: Edit::replace(start..unit.range.end, "---") }
-        } else {
-            let at = unit.range.end;
-            Plan { focus_offset: at + "\n\n---\n\n".len(), edit: Edit::insert(at, "\n\n---\n\n") }
-        });
+    if target == BlockType::Divider && !content.trim().is_empty() {
+        let text = format!("\n{prefix}\n{prefix}---\n{prefix}\n{prefix}");
+        return Some(Plan { focus_offset: end + text.len(), edit: Edit::insert(end, text) });
     }
 
     let (text, cursor) = match target {
@@ -912,22 +880,17 @@ fn convert_leaf(doc: &Document, units: &[Unit], ix: usize, target: BlockType) ->
         BlockType::Bullet => (format!("- {content}"), 2 + content.len()),
         BlockType::Numbered => (format!("1. {content}"), 3 + content.len()),
         BlockType::Task => (format!("- [ ] {content}"), 6 + content.len()),
-        BlockType::Quote => {
-            let t: String = if content.is_empty() {
-                "> ".to_owned()
-            } else {
-                content.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
-            };
-            (t.clone(), t.len())
-        }
         BlockType::Code => {
-            let longest =
-                content.lines().map(|line| line.chars().take_while(|c| *c == '`').count()).max().unwrap_or(0);
+            let longest = content
+                .lines()
+                .map(|line| line.trim_start_matches([' ', '\t']).bytes().take_while(|&b| b == b'`').count())
+                .max()
+                .unwrap_or(0);
             let fence = "`".repeat(longest.max(2) + 1);
             (format!("{fence}\n{content}\n{fence}"), fence.len() + 1 + content.len())
         }
-        BlockType::Highlight => unreachable!(),
-        BlockType::Divider => unreachable!(),
+        BlockType::Divider => ("---".to_owned(), 3),
+        BlockType::Quote | BlockType::Highlight => unreachable!(),
     };
     let block = doc.blocks().find(unit.id)?;
     let mut text = text;
@@ -937,7 +900,7 @@ fn convert_leaf(doc: &Document, units: &[Unit], ix: usize, target: BlockType) ->
         format!("{{{}}}", aero_core::properties::render(&block.attrs))
     };
     if !metadata.is_empty() || block.persisted_id.is_some() {
-        text.push_str(if target == BlockType::Code { "\n\n" } else { " " });
+        text.push_str(if matches!(target, BlockType::Code | BlockType::Divider) { "\n\n" } else { " " });
         text.push_str(&metadata);
         if let Some(id) = block.persisted_id.as_deref() {
             if !metadata.is_empty() {
@@ -947,8 +910,17 @@ fn convert_leaf(doc: &Document, units: &[Unit], ix: usize, target: BlockType) ->
             text.push_str(id);
         }
     }
-    let end = aero_core::properties::owned_range(doc, unit.id)?.end;
-    Some(Plan { focus_offset: start + cursor, edit: Edit::replace(start..end, text) })
+    let mut focus_offset =
+        start + cursor + text[..cursor].bytes().filter(|&b| b == b'\n').count() * prefix.len();
+    let mut text = text.replace('\n', &format!("\n{prefix}"));
+    if target == BlockType::Code && scope == unit.id && task_header.is_some() {
+        // The checkbox needs its own line so Markdown can recognize both the task and the fence.
+        let blank_prefix = prefix.trim_end_matches([' ', '\t']);
+        let header = format!("\n{blank_prefix}\n{prefix}");
+        focus_offset += header.len();
+        text.insert_str(0, &header);
+    }
+    Some(Plan { focus_offset, edit: Edit::replace(start..end, text) })
 }
 
 /// Container handles address tree nodes, independently of their leaf editors.
@@ -1000,17 +972,15 @@ pub fn convert_node(
         let children: Vec<_> = block.children.iter().filter(|b| b.kind != BlockKind::Marker).collect();
         let units = super::units::units(doc);
         let leaf = children.first().map_or(block.id, |b| b.id);
-        let ix = units.iter().position(|u| u.id == leaf).ok_or("正文不可转换")?;
-        return Ok(convert_leaf(doc, &units, ix, target));
+        let unit = units.iter().find(|u| u.id == leaf).ok_or("正文不可转换")?;
+        return Ok(convert_leaf(doc, unit, id, target));
     }
     if aero_core::containers::is_editable(&block.kind) {
         return Err("容器不能无损压缩为单个正文块，请使用解除容器".into());
     }
-    let mut units = super::units::units(doc);
-    let ix = units.iter().position(|u| u.id == id).ok_or("此块不支持类型转换")?;
-    // A paragraph's own handle changes its syntax inside the existing item.
-    units[ix].list = None;
-    Ok(convert_leaf(doc, &units, ix, target))
+    let units = super::units::units(doc);
+    let unit = units.iter().find(|u| u.id == id).ok_or("此块不支持类型转换")?;
+    Ok(convert_leaf(doc, unit, id, target))
 }
 
 fn item_marker(
@@ -1239,6 +1209,83 @@ mod tests {
         let (text, focused) = apply(&mut doc, plan);
         assert_eq!(text, "# item\n");
         assert_eq!(focused.as_deref(), Some("# item"));
+    }
+
+    #[test]
+    fn converting_quoted_text_to_code_preserves_container_content_and_identity() {
+        let source = "> first  \n>second {.red custom=keep} ^body\n>\n> sibling\n\nafter\n";
+        let expected =
+            "> ```\n> first  \n> second\n> ```\n> \n> {.red custom=keep} ^body\n>\n> sibling\n\nafter\n";
+        let mut doc = Document::from_text(source);
+        let id = units(&doc)[0].id;
+        let plan = convert_node(&doc, id, BlockType::Code).unwrap().unwrap();
+        assert_eq!(&expected[..plan.focus_offset], "> ```\n> first  \n> second");
+        assert_eq!(apply(&mut doc, plan).0, expected);
+        let quote = &doc.blocks().roots[0];
+        assert_eq!(quote.kind, BlockKind::BlockQuote);
+        let code = &quote.children[0];
+        assert!(matches!(code.kind, BlockKind::CodeFence { .. }));
+        assert_eq!(code.persisted_id.as_deref(), Some("body"));
+        assert_eq!(code.attrs.pairs, [("custom".into(), "keep".into())]);
+        assert_eq!(code.attrs.classes, ["red"]);
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+        doc.redo().unwrap();
+        assert_eq!(doc.to_string(), expected);
+    }
+
+    #[test]
+    fn converting_list_body_to_code_preserves_the_item() {
+        for (source, expected, index, checked) in [
+            (
+                "12. first\n    second\n13. sibling\n",
+                "12. ```\n    first\n    second\n    ```\n13. sibling\n",
+                0,
+                None,
+            ),
+            (
+                "- first\n\n  second\n  third\n- sibling\n",
+                "- first\n\n  ```\n  second\n  third\n  ```\n- sibling\n",
+                1,
+                None,
+            ),
+            (
+                "- [x] first\n  second\n- sibling\n",
+                "- [x] \n\n  ```\n  first\n  second\n  ```\n- sibling\n",
+                0,
+                Some(true),
+            ),
+            (
+                "- > first\n  > second\n- sibling\n",
+                "- > ```\n  > first\n  > second\n  > ```\n- sibling\n",
+                0,
+                None,
+            ),
+        ] {
+            let mut doc = Document::from_text(source);
+            let plan = convert(&doc, &units(&doc), index, BlockType::Code).unwrap();
+            assert_eq!(apply(&mut doc, plan).0, expected);
+            let list = &doc.blocks().roots[0];
+            assert_eq!(list.children.len(), 2);
+            let item = &list.children[0];
+            assert_eq!(item.kind, BlockKind::ListItem { task: checked });
+            assert_eq!(item.children.len(), index + 1);
+            let body = &item.children[index];
+            let code = if body.kind == BlockKind::BlockQuote { &body.children[0] } else { body };
+            assert!(matches!(code.kind, BlockKind::CodeFence { .. }));
+            doc.undo().unwrap();
+            assert_eq!(doc.to_string(), source);
+        }
+    }
+
+    #[test]
+    fn converting_item_as_a_whole_keeps_its_outer_quote() {
+        let source = "> - first\n>   second\n\nafter\n";
+        let mut doc = Document::from_text(source);
+        let item = doc.blocks().roots[0].children[0].children[0].id;
+        let plan = convert_node(&doc, item, BlockType::Code).unwrap().unwrap();
+        assert_eq!(apply(&mut doc, plan).0, "> ```\n> first\n> second\n> ```\n\nafter\n");
+        assert!(matches!(doc.blocks().roots[0].children[0].kind, BlockKind::CodeFence { .. }));
     }
 
     #[test]
@@ -1662,5 +1709,23 @@ mod tests {
         assert_eq!(moved("- a\n\npara\n", 1, 1, Some(0)).as_deref(), Some("- a\n  - para\n"));
         assert_eq!(moved("- a\n  - child\n\npara\n", 1, 2, None).as_deref(), Some("- a\n\nchild\n\npara\n"));
         assert_eq!(moved("- a\n- b\n\npara\n", 2, 0, Some(0)).as_deref(), Some("- a\n  - para\n- b\n"));
+    }
+
+    #[test]
+    fn moving_a_paragraph_preserves_code_and_unrelated_whitespace_byte_for_byte() {
+        let fence = "```text\r\n保留\r\n\r\n\r\n  \t\r\n\r\n末尾  \r\n```";
+        let moved = "拖动  \r\n下一行";
+        let prefix = format!("\u{feff}开头\r\n\r\n{fence}\r\n\r\n\r\n后面\r\n\r\n");
+        let tail = "最后\r\n";
+        let source = format!("{prefix}{moved}\r\n\r\n{tail}");
+        let expected = format!("\u{feff}{moved}\r\n\r\n{}{}", &prefix['\u{feff}'.len_utf8()..], tail);
+        let mut doc = Document::from_bytes(source.as_bytes()).unwrap();
+        let plan = move_unit(&doc, &units(&doc), 3, DropPlace { before: 0, parent: None }).unwrap();
+        apply(&mut doc, plan);
+        assert_eq!(doc.to_bytes(), expected.as_bytes());
+        doc.undo().unwrap();
+        assert_eq!(doc.to_bytes(), source.as_bytes());
+        doc.redo().unwrap();
+        assert_eq!(doc.to_bytes(), expected.as_bytes());
     }
 }

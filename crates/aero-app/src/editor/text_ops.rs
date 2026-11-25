@@ -45,6 +45,19 @@ pub fn line_start(text: &str, offset: usize) -> usize {
     text[..offset.min(text.len())].rfind('\n').map_or(0, |i| i + 1)
 }
 
+pub(super) fn strip_continuation<'a>(line: &'a str, prefix: &str) -> &'a str {
+    let mut indents = prefix.split('>');
+    let mut line = line.strip_prefix(indents.next().unwrap_or_default()).unwrap_or(line);
+    for indent in indents {
+        let Some(rest) = line.strip_prefix('>') else { break };
+        // A quote marker can have one optional space before the remaining container indent.
+        let rest = rest.strip_prefix([' ', '\t']).unwrap_or(rest);
+        let indent = indent.strip_prefix([' ', '\t']).unwrap_or(indent);
+        line = rest.strip_prefix(indent).unwrap_or(rest);
+    }
+    line
+}
+
 /// 0-based 行号与行内 UTF-16 列（与 gpui-base 的 `Position` 同单位）。
 pub fn line_col(text: &str, offset: usize) -> (u32, u32) {
     let offset = offset.min(text.len());
