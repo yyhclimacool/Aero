@@ -31,11 +31,15 @@ pub(super) struct BlockDrag {
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct BlockDropHint {
-    before: usize,
-    parent: Option<usize>,
-    node: Option<(BlockId, bool, bool)>,
+    target: BlockDropTarget,
     origin: Point<Pixels>,
     width: Pixels,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BlockDropTarget {
+    Unit { index: usize, after: bool, nest: bool },
+    Node { id: BlockId, after: bool, into: bool },
 }
 
 pub(super) struct BlockDragGhost {
@@ -183,15 +187,14 @@ impl Editor {
                 && cursor.y > bounds.top() + px(8.)
                 && cursor.y < bounds.bottom() - px(8.);
             let after = cursor.y >= bounds.top() + bounds.size.height / 2.;
-            let ordinary = self.unit_index(id).is_some()
+            let ordinary = !container
+                && self.unit_index(id).is_some()
                 && !aero_core::containers::ancestors(&self.doc, id)
                     .iter()
                     .any(|b| aero_core::containers::is_editable(&b.kind));
             if !ordinary {
                 return Some(BlockDropHint {
-                    before: 0,
-                    parent: None,
-                    node: Some((id, after, into)),
+                    target: BlockDropTarget::Node { id, after, into },
                     origin: point(
                         bounds.left() + if into { px(16.) } else { px(0.) },
                         if after || into { bounds.bottom() } else { bounds.top() },
@@ -219,15 +222,12 @@ impl Editor {
             }
         }
         let (ix, bounds) = hovered.or_else(|| nearest.map(|(ix, bounds, _)| (ix, bounds)))?;
-        let before = if cursor.y < bounds.top() + bounds.size.height / 2. { ix } else { ix + 1 };
+        let after = cursor.y >= bounds.top() + bounds.size.height / 2.;
         let nest = self.units[ix].list.is_some() && cursor.x >= bounds.right() - px(24.);
-        let parent = nest.then_some(ix);
-        let y = if nest || before > ix { bounds.bottom() } else { bounds.top() };
+        let y = if nest || after { bounds.bottom() } else { bounds.top() };
         let x = if nest { bounds.left() + px(24.) } else { bounds.left() };
         Some(BlockDropHint {
-            before,
-            parent,
-            node: None,
+            target: BlockDropTarget::Unit { index: ix, after, nest },
             origin: point(x, y),
             width: (bounds.right() - x).max(px(48.)),
         })
@@ -253,20 +253,36 @@ impl Editor {
             cx.notify();
             return;
         };
-        let plan = if let Some((to, after, into)) = hint.node {
-            ops::move_node(&self.doc, drag.id, to, after, into)
-        } else if let Some(from) = self.unit_index(drag.id) {
-            ops::move_unit(
-                &self.doc,
-                &self.units,
-                from,
-                DropPlace { before: hint.before, parent: hint.parent },
-            )
-        } else {
-            let index = hint.before.min(self.units.len().saturating_sub(1));
-            self.units.get(index).and_then(|to| {
-                ops::move_node(&self.doc, drag.id, to.id, hint.before >= self.units.len(), false)
-            })
+        let plan = match hint.target {
+            BlockDropTarget::Node { id, after, into } => ops::move_node(&self.doc, drag.id, id, after, into),
+            BlockDropTarget::Unit { index, after, nest } => {
+                let source_path = aero_core::containers::ancestors(&self.doc, drag.id);
+                let source_is_container = self
+                    .doc
+                    .blocks()
+                    .find(drag.id)
+                    .is_some_and(|b| aero_core::containers::is_editable(&b.kind));
+                if !source_is_container
+                    && source_path.is_empty()
+                    && let Some(from) = self.unit_index(drag.id)
+                {
+                    let place =
+                        DropPlace { before: index + usize::from(after), parent: nest.then_some(index) };
+                    ops::move_unit(&self.doc, &self.units, from, place)
+                } else {
+                    let target = &self.units[index];
+                    let id = if nest {
+                        aero_core::containers::ancestors(&self.doc, target.id)
+                            .into_iter()
+                            .rev()
+                            .find(|block| matches!(block.kind, BlockKind::ListItem { .. }))
+                            .map_or(target.id, |item| item.id)
+                    } else {
+                        target.id
+                    };
+                    ops::move_node(&self.doc, drag.id, id, after, nest)
+                }
+            }
         };
         let Some(plan) = plan else {
             cx.notify();
@@ -361,18 +377,14 @@ impl Editor {
     fn block_menu_copy(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.block_menu.as_ref().map(|menu| menu.block) else { return };
         self.block_menu = None;
-        let Some(range) = aero_core::properties::owned_range(&self.doc, id) else { return };
-        let text = aero_core::containers::standalone(&self.doc, range);
-        self.copy_blocks(text, cx);
+        self.copy_block_targets(&[id], cx);
         cx.notify();
     }
 
     fn block_menu_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.block_menu.as_ref().map(|menu| menu.block) else { return };
         self.block_menu = None;
-        let Some(range) = aero_core::properties::owned_range(&self.doc, id) else { return };
-        let at = range.start;
-        self.structural_edit(aero_core::Edit::delete(range), at, window, cx);
+        self.delete_block_targets(&[id], window, cx);
     }
 
     fn block_menu_cut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -380,9 +392,7 @@ impl Editor {
         if menu.revision != self.doc.version() {
             return;
         }
-        if let Some(range) = aero_core::properties::owned_range(&self.doc, menu.block) {
-            self.cut_blocks(range, window, cx);
-        }
+        self.cut_blocks(&[menu.block], window, cx);
     }
 
     fn block_menu_property(

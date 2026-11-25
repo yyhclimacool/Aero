@@ -5,6 +5,7 @@ use std::ops::Range;
 
 use aero_core::{BlockId, BlockKind, Document, Edit};
 
+use super::block_ops;
 use super::text_ops::{ListMarker, heading_prefix_len, line_start, strip_continuation};
 use super::units::Unit;
 
@@ -338,7 +339,7 @@ pub fn down_target(
 
 /// 连续几个单位（下标闭区间 `first..=last`）在源码里占的整行区间：首个单位所在行的行首到最后一个单位
 /// 末行的行尾（不含那个换行）。列表项按整项算（含嵌套子项）；`^id` 等尾标记与正文同行，自然包含。
-/// 这就是块选中态里 ⌘C 复制、⌫ 删除的对象（`ui_design.md` 6）。
+/// 用于平面拖拽在列表项边缘定位落点。
 pub fn units_span(doc: &Document, units: &[Unit], first: usize, last: usize) -> Range<usize> {
     let text = doc.to_string();
     let mut start = usize::MAX;
@@ -356,24 +357,6 @@ pub fn units_span(doc: &Document, units: &[Unit], first: usize, last: usize) -> 
     let start = line_start(&text, start.min(text.len()));
     let end = text[end.min(text.len())..].find('\n').map_or(text.len(), |i| end + i);
     start..end
-}
-
-/// 删除连续几个单位：整行删掉，连同它们之后的空行；删到文末时也收掉前面多出来的空行，
-/// 文档结尾仍是单个换行。
-pub fn delete_units(doc: &Document, units: &[Unit], first: usize, last: usize) -> Edit {
-    let text = doc.to_string();
-    let Range { mut start, mut end } = units_span(doc, units, first, last);
-    while end < text.len() && text.as_bytes()[end] == b'\n' {
-        end += 1;
-    }
-    if end == text.len() {
-        // 按前缀判断而不是 `text[start - 2..start]`：`start` 是字符边界，但它前面两个字节
-        // 可能落在一个多字节字符（如 `。`）中间，直接切片会 panic。
-        while start >= 2 && text[..start].ends_with("\n\n") {
-            start -= 1;
-        }
-    }
-    Edit::delete(start..end)
 }
 
 /// 在文末新建空段落：需要补的换行与新段落的偏移；不需要编辑时 `edit` 为 `None`。
@@ -474,48 +457,67 @@ pub fn move_node(
 ) -> Option<Plan> {
     let from = doc.blocks().find(source)?;
     let to = doc.blocks().find(target)?;
-    if source == target || aero_core::containers::ancestors(doc, target).iter().any(|b| b.id == source) {
+    let target_path = aero_core::containers::ancestors(doc, target);
+    if source == target || target_path.iter().any(|b| b.id == source) {
         return None;
     }
-    let range = aero_core::properties::owned_range(doc, source)?;
-    let target_range = aero_core::properties::owned_range(doc, target)?;
-    let original = doc.to_string();
-    let external = aero_core::containers::continuation(doc, source);
-    let piece = original[range.clone()]
-        .split('\n')
-        .enumerate()
-        .map(|(i, line)| if i == 0 { line } else { line.strip_prefix(external.as_str()).unwrap_or(line) })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let (at, prefix) = if into {
-        if !aero_core::containers::is_editable(&to.kind) {
+    let parent = target_path.last();
+    if !into && parent.map(|b| b.id) == aero_core::containers::ancestors(doc, source).last().map(|b| b.id) {
+        let siblings = parent.map_or(&doc.blocks().roots, |b| &b.children);
+        let mut ids = siblings.iter().filter(|block| block.kind != BlockKind::Marker).map(|block| block.id);
+        let (left, right) = if after { (target, source) } else { (source, target) };
+        if ids.any(|id| id == left) && ids.next() == Some(right) {
             return None;
         }
-        let prefix = aero_core::containers::continuation(doc, target);
-        match to.kind {
-            BlockKind::BlockQuote => (doc.range_of(to).end, format!("{prefix}> ")),
-            _ => {
-                let span = doc.range_of(to);
-                let offset = original[span.clone()].rfind('\n')? + span.start;
-                (offset, prefix)
+    }
+    let target_range = aero_core::properties::owned_range(doc, target)?;
+    let original = doc.to_string();
+    let delete = block_ops::deletions(doc, &original, &[source]).pop()?;
+    let range = delete.range.clone();
+    let mut piece = block_ops::source(doc, &original, &[source]);
+    let (at, prefix, task_header) = if into {
+        if matches!(to.kind, BlockKind::ListItem { .. }) {
+            let prefix = to.children.first().map_or_else(
+                || {
+                    let prefix = aero_core::containers::continuation(doc, target);
+                    let marker = &original[target_range.clone()];
+                    let width = list_marker_len(marker).unwrap_or_else(|| marker.trim_end().len() + 1);
+                    format!("{prefix}{}", " ".repeat(width))
+                },
+                |child| block_ops::continuation(doc, &original, child.id, doc.range_of(child).start).0,
+            );
+            if !matches!(from.kind, BlockKind::ListItem { .. } | BlockKind::List { .. }) {
+                piece = format!("- {}", piece.replace('\n', "\n  "));
+            }
+            (target_range.end, prefix, false)
+        } else {
+            let prefix = aero_core::containers::continuation(doc, target);
+            match &to.kind {
+                BlockKind::BlockQuote => (doc.range_of(to).end, format!("{prefix}> "), false),
+                BlockKind::Directive { name } if name == "highlight" => {
+                    let span = doc.range_of(to);
+                    let offset = original[span.clone()].rfind('\n')? + span.start;
+                    (offset, prefix, false)
+                }
+                _ => return None,
             }
         }
     } else {
-        (
-            if after { target_range.end } else { target_range.start },
-            aero_core::containers::continuation(doc, target),
-        )
+        let (prefix, task_header) = block_ops::continuation(doc, &original, target, target_range.start);
+        (if after { target_range.end } else { target_range.start }, prefix, task_header)
     };
-    if range.start <= at && at <= range.end {
+    if range.start < at && at < range.end {
         return None;
     }
-    let piece = piece.replace('\n', &format!("\n{prefix}"));
-    let insertion = if into || after {
-        format!("\n{prefix}\n{prefix}{}", piece.trim_end_matches('\n'))
+    let piece = piece.trim_end_matches('\n').replace('\n', &format!("\n{prefix}"));
+    let separator = format!("\n{}\n{prefix}", prefix.trim_end_matches([' ', '\t']));
+    let (insertion, leading) = if into || after || task_header {
+        let tail = if task_header && !after { separator.as_str() } else { "" };
+        (format!("{separator}{piece}{tail}"), separator.len())
     } else {
-        format!("{}\n{prefix}\n{prefix}", piece.trim_end_matches('\n'))
+        (format!("{piece}{separator}"), 0)
     };
-    let mut edits = vec![Edit::delete(range.clone()), Edit::insert(at, insertion)];
+    let mut edits = vec![delete, Edit::insert(at, insertion)];
     edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
     let mut probe = doc.clone();
     probe.edit_group(edits).ok()?;
@@ -534,9 +536,9 @@ pub fn move_node(
     if identities(doc) != identities(&probe) {
         return None;
     }
-    let focus_offset = if at > range.end { at - range.len() } else { at };
-    let _ = from;
-    Some(Plan { edit: Edit::replace(0..doc.len(), probe.to_string()), focus_offset })
+    let focus_offset = if at >= range.end { at - range.len() } else { at } + leading;
+    let text = probe.to_string();
+    (original != text).then(|| Plan { edit: Edit::replace(0..doc.len(), text), focus_offset })
 }
 
 fn adapt_moved_block(raw: &str, source: &Unit, units: &[Unit], place: DropPlace, text: &str) -> String {
@@ -1348,6 +1350,29 @@ mod tests {
     }
 
     #[test]
+    fn moving_list_body_keeps_other_children_in_their_original_item() {
+        let source =
+            "before\n\n- first ^first\n\n  continuation ^cont\n\n  - nested ^nested\n- sibling\n\nend\n";
+        for (index, identity) in [(0, "first"), (1, "cont")] {
+            let mut doc = Document::from_text(source);
+            let target = doc.blocks().roots[0].id;
+            let id = doc.blocks().roots[1].children[0].children[index].id;
+            let plan = move_node(&doc, id, target, false, false).unwrap();
+            doc.edit(plan.edit).unwrap();
+            doc.reparse();
+            assert_eq!(doc.blocks().roots[0].persisted_id.as_deref(), Some(identity));
+            let list = &doc.blocks().roots[2];
+            assert_eq!(list.children.len(), 2);
+            let item = &list.children[0];
+            assert_eq!(item.children.len(), 2);
+            assert!(matches!(item.children[1].kind, BlockKind::List { .. }));
+            assert_eq!(item.children[1].children[0].children[0].persisted_id.as_deref(), Some("nested"));
+            doc.undo().unwrap();
+            assert_eq!(doc.to_string(), source);
+        }
+    }
+
+    #[test]
     fn enter_splits_paragraph() {
         let mut doc = Document::from_text("hello world\n");
         let us = units(&doc);
@@ -1643,41 +1668,41 @@ mod tests {
     }
 
     #[test]
-    fn delete_units_removes_lines_and_surrounding_blank_lines() {
+    fn deleting_nodes_removes_lines_and_surrounding_blank_lines() {
+        let delete = |doc: &mut Document, ids: &[BlockId]| {
+            let edits = block_ops::deletions(doc, &doc.to_string(), ids);
+            doc.edit_group(edits).unwrap();
+            doc.reparse();
+        };
         let mut doc = Document::from_text("aaa\n\nbbb\n\nccc\n");
-        let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+        let middle = doc.blocks().roots[1].id;
+        delete(&mut doc, &[middle]);
         assert_eq!(doc.to_string(), "aaa\n\nccc\n");
-        // 删最后一块：前面的空行也收掉
-        doc.reparse();
-        let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+        let last = doc.blocks().roots[1].id;
+        delete(&mut doc, &[last]);
         assert_eq!(doc.to_string(), "aaa\n");
-        // 删第一块
+
         let mut doc = Document::from_text("aaa\n\nbbb\n");
-        let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 0, 0)).unwrap();
+        let first = doc.blocks().roots[0].id;
+        delete(&mut doc, &[first]);
         assert_eq!(doc.to_string(), "bbb\n");
-        // 全删：空文档
         let mut doc = Document::from_text("aaa\n\nbbb\n");
-        let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 0, 1)).unwrap();
+        let ids: Vec<_> = doc.blocks().roots.iter().map(|b| b.id).collect();
+        delete(&mut doc, &ids);
         assert_eq!(doc.to_string(), "");
-        // 列表项：整行；紧邻的项不需要空行
+
         let mut doc = Document::from_text("- a\n- b\n- c\n");
-        let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+        let item = doc.blocks().roots[0].children[1].id;
+        delete(&mut doc, &[item]);
         assert_eq!(doc.to_string(), "- a\n- c\n");
-        // 标题与紧跟的段落之间没有空行
         let mut doc = Document::from_text("# T\npara\n");
-        let us = units(&doc);
-        doc.edit(delete_units(&doc, &us, 0, 0)).unwrap();
+        let heading = doc.blocks().roots[0].id;
+        delete(&mut doc, &[heading]);
         assert_eq!(doc.to_string(), "para\n");
-        // 删最后一块、且前一行以多字节字符结尾：收空行不能按字节切片（曾 panic 在 `。` 中间）
         for before in ["中文。", "图 🎨", "ascii"] {
             let mut doc = Document::from_text(&format!("{before}\n\n![[x.png]]\n"));
-            let us = units(&doc);
-            doc.edit(delete_units(&doc, &us, 1, 1)).unwrap();
+            let image = doc.blocks().roots[1].id;
+            delete(&mut doc, &[image]);
             assert_eq!(doc.to_string(), format!("{before}\n"), "{before}");
         }
     }

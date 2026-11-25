@@ -1765,6 +1765,33 @@ fn dragging_a_block_handle_reorders_it(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui_kit::test]
+fn dragging_an_empty_highlight_moves_its_fences(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, point, px};
+    let source = "first\n\n:::highlight\n:::\n\nlast\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    let (first, highlight) = cx.update(|_, cx| {
+        let roots = &editor.read(cx).doc.blocks().roots;
+        (roots[0].id, roots[1].id)
+    });
+    hover_block(highlight, cx);
+    let handle = Box::leak(format!("gutter-handle-{}", highlight.0).into_boxed_str());
+    let target = Box::leak(format!("unit-{}", first.0).into_boxed_str());
+    let from = cx.debug_bounds(handle).unwrap().center();
+    let to = cx.debug_bounds(target).unwrap().origin + point(px(24.), px(4.));
+    cx.simulate_mouse_move(from, None, Modifiers::default());
+    cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(from + point(px(12.), px(0.)), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+    settle(cx);
+    assert_eq!(text(&editor, cx), ":::highlight\n:::\n\nfirst\n\nlast\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
 /// 拖到列表项右侧 24 px 时，块缩进成该项的子项。
 #[gpui_kit::test]
 fn dragging_onto_the_right_edge_nests_under_the_list_item(cx: &mut TestAppContext) {
@@ -4928,11 +4955,11 @@ fn block_selection_keyboard_flow(cx: &mut TestAppContext) {
         assert_eq!(f.textarea.read(cx).cursor(), 4);
     });
 
-    // ⌘C 复制选中块的源码（列表项含标记）；⌫ 删除；选区落到下一块；⌘Z 撤销并重新选中恢复的块
+    // 键盘选区命中正文子块。复制正文并删除时保留这两个列表项的标记。
     cx.simulate_keystrokes("escape shift-down cmd-c");
-    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some("- one!\n- two".to_owned()));
+    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some("one!\n\ntwo".to_owned()));
     cx.simulate_keystrokes("backspace");
-    assert_eq!(text(&editor, cx), "# Title\n\nlast\n");
+    assert_eq!(text(&editor, cx), "# Title\n\n- \n- \n\nlast\n");
     assert_eq!(selected(&editor, cx), Some(1..2));
     cx.simulate_keystrokes("cmd-z");
     assert_eq!(text(&editor, cx), "# Title\n\n- one!\n- two\n\nlast\n");
@@ -4944,13 +4971,122 @@ fn block_selection_keyboard_flow(cx: &mut TestAppContext) {
     assert!(text(&editor, cx).ends_with("# Title\n\n- one!\n- two\n"));
     assert_eq!(selected(&editor, cx), Some(2..3));
 
-    // 删到空文档：回浏览态，文件也随之为空
-    cx.simulate_keystrokes("shift-up shift-up backspace");
+    // 选择列表外层时，删除整个列表，再删标题。
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let list = e
+                .doc
+                .blocks()
+                .roots
+                .iter()
+                .find(|b| matches!(b.kind, aero_core::BlockKind::List { .. }))
+                .unwrap();
+            e.select_block_by_id(list.id, window, cx);
+        })
+    });
+    cx.simulate_keystrokes("backspace backspace");
     cx.update(|_, cx| assert!(editor.read(cx).units.is_empty()));
     assert_eq!(selected(&editor, cx), None);
     cx.executor().advance_clock(Duration::from_millis(600));
     cx.run_until_parked();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), text(&editor, cx));
+}
+
+#[gpui_kit::test]
+fn selected_container_routes_input_to_its_first_editable_child(cx: &mut TestAppContext) {
+    let source = ":::highlight\nfirst ^first\n\nsecond\n:::\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let id = cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let id = e.doc.blocks().roots[0].id;
+            e.select_block_by_id(id, window, cx);
+            e.units[0].id
+        })
+    });
+    cx.simulate_input("新");
+    assert_eq!(text(&editor, cx), source.replace("first ^first", "first新 ^first"));
+    cx.update(|_, cx| assert_eq!(editor.read(cx).focused.as_ref().unwrap().id, Some(id)));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn first_input_in_a_selected_empty_highlight_keeps_its_closing_fence(cx: &mut TestAppContext) {
+    let source = ":::highlight\n:::\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| e.select_block_by_id(e.doc.blocks().roots[0].id, window, cx))
+    });
+    cx.simulate_input("新");
+    assert_eq!(text(&editor, cx), ":::highlight\n新\n:::\n\nafter\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn first_input_in_a_selected_empty_quote_keeps_its_container(cx: &mut TestAppContext) {
+    let source = "> \n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| e.select_block_by_id(e.doc.blocks().roots[0].id, window, cx))
+    });
+    cx.simulate_input("新");
+    assert_eq!(text(&editor, cx), "> 新\n\nafter\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn dragging_text_across_containers_deletes_only_the_selected_children(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton, point, px};
+    let source = ":::highlight\nfirst ^first\n:::\n\n> second ^second\n\nafter\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    let ids = cx.update(|_, cx| editor.read(cx).units.iter().map(|u| u.id).collect::<Vec<_>>());
+    let body = |cx: &mut VisualTestContext, index: usize| {
+        let selector = Box::leak(format!("unit-{}", ids[index].0).into_boxed_str());
+        let row = cx.debug_bounds(selector).unwrap();
+        row.origin + point(px(10.), px(10.))
+    };
+    let from = body(cx, 0);
+    let to = body(cx, 1);
+    cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+    settle(cx);
+    assert_eq!(selected(&editor, cx), Some(0..2));
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(text(&editor, cx), ":::highlight\n:::\n\n> \n\nafter\n");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn copying_task_body_strips_alignment_spaces_from_the_clipboard(cx: &mut TestAppContext) {
+    let source = "- [ ] first\n      continued\n\n  - nested ^nested\n- sibling\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("escape cmd-c");
+    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("first\ncontinued"));
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn cutting_first_list_body_keeps_its_item_and_continuation(cx: &mut TestAppContext) {
+    let source = "- first ^first\n\n  continuation ^cont\n\n  - nested ^nested\n- sibling\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("escape cmd-x");
+    assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("first ^first"));
+    assert!(text(&editor, cx).ends_with("- \n  continuation ^cont\n\n  - nested ^nested\n- sibling\n"));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
 }
 
 /// Type labels and six-dot handles open the captured block menu without edits.

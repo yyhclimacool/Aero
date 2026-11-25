@@ -12,8 +12,10 @@
 
 mod backlinks_ui;
 mod block_menu;
+mod block_ops;
 mod block_refs_ui;
 mod clipboard_ui;
+pub(crate) use clipboard_ui::insert_tree_after;
 pub(crate) use sync_picker::insert_tree;
 mod color_menu;
 mod colors_ui;
@@ -38,6 +40,7 @@ mod pdf_reader;
 mod presenter;
 mod preview;
 mod rich_ui;
+mod selected_input;
 mod slash;
 mod source_cache;
 mod sync_picker;
@@ -284,6 +287,7 @@ pub struct Editor {
     /// 块选中态；与 `focused` 互斥
     selection: Option<BlockSelection>,
     selected_node: Option<BlockId>,
+    text_drag_anchor: Option<BlockId>,
     sync_picker: Option<sync_picker::SyncPicker>,
     /// 点在图片上：`(块, 这一段里的第几张)`。只给这张图画选中框，不给整块上底色
     selected_image: Option<(BlockId, usize)>,
@@ -430,6 +434,7 @@ impl Editor {
             empty_slots: Vec::new(),
             selection: None,
             selected_node: None,
+            text_drag_anchor: None,
             sync_picker: None,
             selected_image: None,
             picker_open: false,
@@ -496,6 +501,7 @@ impl Editor {
     ) {
         self.focused = None;
         self.selection = None;
+        self.selected_node = None;
         match direction {
             Some(true) => {
                 self.doc.redo();
@@ -1213,6 +1219,7 @@ impl Editor {
         self.last_edit_at = None;
         log::debug!("focus {:?} id={:?}", range, id);
         self.selection = None;
+        self.selected_node = None;
         self.wiki = None;
         self.tag_menu = None;
         match self.presenter_key_of(&textarea) {
@@ -1439,10 +1446,6 @@ impl Editor {
     /// 编辑态里的 Esc（文本控件的 `Escape` 冒泡到这里）：先关菜单 / 标题编辑；否则退出编辑并选中刚才的块
     /// （`ui_design.md` 6："Esc 两段式退出"）。光标在没有块的空位上时直接回浏览态。
     fn on_escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_node.take().is_some() {
-            cx.notify();
-            return;
-        }
         self.clear_navigation(cx);
         self.cancel_link_preview(cx);
         if self.close_image_viewer(window, cx) {
@@ -1456,6 +1459,10 @@ impl Editor {
             return;
         }
         if self.close_block_menu(cx) {
+            return;
+        }
+        if self.selected_node.take().is_some() {
+            cx.notify();
             return;
         }
         if self.cancel_block_drag(window, cx) {
@@ -1494,7 +1501,10 @@ impl Editor {
         if self.cancel_block_drag(window, cx) {
             return;
         }
-        let busy = self.slash.is_some() || self.focused.is_some() || self.selection.is_some();
+        let busy = self.slash.is_some()
+            || self.focused.is_some()
+            || self.selection.is_some()
+            || self.selected_node.is_some();
         if busy {
             self.blur_to_browse(window, cx);
         } else {
@@ -1523,7 +1533,8 @@ impl Editor {
             return;
         }
         self.exit_edit(cx);
-        if self.selection.take().is_some() {
+        let blocks = self.selection.take();
+        if self.selected_node.take().is_some() || blocks.is_some() {
             cx.notify();
         }
         self.focus_handle.focus(window, cx);
@@ -1604,53 +1615,89 @@ impl Editor {
         self.extend_selection(1, window, cx);
     }
 
-    /// ⏎：编辑 `head` 那块，光标在块末。
+    fn unit_under_pointer(&self, position: Point<Pixels>) -> Option<BlockId> {
+        self.unit_bounds
+            .iter()
+            .find(|(id, bounds)| bounds.contains(&position) && self.unit_index(*id).is_some())
+            .map(|(id, _)| *id)
+    }
+
+    fn track_text_drag(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.text_drag_anchor = None;
+            return;
+        }
+        let Some(anchor) = self.text_drag_anchor else { return };
+        if self.dragging_block || cx.has_active_drag() || self.input_composing(window, cx) {
+            return;
+        }
+        let Some(anchor_index) = self.unit_index(anchor) else { return };
+        let selecting = self.selection.filter(|selection| selection.anchor == anchor_index);
+        if selecting.is_none() && self.focused_block_id() != Some(anchor) {
+            return;
+        }
+        let Some(head) = self.unit_under_pointer(event.position).and_then(|id| self.unit_index(id)) else {
+            return;
+        };
+        if selecting.is_none() && head == anchor_index {
+            return;
+        }
+        if selecting.is_none_or(|selection| selection.head != head) {
+            self.select_blocks(anchor_index, head, window, cx);
+        }
+        cx.stop_propagation();
+    }
+
     fn on_edit_selected(&mut self, _: &EditSelectedBlock, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(sel) = self.selection else {
+        let Some(ix) = self.selection.map(|s| s.head).or_else(|| self.selected_edit_unit(cx)) else {
             cx.propagate();
             return;
         };
-        let Some(unit) = self.units.get(sel.head) else { return };
-        let len = unit.range.len();
-        self.focus_unit(sel.head, len, window, cx);
+        self.focus_unit(ix, self.units[ix].range.len(), window, cx);
     }
 
-    /// 选中块的 Markdown 源码（整行，列表项含标记与嵌套子项）。
-    fn selected_source(&self) -> Option<String> {
+    fn selection_targets(&self) -> Vec<BlockId> {
         if let Some(id) = self.selected_node {
-            return aero_core::properties::owned_range(&self.doc, id)
-                .map(|r| aero_core::containers::standalone(&self.doc, r));
+            return block_ops::targets(&self.doc, [id]);
         }
-        let sel = self.selection?;
-        let span = ops::units_span(&self.doc, &self.units, sel.first(), sel.last());
-        Some(aero_core::containers::standalone(&self.doc, span))
+        let Some(sel) = self.selection else { return Vec::new() };
+        let ids = self.units[sel.first()..=sel.last()]
+            .iter()
+            // Empty quote/highlight placeholders are virtual paragraphs.
+            .filter(|unit| !unit.range.is_empty() || !matches!(unit.kind, BlockKind::Paragraph))
+            .map(|unit| unit.id);
+        block_ops::targets(&self.doc, ids)
     }
 
     /// ⌫ / ⌦：删掉选中的块，一个撤销组；选区落到原位置上的下一块（没有就上一块；文档空了回浏览态）。
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_current_parse();
-        if let Some(id) = self.selected_node.take() {
-            if let Some(range) = aero_core::properties::owned_range(&self.doc, id) {
-                let at = range.start;
-                self.structural_edit(Edit::delete(range), at, window, cx);
-            }
-            return;
-        }
-        let Some(sel) = self.selection else { return };
-        let edit = ops::delete_units(&self.doc, &self.units, sel.first(), sel.last());
-        if let Err(err) = self.doc.edit(edit) {
+        self.delete_block_targets(&self.selection_targets(), window, cx);
+    }
+
+    fn delete_block_targets(&mut self, ids: &[BlockId], window: &mut Window, cx: &mut Context<Self>) {
+        let edits = block_ops::deletions(&self.doc, &self.doc.to_string(), ids);
+        let Some(last) = edits.last() else { return };
+        let at = last.range.start;
+        if let Err(err) = self.doc.edit_group(edits) {
             log::error!("edit rejected: {err}");
             return;
         }
-        let first = sel.first();
+        self.finish_block_removal(at, window, cx);
+    }
+
+    fn finish_block_removal(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = None;
+        self.selection = None;
+        self.selected_node = None;
         self.last_edit_at = None;
         self.after_doc_change(cx);
-        if self.units.is_empty() {
-            self.selection = None;
-            self.focus_handle.focus(window, cx);
-        } else {
-            let ix = first.min(self.units.len() - 1);
+        self.ensure_current_parse();
+        if !self.units.is_empty() {
+            let ix = self.units.partition_point(|unit| unit.range.end < at).min(self.units.len() - 1);
             self.select_blocks(ix, ix, window, cx);
+        } else {
+            self.focus_handle.focus(window, cx);
         }
     }
 
@@ -1684,6 +1731,7 @@ impl Editor {
     ) {
         self.exit_edit(cx);
         self.selection = None;
+        self.selected_node = None;
         self.selected_image = Some((id, index));
         self.focus_handle.focus(window, cx);
         cx.notify();
@@ -1695,29 +1743,42 @@ impl Editor {
 
     /// gutter 的 `⠿`：进入块选中态；拖动走 `on_drag`。
     fn select_block_by_id(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.unit_index(id) {
+        if self.doc.blocks().find(id).is_some_and(|block| {
+            aero_core::containers::is_editable(&block.kind)
+                || matches!(block.kind, BlockKind::List { .. } | BlockKind::ListItem { .. })
+        }) {
+            self.select_node(id, window, cx);
+        } else if let Some(ix) = self.unit_index(id) {
             self.select_blocks(ix, ix, window, cx);
         }
     }
 
+    fn select_node(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
+        self.exit_edit(cx);
+        self.selection = None;
+        self.selected_image = None;
+        self.selected_node = Some(id);
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
     fn on_copy_selected(&mut self, _: &CopySelectedBlocks, _: &mut Window, cx: &mut Context<Self>) {
         self.ensure_current_parse();
-        match self.selected_source() {
-            Some(text) => self.copy_blocks(text, cx),
-            None => cx.propagate(),
+        let ids = self.selection_targets();
+        if ids.is_empty() {
+            cx.propagate();
+        } else {
+            self.copy_block_targets(&ids, cx);
         }
     }
 
     fn on_cut_selected(&mut self, _: &CutSelectedBlocks, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_current_parse();
-        let range = self
-            .selected_node
-            .and_then(|id| aero_core::properties::owned_range(&self.doc, id))
-            .or_else(|| self.selection.map(|s| ops::units_span(&self.doc, &self.units, s.first(), s.last())));
-        if let Some(range) = range {
-            self.cut_blocks(range, window, cx);
-        } else {
+        let ids = self.selection_targets();
+        if ids.is_empty() {
             cx.propagate();
+        } else {
+            self.cut_blocks(&ids, window, cx);
         }
     }
 
@@ -1759,6 +1820,9 @@ impl Editor {
         self.parse_window = Some(window.window_handle());
         self.sanitize_cell(window, cx);
         let paired = self.complete_pairs(window, cx);
+        if self.fill_empty_highlight(window, cx) {
+            return;
+        }
         if self.hides_markers(cx)
             && !self.note_source
             && !self.input_composing(window, cx)
@@ -1853,6 +1917,33 @@ impl Editor {
             self.refresh_markup(cx);
         }
         self.settle_image_embed(window, cx);
+    }
+
+    fn fill_empty_highlight(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(focused) = self.focused.as_ref().filter(|f| f.range.is_empty()) else { return false };
+        let Some(id) = focused.id else { return false };
+        let Some(block) = self.doc.blocks().find(id) else { return false };
+        if !matches!(&block.kind, BlockKind::Directive { name } if name == "highlight")
+            || !block.children.is_empty()
+            || self.input_composing(window, cx)
+        {
+            return false;
+        }
+        let input = focused.textarea.read(cx);
+        let raw = input.value();
+        if raw.is_empty() {
+            return false;
+        }
+        let at = focused.range.start;
+        let cursor = input.cursor();
+        let prefix = aero_core::containers::continuation(&self.doc, id);
+        let mut text = format!("{prefix}{}", raw.replace('\n', &format!("\n{prefix}")));
+        let offset = at + cursor + (1 + raw[..cursor].bytes().filter(|&b| b == b'\n').count()) * prefix.len();
+        if at < self.doc.len() && self.doc.slice(at..at + 1) != "\n" {
+            text.push('\n');
+        }
+        self.structural_edit(Edit::insert(at, text), offset, window, cx);
+        true
     }
 
     /// 这一段已经变成整段图片嵌入时，退出文本框，改回和预览同一张图。
@@ -2408,11 +2499,7 @@ impl Editor {
         };
         match outcome {
             ops::Backspace::SelectContainer(id) => {
-                self.focused = None;
-                self.selection = None;
-                self.selected_node = Some(id);
-                self.focus_handle.focus(window, cx);
-                cx.notify();
+                self.select_node(id, window, cx);
             }
             ops::Backspace::Edit(plan) => self.apply_plan(plan, window, cx),
             ops::Backspace::MoveTo { unit, cursor } => self.focus_unit(unit, cursor, window, cx),
@@ -3072,6 +3159,8 @@ impl Editor {
         log::info!("reload {} (changed on disk)", self.path.as_str());
         self.cancel_link_preview(cx);
         self.focused = None;
+        self.selected_node = None;
+        self.text_drag_anchor = None;
         // 块 id 随新文档重排，旧的定位高亮会落到别的块上
         self.empty_slots.clear();
         self.highlight = None;
@@ -3407,6 +3496,9 @@ impl Editor {
 
     /// 块选区里"头"那一块（⇧↑↓ 动的那一端）。
     fn selection_head(&self) -> Option<BlockId> {
+        if self.selected_node.is_some() {
+            return self.selected_node;
+        }
         let sel = self.selection?;
         self.units.get(sel.head).map(|u| u.id)
     }
@@ -3879,6 +3971,9 @@ impl Editor {
                     return;
                 }
                 cx.stop_propagation();
+                if outer {
+                    this.select_node(id, window, cx);
+                }
                 this.open_block_menu(id, window.mouse_position(), window, cx);
             }));
         let kind = self
@@ -3899,6 +3994,9 @@ impl Editor {
             MouseButton::Left,
             cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
+                if outer {
+                    this.select_node(id, window, cx);
+                }
                 this.open_block_menu(id, window.mouse_position(), window, cx);
             }),
         );
@@ -4535,9 +4633,12 @@ impl Render for Editor {
             }))
             .track_focus(&self.focus_handle)
             // 菜单面板由 occlude 排除；在正文链接吞掉捕获事件前关闭菜单。
-            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
                 this.close_block_menu(cx);
                 this.clear_navigation(cx);
+                this.text_drag_anchor = (event.button == MouseButton::Left && !event.modifiers.alt)
+                    .then(|| this.unit_under_pointer(event.position))
+                    .flatten();
             }))
             .on_action(cx.listener(Self::on_block_up))
             .on_action(cx.listener(Self::on_block_down))
@@ -4665,6 +4766,29 @@ impl Render for Editor {
             .children(self.render_link_preview(window, cx))
             .children(self.render_toolbar(cx))
             .children(self.render_block_menu(cx))
+            .child({
+                let editor = cx.weak_entity();
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, window, _| {
+                        let track = editor.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                            if phase.capture()
+                                && let Some(editor) = track.upgrade()
+                                && editor.read(cx).text_drag_anchor.is_some()
+                            {
+                                editor.update(cx, |editor, cx| editor.track_text_drag(event, window, cx));
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+            })
+            .when(self.selection.is_some() || self.selected_node.is_some(), |el| {
+                el.child(self.selected_input(cx))
+            })
             .children(self.render_sync_picker(cx))
             .children(self.render_block_drop_line(cx))
             .children(self.render_math_editor(cx))

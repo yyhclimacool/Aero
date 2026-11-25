@@ -70,6 +70,12 @@ fn commit_restoring(
 }
 
 #[derive(Clone)]
+pub(crate) enum PastePosition {
+    Text(std::ops::Range<usize>),
+    AfterBlock { offset: usize, prefix: String },
+}
+
+#[derive(Clone)]
 pub(crate) enum Operation {
     Paste {
         token: String,
@@ -78,7 +84,7 @@ pub(crate) enum Operation {
         source: String,
         destination: VaultPath,
         before: Vec<u8>,
-        range: std::ops::Range<usize>,
+        position: PastePosition,
         cut: Option<FileChange>,
         journal: PathBuf,
     },
@@ -245,7 +251,7 @@ fn execute_with_paste_snapshot(
 ) -> Result<Outcome, String> {
     let mut outcome = Outcome::default();
     match operation {
-        Operation::Paste { token, payload, source, destination, before, range, cut, journal } => {
+        Operation::Paste { token, payload, source, destination, before, position, cut, journal } => {
             let (actual, _) = vault.read_bytes(&destination).map_err(|e| e.to_string())?;
             if actual != before {
                 return Err("目标文档已变化，请重新粘贴".into());
@@ -261,7 +267,13 @@ fn execute_with_paste_snapshot(
                 &document,
                 cut.is_some(),
             )?;
-            doc = crate::editor::insert_tree(&doc, range, &plan.source)?;
+            match position {
+                PastePosition::Text(range) => doc = crate::editor::insert_tree(&doc, range, &plan.source)?,
+                PastePosition::AfterBlock { offset, prefix } => {
+                    let edit = crate::editor::insert_tree_after(&doc, offset, &prefix, &plan.source);
+                    doc.edit(edit).map_err(|e| e.to_string())?;
+                }
+            }
             // Metadata is inserted after the body, so its original prefix offsets remain valid.
             doc.edit_group(metadata).map_err(|e| e.to_string())?;
             if cut.is_some() {
@@ -621,7 +633,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{Operation, execute, finish_on_shutdown};
+    use super::{Operation, PastePosition, execute, finish_on_shutdown};
     use aero_core::Vault;
     use std::sync::Arc;
 
@@ -653,7 +665,7 @@ mod tests {
             source: moved,
             destination: target.clone(),
             before: b"destination\n".to_vec(),
-            range: 11..11,
+            position: PastePosition::Text(11..11),
             cut: Some(FileChange {
                 path: source.clone(),
                 before: Some(source_before),

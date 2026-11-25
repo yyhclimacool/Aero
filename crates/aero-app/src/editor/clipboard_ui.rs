@@ -2,6 +2,8 @@ use super::*;
 use aero_core::transaction::FileChange;
 use gpui_kit::component::WindowExt as _;
 
+use crate::workspace::files::PastePosition;
+
 #[derive(Default)]
 struct Cuts(std::collections::HashMap<String, Cut>);
 impl Global for Cuts {}
@@ -14,6 +16,10 @@ struct Cut {
 }
 
 impl Editor {
+    pub(super) fn copy_block_targets(&self, ids: &[BlockId], cx: &mut Context<Self>) {
+        self.copy_blocks(block_ops::source(&self.doc, &self.doc.to_string(), ids), cx);
+    }
+
     pub(super) fn copy_blocks(&self, text: String, cx: &mut Context<Self>) {
         let payload = aero_core::clipboard::Payload {
             version: 1,
@@ -25,11 +31,15 @@ impl Editor {
         cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(text, payload));
     }
 
-    pub(super) fn cut_blocks(&mut self, range: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn cut_blocks(&mut self, ids: &[BlockId], window: &mut Window, cx: &mut Context<Self>) {
         if self.io.suspended {
             return;
         }
-        let (document, mut edits) = match aero_core::identity::ensure(&self.doc) {
+        let text = self.doc.to_string();
+        let mut edits = block_ops::deletions(&self.doc, &text, ids);
+        let Some(last) = edits.last() else { return };
+        let at = last.range.start;
+        let (document, metadata) = match aero_core::identity::ensure(&self.doc) {
             Ok(result) => result,
             Err(error) => {
                 window.push_notification(gpui_kit::component::notification::Notification::error(error), cx);
@@ -38,14 +48,10 @@ impl Editor {
         };
         let token = aero_core::identity::new_block_id();
         let before = self.doc.to_bytes();
-        let source = aero_core::containers::standalone(&self.doc, range.clone());
-        let at = range.start;
-        let selection = self.selection;
-        let delete = selection
-            .filter(|_| self.selected_node.is_none())
-            .map(|s| ops::delete_units(&self.doc, &self.units, s.first(), s.last()))
-            .unwrap_or_else(|| Edit::delete(range));
-        edits.insert(0, delete);
+        let source = block_ops::source(&self.doc, &text, ids);
+        let metadata_delta: isize =
+            metadata.iter().filter(|edit| edit.range.start <= at).map(Edit::delta).sum();
+        edits.extend(metadata);
         if let Err(error) = self.doc.edit_transaction(edits, &token) {
             window.push_notification(
                 gpui_kit::component::notification::Notification::error(error.to_string()),
@@ -80,19 +86,7 @@ impl Editor {
                 cut: Some(token),
             },
         ));
-        self.focused = None;
-        self.selection = None;
-        self.selected_node = None;
-        self.last_edit_at = None;
-        self.after_doc_change(cx);
-        if let Some(s) = selection
-            && !self.units.is_empty()
-        {
-            let ix = s.first().min(self.units.len() - 1);
-            self.select_blocks(ix, ix, window, cx);
-        } else {
-            self.focus_at(at.min(self.doc.len()), None, window, cx);
-        }
+        self.finish_block_removal(at.saturating_add_signed(metadata_delta), window, cx);
     }
 
     pub(super) fn paste_blocks(
@@ -158,15 +152,18 @@ impl Editor {
         } else {
             None
         };
-        let range = if let Some(id) = self.selected_node {
-            aero_core::properties::owned_range(&self.doc, id).unwrap_or(self.doc.len()..self.doc.len())
-        } else if let Some(s) = self.selection {
-            ops::units_span(&self.doc, &self.units, s.first(), s.last())
+        let target = self.selection_targets().last().and_then(|&id| {
+            let range = aero_core::properties::owned_range(&self.doc, id)?;
+            let (prefix, _) = block_ops::continuation(&self.doc, &self.doc.to_string(), id, range.start);
+            Some(PastePosition::AfterBlock { offset: range.end, prefix })
+        });
+        let position = if let Some(target) = target {
+            target
         } else if let Some(f) = &self.focused {
             let r = f.textarea.read(cx).selected_range();
-            f.range.start + r.start..f.range.start + r.end
+            PastePosition::Text(f.range.start + r.start..f.range.start + r.end)
         } else {
-            self.doc.len()..self.doc.len()
+            PastePosition::Text(self.doc.len()..self.doc.len())
         };
         let token =
             if cut.is_some() { payload.cut.clone().unwrap() } else { aero_core::identity::new_block_id() };
@@ -184,7 +181,7 @@ impl Editor {
             source,
             destination: self.path.clone(),
             before: self.doc.to_bytes(),
-            range,
+            position,
             cut,
             journal: crate::paths::app_data_dir().join("transactions").join(self.vault.id()),
         }));
@@ -252,5 +249,38 @@ impl Editor {
         self.stamp = stamp;
         self.resume_io(cx);
         true
+    }
+}
+
+pub(crate) fn insert_tree_after(doc: &Document, offset: usize, prefix: &str, source: &str) -> Edit {
+    let existing = doc.to_string();
+    let blank = prefix.trim_end_matches([' ', '\t']);
+    let leading = if existing[..offset].ends_with('\n') { "" } else { "\n" };
+    let gap = format!("\n{blank}\n");
+    let source = source.trim_end_matches('\n').replace('\n', &format!("\n{prefix}"));
+    let rest = &existing[offset..];
+    let trailing = if rest.trim().is_empty() || rest.starts_with(&gap) {
+        String::new()
+    } else if rest.starts_with('\n') {
+        format!("\n{blank}")
+    } else {
+        gap
+    };
+    Edit::insert(offset, format!("{leading}{blank}\n{prefix}{source}{trailing}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Document, insert_tree_after};
+
+    #[test]
+    fn pasting_after_a_selected_quote_child_preserves_the_quote_and_the_child() {
+        let mut doc = Document::from_text("> kept ^keep\n\nnext\n");
+        let end = doc.range_of(&doc.blocks().roots[0].children[0]).end;
+        doc.edit(insert_tree_after(&doc, end, "> ", "pasted\ncontinued")).unwrap();
+        doc.reparse();
+        assert_eq!(doc.to_string(), "> kept ^keep\n>\n> pasted\n> continued\n>\n\nnext\n");
+        assert_eq!(doc.blocks().roots[0].children.len(), 2);
+        assert_eq!(doc.blocks().roots[0].children[0].persisted_id.as_deref(), Some("keep"));
     }
 }
