@@ -20,8 +20,11 @@ pub enum Mark {
     Code,
     Highlight,
     Link,
-    /// 调色板类名，文字色是 `red`，背景色是 `bg-blue`。
-    Palette(Vec<String>),
+    /// Each channel carries the effective preset name or the custom color from source.
+    Color {
+        text: Option<String>,
+        background: Option<String>,
+    },
 }
 
 pub struct Analysis {
@@ -89,7 +92,7 @@ pub fn analyze_editing(src: &str, selection: Option<Range<usize>>) -> Analysis {
         mark_node(src, &range, node, &wikilinks, &pointers, selection.as_ref(), &mut out);
     }
     line_prefixes(src, &code, &mut out.conceal);
-    color_marks(src, &code, &mut out);
+    color_marks(src, root, &positions, &mut out);
     escapes(src, &code, &mut out.conceal);
     out.conceal.sort_by_key(|range| range.start);
     out
@@ -298,40 +301,17 @@ fn line_prefixes(src: &str, code: &[Range<usize>], conceal: &mut Vec<Range<usize
     }
 }
 
-fn color_marks(src: &str, code: &[Range<usize>], out: &mut Analysis) {
-    let mut search = 0;
-    while let Some(rel) = src[search..].find('{') {
-        let open = search + rel;
-        let Some((attrs, end)) = colors::attrs_at(src, open) else {
-            search = open + 1;
-            continue;
-        };
-        search = end;
-        if !colors::has_color(&attrs) {
-            continue;
+fn color_marks<'a>(src: &str, root: &'a AstNode<'a>, positions: &SourceMap, out: &mut Analysis) {
+    for carrier in crate::highlight::carriers(src, &(0..src.len()), root, positions) {
+        if !carrier.before.is_empty() {
+            out.conceal.push(carrier.before);
         }
-        if code.iter().any(|code| code.start <= open && end <= code.end) {
-            continue;
+        out.conceal.push(carrier.after);
+        let text = Slot::Text.color_of(&carrier.attrs).map(str::to_owned);
+        let background = Slot::Background.color_of(&carrier.attrs).map(str::to_owned);
+        if text.is_some() || background.is_some() {
+            out.styles.push((carrier.content, Mark::Color { text, background }));
         }
-        let classes: Vec<String> = attrs
-            .classes
-            .iter()
-            .filter(|class| Slot::Text.owns(class) || Slot::Background.owns(class))
-            .cloned()
-            .collect();
-        if open > 0
-            && src.as_bytes()[open - 1] == b']'
-            && let Some(bracket) = colors::bracket_start(src, open - 1, colors::line_start(src, open))
-        {
-            out.conceal.push(bracket..bracket + 1);
-            out.conceal.push(open - 1..end);
-            let content = bracket + 1..open - 1;
-            if content.start < content.end && !classes.is_empty() {
-                out.styles.push((content, Mark::Palette(classes)));
-            }
-            continue;
-        }
-        out.conceal.push(open..end);
     }
 }
 
@@ -422,6 +402,28 @@ mod tests {
             ),
             "第一段有 加粗文字、斜体、行内代码、删除线、高亮，以及 双链别名 和 外部链接，还有 红色文字 这种颜色。"
         );
+    }
+
+    #[test]
+    fn inline_color_uses_valid_custom_values_then_the_first_preset_per_channel() {
+        let source = r##"前 [字]{.red .blue .bg-green .bg-blue color="#112233" color=bad color="rgba(12, 34, 56, 0.3749)"} **粗**{.blue .red background="#33669980"} 后"##;
+        let analysis = analyze(source);
+        assert_eq!(analysis.visible_text(source), "前 字 粗 后");
+        let expected = [
+            ("字", Some("rgba(12, 34, 56, 0.3749)"), Some("green")),
+            ("**粗**", Some("blue"), Some("#33669980")),
+        ];
+        let colors: Vec<_> = analysis
+            .styles
+            .iter()
+            .filter_map(|(range, mark)| match mark {
+                Mark::Color { text, background } => {
+                    Some((&source[range.clone()], text.as_deref(), background.as_deref()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(colors, expected);
     }
 
     #[test]

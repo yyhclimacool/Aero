@@ -51,10 +51,16 @@ pub fn token(slot: Slot, color: &str, dark: bool) -> Option<Hsla> {
     value(slot, color, dark).map(|v| rgb(v).into())
 }
 
-/// 同一个令牌的 CSS 写法，供富文本预览的 `<span style>` 用。
+/// CSS hex for the native HTML renderer, which accepts hex colors in spans.
 fn hex(slot: Slot, color: &str, dark: bool) -> Option<String> {
     if let Some(color) = aero_core::colors::normalize_custom(color) {
-        return Some(color);
+        if color.starts_with('#') {
+            return Some(color);
+        }
+        let c = aero_core::colors::CustomColor::parse(&color)?;
+        // Only the HTML renderer needs an 8-bit alpha. The Markdown source and presenter retain the decimal value.
+        let alpha = (c.alpha * 255.).round() as u8;
+        return Some(format!("#{:02X}{:02X}{:02X}{alpha:02X}", c.red, c.green, c.blue));
     }
     value(slot, color, dark).map(|v| format!("#{v:06x}"))
 }
@@ -74,7 +80,7 @@ impl Paint {
     }
 }
 
-/// 属性列表里的颜色。未知类名与 `key=value` 不上色。
+/// 属性列表中的有效预设色或自定义色。
 pub fn of(attrs: &Attrs, cx: &App) -> Paint {
     let dark = cx.theme().mode.is_dark();
     let color = |slot: Slot| slot.color_of(attrs).and_then(|c| token(slot, c, dark));
@@ -232,6 +238,10 @@ mod tests {
         assert_eq!(
             marked,
             "<p><mark color=\"#fef08a\">a</mark><span style=\"background-color:#fef08a;\">b</span></p>"
+        );
+        assert_eq!(
+            paint_html(r##"<span class="#123456 bg-rgba(12,34,56,0.3749)">字</span>"##, false),
+            r#"<span style="color:#123456;background-color:#0C223860;">字</span>"#
         );
     }
 }

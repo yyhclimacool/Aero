@@ -405,19 +405,13 @@ impl Editor {
                     };
                     HighlightStyle { color: Some(color), underline, ..Default::default() }
                 }
-                Mark::Palette(classes) => {
-                    let mut style = HighlightStyle::default();
-                    for class in classes {
-                        if let Some(name) = class.strip_prefix("bg-") {
-                            if let Some(bg) = crate::colors::token(Slot::Background, name, dark) {
-                                style.background_color = Some(bg);
-                            }
-                        } else if let Some(fg) = crate::colors::token(Slot::Text, class, dark) {
-                            style.color = Some(fg);
-                        }
-                    }
-                    style
-                }
+                Mark::Color { text, background } => HighlightStyle {
+                    color: text.as_deref().and_then(|value| crate::colors::token(Slot::Text, value, dark)),
+                    background_color: background
+                        .as_deref()
+                        .and_then(|value| crate::colors::token(Slot::Background, value, dark)),
+                    ..Default::default()
+                },
             };
             styles.push((range.clone(), style));
         }

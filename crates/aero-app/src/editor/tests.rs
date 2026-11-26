@@ -2336,6 +2336,55 @@ fn inline_color_wraps_the_selection_and_paints_it_in_preview(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
+fn custom_inline_color_paints_on_preview_commit_and_reload(cx: &mut TestAppContext) {
+    use aero_core::colors::Slot;
+
+    let source = "前 [中文😀]{.red .blue .bg-blue} 后\n";
+    let (_dir, vault, path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    for (input, stored) in
+        [("#269a6d80", "#269A6D80"), ("rgba(38,154,109,0.374900)", "rgba(38,154,109,0.374900)")]
+    {
+        let color = content_color(Slot::Background, stored);
+        focus_unit(&editor, 0, cx);
+        select_inline_text(&editor, "中文😀", cx);
+        open_color_menu(&editor, cx);
+        cx.simulate_input(input);
+        assert!(!quads_of(cx, color).is_empty(), "pending preview of {input}");
+        assert_eq!(text(&editor, cx), source);
+        cx.simulate_keystrokes("escape");
+        assert!(quads_of(cx, color).is_empty(), "cancel restores {input}");
+
+        open_color_menu(&editor, cx);
+        cx.simulate_input(input);
+        cx.simulate_keystrokes("enter");
+        let expected = if stored.starts_with('#') {
+            format!("前 [中文😀]{{.red .blue background=\"{stored}\"}} 后\n")
+        } else {
+            format!("前 [中文😀]{{.red .blue background={stored}}} 后\n")
+        };
+        assert_eq!(text(&editor, cx), expected);
+        assert_eq!(selected_inline_text(&editor, cx), "中文😀");
+        cx.simulate_keystrokes("escape");
+        assert!(!quads_of(cx, color).is_empty(), "confirmed preview of {input}");
+
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        let (reopened, _) = Editor::load(vault.clone(), path.clone()).unwrap();
+        assert_eq!(reopened.to_string(), expected);
+        cx.update(|_, cx| {
+            let analysis = aero_core::markup::analyze(&expected);
+            let markup = editor.read(cx).presenter_markup(&expected, &analysis, &Default::default(), cx);
+            assert!(markup.styles.iter().any(|(_, style)| {
+                style.background_color == Some(color) && style.color == Some(content_color(Slot::Text, "red"))
+            }));
+        });
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(text(&editor, cx), source);
+    }
+}
+
+#[gpui_kit::test]
 fn highlight_history_clears_source_and_preview_background(cx: &mut TestAppContext) {
     let source = "正文 中文😀 后文\n";
     let (_dir, _vault, _path, editor) = open(cx, source);

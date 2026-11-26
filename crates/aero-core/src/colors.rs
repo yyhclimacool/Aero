@@ -6,8 +6,12 @@
 
 use std::ops::Range;
 
+use comrak::{Arena, parse_document};
+
 use crate::Edit;
-use crate::block::Attrs;
+use crate::block::{Attrs, tokenize_attrs};
+use crate::highlight::{self, Carrier};
+use crate::inline_links::SourceMap;
 
 /// 与 Notion 对齐的 9 色（UI 7.7）。
 pub const PALETTE: [&str; 9] =
@@ -145,8 +149,23 @@ pub(crate) fn attrs_at(src: &str, at: usize) -> Option<(Attrs, usize)> {
     if !rest.starts_with('{') || src[..at].chars().rev().take_while(|&c| c == '\\').count() % 2 == 1 {
         return None;
     }
-    let close = rest.find('}')?;
-    Attrs::parse_inner(&rest[1..close]).map(|attrs| (attrs, at + close + 1))
+    let mut quoted = false;
+    let mut escaped = false;
+    for (offset, ch) in rest.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '}' if !quoted => {
+                return Attrs::parse_inner(&rest[1..offset]).map(|attrs| (attrs, at + offset + 1));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 块末属性列表里的颜色。多行块写在后面独占行上的颜色不在这段正文里，读块上的 `attrs`。
@@ -265,7 +284,7 @@ pub fn marker_ranges(src: &str) -> Vec<Range<usize>> {
             search = open + 1;
             continue;
         };
-        if has_color(&attrs) {
+        if [Slot::Text, Slot::Background].iter().any(|slot| slot.color_of(&attrs).is_some()) {
             ranges.push(open..end);
             if open > 0 && src.as_bytes()[open - 1] == b']' {
                 ranges.push(open - 1..open);
@@ -313,8 +332,7 @@ pub enum Inline {
 ///
 /// 选区已经被 `[文本]{...}` 或紧跟 `{...}` 的行内元素承载时就地改属性，否则包一层 `[文本]{.类名}`。
 /// 去色后属性列表空了就连 `{}` 一起收掉，如果 `[ ]` 也不再承载任何属性则一并去掉。
-/// 选区比已有的颜色范围更大、并且把它整段盖住时，收掉里面的颜色标记，整段只用这次的颜色
-/// （范围逐渐扩大时以最大范围为准）。选区缩在某一段颜色里面时仍套一层，外层保持原色。
+/// 扩大选区时只移除被完整覆盖的同通道颜色。其他属性仍附着在原来的文字上。
 /// 选区跨行、跨块或改完结构变了一律拒绝，不写坏文档。
 pub fn inline_edit(src: &str, selection: Range<usize>, slot: Slot, color: Option<&str>) -> Option<Inline> {
     if slot == Slot::Border {
@@ -333,214 +351,156 @@ pub fn inline_edit(src: &str, selection: Range<usize>, slot: Slot, color: Option
     if selected.trim().is_empty() || selected.contains(['\n', '\r']) {
         return None;
     }
-    if let Some(edit) = flatten_covered(src, &selection, slot, color) {
-        return Some(edit);
+    let arena = Arena::new();
+    let root = parse_document(&arena, src, &crate::parse::comrak_options());
+    let positions = SourceMap::new(src);
+    let line = line_start(src, selection.start)
+        ..src[selection.end..].find('\n').map_or(src.len(), |i| selection.end + i);
+    let carriers = highlight::carriers(src, &line, root, &positions);
+    let existing =
+        carriers.iter().find(|carrier| carrier.content == selection || carrier.full_range() == selection);
+    let content = existing.map_or(selection.clone(), |carrier| carrier.content.clone());
+    let mut body_range = content.clone();
+    let mut edits = Vec::new();
+    for carrier in &carriers {
+        let whole = carrier.full_range();
+        let intersects = whole.start < content.end && content.start < whole.end;
+        let inside = carrier.content.start <= content.start && content.end <= carrier.content.end;
+        if intersects && !inside && !expands_over(&content, &carrier.content) {
+            // Wrapping across a partial carrier would move its attributes onto a different span.
+            return None;
+        }
+        if !expands_over(&content, &carrier.content) {
+            continue;
+        }
+        body_range.start = body_range.start.min(whole.start);
+        body_range.end = body_range.end.max(whole.end);
+        let original = attribute_source(src, carrier);
+        let attrs = write_inline_attrs(original, slot, None);
+        if attrs.is_empty() {
+            if !carrier.before.is_empty() {
+                edits.push(Edit::delete(carrier.before.clone()));
+            }
+            edits.push(Edit::delete(carrier.after.clone()));
+        } else if attrs != original {
+            edits.push(Edit::replace(carrier.attrs_range(), format!("{{{attrs}}}")));
+        }
     }
-    if slot == Slot::Background && color == Some("yellow") {
-        return Some(Inline::Highlight);
-    }
-    // 已有承载者：`[文本]{...}`（选区在括号内）或 `文本{...}`（选区恰好是元素本身）
-    let bracketed = src[..selection.start].ends_with('[') && src[selection.end..].starts_with("]{");
-    let brace = if bracketed { selection.end + 1 } else { selection.end };
-    let existing = attrs_at(src, brace).map(|(attrs, end)| (attrs, brace..end));
-    let mut attrs = existing.as_ref().map(|(attrs, _)| attrs.clone()).unwrap_or_default();
-    if color.is_some() && slot.color_of(&attrs) == color {
-        return None;
-    }
-    let before = attrs.clone();
-    slot.write(&mut attrs, color);
-    if before == attrs {
-        return None;
-    }
-    // 改写区间：有承载者就连着它一起重写，否则只包选区
-    let range = match &existing {
-        Some((_, attrs_range)) => {
-            if bracketed {
-                selection.start - 1..attrs_range.end
-            } else {
-                selection.start..attrs_range.end
+    if slot == Slot::Background && src.contains("==") {
+        for range in highlight::ranges_in(root, &positions) {
+            let open = range.start - 2..range.start;
+            let close = range.end..range.end + 2;
+            if expands_over(&content, &range)
+                && content.start <= open.start
+                && close.end <= content.end
+                && !carriers.iter().any(|carrier| {
+                    [&open, &close].iter().any(|marker| {
+                        [&carrier.before, &carrier.after].iter().any(|meta| {
+                            !meta.is_empty() && meta.start < marker.end && marker.start < meta.end
+                        })
+                    })
+                })
+            {
+                edits.push(Edit::delete(open));
+                edits.push(Edit::delete(close));
             }
         }
-        None => selection.clone(),
-    };
-    let body = if bracketed || existing.is_none() { selected } else { &src[selection.clone()] };
-    let mut out = String::with_capacity(range.len() + 16);
-    if attrs.is_empty() {
-        // 没有属性可挂：`[ ]` 也不留（它只是属性的容器）
-        out.push_str(body);
-    } else {
-        // 选区恰好是一个行内元素时属性直接挂在它后面（6.3.10 的写回规则），不再多包一层
-        let wrap = match (&existing, bracketed) {
-            (Some(_), true) => true,
-            (Some(_), false) => false,
-            (None, _) => !is_element(selected),
-        };
-        if wrap {
-            out.push('[');
-        }
-        out.push_str(body);
-        if wrap {
-            out.push(']');
-        }
-        out.push('{');
-        out.push_str(&render(&attrs));
-        out.push('}');
     }
+    let yellow = slot == Slot::Background && color == Some("yellow");
+    if yellow && existing.is_none() && edits.is_empty() && body_range == selection {
+        return Some(Inline::Highlight);
+    }
+    let original = existing.map_or("", |carrier| attribute_source(src, carrier));
+    let attrs = write_inline_attrs(original, slot, color);
+    if edits.is_empty() && attrs == original {
+        return None;
+    }
+    let bracketed = existing.map_or_else(
+        || {
+            !root.descendants().any(|node| {
+                highlight::is_inline_element(&node.data().value)
+                    && positions.range(node).is_some_and(|range| range == body_range)
+            })
+        },
+        |carrier| !carrier.before.is_empty(),
+    );
+    let mut body = src[body_range.clone()].to_owned();
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+    for edit in edits {
+        body.replace_range(
+            edit.range.start - body_range.start..edit.range.end - body_range.start,
+            &edit.text,
+        );
+    }
+    let out = if yellow && write_inline_attrs(original, slot, None).is_empty() {
+        format!("=={body}==")
+    } else if attrs.is_empty() {
+        body
+    } else if bracketed {
+        format!("[{body}]{{{attrs}}}")
+    } else {
+        format!("{body}{{{attrs}}}")
+    };
+    let range = existing.map_or(body_range.clone(), Carrier::full_range);
     let mut after = src.to_owned();
     after.replace_range(range.clone(), &out);
-    // 结构没变才算安全：包裹不能把段落、链接或表格改坏
     let before = crate::parse::parse(src).blocks;
     if !crate::inline_links::same_structure(&before, &crate::parse::parse(&after).blocks) {
         return None;
     }
     Some(Inline::Edit(Edit::replace(range, out)))
+}
+
+fn attribute_source<'a>(src: &'a str, carrier: &Carrier) -> &'a str {
+    let range = carrier.attrs_range();
+    &src[range.start + 1..range.end - 1]
+}
+
+fn write_inline_attrs(source: &str, slot: Slot, color: Option<&str>) -> String {
+    let mut tokens = tokenize_attrs(source).unwrap_or_default();
+    let count = tokens.len();
+    tokens.retain(|token| {
+        !token.strip_prefix('.').is_some_and(|class| slot.owns(class))
+            && !token.split_once('=').is_some_and(|(key, _)| key == slot.key())
+    });
+    if color.is_none() && tokens.len() == count {
+        return source.to_owned();
+    }
+    let mut added = Attrs::default();
+    slot.write(&mut added, color);
+    let added = render(&added);
+    if !added.is_empty() {
+        let at = if added.starts_with('.') {
+            tokens.iter().position(|token| token.contains('=')).unwrap_or(tokens.len())
+        } else {
+            tokens.len()
+        };
+        tokens.insert(at, &added);
+    }
+    tokens.join(" ")
 }
 
 /// 替换文本里真正被上色的那一段（不含 `[ ]` / `{...}` / `==`）。上色后用它把选区留在正文上。
 pub fn painted_content(replacement: &str) -> Range<usize> {
-    if let Some(inner) = replacement.strip_prefix('[')
-        && let Some(end) = inner.find("]{")
-        && attrs_at(replacement, 1 + end + 1).is_some_and(|(_, at)| at == replacement.len())
-    {
-        return 1..1 + end;
-    }
-    if let Some(inner) = replacement.strip_prefix("==")
-        && let Some(body) = inner.strip_suffix("==")
-        && !body.is_empty()
-        && !body.contains("==")
-    {
-        return 2..2 + body.len();
-    }
-    if let Some(brace) = replacement.rfind('{')
-        && brace > 0
-        && attrs_at(replacement, brace).is_some_and(|(_, end)| end == replacement.len())
-    {
-        return 0..brace;
-    }
-    0..replacement.len()
-}
-
-/// 选区盖住了更小的颜色范围：收掉那些标记，再按这次的颜色写整段。
-/// 没有被盖住的颜色时返回 `None`，调用方走原来的就地修改 / 套一层。
-fn flatten_covered(src: &str, selection: &Range<usize>, slot: Slot, color: Option<&str>) -> Option<Inline> {
-    let holes = covered_markup(src, selection);
-    if holes.is_empty() {
-        return None;
-    }
-    let mut range = selection.clone();
-    for hole in &holes {
-        range.start = range.start.min(hole.start);
-        range.end = range.end.max(hole.end);
-    }
-    let body = splice_out(src, &range, &holes);
-    if body.trim().is_empty() || body.contains(['\n', '\r']) {
-        return None;
-    }
-    // 选区正好是外层 `[文本]{...}` 的正文：外层保留，只换这次的这一组，里面的颜色已经收掉
-    let out = if src[..selection.start].ends_with('[')
-        && src[selection.end..].starts_with("]{")
-        && bracket_start(src, selection.end, line_start(src, selection.end)) == Some(selection.start - 1)
-    {
-        let (mut attrs, end) = attrs_at(src, selection.end + 1)?;
-        range.start = selection.start - 1;
-        range.end = end;
-        if slot == Slot::Background && color == Some("yellow") {
-            format!("=={body}==")
-        } else {
-            slot.write(&mut attrs, color);
-            if attrs.is_empty() { body } else { format!("[{body}]{{{}}}", render(&attrs)) }
-        }
-    } else if slot == Slot::Background && color == Some("yellow") {
-        format!("=={body}==")
-    } else if let Some(color) = color {
-        let mut attrs = Attrs::default();
-        slot.write(&mut attrs, Some(color));
-        let attrs = render(&attrs);
-        if is_element(&body) { format!("{body}{{{attrs}}}") } else { format!("[{body}]{{{attrs}}}") }
-    } else {
-        body
-    };
-    let mut after = src.to_owned();
-    after.replace_range(range.clone(), &out);
-    let before = crate::parse::parse(src).blocks;
-    if !crate::inline_links::same_structure(&before, &crate::parse::parse(&after).blocks) {
-        return None;
-    }
-    Some(Inline::Edit(Edit::replace(range, out)))
-}
-
-/// 被选区整段盖住、并且选区还伸出这段颜色之外的标记。这些标记要删掉。
-fn covered_markup(src: &str, selection: &Range<usize>) -> Vec<Range<usize>> {
-    let mut holes = Vec::new();
-    let mut search = 0;
-    while let Some(rel) = src[search..].find("]{") {
-        let close = search + rel;
-        let Some((attrs, end)) = attrs_at(src, close + 1) else {
-            search = close + 2;
-            continue;
-        };
-        let Some(open) = bracket_start(src, close, line_start(src, close)) else {
-            search = end;
-            continue;
-        };
-        let content = open + 1..close;
-        if expands_over(selection, &content) && has_color(&attrs) && only_colors(&attrs) {
-            holes.push(open..open + 1);
-            holes.push(close..end);
-        }
-        search = end;
-    }
-    search = 0;
-    while let Some(rel) = src[search..].find('{') {
-        let brace = search + rel;
-        if brace > 0 && src.as_bytes().get(brace - 1) == Some(&b']') {
-            search = brace + 1;
-            continue;
-        }
-        let Some((attrs, end)) = attrs_at(src, brace) else {
-            search = brace + 1;
-            continue;
-        };
-        let Some(element) = element_before(src, brace) else {
-            search = end;
-            continue;
-        };
-        if expands_over(selection, &element)
-            && has_color(&attrs)
-            && only_colors(&attrs)
-            && end <= selection.end
+    let range = 0..replacement.len();
+    if replacement.ends_with('}') || replacement.starts_with("==") {
+        let arena = Arena::new();
+        let root = parse_document(&arena, replacement, &crate::parse::comrak_options());
+        let positions = SourceMap::new(replacement);
+        if let Some(carrier) = highlight::carriers(replacement, &range, root, &positions)
+            .into_iter()
+            .find(|carrier| carrier.full_range() == range)
         {
-            holes.push(brace..end);
+            return carrier.content;
         }
-        search = end;
-    }
-    search = selection.start;
-    while let Some(rel) = src[search..selection.end].find("==") {
-        let start = search + rel;
-        if escaped(src, start) {
-            search = start + 2;
-            continue;
-        }
-        let Some(end_rel) = src[start + 2..selection.end].find("==") else { break };
-        let end = start + 2 + end_rel + 2;
-        if escaped(src, end - 2) {
-            search = start + 2;
-            continue;
-        }
-        let content = start + 2..end - 2;
-        if expands_over(selection, &content)
-            && !content.is_empty()
-            && !src[content.clone()].contains('\n')
-            && !holes.iter().any(|hole| hole.start < end && start < hole.end)
+        if let Some(inner) = highlight::ranges_in(root, &positions)
+            .into_iter()
+            .find(|inner| inner.start == 2 && inner.end + 2 == range.end)
         {
-            holes.push(start..start + 2);
-            holes.push(end - 2..end);
+            return inner;
         }
-        search = end;
     }
-    holes.retain(|hole| !hole.is_empty());
-    holes.sort_by_key(|hole| hole.start);
-    holes
+    range
 }
 
 /// 选区盖住 `content`，并且至少有一侧伸到这段颜色外面。正好重合是就地改色，不算扩大。
@@ -549,57 +509,6 @@ fn expands_over(selection: &Range<usize>, content: &Range<usize>) -> bool {
         && selection.start <= content.start
         && content.end <= selection.end
         && (selection.start < content.start || selection.end > content.end)
-}
-
-pub(crate) fn has_color(attrs: &Attrs) -> bool {
-    [Slot::Text, Slot::Background].iter().any(|slot| slot.color_of(attrs).is_some())
-}
-
-fn only_colors(attrs: &Attrs) -> bool {
-    attrs.id.is_none()
-        && attrs
-            .pairs
-            .iter()
-            .all(|(k, v)| ["color", "background"].contains(&k.as_str()) && CustomColor::parse(v).is_some())
-        && has_color(attrs)
-        && attrs.classes.iter().all(|class| Slot::Text.owns(class) || Slot::Background.owns(class))
-}
-
-fn element_before(src: &str, brace: usize) -> Option<Range<usize>> {
-    let before = &src[..brace];
-    for delimiter in ["**", "~~", "==", "`", "*", "_"] {
-        if !before.ends_with(delimiter) {
-            continue;
-        }
-        let stem_end = before.len() - delimiter.len();
-        let stem = &before[..stem_end];
-        let open = stem.rfind(delimiter)?;
-        let interior = &src[open + delimiter.len()..stem_end];
-        if interior.is_empty() || interior.contains('\n') {
-            continue;
-        }
-        return Some(open..brace);
-    }
-    None
-}
-
-fn splice_out(src: &str, range: &Range<usize>, holes: &[Range<usize>]) -> String {
-    let mut out = String::with_capacity(range.len());
-    let mut at = range.start;
-    for hole in holes {
-        if hole.end <= at || hole.start >= range.end {
-            continue;
-        }
-        let start = hole.start.max(range.start);
-        let end = hole.end.min(range.end);
-        if start < at {
-            continue;
-        }
-        out.push_str(&src[at..start]);
-        at = end;
-    }
-    out.push_str(&src[at..range.end]);
-    out
 }
 
 pub(crate) fn line_start(src: &str, at: usize) -> usize {
@@ -627,14 +536,6 @@ pub(crate) fn bracket_start(src: &str, close: usize, limit: usize) -> Option<usi
 
 fn escaped(src: &str, at: usize) -> bool {
     src[..at].chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
-}
-
-/// 选区是否恰好是一个完整的行内元素（`**粗**`、`*斜*`、`` `码` ``、`~~删~~`、`==高亮==`）。
-/// 链接 / 嵌入等其他形态先按"包一层"处理，由 `same_structure` 兜底拒绝改坏结构的情况。
-fn is_element(selected: &str) -> bool {
-    ["**", "~~", "==", "`", "*", "_"]
-        .iter()
-        .any(|d| selected.len() > d.len() * 2 && selected.starts_with(d) && selected.ends_with(d))
 }
 
 /// 属性列表内部的源码：`#id` 在前，其次类名，最后 `key=value`，与解析顺序一致。
@@ -780,7 +681,7 @@ mod tests {
             "[也[可以通过[「文件 → 关闭 Vault」回到库选择页，再从最近列]{.blue}表]{.pink}切换。]{.bg-blue}";
         assert_eq!(
             edit(&format!("{nested}\n"), nested, Slot::Background, Some("green")),
-            "[也可以通过「文件 → 关闭 Vault」回到库选择页，再从最近列表切换。]{.bg-green}\n"
+            "[也[可以通过[「文件 → 关闭 Vault」回到库选择页，再从最近列]{.blue}表]{.pink}切换。]{.bg-green}\n"
         );
         // 选区正好是外层正文：收掉里面的颜色，外层换成本次的颜色
         let outer = "也[可以通过[「文件」]{.blue}表]{.pink}切换。";
@@ -794,6 +695,44 @@ mod tests {
             edit(wide, "「文件」", Slot::Text, Some("blue")),
             "[也可以通过[「文件」]{.blue}表切换。]{.bg-blue}\n"
         );
+    }
+
+    #[test]
+    fn expanding_inline_color_preserves_other_channels_and_attributes() {
+        let cases = [
+            (
+                r#"前 [字]{.red background="rgba(12, 34, 56, 0.374900)" note="keep } verbatim"} 后"#,
+                Slot::Text,
+                "blue",
+                r#"[前 [字]{background="rgba(12, 34, 56, 0.374900)" note="keep } verbatim"} 后]{.blue}"#,
+            ),
+            (
+                r##"前 **粗**{.bg-blue color="#112233"} 后"##,
+                Slot::Background,
+                "green",
+                r##"[前 **粗**{color="#112233"} 后]{.bg-green}"##,
+            ),
+            ("前 ==亮== 与 [字]{.red} 后", Slot::Text, "blue", "[前 ==亮== 与 字 后]{.blue}"),
+            (
+                r#"前 [**粗**{.bg-blue} 字]{.red #kept note="a b"} 后"#,
+                Slot::Background,
+                "yellow",
+                r#"前 [**粗** 字]{.red #kept .bg-yellow note="a b"} 后"#,
+            ),
+        ];
+        for (source, slot, color, expected) in cases {
+            let selection = if slot == Slot::Background && color == "yellow" {
+                source.find("**").unwrap()..source.find("]{").unwrap()
+            } else {
+                0..source.len()
+            };
+            let Some(Inline::Edit(edit)) = inline_edit(source, selection, slot, Some(color)) else {
+                panic!("missing color edit for {source}");
+            };
+            let mut doc = Document::from_text(source);
+            doc.edit(edit).unwrap();
+            assert_eq!(doc.to_string(), expected);
+        }
     }
 
     /// 读回选区上的颜色：菜单用它画选中标记。

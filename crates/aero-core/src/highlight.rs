@@ -21,7 +21,10 @@ pub fn ranges(src: &str) -> Vec<Range<usize>> {
     }
     let arena = Arena::new();
     let root = parse_document(&arena, src, &parse::comrak_options());
-    let positions = SourceMap::new(src);
+    ranges_in(root, &SourceMap::new(src))
+}
+
+pub(crate) fn ranges_in<'a>(root: &'a AstNode<'a>, positions: &SourceMap) -> Vec<Range<usize>> {
     root.descendants()
         .filter(|n| matches!(n.data().value, NodeValue::Highlight))
         .filter_map(|n| {
@@ -60,7 +63,7 @@ pub fn preview(src: &str, range: Range<usize>) -> Option<Preview> {
         let arena = Arena::new();
         let root = parse_document(&arena, src, &options);
         let node = block_node(root, src, &range)?;
-        let carriers = carriers(src, &range, node);
+        let carriers = render_carriers(src, &range, node);
         if carriers.is_empty() && !node.descendants().any(|n| matches!(n.data().value, NodeValue::Highlight))
         {
             return None;
@@ -160,23 +163,35 @@ fn is_sentinel(c: char) -> bool {
 }
 
 /// 一处行内属性列表（6.3.10）：`[文本]{...}`，或紧跟行内元素的 `{...}`。
-struct Carrier {
+pub(crate) struct Carrier {
     /// 上色的正文
-    content: Range<usize>,
+    pub content: Range<usize>,
     /// 渲染时要隐藏的两段标记：`[`（元素形式为空区间）与 `]{...}` / `{...}`
-    before: Range<usize>,
-    after: Range<usize>,
-    /// 调色板里的类名（`red` / `bg-blue`），空表示这一处不上色，只隐藏标记
-    classes: String,
+    pub before: Range<usize>,
+    pub after: Range<usize>,
+    pub attrs: crate::Attrs,
+}
+
+impl Carrier {
+    pub(crate) fn full_range(&self) -> Range<usize> {
+        self.before.start..self.after.end
+    }
+
+    pub(crate) fn attrs_range(&self) -> Range<usize> {
+        self.after.start + usize::from(!self.before.is_empty())..self.after.end
+    }
 }
 
 /// 一个块里的行内属性承载者，按出现顺序。代码、数学、HTML 里的 `{...}` 不算属性列表。
-fn carriers<'a>(src: &str, range: &Range<usize>, block: &'a AstNode<'a>) -> Vec<Carrier> {
-    // 正文里自带私有使用区字符时不上色：那些字符正是改写用的哨兵，混在一起会画出错位的 span
-    if src.get(range.clone()).is_none_or(|text| text.contains(is_sentinel)) {
+pub(crate) fn carriers<'a>(
+    src: &str,
+    range: &Range<usize>,
+    block: &'a AstNode<'a>,
+    positions: &SourceMap,
+) -> Vec<Carrier> {
+    let Some(text) = src.get(range.clone()).filter(|text| text.contains('{')) else {
         return Vec::new();
-    }
-    let positions = SourceMap::new(src);
+    };
     let mut protected: Vec<Range<usize>> = Vec::new();
     let mut out: Vec<Carrier> = Vec::new();
     for node in block.descendants() {
@@ -198,6 +213,7 @@ fn carriers<'a>(src: &str, range: &Range<usize>, block: &'a AstNode<'a>) -> Vec<
                 | NodeValue::HtmlInline(_)
                 | NodeValue::HtmlBlock(_)
                 | NodeValue::WikiLink(_)
+                | NodeValue::FrontMatter(_)
         ) {
             protected.push(content.clone());
         }
@@ -206,33 +222,30 @@ fn carriers<'a>(src: &str, range: &Range<usize>, block: &'a AstNode<'a>) -> Vec<
         }
         // 元素形式：属性紧跟行内元素之后（`**粗**{.blue}`），或已经被 comrak 收进节点（`` `码`{.red} ``、链接）
         let after = content.end;
-        if let Some((list, end)) = colors::attrs_at(src, after) {
+        if content.start >= range.start
+            && let Some((attrs, end)) = colors::attrs_at(src, after)
+            && end <= range.end
+        {
             out.push(Carrier {
                 content: content.clone(),
                 before: content.start..content.start,
                 after: after..end,
-                classes: classes(&list),
+                attrs,
             });
         }
     }
     // `[文本]{...}` 形式：`]` 紧跟属性列表，向前找配对的 `[`
-    let Some(text) = src.get(range.clone()) else { return out };
     for (at, _) in text.match_indices(']') {
         let close = range.start + at;
         if escaped(src, close) {
             continue;
         }
-        let Some((list, end)) = colors::attrs_at(src, close + 1) else { continue };
-        let Some(open) = bracket_start(src, close, range.start) else { continue };
-        if open + 1 == close {
+        let Some((attrs, end)) = colors::attrs_at(src, close + 1) else { continue };
+        let Some(open) = colors::bracket_start(src, close, range.start) else { continue };
+        if open + 1 == close || end > range.end {
             continue;
         }
-        out.push(Carrier {
-            content: open + 1..close,
-            before: open..open + 1,
-            after: close..end,
-            classes: classes(&list),
-        });
+        out.push(Carrier { content: open + 1..close, before: open..open + 1, after: close..end, attrs });
     }
     out.retain(|c| !protected.iter().any(|p| overlaps(p, &c.before) || overlaps(p, &c.after)));
     out.sort_by_key(|c| (c.content.start, std::cmp::Reverse(c.content.end)));
@@ -247,12 +260,21 @@ fn carriers<'a>(src: &str, range: &Range<usize>, block: &'a AstNode<'a>) -> Vec<
             kept.push(c);
         }
     }
-    kept.truncate(MAX_CARRIERS);
     kept
 }
 
+fn render_carriers<'a>(src: &str, range: &Range<usize>, block: &'a AstNode<'a>) -> Vec<Carrier> {
+    // Leave literal private-use characters alone when they coincide with the HTML sentinels.
+    if src.get(range.clone()).is_none_or(|text| text.contains(is_sentinel)) {
+        return Vec::new();
+    }
+    let mut found = carriers(src, range, block, &SourceMap::new(src));
+    found.truncate(MAX_CARRIERS);
+    found
+}
+
 /// 能承载属性列表的行内元素（6.3.10：强调、代码、链接、`==高亮==` 等）。
-fn is_inline_element(value: &NodeValue) -> bool {
+pub(crate) fn is_inline_element(value: &NodeValue) -> bool {
     matches!(
         value,
         NodeValue::Strong
@@ -279,25 +301,6 @@ fn classes(attrs: &crate::block::Attrs) -> String {
         }
     }
     out.join(" ")
-}
-
-/// `close` 处 `]` 配对的 `[` 的位置（同一块内、未转义、允许嵌套）。
-fn bracket_start(src: &str, close: usize, limit: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (at, ch) in src[limit..close].char_indices().rev() {
-        let at = limit + at;
-        if !matches!(ch, '[' | ']') || escaped(src, at) {
-            continue;
-        }
-        if ch == ']' {
-            depth += 1;
-        } else if depth == 0 {
-            return Some(at);
-        } else {
-            depth -= 1;
-        }
-    }
-    None
 }
 
 fn escaped(src: &str, at: usize) -> bool {
@@ -340,12 +343,13 @@ fn paint(lines: &mut [String], carriers: &[Carrier]) {
     if carriers.is_empty() {
         return;
     }
-    let tag = |ix: usize| match carriers.get(ix) {
-        Some(c) if !c.classes.is_empty() => format!("<span class=\"{}\">", c.classes),
+    let colors: Vec<_> = carriers.iter().map(|c| classes(&c.attrs)).collect();
+    let tag = |ix: usize| match colors.get(ix) {
+        Some(classes) if !classes.is_empty() => format!("<span class=\"{classes}\">"),
         _ => String::new(),
     };
-    let end_tag = |ix: usize| match carriers.get(ix) {
-        Some(c) if !c.classes.is_empty() => "</span>",
+    let end_tag = |ix: usize| match colors.get(ix) {
+        Some(classes) if !classes.is_empty() => "</span>",
         _ => "",
     };
     let mut carried: Vec<usize> = Vec::new();
@@ -389,7 +393,7 @@ pub fn export_html(src: &str) -> String {
     let found = {
         let arena = Arena::new();
         let root = parse_document(&arena, src, &options);
-        carriers(src, &range, root)
+        render_carriers(src, &range, root)
     };
     let source = if found.is_empty() { src.to_owned() } else { rewrite(src, &range, &found).0 };
     let arena = Arena::new();
