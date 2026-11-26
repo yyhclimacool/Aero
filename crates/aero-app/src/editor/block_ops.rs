@@ -131,6 +131,13 @@ fn removal_range(doc: &Document, text: &str, id: BlockId) -> Option<Range<usize>
     Some(range)
 }
 
+/// Delete one continuous range, including blank lines between adjacent siblings.
+pub(super) fn deletion_span(doc: &Document, text: &str, ids: &[BlockId]) -> Option<Range<usize>> {
+    let first = ids.first().and_then(|&id| removal_range(doc, text, id))?;
+    let last = ids.last().and_then(|&id| removal_range(doc, text, id))?;
+    Some(first.start..last.end)
+}
+
 /// Remove the selected nodes in one undo group, retaining unselected syntax
 /// between them. Coordinates are ordered from the end of the document.
 pub(super) fn deletions(doc: &Document, text: &str, ids: &[BlockId]) -> Vec<Edit> {

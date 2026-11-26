@@ -1,6 +1,6 @@
 # 块交互体验实现差距与代码审查（2026-10-21）
 
-状态更新于 2026-11-26。G01–G04、G06、G07、G11 已通过专项验收，G05、G08–G10 仍开放。本记录对照 [A01–A37 与 P1–P3 需求基线](../edit_experience/edit_experience_request.md#15-验收标准) 跟踪实现与验收。
+状态更新于 2026-11-26。G01–G07、G11 已通过专项验收，G08–G10 仍开放。本记录对照 [A01–A37 与 P1–P3 需求基线](../edit_experience/edit_experience_request.md#15-验收标准) 跟踪实现与验收。
 
 ## 审查范围与证据边界
 
@@ -29,7 +29,7 @@
 | G02 | 高 | 子块操作范围与选中后输入（已通过专项验收） | 操作按树节点选取，跨块选区删除后保留未选父容器。选中容器后直接输入进入首个可编辑子块。 | A02、A04、A14、A27、A28 | [节点范围](../../crates/aero-app/src/editor/block_ops.rs)、[拖动分派](../../crates/aero-app/src/editor/block_menu.rs#L239)、[选中后输入](../../crates/aero-app/src/editor/selected_input.rs) |
 | G03 | 高 | 容器连续编辑与嵌套移动（已通过专项验收） | 内部与末尾空位分流，空行归入最深层容器；非空首子块 Backspace 保持边界。嵌套移动同步延长祖先围栏并校验结构，Into 有独立标识，有身份容器的解除入口置灰并解释。 | A04、A08、A20、A24、A27、A36 | [连续编辑](../../crates/aero-app/src/editor/ops.rs#L22)、[空行归属](../../crates/aero-app/src/editor/empty_slots.rs#L72)、[围栏扩展](../../crates/aero-core/src/containers.rs#L175)、[Into 与门禁](../../crates/aero-app/src/editor/block_menu.rs#L161) |
 | G04 | 高 | 行内自定义颜色（已通过专项验收） | 编辑和预览按通道取最后一个有效自定义色，否则取第一个有效预设。扩大选区时只改目标通道，其他颜色和未知属性保留。 | A10、A11、A34 | [颜色标记解析](../../crates/aero-core/src/markup.rs#L304)、[颜色绘制](../../crates/aero-app/src/editor/presenter.rs#L408)、[选区写回](../../crates/aero-core/src/colors.rs#L337) |
-| G05 | 中 | 取色与恢复默认：部分实现；无效旧值提示：尚未实现 | 块目标预览已接入，但从行内目标勾选“应用到整块”时预览被排除；旧无效属性静默忽略。选中 `==高亮==` 内的正文后恢复默认背景不能清除高亮。图形取色事件会重新序列化色值，源通道／精度契约仍需补齐。 | A10、A11、A34 | [图形取色序列化](../../crates/aero-app/src/editor/colors_ui.rs#L304-L317)、[有效颜色读取](../../crates/aero-app/src/editor/colors_ui.rs#L348-L355)、[错误与预览](../../crates/aero-app/src/editor/colors_ui.rs#L693-L741)、[默认清除](../../crates/aero-core/src/colors.rs#L319-L354) |
+| G05 | 中 | 取色与恢复默认（已通过专项验收） | 行内转整块保留临时预览，取消不写入。恢复默认可清除精确高亮选区的成对标记；块与行内无效旧值有提示且不参与绘制。取色保留 HEX/RGBA 形式、HEX alpha 通道和 RGBA 小数字符串精度。 | A10、A11、A34 | [预览与无效值](../../crates/aero-app/src/editor/colors_ui.rs#L719)、[取色序列化](../../crates/aero-app/src/editor/colors_ui.rs#L754)、[高亮恢复](../../crates/aero-core/src/colors.rs#L389) |
 | G06 | 中 | 列表缩进（已通过专项验收） | 列表菜单与 Tab 调整整项结构并保留子树和身份，非末项出缩收养后续同级；普通段落只改变视觉偏移。空项与无结构落点的按键行为明确，0／8 级和当前可用宽度不足 160 pt 时禁用增加。 | A12、A28 | [结构层级](../../crates/aero-app/src/editor/ops.rs#L473)、[Tab 分派](../../crates/aero-app/src/editor/mod.rs#L2196)、[布局与门禁](../../crates/aero-app/src/editor/block_menu.rs#L657) |
 | G07 | 高 | 同步引用与身份（已通过专项验收） | 目标撤销保留跨文档来源身份。复制保留外部身份地址，并用新 ID 重映射副本内部引用。来源选择与提交校验库内文档 ID、主块 ID 和别名。 | A14、A29、A30、A33 | [同步插入事务](../../crates/aero-app/src/workspace/files.rs#L203)、[身份检查](../../crates/aero-core/src/block_refs.rs#L109)、[副本引用映射](../../crates/aero-core/src/clipboard.rs#L315) |
 | G08 | 中 | 链接与同步异常展示：部分实现；异常跳转入口：尚未实现 | 普通段落链接未实现正文中的动态“标题＋摘要”，新复制地址也未带可读名称；悬停预览已有相关信息，不能记为完全缺失。同步来源冲突未透传到引用状态，循环／超过 3 跳占位缺少来源信息及继续跳转入口。 | A16、A30 | [链接生成](../../crates/aero-app/src/editor/toolbar.rs#L204-L222)、[已有悬停摘要](../../crates/aero-app/src/editor/link_preview.rs#L632-L650)、[内存来源状态](../../crates/aero-app/src/editor/live_sources.rs#L101-L129)、[异常展示](../../crates/aero-app/src/editor/preview.rs#L371-L451) |
@@ -81,12 +81,20 @@
 - 核心回归覆盖背景与文字双向保留、嵌套及直接挂在行内元素后的属性、未知属性和有引号的值，以及有效自定义值与预设的优先级。GPUI 回归覆盖两种输入的预览、取消、确认、保存读回和一次撤销。
 - 富文本 HTML 预览使用控件支持的 8 位 HEX 透明度，编辑器绘制与 Markdown 写回直接使用输入的 RGBA 精度。四个正式 crate 共 1,036 项通过、3 项忽略，应用和核心 crate 的严格 Clippy 检查通过。
 
+### G05 专项验收（2026-11-26）
+
+- 核心回归验证精确选中 `==高亮==` 正文后恢复默认会删除定界符，重复黄色仍保持切换语义；其他颜色和结构回归保持通过。
+- 无头 GPUI 验证行内转整块的临时预览、原文不变、块与行内无效旧值提示，以及确认和取消路径。取色序列化覆盖相同色值复用原文、HEX8 通道及 RGBA 小数字符串精度。
+- 真实窗口菜单选区路径未能稳定复现整块预览与恢复默认，因此不将其记为真实界面通过；当前证据以无头 GPUI 和核心回归为准。
+- `cargo test --locked -p aero-app -p aero-core` 共 949 项通过、2 项忽略，应用和核心 crate 的严格 Clippy 检查通过。
+
 ### G06 专项验收（2026-11-26）
 
 - `ops` 回归覆盖整项增加／减少层级、空项和无结构落点、非末项出缩收养后续同级，以及子树、身份和撤销保持。普通段落仅写 `indent` 属性，不建立父子关系；0／8 级与 160 pt 宽度边界有变异回归，真实 `unit_bounds` 已扣当前级数时只再预留 24 pt。
+- 补充松散引用列表的连续删除与顺序回归，后续项不重复、嵌套引用前缀不重复；列表内代码块的 Tab 保持代码缩进，不进入列表层级操作。
 - 无头 GPUI 覆盖连续 Tab／Shift-Tab、空项自身定位、不可调整按键消费、菜单结构操作和禁用项遮挡。菜单内部动作、普通外部点击及链接外部点击均有独立回归。
 - 真实窗口在第二项正文按 Tab，落盘确认该项及其续段、嵌套子树移入前一项，随后 Shift-Tab 出缩；普通段落未发生结构修改。
-- `cargo test --locked -p aero-app -p aero-core` 共 941 项通过、2 项忽略，应用和核心 crate 的严格 Clippy 检查通过。
+- `cargo test --locked -p aero-app -p aero-core` 共 949 项通过、2 项忽略，应用和核心 crate 的严格 Clippy 检查通过。
 
 ### G07 专项验收（2026-11-25）
 
@@ -110,8 +118,8 @@
 
 ## 修复与验收顺序
 
-1. **已通过专项验收**。G01–G04、G06、G07、G11。
-2. **补齐样式与交互**。G05、G08–G10。
+1. **已通过专项验收**。G01–G07、G11。
+2. **补齐样式与交互**。G08–G10。
 3. 每项先补最小失败回归，再修复并复跑受影响 crate；G10 的字素换行修复需覆盖输入底座已有回归。历史指纹变化的路径不得沿用旧日志作为当前基线证据。
 4. 代码稳定后集中执行 A01–A37、原生 IME／表情点选和 P1–P3。功能修复完成与验收完成分别登记，不用测试总数推算需求完成率。
 

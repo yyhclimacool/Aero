@@ -2201,6 +2201,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> ListLevelOutcome {
         self.ensure_current_parse();
+        if self.editing_code() {
+            return ListLevelOutcome::NotList;
+        }
         let Some(id) = self.focused_block_id() else { return ListLevelOutcome::NotList };
         let item = self
             .doc

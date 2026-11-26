@@ -175,6 +175,20 @@ pub fn block_color(src: &str, block: Range<usize>, slot: Slot) -> Option<String>
     slot.color_of(trailing.attrs.as_ref()?).map(str::to_owned)
 }
 
+/// Return the byte length of visible inline content, excluding attributes and trailing markers.
+pub fn inline_content_len(src: &str) -> usize {
+    let mut visible = String::new();
+    let mut last = 0;
+    for (at, _) in src.char_indices().filter(|(_, ch)| *ch == '{') {
+        if let Some((_, end)) = attrs_at(src, at) {
+            visible.push_str(&src[last..at]);
+            last = end;
+        }
+    }
+    visible.push_str(&src[last..]);
+    crate::parse::markers::strip_trailing(&visible).content_len
+}
+
 /// 给一个块上色 / 去色：`color` 为 `None` 时移除这一组（对应菜单里的"默认"）。
 ///
 /// 单行块把属性列表写在块末。多行块写在后面的独占行 `{.bg-gray}`，规则同 `^id`。
@@ -320,6 +334,21 @@ pub fn inline_color(src: &str, selection: Range<usize>, slot: Slot) -> Option<St
     slot.color_of(&attrs).map(str::to_owned)
 }
 
+/// Return an invalid custom color value attached to an inline selection.
+pub fn inline_invalid_color(src: &str, selection: Range<usize>, slot: Slot) -> Option<String> {
+    if selection.is_empty() {
+        return None;
+    }
+    let bracketed = src[..selection.start].ends_with('[') && src[selection.end..].starts_with("]{");
+    let brace = if bracketed { selection.end + 1 } else { selection.end };
+    let (attrs, _) = attrs_at(src, brace)?;
+    attrs
+        .pairs
+        .iter()
+        .find(|(key, value)| *key == slot.key() && CustomColor::parse(value).is_none())
+        .map(|(_, value)| value.clone())
+}
+
 /// 行内颜色的写回方式。
 pub enum Inline {
     Edit(Edit),
@@ -390,9 +419,11 @@ pub fn inline_edit(src: &str, selection: Range<usize>, slot: Slot, color: Option
         for range in highlight::ranges_in(root, &positions) {
             let open = range.start - 2..range.start;
             let close = range.end..range.end + 2;
-            if expands_over(&content, &range)
-                && content.start <= open.start
-                && close.end <= content.end
+            let exact = content == range && open.start <= content.start && content.end <= close.end;
+            let expanded =
+                expands_over(&content, &range) && content.start <= open.start && close.end <= content.end;
+            if color != Some("yellow")
+                && (exact || expanded)
                 && !carriers.iter().any(|carrier| {
                     [&open, &close].iter().any(|marker| {
                         [&carrier.before, &carrier.after].iter().any(|meta| {
@@ -401,6 +432,8 @@ pub fn inline_edit(src: &str, selection: Range<usize>, slot: Slot, color: Option
                     })
                 })
             {
+                body_range.start = body_range.start.min(open.start);
+                body_range.end = body_range.end.max(close.end);
                 edits.push(Edit::delete(open));
                 edits.push(Edit::delete(close));
             }
@@ -545,7 +578,9 @@ fn render(attrs: &Attrs) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Inline, PALETTE, Slot, block_color, block_edit, inline_color, inline_edit};
+    use super::{
+        Inline, PALETTE, Slot, block_color, block_edit, inline_color, inline_content_len, inline_edit,
+    };
     use crate::Document;
 
     /// 在文档上真正应用一次块上色，返回改完的源码。
@@ -655,6 +690,54 @@ mod tests {
         let source = "第一行\n第二行\n";
         assert!(inline_edit(source, 0..source.len(), Slot::Text, Some("red")).is_none());
         assert!(inline_edit("前 文字\n", 1..2, Slot::Text, Some("red")).is_none());
+    }
+
+    #[test]
+    fn restoring_default_removes_exact_highlight_delimiters() {
+        let source = "前 ==高亮== 后\n";
+        let at = source.find("高亮").unwrap();
+        let Some(Inline::Edit(edit)) = inline_edit(source, at..at + "高亮".len(), Slot::Background, None)
+        else {
+            panic!("exact highlight selection should be editable");
+        };
+        let mut doc = Document::from_text(source);
+        doc.edit(edit).unwrap();
+        assert_eq!(doc.to_string(), "前 高亮 后\n");
+    }
+
+    #[test]
+    fn inline_content_length_excludes_attributes_and_markers() {
+        assert_eq!(inline_content_len("第一段{background=\"rgba(1,2,3,1.5)\"} {background=\"#bad\"}"), 9);
+        assert_eq!(inline_content_len("第一段"), 9);
+    }
+
+    #[test]
+    fn restoring_default_handles_expanded_and_attributed_highlights() {
+        let source = "前 ==高亮== 后\n";
+        let Some(Inline::Edit(edit)) =
+            inline_edit(source, 0..source.trim_end().len(), Slot::Background, None)
+        else {
+            panic!("expanded highlight selection should be editable");
+        };
+        let mut doc = Document::from_text(source);
+        doc.edit(edit).unwrap();
+        assert_eq!(doc.to_string(), "前 高亮 后\n");
+
+        let source = "前 ==高亮=={.red} 后\n";
+        let at = source.find("高亮").unwrap();
+        let Some(Inline::Edit(edit)) = inline_edit(source, at..at + "高亮".len(), Slot::Background, None)
+        else {
+            panic!("attributed highlight should be editable");
+        };
+        let mut doc = Document::from_text(source);
+        doc.edit(edit).unwrap();
+        assert_eq!(doc.to_string(), "前 高亮{.red} 后\n");
+
+        assert!(matches!(
+            inline_edit(source, at..at + "高亮".len(), Slot::Background, Some("yellow")),
+            Some(Inline::Highlight)
+        ));
+        assert!(inline_edit(source, at + 1..at + 2, Slot::Background, None).is_none());
     }
 
     /// 选区扩大盖住已有颜色时，以这一次的范围为准，不再一层层套；缩小则外层保留、内层用新颜色。

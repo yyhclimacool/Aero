@@ -2034,6 +2034,26 @@ fn color_menu_can_apply_a_full_selection_to_the_whole_block(cx: &mut TestAppCont
     assert_eq!(text(&editor, cx), "第一段 {.blue}\n");
 }
 
+#[gpui_kit::test]
+fn color_menu_whole_block_preview_uses_pending_color(cx: &mut TestAppContext) {
+    let source = "第一段\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "第一段", cx);
+    open_color_menu(&editor, cx);
+    let switch = cx.debug_bounds("color-apply-block").unwrap();
+    cx.simulate_click(switch.center(), gpui_kit::Modifiers::default());
+    cx.simulate_input("rgba(38,154,109,0.374900)");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let id = e.doc.blocks().roots[0].id;
+        let attrs = e.preview_attrs(id, &Default::default());
+        assert_eq!(aero_core::colors::Slot::Background.color_of(&attrs), Some("rgba(38,154,109,0.374900)"));
+    });
+    assert_eq!(text(&editor, cx), source);
+}
+
 /// 编辑态没有选区时菜单改当前块；块选中态一次改选中的每一块（7.7）。
 #[gpui_kit::test]
 fn color_menu_colors_blocks_when_no_text_is_selected(cx: &mut TestAppContext) {
@@ -2073,6 +2093,72 @@ fn color_menu_colors_blocks_when_no_text_is_selected(cx: &mut TestAppContext) {
     assert_eq!(cx.update(|_, cx| editor.read(cx).selected_blocks()), Some(0..2), "选区还在");
     cx.simulate_keystrokes("cmd-z");
     assert_eq!(text(&editor, cx), "第一段 {.bg-gray}\n\n第二段\n");
+}
+
+#[gpui_kit::test]
+fn color_menu_warns_about_invalid_existing_values(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "段落 {background=\"#bad\"}\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    open_color_menu(&editor, cx);
+    assert!(cx.debug_bounds("color-invalid-value-#bad").is_some(), "块旧无效色值应提示");
+    cx.simulate_keystrokes("escape");
+
+    let (_dir2, _vault2, _path2, editor) =
+        open(cx, "第一段{background=\"rgba(1,2,3,1.5)\"} {background=\"#bad\"}\n");
+    let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+    focus_unit(&editor, 0, cx);
+    select_inline_text(&editor, "第一段", cx);
+    open_color_menu(&editor, cx);
+    assert!(cx.debug_bounds("color-apply-block").is_some(), "带属性全段也应能切换整块");
+    assert!(cx.debug_bounds("color-invalid-value-rgba(1,2,3,1.5)").is_some(), "行内旧无效色值应提示");
+    let switch = cx.debug_bounds("color-apply-block").unwrap();
+    cx.simulate_click(switch.center(), gpui_kit::Modifiers::default());
+    assert!(cx.debug_bounds("color-invalid-value-#bad").is_some(), "切换整块后应显示目标块旧无效值");
+    assert!(cx.debug_bounds("color-invalid-value-rgba(1,2,3,1.5)").is_none());
+
+    cx.simulate_keystrokes("escape");
+    focus_unit(&editor, 0, cx);
+    cx.update(|_, cx| {
+        let input = editor.read(cx).focused.as_ref().unwrap().textarea.clone();
+        let len = input.read(cx).value().len();
+        input.update(cx, |ta, cx| ta.set_selected_range(0..len, cx));
+    });
+    open_color_menu(&editor, cx);
+    assert!(cx.debug_bounds("color-apply-block").is_some(), "全选含属性源码也应能切换整块");
+}
+
+#[gpui_kit::test]
+fn picker_color_serialization_preserves_source_format_and_alpha_precision(_cx: &mut TestAppContext) {
+    let color = |source| {
+        let parsed = aero_core::colors::CustomColor::parse(source).unwrap();
+        gpui_kit::Hsla::from(gpui_kit::Rgba {
+            r: parsed.red as f32 / 255.,
+            g: parsed.green as f32 / 255.,
+            b: parsed.blue as f32 / 255.,
+            a: parsed.alpha,
+        })
+    };
+    let rgba = "rgba(38,154,109,0.374900)";
+    assert_eq!(Editor::serialize_picker_color(color(rgba), Some(rgba)), rgba);
+    assert_eq!(Editor::serialize_picker_color(color("#269A6D80"), Some("#269A6D80")), "#269A6D80");
+
+    let changed = gpui_kit::Hsla::from(gpui_kit::Rgba { r: 1., g: 0.5, b: 0.25, a: 0.3749 });
+    assert_eq!(Editor::serialize_picker_color(changed, Some(rgba)), "rgba(255,128,64,0.374900)");
+    let changed_hex = gpui_kit::Hsla::from(gpui_kit::Rgba { r: 1., g: 0.5, b: 0.25, a: 97. / 255. });
+    assert_eq!(Editor::serialize_picker_color(changed_hex, Some("#00000061")), "#FF804061");
+
+    assert_eq!(
+        Editor::serialize_picker_color(changed, Some("rgba(38,154,109,0.374900) \u{2003}")),
+        "rgba(255,128,64,0.374900)"
+    );
+    assert_eq!(
+        Editor::serialize_picker_color(changed, Some("rgba(38,154,109,0.374900) ")),
+        "rgba(255,128,64,0.374900)"
+    );
+    assert_eq!(Editor::serialize_picker_color(changed, Some("#00000000")), "#FF804060");
+    let opaque = gpui_kit::Hsla::from(gpui_kit::Rgba { r: 1., g: 0.5, b: 0.25, a: 1. });
+    assert_eq!(Editor::serialize_picker_color(opaque, Some("rgba(0,0,0,1)")), "rgba(255,128,64,1)");
 }
 
 /// `/` 菜单里的颜色（7.1）：`/颜色` 开菜单，`/蓝色背景` 直接给当前块上色。
@@ -5523,6 +5609,19 @@ fn tab_handles_empty_items_and_unavailable_list_targets(cx: &mut TestAppContext)
     focus_unit(&editor, 0, cx);
     cx.simulate_keystrokes("tab");
     assert_eq!(text(&editor, cx), "- only\n");
+}
+
+#[gpui_kit::test]
+fn tab_inside_a_nested_code_block_is_not_list_indent(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "- ```\n  code\n  ```\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("tab shift-tab");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.doc.blocks().roots.len(), 1);
+        assert!(matches!(e.doc.blocks().roots[0].kind, aero_core::BlockKind::List { .. }));
+    });
 }
 
 #[gpui_kit::test]

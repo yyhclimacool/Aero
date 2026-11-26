@@ -24,6 +24,28 @@ enum Target {
     Blocks(Vec<BlockId>),
 }
 
+fn invalid_colors(attrs: &aero_core::Attrs) -> Vec<(Slot, String)> {
+    [Slot::Text, Slot::Background, Slot::Border]
+        .into_iter()
+        .filter_map(|slot| {
+            attrs
+                .pairs
+                .iter()
+                .find(|(key, value)| *key == slot.key() && colors::CustomColor::parse(value).is_none())
+                .map(|(_, value)| (slot, value.clone()))
+        })
+        .collect()
+}
+
+fn invalid_inline_colors(source: &str, selection: Range<usize>) -> Vec<(Slot, String)> {
+    [Slot::Text, Slot::Background]
+        .into_iter()
+        .filter_map(|slot| {
+            colors::inline_invalid_color(source, selection.clone(), slot).map(|value| (slot, value))
+        })
+        .collect()
+}
+
 /// 颜色菜单态（7.7）。
 pub(super) struct ColorMenu {
     allowed: [bool; 3],
@@ -31,6 +53,7 @@ pub(super) struct ColorMenu {
     target: Target,
     picker: Entity<ColorPickerState>,
     custom: Option<String>,
+    source: Option<String>,
     custom_slot: Slot,
     _picker_subscription: Subscription,
     /// 过滤输入框：菜单打开时持有焦点，中文也能输入
@@ -41,6 +64,7 @@ pub(super) struct ColorMenu {
     selected: usize,
     /// 打开时目标已有的颜色（文字、背景），用来画选中标记
     current: [Option<String>; 3],
+    invalid: Vec<(Slot, String)>,
     /// 选区盖住整块时可以改去给块上色。`None` 表示这次菜单没有这个开关。
     whole_block_id: Option<BlockId>,
     whole_block: bool,
@@ -273,11 +297,23 @@ impl Editor {
                 (None, None) => return false,
             }
         };
+        let invalid = match &target {
+            Target::Blocks(ids) => ids
+                .iter()
+                .filter_map(|id| self.doc.blocks().find(*id))
+                .flat_map(|block| invalid_colors(&block.attrs))
+                .collect(),
+            Target::Inline(selection) => invalid_inline_colors(&source, selection.clone()),
+        };
         let whole_block_id = match &self.focused {
             Some(f) if matches!(target, Target::Inline(_)) => {
                 let selected = f.textarea.read(cx).selected_range();
-                let len = f.textarea.read(cx).value().len();
-                (selected.start == 0 && selected.end == len && len > 0)
+                let content = self.doc.slice(f.range.clone()).to_string();
+                let visible_len = colors::inline_content_len(&content);
+                let source_len = content.trim_end().len();
+                (selected.start == 0
+                    && (selected.end == visible_len || selected.end == source_len)
+                    && visible_len > 0)
                     .then(|| self.focused_block_id())
                     .flatten()
             }
@@ -306,15 +342,8 @@ impl Editor {
             cx.subscribe_in(&picker, window, |this, _, event: &ColorPickerEvent, _, cx| {
                 let ColorPickerEvent::Change(value) = event;
                 if let Some(menu) = &mut this.color_menu {
-                    menu.custom = value.map(|color| {
-                        let rgba = gpui_kit::Rgba::from(color);
-                        let byte = |v: f32| (v * 255.).round().clamp(0., 255.) as u8;
-                        if rgba.a < 1. {
-                            format!("rgba({},{},{},{})", byte(rgba.r), byte(rgba.g), byte(rgba.b), rgba.a)
-                        } else {
-                            format!("#{:02X}{:02X}{:02X}", byte(rgba.r), byte(rgba.g), byte(rgba.b))
-                        }
-                    });
+                    menu.custom =
+                        value.map(|color| Self::serialize_picker_color(color, menu.source.as_deref()));
                 }
                 cx.notify();
             });
@@ -327,6 +356,9 @@ impl Editor {
             target,
             picker,
             custom: None,
+            source: current[slot_index(Slot::Background)]
+                .clone()
+                .filter(|value| colors::CustomColor::parse(value).is_some()),
             custom_slot: Slot::Background,
             _picker_subscription: picker_subscription,
             input: input.clone(),
@@ -336,6 +368,7 @@ impl Editor {
                 .collect(),
             selected: 0,
             current,
+            invalid,
             whole_block_id,
             whole_block: false,
             _subscription: subscription,
@@ -445,6 +478,7 @@ impl Editor {
                     .filter(|ix| menu.allowed[slot_index(color_menu::item(*ix).slot)])
                     .collect();
                 menu.custom = colors::normalize_custom(&query);
+                menu.source = menu.custom.clone();
                 menu.selected = 0;
                 cx.notify();
             }
@@ -589,8 +623,68 @@ impl Editor {
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
-                                        if let Some(menu) = &mut this.color_menu {
-                                            menu.whole_block = !menu.whole_block;
+                                        if this
+                                            .color_menu
+                                            .as_ref()
+                                            .is_some_and(|menu| menu.revision != this.doc.version())
+                                        {
+                                            return;
+                                        }
+                                        let source = this.doc.to_string();
+                                        let whole = this
+                                            .color_menu
+                                            .as_ref()
+                                            .map(|menu| menu.whole_block)
+                                            .unwrap_or(false);
+                                        let selection = this.color_menu.as_ref().and_then(|menu| {
+                                            let Target::Inline(selection) = &menu.target else { return None };
+                                            Some(selection.clone())
+                                        });
+                                        let id =
+                                            this.color_menu.as_ref().and_then(|menu| menu.whole_block_id);
+                                        let custom_slot =
+                                            this.color_menu.as_ref().map(|menu| menu.custom_slot);
+                                        if !whole && let Some(id) = id {
+                                            let current = this.block_colors(id, &source);
+                                            let invalid = this
+                                                .doc
+                                                .blocks()
+                                                .find(id)
+                                                .map(|block| invalid_colors(&block.attrs))
+                                                .unwrap_or_default();
+                                            let source_color = custom_slot.and_then(|slot| {
+                                                current[slot_index(slot)].clone().filter(|value| {
+                                                    colors::CustomColor::parse(value).is_some()
+                                                })
+                                            });
+                                            if let Some(menu) = &mut this.color_menu {
+                                                menu.whole_block = true;
+                                                menu.current = current;
+                                                menu.invalid = invalid;
+                                                menu.source = source_color;
+                                            }
+                                        } else if let Some(selection) = selection {
+                                            let current = [
+                                                colors::inline_color(&source, selection.clone(), Slot::Text),
+                                                colors::inline_color(
+                                                    &source,
+                                                    selection.clone(),
+                                                    Slot::Background,
+                                                ),
+                                                None,
+                                            ];
+                                            let invalid = invalid_inline_colors(&source, selection);
+                                            let source_color = custom_slot.and_then(|slot| {
+                                                current[slot_index(slot)].clone().filter(|value| {
+                                                    colors::CustomColor::parse(value).is_some()
+                                                })
+                                            });
+                                            if let Some(menu) = &mut this.color_menu {
+                                                menu.whole_block = false;
+                                                menu.current = current;
+                                                menu.invalid = invalid;
+                                                menu.source = source_color;
+                                            }
                                         }
                                         cx.notify();
                                     }),
@@ -616,6 +710,7 @@ impl Editor {
                                     if let Some(menu) = &mut this.color_menu {
                                         menu.custom_slot = last.slot;
                                         menu.custom = Some(last.color.clone());
+                                        menu.source = Some(last.color.clone());
                                     }
                                     this.confirm_color_menu(None, window, cx);
                                 }),
@@ -664,6 +759,11 @@ impl Editor {
                                                     && menu.allowed[slot_index(slot)]
                                                 {
                                                     menu.custom_slot = slot;
+                                                    menu.source = menu.current[slot_index(slot)]
+                                                        .clone()
+                                                        .filter(|value| {
+                                                            colors::CustomColor::parse(value).is_some()
+                                                        });
                                                 }
                                                 cx.notify();
                                             }),
@@ -689,6 +789,21 @@ impl Editor {
                                 ),
                         )
                     })
+                    .children(menu.invalid.iter().map(|(slot, value)| {
+                        let name = match slot {
+                            Slot::Text => "文字色",
+                            Slot::Background => "背景色",
+                            Slot::Border => "边框色",
+                        };
+                        div()
+                            .debug_selector(move || format!("color-invalid-value-{value}"))
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme.warning)
+                            .child(format!("旧{name}值无效：{value}；保留原文，不参与绘制"))
+                            .into_any_element()
+                    }))
                     .children(body)
                     .when(menu.matches.is_empty(), |el| {
                         el.child(
@@ -709,6 +824,42 @@ impl Editor {
         .into_any_element()
     }
 
+    pub(super) fn serialize_picker_color(color: Hsla, source: Option<&str>) -> String {
+        let rgba = gpui_kit::Rgba::from(color);
+        let byte = |value: f32| (value * 255.).round().clamp(0., 255.) as u8;
+        let source = source.map(str::trim);
+        if let Some(source) = source
+            && let Some(original) = colors::CustomColor::parse(source)
+        {
+            let same_alpha = original.alpha == rgba.a;
+            if same_alpha
+                && original.red == byte(rgba.r)
+                && original.green == byte(rgba.g)
+                && original.blue == byte(rgba.b)
+            {
+                return source.to_owned();
+            }
+            if let Some(hex) = source.strip_prefix('#') {
+                let alpha = if same_alpha { hex[6..].to_owned() } else { format!("{:02X}", byte(rgba.a)) };
+                if hex.len() == 8 || rgba.a < 1. {
+                    return format!("#{:02X}{:02X}{:02X}{alpha}", byte(rgba.r), byte(rgba.g), byte(rgba.b));
+                }
+                return format!("#{:02X}{:02X}{:02X}", byte(rgba.r), byte(rgba.g), byte(rgba.b));
+            }
+            if same_alpha && let Some((_, alpha)) = source[5..source.len() - 1].rsplit_once(',') {
+                return format!("rgba({},{},{},{})", byte(rgba.r), byte(rgba.g), byte(rgba.b), alpha.trim());
+            }
+            if rgba.a >= 1. {
+                return format!("#{:02X}{:02X}{:02X}", byte(rgba.r), byte(rgba.g), byte(rgba.b));
+            }
+        }
+        if rgba.a < 1. {
+            format!("rgba({},{},{},{})", byte(rgba.r), byte(rgba.g), byte(rgba.b), rgba.a)
+        } else {
+            format!("#{:02X}{:02X}{:02X}", byte(rgba.r), byte(rgba.g), byte(rgba.b))
+        }
+    }
+
     pub(super) fn preview_attrs(&self, id: BlockId, attrs: &aero_core::Attrs) -> aero_core::Attrs {
         let mut attrs = self
             .focused
@@ -718,11 +869,15 @@ impl Editor {
             .unwrap_or_else(|| attrs.clone());
         if let Some(menu) = &self.color_menu
             && menu.revision == self.doc.version()
-            && let Target::Blocks(ids) = &menu.target
-            && ids.contains(&id)
             && let Some(color) = &menu.custom
         {
-            menu.custom_slot.write(&mut attrs, Some(color));
+            let applies = match &menu.target {
+                Target::Blocks(ids) => ids.contains(&id),
+                Target::Inline(_) => menu.whole_block && menu.whole_block_id == Some(id),
+            };
+            if applies {
+                menu.custom_slot.write(&mut attrs, Some(color));
+            }
         }
         attrs
     }

@@ -579,7 +579,11 @@ fn move_node_with_following(
     let mut moving = Vec::with_capacity(1 + following.len());
     moving.push(source);
     moving.extend_from_slice(following);
-    let delete = block_ops::deletions(doc, &original, &moving).pop()?;
+    let delete = if following.is_empty() {
+        block_ops::deletions(doc, &original, &moving).pop()?
+    } else {
+        Edit::delete(block_ops::deletion_span(doc, &original, &moving)?)
+    };
     let range = delete.range.clone();
     let moves_out_of_target = after
         && !into
@@ -598,6 +602,12 @@ fn move_node_with_following(
             },
             |child| block_ops::continuation(doc, &original, child.id, doc.range_of(child).start).0,
         );
+        let nested_prefix = if nested_prefix.contains('>') {
+            let relative = nested_prefix.rsplit('>').next().unwrap_or(&nested_prefix);
+            relative.strip_prefix([' ', '\t']).unwrap_or(relative).to_owned()
+        } else {
+            nested_prefix
+        };
         for id in following {
             let child = block_ops::source(doc, &original, &[*id]);
             piece =
@@ -649,8 +659,15 @@ fn move_node_with_following(
         let needs_tail = moves_out_of_target
             && matches!(from.kind, BlockKind::ListItem { .. })
             && at < original.len()
-            && !original[at..].starts_with(&separator);
-        let tail = if task_header && !after || needs_tail { separator.as_str() } else { "" };
+            && !original[at..].starts_with('\n');
+        let tail_separator = format!("\n{}\n", prefix.trim_end_matches([' ', '\t']));
+        let tail = if task_header && !after {
+            separator.as_str()
+        } else if needs_tail {
+            tail_separator.as_str()
+        } else {
+            ""
+        };
         (format!("{separator}{piece}{tail}"), separator.len())
     } else {
         (format!("{piece}{separator}"), 0)
@@ -1685,6 +1702,31 @@ mod tests {
         assert!(
             aero_core::containers::ancestors(&doc, third_body).iter().any(|block| block.id == second_item)
         );
+    }
+
+    #[test]
+    fn outdenting_loose_quoted_items_does_not_duplicate_following_or_prefixes() {
+        let source = "> - parent\n>   - first\n>   - second\n>\n>   - third\n> - next\n";
+        let mut doc = Document::from_text(source);
+        let second = doc
+            .blocks()
+            .iter()
+            .filter(|(_, block)| matches!(block.kind, BlockKind::ListItem { .. }))
+            .nth(1)
+            .unwrap()
+            .1
+            .id;
+        let plan = change_list_level(&doc, second, ListLevelDirection::Outdent)
+            .expect("quoted loose item can outdent");
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let text = doc.to_string();
+        assert_eq!(text.matches("third").count(), 1, "{text}");
+        assert_eq!(text.matches("second").count(), 1, "{text}");
+        assert!(!text.contains("> >"), "{text}");
+        assert!(!text.contains(">>"), "{text}");
+        let order = ["first", "second", "third", "next"].map(|id| text.find(id).unwrap());
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
     }
 
     #[test]
