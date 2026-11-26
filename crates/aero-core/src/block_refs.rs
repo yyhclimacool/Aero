@@ -3,7 +3,28 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
+use crate::links::Resolver;
+use crate::transaction::FileChange;
 use crate::{Block, BlockId, BlockKind, Document, Edit, Vault, VaultPath};
+
+/// Read managed notes from disk for identity validation and transactional observations.
+///
+/// # Errors
+///
+/// Returns an error if a managed note or its identity metadata cannot be read.
+pub fn vault_snapshot(vault: &Vault) -> Result<(Resolver, Vec<FileChange>), String> {
+    let mut resolver = Resolver::new();
+    let mut notes = Vec::new();
+    for path in vault.notes().map_err(|e| e.to_string())? {
+        let (bytes, _) = vault.read_bytes(&path).map_err(|e| format!("{path}：{e}"))?;
+        let doc = Document::from_bytes(&bytes).map_err(|e| format!("{path}：{e}"))?;
+        crate::identity::read(&doc).map_err(|e| format!("{path}：{e}"))?;
+        resolver.insert(path.clone(), Some(&doc.title_or(path.stem())), &doc.front_matter_aliases());
+        resolver.register_identity(&path, &doc);
+        notes.push(FileChange { path, before: Some(bytes.clone()), after: Some(bytes) });
+    }
+    Ok((resolver, notes))
+}
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
@@ -15,10 +36,15 @@ pub struct Candidate {
 }
 
 pub fn candidates(doc: &Document) -> Vec<Candidate> {
+    candidates_matching(doc, |_| true)
+}
+
+/// Build source picker rows for blocks that pass the caller's eligibility check.
+pub fn candidates_matching(doc: &Document, mut eligible: impl FnMut(&Block) -> bool) -> Vec<Candidate> {
     doc.blocks()
         .iter()
         .filter_map(|(_, b)| {
-            if matches!(b.kind, BlockKind::FrontMatter | BlockKind::Marker | BlockKind::Raw) {
+            if matches!(b.kind, BlockKind::FrontMatter | BlockKind::Marker | BlockKind::Raw) || !eligible(b) {
                 return None;
             }
             let source = doc.slice(doc.content_range(b)).to_string();
@@ -68,10 +94,47 @@ pub struct Assignment {
     pub edit: Option<Edit>,
 }
 
+#[derive(Debug)]
 pub struct PersistentAssignment {
     pub document: String,
     pub id: String,
     pub edits: Vec<Edit>,
+}
+
+/// Prepare a portable reference whose source and proposed identities are unique in the vault.
+///
+/// # Errors
+///
+/// Returns an error if the block changed, cannot hold a reference, or has a conflicting identity.
+pub fn permanent_in(
+    resolver: &mut Resolver,
+    path: &VaultPath,
+    doc: &Document,
+    block: BlockId,
+) -> Result<PersistentAssignment, String> {
+    let document = crate::identity::read(doc)?.id;
+    if let Some(id) = &document {
+        resolver.check_document_identity(path, id)?;
+    }
+    let node = doc.blocks().find(block).ok_or("目标块已不存在")?;
+    resolver.check_block_identity(path, document.as_deref(), node)?;
+    let assignment = permanent(doc, block)?;
+    if !assignment.edits.is_empty() {
+        let mut proposed = doc.clone();
+        proposed.edit_group(assignment.edits.clone()).map_err(|e| e.to_string())?;
+        proposed.reparse();
+        // Check the newly claimed IDs and any scoped aliases produced by a short-ID upgrade.
+        let validation = (|| {
+            resolver.register_identity(path, &proposed);
+            let id = resolve(&proposed, &assignment.id)?;
+            let node = proposed.blocks().find(id).ok_or("目标块已不存在")?;
+            resolver.check_document_identity(path, &assignment.document)?;
+            resolver.check_block_identity(path, Some(&assignment.document), node)
+        })();
+        resolver.register_identity(path, doc);
+        validation?;
+    }
+    Ok(assignment)
 }
 
 /// A portable reference upgrades a legacy short ID only at this explicit boundary.

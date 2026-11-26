@@ -28,6 +28,23 @@ enum Submenu {
     More,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum IdentityCopy {
+    Link,
+    Sync,
+    Id,
+}
+
+impl IdentityCopy {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Link => "复制块链接",
+            Self::Sync => "复制同步引用",
+            Self::Id => "添加块 ID",
+        }
+    }
+}
+
 /// 工具条态。位置每帧按选区重算，所以这里只记"为哪个选区出现的"。
 pub(super) struct Toolbar {
     /// 控件内的选区；选区一变就重新计时
@@ -172,27 +189,70 @@ impl Editor {
         cx.notify();
     }
 
-    /// 当前块没有 `^id` 就写上一个。返回这块的 id。
-    fn ensure_block_id(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<String, String> {
-        let block = self.focused_unit().map(|ix| self.units[ix].id).ok_or_else(|| "没有当前块".to_owned())?;
-        self.ensure_id_for(block, window, cx)
-    }
-
-    pub(super) fn ensure_id_for(
+    pub(super) fn copy_identity_for(
         &mut self,
-        block: aero_core::BlockId,
+        block: BlockId,
+        action: IdentityCopy,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<String, String> {
-        let assignment = aero_core::block_refs::permanent(&self.doc, block)?;
-        let id = assignment.id.clone();
-        if !assignment.edits.is_empty() {
-            self.doc.edit_group(assignment.edits).map_err(|e| e.to_string())?;
-            self.focused = None;
-            self.after_doc_change(cx);
+    ) {
+        if self.io.suspended || self.is_deleted() {
+            return;
         }
-        let _ = window;
-        Ok(id)
+        self.ensure_current_parse();
+        let path = self.path.clone();
+        let vault = self.vault.clone();
+        let revision = self.doc.version();
+        let generation = super::live_sources::generation(vault.id(), cx);
+        let overlays = self.identity_overlays(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let source_path = path.clone();
+            let assignment = cx
+                .background_spawn(async move {
+                    let (mut resolver, source) =
+                        super::live_sources::identity_source(&vault, &source_path, overlays)?;
+                    aero_core::block_refs::permanent_in(&mut resolver, &source_path, &source, block)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let result = assignment.and_then(|assignment| {
+                    if this.path != path
+                        || this.doc.version() != revision
+                        || this.io.suspended
+                        || this.is_deleted()
+                        || super::live_sources::generation(this.vault.id(), cx) != generation
+                    {
+                        return Err("笔记已变化，请重试".into());
+                    }
+                    if !assignment.edits.is_empty() {
+                        this.doc.edit_group(assignment.edits).map_err(|e| e.to_string())?;
+                        this.focused = None;
+                        this.after_doc_change(cx);
+                    }
+                    let document = assignment.document;
+                    let id = assignment.id;
+                    match action {
+                        IdentityCopy::Link => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(format!(
+                                "[[id:{document}#^{id}]]"
+                            )));
+                        }
+                        IdentityCopy::Sync => this.copy_blocks(format!("![[id:{document}#^{id}]]"), cx),
+                        IdentityCopy::Id => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(format!("^{id}")))
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::error(error).title(action.title()),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
     }
 
     fn copy_block_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -207,29 +267,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = match self.ensure_id_for(block, window, cx) {
-            Ok(id) => id,
-            Err(error) => {
-                window.push_notification(
-                    gpui_kit::component::notification::Notification::error(error).title("复制块链接"),
-                    cx,
-                );
-                return;
-            }
-        };
-        let Some(document) = aero_core::identity::read(&self.doc).ok().and_then(|m| m.id) else { return };
-        cx.write_to_clipboard(ClipboardItem::new_string(format!("[[id:{document}#^{id}]]")));
+        self.copy_identity_for(block, IdentityCopy::Link, window, cx);
     }
 
     fn add_block_id(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.ensure_block_id(window, cx) {
-            Ok(id) => cx.write_to_clipboard(ClipboardItem::new_string(format!("^{id}"))),
-            Err(error) => {
-                window.push_notification(
-                    gpui_kit::component::notification::Notification::error(error).title("添加块 ID"),
-                    cx,
-                );
-            }
+        if let Some(block) = self.focused_unit().map(|ix| self.units[ix].id) {
+            self.copy_identity_for(block, IdentityCopy::Id, window, cx);
         }
         let _ = self.close_toolbar_submenu(cx);
     }

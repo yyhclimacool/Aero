@@ -1,6 +1,8 @@
 //! Source selection captures a destination revision and insertion range. Picking
 //! a source is read-only; confirmation submits one recoverable workspace edit.
 use super::*;
+use crate::actions::ConfirmSyncSource;
+use crate::workspace::files::{Operation, SyncEdit, SyncReference};
 use gpui_kit::base::input::{InputEvent, InputState};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::Input;
@@ -133,28 +135,24 @@ impl Editor {
         if menu.source.is_none() {
             let generation = menu.generation.clone();
             let path = menu.notes[index].path.clone();
-            let overlay = if path == self.path {
-                Some(self.doc.clone())
-            } else {
-                Self::live_editors(self.vault.id(), cx)
-                    .into_iter()
-                    .filter(|e| e.entity_id() != cx.entity_id())
-                    .find_map(|e| {
-                        let e = e.read(cx);
-                        (e.path == path).then(|| e.doc.clone())
-                    })
-            };
+            let overlays = self.identity_overlays(cx);
             let vault = self.vault.clone();
-            self.sync_picker.as_mut().unwrap().loading = true;
+            if let Some(menu) = &mut self.sync_picker {
+                menu.loading = true;
+                menu.error = None;
+            }
             cx.spawn_in(window, async move |this, cx| {
                 let doc = cx
                     .background_spawn(async move {
-                        overlay
-                            .map(Ok)
-                            .unwrap_or_else(|| {
-                                vault.read(&path).map(|(doc, _)| doc).map_err(|e| e.to_string())
-                            })
-                            .map(|doc| (path, doc))
+                        let (resolver, doc) = super::live_sources::identity_source(&vault, &path, overlays)?;
+                        let document = aero_core::identity::read(&doc)?.id;
+                        if let Some(id) = &document {
+                            resolver.check_document_identity(&path, id)?;
+                        }
+                        let candidates = aero_core::block_refs::candidates_matching(&doc, |block| {
+                            resolver.check_block_identity(&path, document.as_deref(), block).is_ok()
+                        });
+                        Ok::<_, String>((path, doc, candidates))
                     })
                     .await;
                 let _ = this.update_in(cx, |this, window, cx| {
@@ -164,8 +162,11 @@ impl Editor {
                     }
                     menu.loading = false;
                     match doc {
-                        Ok((path, doc)) => {
-                            menu.candidates = aero_core::block_refs::candidates(&doc);
+                        Ok((path, doc, candidates)) => {
+                            if candidates.is_empty() {
+                                menu.error = Some("文档中没有身份唯一的可引用块".into());
+                            }
+                            menu.candidates = candidates;
                             menu.source = Some((path, doc));
                             menu.input.update(cx, |input, cx| {
                                 input.set_value("", window, cx);
@@ -180,78 +181,37 @@ impl Editor {
             .detach();
             return;
         }
-        let menu = self.sync_picker.take().unwrap();
-        let (path, mut source) = menu.source.unwrap();
-        let before_source = source.to_bytes();
-        let result = (|| -> Result<_, String> {
-            let assignment = aero_core::block_refs::permanent(&source, menu.candidates[index].block)?;
-            let mut range = menu.range.clone();
-            if path == self.path {
-                for edit in &assignment.edits {
-                    if edit.range.end <= range.start {
-                        range.start = (range.start as isize + edit.delta()) as usize;
-                        range.end = (range.end as isize + edit.delta()) as usize;
-                    }
-                }
-            }
-            source.edit_group(assignment.edits).map_err(|e| e.to_string())?;
-            source.reparse();
-            let reference = format!("![[id:{}#^{}]]", assignment.document, assignment.id);
-            let mut destination = if path == self.path { source.clone() } else { self.doc.clone() };
-            if menu.replace {
-                destination.edit(Edit::replace(range, reference)).map_err(|e| e.to_string())?;
-            } else {
-                destination = insert_tree(&destination, range, &reference)?;
-            }
-            let mut changes = Vec::new();
-            if path != self.path && before_source != source.to_bytes() {
-                changes.push(aero_core::transaction::FileChange {
-                    path,
-                    before: Some(before_source),
-                    after: Some(source.to_bytes()),
-                });
-            }
-            changes.push(aero_core::transaction::FileChange {
-                path: self.path.clone(),
-                before: Some(self.doc.to_bytes()),
-                after: Some(destination.to_bytes()),
-            });
-            Ok(changes)
-        })();
-        match result {
-            Ok(changes) => {
-                cx.emit(EditorEvent::TransactionRequested(crate::workspace::files::Operation::Transaction {
-                    token: aero_core::identity::new_block_id(),
-                    changes,
-                    history_changes: None,
-                    direction: None,
-                    open: None,
-                    journal: crate::paths::app_data_dir().join("transactions").join(self.vault.id()),
-                }))
-            }
-            Err(error) => window.push_notification(
-                gpui_kit::component::notification::Notification::error(error).title("同步引用"),
-                cx,
-            ),
-        }
+        let Some((path, source)) = &menu.source else { return };
+        let candidate = &menu.candidates[index];
+        let Some(block) = source.blocks().iter().position(|(_, block)| block.id == candidate.block) else {
+            return;
+        };
+        let edit = if menu.replace {
+            SyncEdit::Replace(menu.range.clone())
+        } else {
+            SyncEdit::Insert(menu.range.clone())
+        };
+        let request = SyncReference {
+            source: path.clone(),
+            source_before: source.to_bytes(),
+            block,
+            destination: self.path.clone(),
+            destination_before: self.doc.to_bytes(),
+            edit,
+        };
+        self.sync_picker = None;
+        cx.emit(EditorEvent::TransactionRequested(Operation::SyncReference {
+            request: Box::new(request),
+            journal: crate::paths::app_data_dir().join("transactions").join(self.vault.id()),
+        }));
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
     pub(super) fn copy_sync_for(&mut self, id: BlockId, window: &mut Window, cx: &mut Context<Self>) {
-        match self.ensure_id_for(id, window, cx) {
-            Ok(id) => {
-                if let Ok(meta) = aero_core::identity::read(&self.doc)
-                    && let Some(document) = meta.id
-                {
-                    self.copy_blocks(format!("![[id:{document}#^{id}]]"), cx);
-                }
-            }
-            Err(error) => {
-                window.push_notification(gpui_kit::component::notification::Notification::error(error), cx)
-            }
-        }
+        self.copy_identity_for(id, super::toolbar::IdentityCopy::Sync, window, cx);
         self.block_menu = None;
+        cx.notify();
     }
 
     pub(super) fn render_sync_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -283,6 +243,10 @@ impl Editor {
                     v_flex()
                         .id("sync-picker")
                         .debug_selector(|| "sync-picker".into())
+                        .key_context("SyncPicker")
+                        .on_action(cx.listener(|this, _: &ConfirmSyncSource, window, cx| {
+                            this.confirm_sync(None, window, cx);
+                        }))
                         .occlude()
                         .w(px(420.))
                         .p_2()

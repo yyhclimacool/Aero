@@ -1,6 +1,6 @@
 # 块交互体验实现差距与代码审查（2026-10-21）
 
-状态更新于 2026-11-25。G01、G02、G03 已通过专项验收，G04–G11 仍开放。本记录对照 [A01–A37 与 P1–P3 需求基线](../edit_experience/edit_experience_request.md#15-验收标准) 跟踪实现与验收。
+状态更新于 2026-11-25。G01–G03、G07 已通过专项验收，G04–G06、G08–G11 仍开放。本记录对照 [A01–A37 与 P1–P3 需求基线](../edit_experience/edit_experience_request.md#15-验收标准) 跟踪实现与验收。
 
 ## 审查范围与证据边界
 
@@ -31,7 +31,7 @@
 | G04 | 高 | 行内自定义颜色：部分实现 | 自定义色可以写入，但正文标记解析和 presenter 仍只消费预设类，预览与确认后的显示不一致；扩大配色选区会删除整个纯颜色载体，可能清掉另一通道。预设类的逐个覆盖也不符合“第一个有效预设优先”。 | A10、A11、A34 | [颜色标记解析](../../crates/aero-core/src/markup.rs#L301-L334)、[颜色绘制](../../crates/aero-app/src/editor/presenter.rs#L410-L420)、[选区展开写回](../../crates/aero-core/src/colors.rs#L425-L489) |
 | G05 | 中 | 取色与恢复默认：部分实现；无效旧值提示：尚未实现 | 块目标预览已接入，但从行内目标勾选“应用到整块”时预览被排除；旧无效属性静默忽略。选中 `==高亮==` 内的正文后恢复默认背景不能清除高亮。图形取色事件会重新序列化色值，源通道／精度契约仍需补齐。 | A10、A11、A34 | [图形取色序列化](../../crates/aero-app/src/editor/colors_ui.rs#L304-L317)、[有效颜色读取](../../crates/aero-app/src/editor/colors_ui.rs#L348-L355)、[错误与预览](../../crates/aero-app/src/editor/colors_ui.rs#L693-L741)、[默认清除](../../crates/aero-core/src/colors.rs#L319-L354) |
 | G06 | 中 | 列表缩进：部分实现 | 列表项菜单仍写视觉 `indent`，不是增加／减少列表层级；Tab 结构缩进未接。最小可编辑宽度与缩进级数边界也没有完整体现在菜单禁用规则中。 | A12、A28 | [属性修改](../../crates/aero-app/src/editor/block_menu.rs#L388-L413)、[布局菜单](../../crates/aero-app/src/editor/block_menu.rs#L591-L628)、[Tab 分派](../../crates/aero-app/src/editor/mod.rs#L2083-L2102) |
-| G07 | 高 | 同步引用与身份：部分实现 | 跨文档同步插入将来源补 ID 与目标插入放入同一撤销事务，撤销会移除应保留的来源 ID。复制同步引用再粘贴还会把身份地址改成路径；来源选择确认的唯一性检查仅针对单篇，未完整覆盖全库冲突。 | A14、A29、A30、A33 | [来源补 ID 与事务](../../crates/aero-app/src/editor/sync_picker.rs#L184-L229)、[关联撤销](../../crates/aero-app/src/workspace/history.rs#L103-L110)、[地址改写](../../crates/aero-core/src/clipboard.rs#L210-L235)、[单篇身份准备](../../crates/aero-core/src/block_refs.rs#L78-L110) |
+| G07 | 高 | 同步引用与身份（已通过专项验收） | 目标撤销保留跨文档来源身份。复制保留外部身份地址，并用新 ID 重映射副本内部引用。来源选择与提交校验库内文档 ID、主块 ID 和别名。 | A14、A29、A30、A33 | [同步插入事务](../../crates/aero-app/src/workspace/files.rs#L203)、[身份检查](../../crates/aero-core/src/block_refs.rs#L109)、[副本引用映射](../../crates/aero-core/src/clipboard.rs#L315) |
 | G08 | 中 | 链接与同步异常展示：部分实现；异常跳转入口：尚未实现 | 普通段落链接未实现正文中的动态“标题＋摘要”，新复制地址也未带可读名称；悬停预览已有相关信息，不能记为完全缺失。同步来源冲突未透传到引用状态，循环／超过 3 跳占位缺少来源信息及继续跳转入口。 | A16、A30 | [链接生成](../../crates/aero-app/src/editor/toolbar.rs#L204-L222)、[已有悬停摘要](../../crates/aero-app/src/editor/link_preview.rs#L632-L650)、[内存来源状态](../../crates/aero-app/src/editor/live_sources.rs#L101-L129)、[异常展示](../../crates/aero-app/src/editor/preview.rs#L371-L451) |
 | G09 | 中 | 子文档创建：部分实现；作为副本导入：尚未实现 | 导入 Markdown 仍保留原身份，没有显式副本导入并重建文档／块身份的流程。创建子文档后未强制切文档视图；有旧无序同级时，新有序项会排到它们前面，不能保证末尾追加。 | A18、A31、A32、A35 | [原字节导入](../../crates/aero-app/src/workspace/files.rs#L380-L405)、[文件树菜单](../../crates/aero-app/src/file_tree.rs#L1303-L1317)、[创建后打开](../../crates/aero-app/src/workspace/files.rs#L590-L598)、[排序规则](../../crates/aero-core/src/relations.rs#L77-L84)、[新项顺序](../../crates/aero-core/src/relations.rs#L147-L185) |
 | G10 | 高 | 四种对齐边界：部分实现 | 四种对齐主体已接入，但含公式／HTML 换行的正文绕过共用布局；自动换行仍按字符找切分点，不能用字素级光标／删除修复代替换行修复。跨折行选区未完整应用逐行对齐偏移，原生输入完整几何矩阵仍需验证。 | A13、A37 | [特殊正文分流](../../crates/aero-app/src/editor/presenter.rs#L165-L172)、[自动换行](../../forks/gpui-kit/crates/base/src/input/editor/display_map/text_wrapper.rs#L210-L249)、[跨行选区](../../forks/gpui-kit/crates/base/src/input/base/element.rs#L650-L699) |
@@ -75,6 +75,12 @@
 - 无头 GPUI 几何回归确认高亮内部空行、引用及其嵌套末尾空行位于最深层容器内；Into 渲染有独立「移入容器」标识。持久 ID／别名的解除入口置灰并解释，无身份容器仍可解除并撤销。
 - 真实窗口确认第一段后的空行显示在第一、第二子块之间，且 Into 拖动将 `outside` 移入高亮容器、撤销恢复原文。注入通道未能持续呈现拖拽视觉状态，因此 Into 标识的渲染证据来自无头 GPUI，不声称真实截图已看到该标识。
 
+### G07 专项验收（2026-11-25）
+
+- 真实窗口通过 `/sync` 从正文中途打开选择器。Enter 确认重复文档 ID 时显示冲突提示，切换到有效来源后可继续用 Enter 选择来源块。插入落盘后核对身份地址；一次 `⌘Z` 恢复目标到确认前的字节，来源文件中的文档 ID、主块 ID 和旧短 ID 别名逐字节保留。
+- 无头 GPUI 覆盖选择器键盘确认、块菜单复制同步引用、首次写入身份的独立撤销，以及跨文档插入的撤销和重做。worker 回归覆盖重复文档 ID、主块 ID、正式别名和有作用域的短 ID 别名，同时验证不同文档里的同名短 ID 可以分别使用。
+- 剪贴板回归核对外部同步地址和显示名原样保留，副本内部显式身份和标题地址随新 ID 重映射，旧别名从副本中移除。四个正式 crate 在 macOS 沙箱外共 1,030 项通过、3 项忽略。应用与核心 crate 的严格 Clippy 检查通过。
+
 ## 已有实现，但尚未完成验收
 
 以下项目是交付证据缺口，不直接归类为功能缺失。
@@ -85,7 +91,7 @@
 
 ## 修复与验收顺序
 
-1. **内容／身份／恢复优先**。G01、G02、G03 已通过专项验收，余下 G07、G11 与 G04 的跨通道丢属性分支。
+1. **内容／身份／恢复优先**。G01–G03、G07 已通过专项验收，余下 G11 与 G04 的跨通道丢属性分支。
 2. **补齐样式与交互**：G04–G06、G08–G10，保留已有主流程，不用禁用整个功能代替修复边界。
 3. 每项先补最小失败回归，再修复并复跑受影响 crate；G10 的字素换行修复需覆盖输入底座已有回归。历史指纹变化的路径不得沿用旧日志作为当前基线证据。
 4. 代码稳定后集中执行 A01–A37、原生 IME／表情点选和 P1–P3。功能修复完成与验收完成分别登记，不用测试总数推算需求完成率。

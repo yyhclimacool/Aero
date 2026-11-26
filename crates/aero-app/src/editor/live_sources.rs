@@ -9,6 +9,47 @@ pub(super) struct LiveSources {
 }
 impl Global for LiveSources {}
 
+pub(super) struct IdentityOverlay {
+    path: VaultPath,
+    document: Document,
+    stamp: FileStamp,
+}
+
+pub(super) fn identity_source(
+    vault: &Vault,
+    path: &VaultPath,
+    overlays: Vec<IdentityOverlay>,
+) -> Result<(aero_core::links::Resolver, Document), String> {
+    let (mut resolver, notes) = aero_core::block_refs::vault_snapshot(vault)?;
+    let disk_bytes = |path: &VaultPath| {
+        let index = notes.binary_search_by(|note| note.path.cmp(path)).ok()?;
+        notes[index].before.as_deref()
+    };
+    let disk = disk_bytes(path).ok_or("来源文档已移除或不在笔记库中")?;
+    let mut source = None;
+    for IdentityOverlay { path: overlay, mut document, stamp } in overlays {
+        let Some(bytes) = disk_bytes(&overlay) else { continue };
+        if aero_core::hash_bytes(bytes) != stamp.hash {
+            if &overlay == path {
+                return Err("来源文档已在磁盘上变化，请重新选择".into());
+            }
+            continue;
+        }
+        if document.is_parse_stale() {
+            document.reparse();
+        }
+        resolver.register_identity(&overlay, &document);
+        if &overlay == path {
+            source = Some(document);
+        }
+    }
+    let source = match source {
+        Some(document) => document,
+        None => Document::from_bytes(disk).map_err(|e| e.to_string())?,
+    };
+    Ok((resolver, source))
+}
+
 pub(super) fn publish(
     vault: &aero_core::Vault,
     path: &VaultPath,
@@ -78,6 +119,26 @@ impl Editor {
     }
     pub(super) fn publish_live(&self, cx: &mut Context<Self>) {
         publish(&self.vault, &self.path, &self.doc, cx.weak_entity(), cx);
+    }
+
+    pub(super) fn identity_overlays(&self, cx: &Context<Self>) -> Vec<IdentityOverlay> {
+        Self::live_editors(self.vault.id(), cx)
+            .into_iter()
+            .filter(|editor| editor.entity_id() != cx.entity_id())
+            .filter_map(|editor| {
+                let editor = editor.read(cx);
+                (!editor.is_deleted() && editor.path != self.path).then(|| IdentityOverlay {
+                    path: editor.path.clone(),
+                    document: editor.doc.clone(),
+                    stamp: editor.stamp,
+                })
+            })
+            .chain((!self.is_deleted()).then(|| IdentityOverlay {
+                path: self.path.clone(),
+                document: self.doc.clone(),
+                stamp: self.stamp,
+            }))
+            .collect()
     }
 
     pub(super) fn live_embed(

@@ -2468,6 +2468,70 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn undo_sync_insertion_retains_the_source_identity_and_redo_reuses_it(cx: &mut TestAppContext) {
+        use super::files::{Operation, SyncEdit, SyncReference};
+
+        let target = "before after\n";
+        let source = "source ^old\n";
+        let (dir, _data, workspace) = open(cx, Some(target));
+        std::fs::write(dir.path().join("source.md"), source).unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let destination =
+            cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        workspace.update_in(cx, |w, window, cx| {
+            w.request_operation(
+                super::PendingOperation::File(Operation::SyncReference {
+                    request: Box::new(SyncReference {
+                        source: VaultPath::new("source.md").unwrap(),
+                        source_before: source.as_bytes().to_vec(),
+                        block: 0,
+                        destination: VaultPath::new("a.md").unwrap(),
+                        destination_before: target.as_bytes().to_vec(),
+                        edit: SyncEdit::Insert(7..7),
+                    }),
+                    journal: w.data_dir.join("transactions").join(w.open.as_ref().unwrap().vault.id()),
+                }),
+                window,
+                cx,
+            );
+        });
+        let ready = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                let w = workspace.read(cx);
+                !w.session_busy() && w.pending_operation.is_none()
+            })
+        };
+        wait_until(cx, ready);
+        let source_with_id = std::fs::read(dir.path().join("source.md")).unwrap();
+        let inserted = std::fs::read_to_string(dir.path().join("a.md")).unwrap();
+        let doc = aero_core::Document::from_bytes(&source_with_id).unwrap();
+        let document = aero_core::identity::read(&doc).unwrap().id.unwrap();
+        let block = doc.blocks().roots[1].persisted_id.as_deref().unwrap();
+        let reference = format!("![[id:{document}#^{block}]]");
+        assert!(inserted.contains(&reference), "{inserted}");
+        let focus = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| destination.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+            cx.run_until_parked();
+        };
+        focus(cx);
+        cx.simulate_keystrokes("cmd-z");
+        wait_until(cx, ready);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), target);
+        assert_eq!(std::fs::read(dir.path().join("source.md")).unwrap(), source_with_id);
+        assert!(aero_core::block_refs::resolve(&doc, "old").is_ok());
+        focus(cx);
+        cx.simulate_keystrokes("cmd-shift-z");
+        wait_until(cx, ready);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), inserted);
+        assert_eq!(std::fs::read(dir.path().join("source.md")).unwrap(), source_with_id);
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
     fn undo_child_creation_closes_removed_tab_and_parent_can_redo(cx: &mut TestAppContext) {
         let original = "before\n\n/子文档\n\nafter\n";
         let (dir, _data, workspace) = open(cx, Some(original));

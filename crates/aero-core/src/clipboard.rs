@@ -30,16 +30,7 @@ impl Relocation {
         moving: bool,
     ) -> Result<Self, String> {
         let origin_path = VaultPath::new(&origin.path).map_err(|e| e.to_string())?;
-        let mut resolver = Resolver::new();
-        let mut notes = Vec::new();
-        for path in vault.notes().map_err(|e| e.to_string())? {
-            let (bytes, _) = vault.read_bytes(&path).map_err(|e| e.to_string())?;
-            let doc = Document::from_bytes(&bytes).map_err(|e| e.to_string())?;
-            crate::identity::read(&doc)?;
-            resolver.insert(path.clone(), Some(&doc.title_or(path.stem())), &doc.front_matter_aliases());
-            resolver.register_identity(&path, &doc);
-            notes.push(FileChange { path, before: Some(bytes.clone()), after: Some(bytes) });
-        }
+        let (resolver, notes) = crate::block_refs::vault_snapshot(vault)?;
         if origin.vault != vault.id() {
             if moving {
                 return Err("跨库剪切只能作为副本粘贴".into());
@@ -54,6 +45,29 @@ impl Relocation {
                 resolver,
             });
         }
+        if !moving {
+            let text = copy_tree_resolved(source, origin, document, |span| {
+                if span.target.is_empty() {
+                    return true;
+                }
+                match resolver.resolve(&span.target, span.fragment.as_deref(), origin_path.parent()) {
+                    Resolution::Resolved { path, .. } => path == origin_path,
+                    Resolution::Unresolved => explicitly_local(&span.target, origin),
+                    Resolution::Ambiguous { .. } => false,
+                }
+            })?;
+            let mut result = Self {
+                source: text,
+                notes,
+                resources: Vec::new(),
+                moved: HashMap::new(),
+                origin: origin_path,
+                destination: document.into(),
+                resolver,
+            };
+            result.source = result.rebase(vault, destination)?;
+            return Ok(result);
+        }
         let mut tree = Document::from_text(source);
         let mut moved = HashMap::new();
         let mut changes = Vec::new();
@@ -62,11 +76,8 @@ impl Relocation {
             if moved.contains_key(old) {
                 return Err(format!("块 ID 重复：{old}"));
             }
-            let new = if !moving || crate::identity::is_block_id(old) {
-                old.into()
-            } else {
-                crate::identity::new_block_id()
-            };
+            let new =
+                if crate::identity::is_block_id(old) { old.into() } else { crate::identity::new_block_id() };
             moved.insert(old.into(), new.clone());
             let mut aliases: Vec<_> = crate::block_refs::aliases(block).map(str::to_owned).collect();
             for alias in &aliases {
@@ -75,12 +86,10 @@ impl Relocation {
                 }
             }
             let original_aliases = aliases.clone();
-            if moving {
-                for alias in &mut aliases {
-                    if !crate::identity::is_block_id(alias) && !alias.contains('#') {
-                        let parent = origin.document.as_deref().ok_or("剪切来源缺少文档身份")?;
-                        *alias = format!("{parent}#{alias}");
-                    }
+            for alias in &mut aliases {
+                if !crate::identity::is_block_id(alias) && !alias.contains('#') {
+                    let parent = origin.document.as_deref().ok_or("剪切来源缺少文档身份")?;
+                    *alias = format!("{parent}#{alias}");
                 }
             }
             if new != old {
@@ -96,7 +105,7 @@ impl Relocation {
         changes.sort_by_key(|e| std::cmp::Reverse(e.range.start));
         tree.edit_group(changes).map_err(|e| e.to_string())?;
         tree.reparse();
-        if moving {
+        {
             let identities: std::collections::HashSet<_> = tree
                 .blocks()
                 .iter()
@@ -135,24 +144,14 @@ impl Relocation {
             resolver,
         };
         result.source = result.rebase(vault, destination)?;
-        if moving {
-            result.source = result.rewrite(&result.source, &result.origin);
-            for i in 0..result.notes.len() {
-                let note = &result.notes[i];
-                let doc = Document::from_bytes(note.after.as_ref().unwrap()).map_err(|e| e.to_string())?;
-                let text = result.rewrite(&doc.to_string(), &note.path);
-                let mut rewritten = doc;
-                rewritten.edit(Edit::replace(0..rewritten.len(), text)).map_err(|e| e.to_string())?;
-                result.notes[i].after = Some(rewritten.to_bytes());
-            }
-        } else {
-            let destination = result.destination.clone();
-            result.destination = origin.document.clone().unwrap_or_else(|| document.into());
-            result.source = result.rewrite(&result.source, &result.origin);
-            let mut copy_origin = origin.clone();
-            copy_origin.document = Some(result.destination.clone());
-            result.destination = destination;
-            result.source = copy_tree(&result.source, &copy_origin, document)?;
+        result.source = result.rewrite(&result.source, &result.origin);
+        for i in 0..result.notes.len() {
+            let note = &result.notes[i];
+            let doc = Document::from_bytes(note.after.as_ref().unwrap()).map_err(|e| e.to_string())?;
+            let text = result.rewrite(&doc.to_string(), &note.path);
+            let mut rewritten = doc;
+            rewritten.edit(Edit::replace(0..rewritten.len(), text)).map_err(|e| e.to_string())?;
+            result.notes[i].after = Some(rewritten.to_bytes());
         }
         Ok(result)
     }
@@ -200,6 +199,9 @@ impl Relocation {
         };
         let mut edits = Vec::new();
         for span in crate::links::scan_for_rename(&text) {
+            if crate::links::identity_target(&span.target).is_some() {
+                continue;
+            }
             if let Some(target) = attachment_target(&span.target)? {
                 edits.push(Edit::replace(
                     crate::links::target_range(&text, &span),
@@ -298,19 +300,35 @@ pub struct Payload {
 }
 
 pub fn copy_tree(source: &str, origin: &Payload, destination: &str) -> Result<String, String> {
+    copy_tree_resolved(source, origin, destination, |span| explicitly_local(&span.target, origin))
+}
+
+fn explicitly_local(target: &str, origin: &Payload) -> bool {
+    if let Some(id) = crate::links::identity_target(target) {
+        return origin.document.as_deref() == Some(id);
+    }
+    target.is_empty()
+        || target.strip_suffix(".md").unwrap_or(target)
+            == origin.path.strip_suffix(".md").unwrap_or(&origin.path)
+}
+
+fn copy_tree_resolved(
+    source: &str,
+    origin: &Payload,
+    destination: &str,
+    is_local: impl Fn(&crate::links::LinkSpan) -> bool,
+) -> Result<String, String> {
     let mut doc = Document::from_text(source);
     let mut mapping = HashMap::new();
     let mut edits = Vec::new();
     for (_, block) in doc.blocks().iter().filter(|(_, b)| b.kind != crate::BlockKind::Marker) {
         let Some(old) = block.persisted_id.as_deref() else { continue };
-        if mapping.contains_key(old) {
-            return Err(format!("复制内容含重复块 ID：{old}"));
-        }
         let new = crate::identity::new_block_id();
-        mapping.insert(old.to_owned(), new.clone());
-        for alias in crate::block_refs::aliases(block) {
-            if mapping.insert(alias.to_owned(), new.clone()).is_some_and(|previous| previous != new) {
-                return Err(format!("复制内容含歧义块身份：{alias}"));
+        for id in std::iter::once(old).chain(crate::block_refs::aliases(block)) {
+            let key = crate::links::block_identity_key(origin.document.as_deref(), id)
+                .unwrap_or_else(|| id.to_owned());
+            if mapping.insert(key, new.clone()).is_some_and(|previous| previous != new) {
+                return Err(format!("复制内容含歧义块身份：{id}"));
             }
         }
         let mut attrs = block.attrs.clone();
@@ -324,37 +342,20 @@ pub fn copy_tree(source: &str, origin: &Payload, destination: &str) -> Result<St
     doc.reparse();
     let source = doc.to_string();
     let mut replacements = Vec::new();
-    let spans = crate::links::scan(&source).into_iter().chain(
-        crate::links::scan_embeds(&source).into_iter().map(|e| crate::links::LinkSpan {
-            range: e.range.start + 1..e.range.end,
-            target: e.target,
-            fragment: e.fragment,
-            alias: e.parameter,
-            pointer: None,
-        }),
-    );
-    for span in spans {
+    for span in crate::links::scan_for_rename(&source) {
         let Some(old) = span.fragment.as_deref().and_then(|f| f.strip_prefix('^')) else { continue };
-        let local = span.target.is_empty()
-            || origin.document.as_ref().is_some_and(|id| span.target == format!("id:{id}"))
-            || span.target == origin.path
-            || span.target.strip_suffix(".md") == origin.path.strip_suffix(".md");
-        if !local {
+        if !is_local(&span) {
             continue;
         }
-        let Some(new) = mapping.get(old) else { continue };
+        let document = crate::links::identity_target(&span.target).or(origin.document.as_deref());
+        let key = crate::links::block_identity_key(document, old);
+        let Some(new) = mapping.get(key.as_deref().unwrap_or(old)) else { continue };
         replacements.push(Edit::replace(
             crate::links::head_range(&source, &span),
             format!("id:{destination}#^{new}"),
         ));
     }
-    replacements.sort_by_key(|e| std::cmp::Reverse(e.range.start));
-    replacements.dedup_by(|a, b| a.range == b.range);
-    let mut text = source;
-    for edit in replacements {
-        text.replace_range(edit.range, &edit.text);
-    }
-    Ok(text)
+    Ok(replace(&source, replacements))
 }
 
 #[cfg(test)]
@@ -403,6 +404,50 @@ mod tests {
         .unwrap();
         assert!(plan.source.contains("[note](../from/文档%20name.md#heading)"), "{}", plan.source);
         assert!(plan.source.contains("[web](https://example.com/path?q=1)"));
+    }
+
+    #[test]
+    fn same_vault_copy_preserves_external_identity_addresses_and_remaps_internal_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let origin_id = crate::identity::new_document_id();
+        let external_id = crate::identity::new_document_id();
+        let destination_id = crate::identity::new_document_id();
+        let primary = crate::identity::new_block_id();
+        let external = crate::identity::new_block_id();
+        let outside = format!("![[id:{external_id}#^{external}|outside]]");
+        let text = format!(
+            "inside {{aero-aliases=\"{origin_id}#legacy\"}} ^{primary}\n\n![[id:{origin_id}#^legacy|alias]]\n\n[[Custom title#^{primary}|title]]\n\n{outside}\n"
+        );
+        std::fs::write(
+            dir.path().join("source.md"),
+            format!("---\ntitle: Custom title\naero:\n  id: {origin_id}\n---\n\n{text}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("external.md"),
+            format!("---\naero:\n  id: {external_id}\n---\n\nexternal ^{external}\n"),
+        )
+        .unwrap();
+        let origin = Payload {
+            version: 1,
+            vault: vault.id().into(),
+            path: "source.md".into(),
+            document: Some(origin_id),
+            cut: None,
+        };
+        let destination = VaultPath::new("destination.md").unwrap();
+        let plan = Relocation::prepare(&vault, &text, &origin, &destination, &destination_id, false).unwrap();
+        let doc = Document::from_text(&plan.source);
+        let id = doc.blocks().roots[0].persisted_id.as_deref().unwrap();
+        assert_ne!(id, primary);
+        assert!(!plan.source.contains("aero-aliases"));
+        assert!(plan.source.contains(&outside), "{}", plan.source);
+        assert!(plan.source.contains(&format!("![[id:{destination_id}#^{id}|alias]]")), "{}", plan.source);
+        assert!(plan.source.contains(&format!("[[id:{destination_id}#^{id}|title]]")), "{}", plan.source);
+        let only_reference =
+            Relocation::prepare(&vault, &outside, &origin, &destination, &destination_id, false).unwrap();
+        assert_eq!(only_reference.source, outside);
     }
 
     #[test]

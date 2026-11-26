@@ -391,13 +391,7 @@ impl Editor {
 
     fn block_menu_add_id(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.block_menu.as_ref().map(|menu| menu.block) else { return };
-        match self.ensure_id_for(id, window, cx) {
-            Ok(block_id) => cx.write_to_clipboard(ClipboardItem::new_string(format!("^{block_id}"))),
-            Err(error) => window.push_notification(
-                gpui_kit::component::notification::Notification::error(error).title("添加块 ID"),
-                cx,
-            ),
-        }
+        self.copy_identity_for(id, super::toolbar::IdentityCopy::Id, window, cx);
         self.block_menu = None;
         cx.notify();
     }

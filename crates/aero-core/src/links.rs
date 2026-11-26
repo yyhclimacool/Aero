@@ -160,18 +160,47 @@ impl Resolver {
         for (_, block) in doc.blocks().iter().filter(|(_, b)| b.kind != crate::BlockKind::Marker) {
             let Some(primary) = block.persisted_id.as_deref() else { continue };
             for id in std::iter::once(primary).chain(crate::block_refs::aliases(block)) {
-                let key = if crate::identity::is_block_id(id) || id.contains('#') {
-                    id.to_owned()
-                } else if let Some(document) = &document {
-                    format!("{document}#{id}")
-                } else {
-                    continue;
-                };
+                let Some(key) = block_identity_key(document.as_deref(), id) else { continue };
                 self.by_block_id.entry(key.clone()).or_default().push((path.clone(), primary.to_owned()));
                 keys.push(key);
             }
         }
         self.identities_of.insert(path.clone(), (document, keys));
+    }
+
+    /// Check that an existing or proposed document ID belongs only to this path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if another note claims the ID.
+    pub fn check_document_identity(&self, path: &VaultPath, id: &str) -> Result<(), String> {
+        if self.by_document_id.get(id).is_some_and(|paths| paths.iter().any(|p| p != path)) {
+            return Err(format!("文档身份重复：{id}，请先解决冲突"));
+        }
+        Ok(())
+    }
+
+    /// Check the primary ID and aliases against all identities registered in this resolver.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any identity is also defined by another block.
+    pub fn check_block_identity(
+        &self,
+        path: &VaultPath,
+        document: Option<&str>,
+        block: &crate::Block,
+    ) -> Result<(), String> {
+        let primary = block.persisted_id.as_deref();
+        for id in primary.into_iter().chain(crate::block_refs::aliases(block)) {
+            let Some(key) = block_identity_key(document, id) else { continue };
+            if let Some(entries) = self.by_block_id.get(&key)
+                && !matches!(entries.as_slice(), [(owner, id)] if owner == path && Some(id.as_str()) == primary)
+            {
+                return Err(format!("块身份或别名重复：{key}，请先解决冲突"));
+            }
+        }
+        Ok(())
     }
 
     fn resolve_identity(&self, document: &str, fragment: Option<&str>) -> Resolution {
@@ -268,7 +297,7 @@ impl Resolver {
     /// Escaping paths are rejected before any name matching.
     pub fn resolve(&self, target: &str, fragment: Option<&str>, note_dir: &str) -> Resolution {
         let target = target.trim();
-        if let Some(id) = target.strip_prefix("id:").filter(|id| crate::identity::is_document_id(id)) {
+        if let Some(id) = identity_target(target) {
             return self.resolve_identity(id, fragment);
         }
         if target.is_empty() || escapes(target) {
@@ -304,6 +333,18 @@ impl Resolver {
             Some(many) if many.len() > 1 => Resolution::Ambiguous { candidates: many.to_vec() },
             _ => Resolution::Unresolved,
         }
+    }
+}
+
+pub(crate) fn identity_target(target: &str) -> Option<&str> {
+    target.strip_prefix("id:").filter(|id| crate::identity::is_document_id(id))
+}
+
+pub(crate) fn block_identity_key(document: Option<&str>, id: &str) -> Option<String> {
+    if crate::identity::is_block_id(id) || id.contains('#') {
+        Some(id.to_owned())
+    } else {
+        document.map(|document| format!("{document}#{id}"))
     }
 }
 

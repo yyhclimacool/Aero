@@ -2150,6 +2150,66 @@ fn toolbar_more_menu_copies_a_block_link_and_adds_an_id(cx: &mut TestAppContext)
     assert_eq!(body.matches('^').count(), 1, "只写一个块 id：{body}");
 }
 
+#[gpui_kit::test]
+fn copying_a_sync_reference_writes_one_undoable_source_identity(cx: &mut TestAppContext) {
+    let original = "source body\n";
+    let (_dir, _vault, _path, editor) = open(cx, original);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let id = e.units[0].id;
+            e.open_block_menu(id, gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(40.)), window, cx);
+        });
+    });
+    settle(cx);
+    let copy = cx.debug_bounds("block-menu-sync-copy").unwrap();
+    cx.simulate_click(copy.center(), Default::default());
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let doc = &editor.read(cx).doc;
+        let document = aero_core::identity::read(doc).unwrap().id.unwrap();
+        let block = doc.blocks().roots[1].persisted_id.as_deref().unwrap();
+        let item = cx.read_from_clipboard().unwrap();
+        let expected = format!("![[id:{document}#^{block}]]");
+        assert_eq!(item.text().as_deref(), Some(expected.as_str()));
+        let payload: aero_core::clipboard::Payload = serde_json::from_str(item.metadata().unwrap()).unwrap();
+        assert_eq!(payload.document.as_deref(), Some(document.as_str()));
+        assert!(doc.to_string().contains(&format!("source body ^{block}")));
+    });
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), original);
+}
+
+#[gpui_kit::test]
+fn enter_in_the_sync_picker_confirms_the_source_without_splitting_the_document(cx: &mut TestAppContext) {
+    let original = "Before after.\n";
+    let (dir, _vault, _path, editor) = open(cx, original);
+    std::fs::write(dir.path().join("Origin.md"), "sync source\n").unwrap();
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let requests = std::rc::Rc::new(std::cell::Cell::new(0));
+    let _subscription = cx.update(|_, cx| {
+        let requests = requests.clone();
+        cx.subscribe(&editor, move |_, event, _| {
+            if matches!(event, super::EditorEvent::TransactionRequested(_)) {
+                requests.set(requests.get() + 1);
+            }
+        })
+    });
+    focus_unit(&editor, 0, cx);
+    cx.update(|window, cx| editor.update(cx, |e, cx| e.open_sync_picker(7..7, false, window, cx)));
+    settle(cx);
+    cx.simulate_input("Origin");
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    assert_eq!(text(&editor, cx), original);
+    assert_eq!(requests.get(), 0);
+    cx.simulate_keystrokes("enter");
+    settle(cx);
+    assert_eq!(requests.get(), 1);
+    assert_eq!(text(&editor, cx), original);
+}
+
 /// 选区浮动工具条（5.9）：键盘选区等 300 ms 出现，点粗体加 / 去格式，按下态跟着变。
 #[gpui_kit::test]
 fn selection_toolbar_appears_after_pause_and_toggles_bold(cx: &mut TestAppContext) {

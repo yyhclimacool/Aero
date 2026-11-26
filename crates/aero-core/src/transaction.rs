@@ -236,7 +236,20 @@ impl Transaction {
     ///
     /// Returns an error on validation, write, or journal failure. A failed rollback leaves its journal for recovery.
     pub fn commit(self, vault: &Vault) -> Result<Vec<FileChange>, String> {
-        self.commit_with(vault, |_| Ok(()))
+        self.commit_checked(vault, || Ok(()))
+    }
+
+    /// Recheck an additional workspace invariant before writing and before sealing the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns commit or validation errors and rolls back the transaction on failure.
+    pub fn commit_checked(
+        self,
+        vault: &Vault,
+        validate: impl FnMut() -> Result<(), String>,
+    ) -> Result<Vec<FileChange>, String> {
+        self.commit_with(vault, validate, |_| Ok(()))
     }
 
     /// Restore pending cuts and discard a prepared journal.
@@ -251,6 +264,7 @@ impl Transaction {
     fn commit_with(
         mut self,
         vault: &Vault,
+        mut validate: impl FnMut() -> Result<(), String>,
         mut hook: impl FnMut(usize) -> Result<(), String>,
     ) -> Result<Vec<FileChange>, String> {
         let commit = (|| {
@@ -258,6 +272,7 @@ impl Transaction {
             for change in self.changes.iter().chain(&self.observations) {
                 check(vault, change, &change.before)?;
             }
+            validate()?;
             self.phase(Phase::Committing)?;
             for (i, change) in self.changes.iter().enumerate() {
                 apply(vault, change, &change.before, &change.after)?;
@@ -271,6 +286,7 @@ impl Transaction {
             for change in &self.observations {
                 check(vault, change, &change.before)?;
             }
+            validate()?;
             self.phase(Phase::Committed)
         })();
         if let Err(cause) = commit {
@@ -446,11 +462,11 @@ mod tests {
             let (_temp, vault, root, changes) = fixture();
             let tx = Transaction::prepare(&vault, &root, changes.clone()).unwrap();
             assert!(
-                tx.commit_with(&vault, |i| if i == failure {
-                    Err("injected failure".into())
-                } else {
-                    Ok(())
-                })
+                tx.commit_with(
+                    &vault,
+                    || Ok(()),
+                    |i| if i == failure { Err("injected failure".into()) } else { Ok(()) }
+                )
                 .is_err()
             );
             for change in changes {
@@ -511,12 +527,16 @@ mod tests {
             let tx = Transaction::prepare(&vault, &root, changes.clone()).unwrap();
             let journal = tx.directory.clone();
             assert!(
-                tx.commit_with(&vault, |i| {
-                    if i == 1 {
-                        vault.write_bytes(&changed, b"external").map_err(|e| e.to_string())?;
+                tx.commit_with(
+                    &vault,
+                    || Ok(()),
+                    |i| {
+                        if i == 1 {
+                            vault.write_bytes(&changed, b"external").map_err(|e| e.to_string())?;
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                })
+                )
                 .is_err()
             );
             assert_eq!(vault.read_bytes(&changed).unwrap().0, b"external");

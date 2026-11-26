@@ -169,6 +169,7 @@ actions!(
         OpenColorMenu,
         /// 颜色菜单里的 `Tab` / `Esc`
         ConfirmColorMenu,
+        ConfirmSyncSource,
         CloseColorMenu,
         /// 当前笔记在「隐藏标记」和「整篇源码」之间换（9.1）
         ToggleNoteSource,
@@ -398,6 +399,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("escape", CloseColorMenu, Some("ColorMenu > Input")),
         // ⌘/ 是开关：菜单开着时焦点在它自己的输入框上，外面那条绑定匹配不到这里
         KeyBinding::new("cmd-/", CloseColorMenu, Some("ColorMenu > Input")),
+        KeyBinding::new("enter", ConfirmSyncSource, Some("SyncPicker > Input")),
         KeyBinding::new("cmd-z", DocUndo, Some("Input")),
         KeyBinding::new("cmd-shift-z", DocRedo, Some("Input")),
         KeyBinding::new("cmd-z", gpui_kit::base::input::Undo, Some("PdfPageInput > Input")),

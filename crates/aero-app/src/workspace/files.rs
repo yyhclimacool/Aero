@@ -59,6 +59,16 @@ fn commit_restoring(
     control: Option<&Control>,
     restorations: std::collections::HashMap<VaultPath, Vec<u8>>,
 ) -> Result<(), String> {
+    prepare_transaction(vault, journal, changes, control, restorations)?.commit(vault).map(|_| ())
+}
+
+fn prepare_transaction(
+    vault: &Vault,
+    journal: &Path,
+    changes: Vec<FileChange>,
+    control: Option<&Control>,
+    restorations: std::collections::HashMap<VaultPath, Vec<u8>>,
+) -> Result<Transaction, String> {
     let transaction = Transaction::prepare_restoring(vault, journal, changes, restorations)?;
     if let Some(control) = control
         && let Err(error) = control.begin_commit()
@@ -66,13 +76,29 @@ fn commit_restoring(
         transaction.cancel(vault)?;
         return Err(error);
     }
-    transaction.commit(vault).map(|_| ())
+    Ok(transaction)
 }
 
 #[derive(Clone)]
 pub(crate) enum PastePosition {
     Text(std::ops::Range<usize>),
     AfterBlock { offset: usize, prefix: String },
+}
+
+#[derive(Clone)]
+pub(crate) enum SyncEdit {
+    Insert(std::ops::Range<usize>),
+    Replace(std::ops::Range<usize>),
+}
+
+#[derive(Clone)]
+pub(crate) struct SyncReference {
+    pub source: VaultPath,
+    pub source_before: Vec<u8>,
+    pub block: usize,
+    pub destination: VaultPath,
+    pub destination_before: Vec<u8>,
+    pub edit: SyncEdit,
 }
 
 #[derive(Clone)]
@@ -98,6 +124,10 @@ pub(crate) enum Operation {
         path: VaultPath,
         parent: Option<VaultPath>,
         before: Option<VaultPath>,
+        journal: PathBuf,
+    },
+    SyncReference {
+        request: Box<SyncReference>,
         journal: PathBuf,
     },
     Transaction {
@@ -138,6 +168,7 @@ impl Operation {
     pub(super) fn set_journal(&mut self, path: PathBuf) {
         match self {
             Self::Paste { journal, .. }
+            | Self::SyncReference { journal, .. }
             | Self::Transaction { journal, .. }
             | Self::CreateChild { journal, .. }
             | Self::Reparent { journal, .. } => *journal = path,
@@ -149,6 +180,7 @@ impl Operation {
             Self::Paste { .. } => "block_paste",
             Self::CreateChild { .. } => "document_child_create",
             Self::Reparent { .. } => "document_reparent",
+            Self::SyncReference { .. } => "sync_reference",
             Self::Transaction { .. } => "workspace_transaction",
             Self::Create { .. } => "file_create",
             Self::Import { .. } => "file_import",
@@ -160,12 +192,88 @@ impl Operation {
 
 #[derive(Default)]
 struct Outcome {
-    history: Option<(String, Vec<FileChange>, Option<bool>)>,
+    history: Vec<(String, Vec<FileChange>, Option<bool>)>,
     open: Option<(VaultPath, bool)>,
     trashed: Option<VaultPath>,
     removed: Vec<(VaultPath, Option<VaultPath>)>,
     touched: Vec<VaultPath>,
     error: Option<String>,
+}
+
+fn insert_sync(
+    vault: &Vault,
+    request: SyncReference,
+    journal: &Path,
+    control: Option<&Control>,
+) -> Result<Outcome, String> {
+    use aero_core::{Document, Edit, block_refs, identity};
+
+    let (mut resolver, mut changes) = block_refs::vault_snapshot(vault)?;
+    let participant = |path, before: &[u8]| {
+        changes
+            .iter()
+            .position(|c| &c.path == path && c.before.as_deref() == Some(before))
+            .ok_or("来源或目标文档已变化，请重新选择同步来源")
+    };
+    let source_index = participant(&request.source, &request.source_before)?;
+    let destination_index = participant(&request.destination, &request.destination_before)?;
+    let mut source = Document::from_bytes(&request.source_before).map_err(|e| e.to_string())?;
+    let (_, block) = source.blocks().iter().nth(request.block).ok_or("同步来源块已变化")?;
+    let assignment = block_refs::permanent_in(&mut resolver, &request.source, &source, block.id)?;
+    let same_document = source_index == destination_index;
+    let (mut range, replace) = match request.edit {
+        SyncEdit::Insert(range) => (range, false),
+        SyncEdit::Replace(range) => (range, true),
+    };
+    if same_document {
+        let original = range.clone();
+        for edit in &assignment.edits {
+            if edit.range.end <= original.start {
+                range.start = range.start.saturating_add_signed(edit.delta());
+                range.end = range.end.saturating_add_signed(edit.delta());
+            } else if edit.range.start < original.end {
+                return Err("同步来源身份与插入位置重叠，请重新选择插入位置".into());
+            }
+        }
+    }
+    source.edit_group(assignment.edits).map_err(|e| e.to_string())?;
+    let mut destination = if same_document {
+        source
+    } else {
+        changes[source_index].after = Some(source.to_bytes());
+        Document::from_bytes(&request.destination_before).map_err(|e| e.to_string())?
+    };
+    let reference = format!("![[id:{}#^{}]]", assignment.document, assignment.id);
+    if replace {
+        destination.edit(Edit::replace(range, reference)).map_err(|e| e.to_string())?;
+    } else {
+        destination = crate::editor::insert_tree(&destination, range, &reference)?;
+    }
+    if same_document {
+        destination.reparse();
+        block_refs::resolve(&destination, &assignment.id)?;
+    }
+    changes[destination_index].after = Some(destination.to_bytes());
+    let mut outcome = Outcome::default();
+    // Commit both files together, but give the source identity its own undo boundary.
+    for index in [destination_index, source_index].into_iter().take(if same_document { 1 } else { 2 }) {
+        let change = &changes[index];
+        if change.before != change.after {
+            outcome.touched.push(change.path.clone());
+            outcome.history.push((identity::new_block_id(), vec![change.clone()], None));
+        }
+    }
+    let paths: Vec<_> = changes.iter().map(|change| change.path.clone()).collect();
+    prepare_transaction(vault, journal, changes, control, Default::default())?.commit_checked(
+        vault,
+        || {
+            if vault.notes().map_err(|e| e.to_string())? != paths {
+                return Err("笔记库文件列表已变化，请重新选择同步来源".into());
+            }
+            Ok(())
+        },
+    )?;
+    Ok(outcome)
 }
 
 pub(super) struct Guard(Option<std::thread::JoinHandle<()>>);
@@ -308,7 +416,7 @@ fn execute_with_paste_snapshot(
             }
             commit_restoring(vault, &journal, changes, control, restorations)?;
             outcome.touched = history.iter().map(|c| c.path.clone()).collect();
-            outcome.history = Some((token, history, None));
+            outcome.history.push((token, history, None));
         }
         Operation::CreateChild { parent, before, range, journal } => {
             let (doc, _) = vault.read(&parent).map_err(|e| e.to_string())?;
@@ -344,6 +452,9 @@ fn execute_with_paste_snapshot(
                 control,
             );
         }
+        Operation::SyncReference { request, journal } => {
+            return insert_sync(vault, *request, &journal, control);
+        }
         Operation::Transaction { token, changes, history_changes, direction, open, journal } => {
             if changes.is_empty() {
                 return Ok(outcome);
@@ -377,7 +488,7 @@ fn execute_with_paste_snapshot(
                 })
                 .collect();
             outcome.open = open.map(|p| (p, true));
-            outcome.history = Some((
+            outcome.history.push((
                 token,
                 history_changes
                     .unwrap_or_else(|| changes.into_iter().filter(|c| c.before != c.after).collect()),
@@ -523,10 +634,10 @@ impl Workspace {
                     Ok((result, loaded)) => (result, loaded),
                     Err(error) => (Err(error.to_string()), Vec::new()),
                 };
-                if let Ok(outcome) = &outcome
-                    && let Some((token, changes, direction)) = &outcome.history
-                {
-                    super::history::record(open.vault.id(), token, changes, *direction, cx);
+                if let Ok(outcome) = &outcome {
+                    for (token, changes, direction) in &outcome.history {
+                        super::history::record(open.vault.id(), token, changes, *direction, cx);
+                    }
                 }
                 for editor in &editors {
                     let path = editor.read(cx).path().clone();
@@ -538,8 +649,11 @@ impl Workspace {
                         continue;
                     }
                     if let Ok(outcome) = &outcome
-                        && let Some((token, changes, direction)) = &outcome.history
-                        && let Some(change) = changes.iter().find(|c| c.path == path)
+                        && let Some((token, change, direction)) =
+                            outcome.history.iter().find_map(|(token, changes, direction)| {
+                                let change = changes.iter().find(|c| c.path == path)?;
+                                Some((token, change, direction))
+                            })
                     {
                         let loaded =
                             loaded.iter().find(|(p, _)| p == &path).and_then(|(_, r)| r.as_ref().ok());
@@ -752,5 +866,66 @@ mod tests {
         assert!(control.begin_commit().is_ok());
         control.cancel();
         assert_eq!(control.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sync_rechecks_the_vault_before_claiming_an_identity() {
+        use aero_core::{Vault, VaultPath, identity};
+        let dir = tempfile::tempdir().unwrap();
+        let journal = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let source = VaultPath::new("source.md").unwrap();
+        let destination = VaultPath::new("destination.md").unwrap();
+        let collision = VaultPath::new("collision.md").unwrap();
+        let document = identity::new_document_id();
+        let other_document = identity::new_document_id();
+        let primary = identity::new_block_id();
+        let alias = identity::new_block_id();
+        let other = identity::new_block_id();
+        let existing =
+            format!("---\naero: {{id: {document}}}\n---\n\nsource {{aero-aliases=\"{alias}\"}} ^{primary}\n");
+        let legacy = format!("---\naero: {{id: {document}}}\n---\n\nsource ^old\n");
+        let target = b"before /sync after\n";
+        vault.create_bytes(&destination, target).unwrap();
+        for (body, conflicting, expected) in [
+            (&existing, format!("---\naero: {{id: {document}}}\n---\n\nother\n"), "文档身份重复"),
+            (&existing, format!("other ^{primary}\n"), "块身份或别名重复"),
+            (&existing, format!("other ^{alias}\n"), "块身份或别名重复"),
+            (&existing, format!("other {{aero-aliases=\"{primary}\"}} ^{other}\n"), "块身份或别名重复"),
+            (&legacy, format!("other {{aero-aliases=\"{document}#old\"}} ^{other}\n"), "块身份或别名重复"),
+        ] {
+            vault.write_bytes(&source, body.as_bytes()).unwrap();
+            vault.write_bytes(&collision, conflicting.as_bytes()).unwrap();
+            let request = super::SyncReference {
+                source: source.clone(),
+                source_before: body.as_bytes().to_vec(),
+                block: 1,
+                destination: destination.clone(),
+                destination_before: target.to_vec(),
+                edit: super::SyncEdit::Insert(7..12),
+            };
+            let result = super::insert_sync(&vault, request, journal.path(), None);
+            assert!(matches!(result, Err(error) if error.contains(expected)), "{conflicting}");
+            assert_eq!(vault.read_bytes(&source).unwrap().0, body.as_bytes());
+            assert_eq!(vault.read_bytes(&destination).unwrap().0, target);
+        }
+
+        vault
+            .write_bytes(
+                &collision,
+                format!("---\naero: {{id: {other_document}}}\n---\n\nother ^old\n").as_bytes(),
+            )
+            .unwrap();
+        let request = super::SyncReference {
+            source: source.clone(),
+            source_before: legacy.as_bytes().to_vec(),
+            block: 1,
+            destination: destination.clone(),
+            destination_before: target.to_vec(),
+            edit: super::SyncEdit::Insert(7..12),
+        };
+        let outcome = super::insert_sync(&vault, request, journal.path(), None).unwrap();
+        assert_eq!(outcome.history.len(), 2);
+        assert!(vault.read(&source).unwrap().0.to_string().contains(&format!("{document}#old")));
     }
 }
