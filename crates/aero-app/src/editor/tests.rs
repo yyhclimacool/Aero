@@ -5360,6 +5360,172 @@ fn gutter_type_and_handle_open_menu_without_geometry_or_document_changes(cx: &mu
 }
 
 #[gpui_kit::test]
+fn tab_and_shift_tab_change_the_list_item_level(cx: &mut TestAppContext) {
+    let source = "- first\n- second ^second\n\n  continuation\n\n  - nested ^nested\n- third\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 1, cx);
+    let depth = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let e = editor.read(cx);
+            let body = e
+                .doc
+                .blocks()
+                .iter()
+                .find(|(_, block)| block.persisted_id.as_deref() == Some("second"))
+                .unwrap()
+                .1
+                .id;
+            aero_core::containers::ancestors(&e.doc, body)
+                .iter()
+                .filter(|block| matches!(block.kind, aero_core::BlockKind::ListItem { .. }))
+                .count()
+        })
+    };
+    cx.simulate_keystrokes("tab");
+    assert_eq!(depth(&editor, cx), 2);
+    assert!(!text(&editor, cx).contains("indent="));
+    cx.simulate_keystrokes("shift-tab");
+    assert_eq!(depth(&editor, cx), 1);
+    cx.simulate_keystrokes("cmd-z cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn visual_indent_increase_enforces_level_and_width_limits(_cx: &mut TestAppContext) {
+    assert!(Editor::can_increase_visual_indent(0, gpui_kit::px(184.)));
+    assert!(!Editor::can_increase_visual_indent(0, gpui_kit::px(183.)));
+    assert!(Editor::can_increase_visual_indent(7, gpui_kit::px(184.)));
+    assert!(!Editor::can_increase_visual_indent(7, gpui_kit::px(183.)));
+    assert!(!Editor::can_increase_visual_indent(8, gpui_kit::px(1000.)));
+}
+
+#[gpui_kit::test]
+fn visual_indent_bounds_show_the_current_available_width(cx: &mut TestAppContext) {
+    let (_dir, _vault, _path, editor) = open(cx, "plain\n\nindented {indent=2}\n");
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    settle(cx);
+    let (plain, indented) = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let plain = e.unit_bounds.iter().find(|(id, _)| *id == e.units[0].id).unwrap().1;
+        let indented = e.unit_bounds.iter().find(|(id, _)| *id == e.units[1].id).unwrap().1;
+        (plain, indented)
+    });
+    assert_eq!(plain.size.width - indented.size.width, gpui_kit::px(48.));
+    assert!(indented.origin.x > plain.origin.x);
+}
+
+#[gpui_kit::test]
+fn paragraph_menu_applies_visual_indent_with_boundaries(cx: &mut TestAppContext) {
+    for (source, row, expected) in [
+        ("para\n", 4, "para {indent=1}\n"),
+        ("para {indent=8}\n", 4, "para {indent=8}\n"),
+        ("para\n", 5, "para\n"),
+    ] {
+        let (_dir, _vault, _path, editor) = open(cx, source);
+        let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                let id = e.doc.blocks().roots[0].id;
+                e.open_block_menu(id, gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(40.)), window, cx);
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        let layout = cx.debug_bounds("block-menu-layout").unwrap().center();
+        cx.simulate_click(layout, gpui_kit::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        let action =
+            cx.debug_bounds(Box::leak(format!("block-layout-{row}").into_boxed_str())).unwrap().center();
+        cx.simulate_click(action, gpui_kit::Modifiers::default());
+        settle(cx);
+        assert_eq!(text(&editor, cx), expected);
+        if expected == source {
+            cx.update(|_, cx| assert!(editor.read(cx).block_menu.is_some(), "禁用项点击不能穿透或关闭菜单"));
+        }
+        assert!(!expected.starts_with(' '));
+    }
+}
+
+#[gpui_kit::test]
+fn list_menu_changes_structure_instead_of_visual_indent(cx: &mut TestAppContext) {
+    let source = "- first\n- second ^second\n\n  continuation\n\n  - nested ^nested\n- third\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            let item = e.doc.blocks().roots[0].children[1].id;
+            e.open_block_menu(item, gpui_kit::point(gpui_kit::px(20.), gpui_kit::px(40.)), window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    let layout = cx.debug_bounds("block-menu-layout").unwrap().center();
+    cx.simulate_click(layout, gpui_kit::Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    let increase = cx.debug_bounds("block-layout-4").unwrap().center();
+    cx.simulate_click(increase, gpui_kit::Modifiers::default());
+    settle(cx);
+    let depth = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        let body = e
+            .doc
+            .blocks()
+            .iter()
+            .find(|(_, block)| block.persisted_id.as_deref() == Some("second"))
+            .unwrap()
+            .1
+            .id;
+        aero_core::containers::ancestors(&e.doc, body)
+            .iter()
+            .filter(|block| matches!(block.kind, aero_core::BlockKind::ListItem { .. }))
+            .count()
+    });
+    assert_eq!(depth, 2);
+    assert!(!text(&editor, cx).contains("indent="));
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), source);
+}
+
+#[gpui_kit::test]
+fn tab_handles_empty_items_and_unavailable_list_targets(cx: &mut TestAppContext) {
+    let source = "- first\n- \n- third\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    focus_unit(&editor, 1, cx);
+    cx.simulate_keystrokes("tab");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(
+            e.doc.blocks().roots[0].children[0]
+                .children
+                .iter()
+                .any(|block| { matches!(block.kind, aero_core::BlockKind::List { .. }) })
+        );
+    });
+    cx.simulate_keystrokes("shift-tab");
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(
+            e.doc.blocks().roots[0].children[0]
+                .children
+                .iter()
+                .all(|block| { !matches!(block.kind, aero_core::BlockKind::List { .. }) })
+        );
+    });
+    cx.simulate_keystrokes("cmd-z cmd-z");
+    assert_eq!(text(&editor, cx), source);
+
+    let (_dir2, _vault2, _path2, editor) = open(cx, "- only\n");
+    let cx = &mut VisualTestContext::from_window(*cx.windows().last().unwrap(), cx);
+    focus_unit(&editor, 0, cx);
+    cx.simulate_keystrokes("tab");
+    assert_eq!(text(&editor, cx), "- only\n");
+}
+
+#[gpui_kit::test]
 fn list_operation_targets_remain_reachable_with_and_without_virtualization(cx: &mut TestAppContext) {
     use gpui_kit::{Modifiers, point, px, size};
     let source = "before\n\n- first\n\n  continuation\n\n  - nested\n- second\n\nafter\n";

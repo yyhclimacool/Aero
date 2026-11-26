@@ -469,12 +469,92 @@ fn contains_unit(units: &[Unit], ancestor: usize, index: usize) -> bool {
     unit.range.start >= span.start && unit.range.end <= span.end && span.start != span.end
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ListLevelDirection {
+    Indent,
+    Outdent,
+}
+
+fn list_level_target(
+    doc: &Document,
+    id: BlockId,
+    direction: ListLevelDirection,
+) -> Option<(BlockId, bool, bool)> {
+    let item = doc.blocks().find(id)?;
+    if !matches!(item.kind, BlockKind::ListItem { .. }) {
+        return None;
+    }
+    let ancestors = aero_core::containers::ancestors(doc, id);
+    match direction {
+        ListLevelDirection::Indent => {
+            let parent = ancestors.last()?;
+            let index = parent.children.iter().position(|block| block.id == id)?;
+            let previous = parent.children[..index]
+                .iter()
+                .rev()
+                .find(|block| matches!(block.kind, BlockKind::ListItem { .. }))?;
+            Some((previous.id, false, true))
+        }
+        ListLevelDirection::Outdent => {
+            let parent =
+                ancestors.iter().rev().find(|block| matches!(block.kind, BlockKind::ListItem { .. }))?;
+            Some((parent.id, true, false))
+        }
+    }
+}
+
+pub(super) fn can_change_list_level(doc: &Document, id: BlockId, direction: ListLevelDirection) -> bool {
+    list_level_target(doc, id, direction).is_some()
+}
+
+pub(super) fn change_list_level(doc: &Document, id: BlockId, direction: ListLevelDirection) -> Option<Plan> {
+    let (target, after, into) = list_level_target(doc, id, direction)?;
+    let following = if direction == ListLevelDirection::Outdent {
+        let ancestors = aero_core::containers::ancestors(doc, id);
+        let parent = ancestors.last()?;
+        let index = parent.children.iter().position(|block| block.id == id)?;
+        parent.children[index + 1..]
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::ListItem { .. }))
+            .map(|block| block.id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    move_node_with_following(doc, id, target, after, into, &following)
+}
+
+fn subtree_end(doc: &Document, id: BlockId) -> Option<usize> {
+    let block = doc.blocks().find(id)?;
+    let mut end = aero_core::properties::owned_range(doc, id)?.end;
+    for child in &block.children {
+        let child_end = if child.kind == BlockKind::Marker {
+            doc.range_of(child).end
+        } else {
+            subtree_end(doc, child.id)?
+        };
+        end = end.max(child_end);
+    }
+    Some(end)
+}
+
 pub fn move_node(
     doc: &Document,
     source: aero_core::BlockId,
     target: aero_core::BlockId,
     after: bool,
     into: bool,
+) -> Option<Plan> {
+    move_node_with_following(doc, source, target, after, into, &[])
+}
+
+fn move_node_with_following(
+    doc: &Document,
+    source: aero_core::BlockId,
+    target: aero_core::BlockId,
+    after: bool,
+    into: bool,
+    following: &[BlockId],
 ) -> Option<Plan> {
     let from = doc.blocks().find(source)?;
     let to = doc.blocks().find(target)?;
@@ -491,11 +571,39 @@ pub fn move_node(
             return None;
         }
     }
-    let target_range = aero_core::properties::owned_range(doc, target)?;
+    let mut target_range = aero_core::properties::owned_range(doc, target)?;
+    if after && !into {
+        target_range.end = subtree_end(doc, target)?;
+    }
     let original = doc.to_string();
-    let delete = block_ops::deletions(doc, &original, &[source]).pop()?;
+    let mut moving = Vec::with_capacity(1 + following.len());
+    moving.push(source);
+    moving.extend_from_slice(following);
+    let delete = block_ops::deletions(doc, &original, &moving).pop()?;
     let range = delete.range.clone();
+    let moves_out_of_target = after
+        && !into
+        && aero_core::containers::ancestors(doc, source).iter().any(|block| block.id == target);
+    if moves_out_of_target {
+        target_range.end = target_range.end.max(range.end);
+    }
     let mut piece = block_ops::source(doc, &original, &[source]);
+    if !following.is_empty() {
+        let marker_range = aero_core::properties::owned_range(doc, source)?;
+        let nested_prefix = from.children.first().map_or_else(
+            || {
+                let marker = &original[marker_range];
+                let width = list_marker_len(marker).unwrap_or_else(|| marker.trim_end().len() + 1);
+                " ".repeat(width)
+            },
+            |child| block_ops::continuation(doc, &original, child.id, doc.range_of(child).start).0,
+        );
+        for id in following {
+            let child = block_ops::source(doc, &original, &[*id]);
+            piece =
+                format!("{piece}\n\n{nested_prefix}{}", child.replace('\n', &format!("\n{nested_prefix}")));
+        }
+    }
     let (at, prefix, task_header) = if into {
         if matches!(to.kind, BlockKind::ListItem { .. }) {
             let prefix = to.children.first().map_or_else(
@@ -538,7 +646,11 @@ pub fn move_node(
     let piece = piece.trim_end_matches('\n').replace('\n', &format!("\n{prefix}"));
     let separator = format!("\n{}\n{prefix}", prefix.trim_end_matches([' ', '\t']));
     let (insertion, leading) = if into || after || task_header {
-        let tail = if task_header && !after { separator.as_str() } else { "" };
+        let needs_tail = moves_out_of_target
+            && matches!(from.kind, BlockKind::ListItem { .. })
+            && at < original.len()
+            && !original[at..].starts_with(&separator);
+        let tail = if task_header && !after || needs_tail { separator.as_str() } else { "" };
         (format!("{separator}{piece}{tail}"), separator.len())
     } else {
         (format!("{piece}{separator}"), 0)
@@ -569,7 +681,12 @@ pub fn move_node(
             return None;
         }
     }
-    let focus_offset = if at >= range.end { at - range.len() } else { at } + leading;
+    let content_start = if matches!(from.kind, BlockKind::ListItem { .. }) {
+        list_marker_len(&piece).unwrap_or(0)
+    } else {
+        0
+    };
+    let focus_offset = if at >= range.end { at - range.len() } else { at } + leading + content_start;
     let text = probe.to_string();
     (original != text).then(|| Plan { edit: Edit::replace(0..doc.len(), text), focus_offset })
 }
@@ -1457,6 +1574,125 @@ mod tests {
         assert!(aero_core::block_refs::resolve(&doc, "outer").is_ok());
         doc.undo().unwrap();
         assert_eq!(doc.to_string(), source);
+    }
+
+    #[test]
+    fn list_level_changes_move_the_whole_item_and_preserve_identity() {
+        let source = "- first\n- second ^second\n\n  continuation\n\n  - nested ^nested\n- third\n";
+        let mut doc = Document::from_text(source);
+        let second = doc.blocks().roots[0].children[1].id;
+        let plan =
+            change_list_level(&doc, second, ListLevelDirection::Indent).expect("second item can indent");
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let body = doc
+            .blocks()
+            .iter()
+            .find(|(_, block)| block.persisted_id.as_deref() == Some("second"))
+            .unwrap()
+            .1
+            .id;
+        let first = doc.blocks().roots[0].children[0].id;
+        assert!(aero_core::containers::ancestors(&doc, body).iter().any(|block| block.id == first));
+        assert!(aero_core::block_refs::resolve(&doc, "second").is_ok());
+        assert!(aero_core::block_refs::resolve(&doc, "nested").is_ok());
+        assert!(!doc.to_string().contains("indent="));
+        doc.undo().unwrap();
+        assert_eq!(doc.to_string(), source);
+
+        let mut doc = Document::from_text(
+            "- first\n  - second ^second\n\n    continuation\n\n    - nested ^nested\n- third\n",
+        );
+        let body = doc
+            .blocks()
+            .iter()
+            .find(|(_, block)| block.persisted_id.as_deref() == Some("second"))
+            .unwrap()
+            .1
+            .id;
+        let second = aero_core::containers::ancestors(&doc, body)
+            .into_iter()
+            .rev()
+            .find(|block| matches!(block.kind, BlockKind::ListItem { .. }))
+            .unwrap()
+            .id;
+        let plan =
+            change_list_level(&doc, second, ListLevelDirection::Outdent).expect("nested item can outdent");
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let body = doc
+            .blocks()
+            .iter()
+            .find(|(_, block)| block.persisted_id.as_deref() == Some("second"))
+            .unwrap()
+            .1
+            .id;
+        assert_eq!(
+            aero_core::containers::ancestors(&doc, body)
+                .iter()
+                .filter(|block| matches!(block.kind, BlockKind::ListItem { .. }))
+                .count(),
+            1
+        );
+        assert!(aero_core::block_refs::resolve(&doc, "second").is_ok());
+        assert!(aero_core::block_refs::resolve(&doc, "nested").is_ok());
+    }
+
+    #[test]
+    fn outdenting_a_middle_item_adopts_following_siblings_and_preserves_order() {
+        let source = "- parent\n  - first ^first\n  - second ^second\n  - third ^third\n- next ^next\n";
+        let mut doc = Document::from_text(source);
+        let body = doc
+            .blocks()
+            .iter()
+            .find(|(_, block)| block.persisted_id.as_deref() == Some("second"))
+            .unwrap()
+            .1
+            .id;
+        let second = aero_core::containers::ancestors(&doc, body)
+            .into_iter()
+            .rev()
+            .find(|block| matches!(block.kind, BlockKind::ListItem { .. }))
+            .unwrap()
+            .id;
+        let plan =
+            change_list_level(&doc, second, ListLevelDirection::Outdent).expect("middle item can outdent");
+        doc.edit(plan.edit).unwrap();
+        doc.reparse();
+        let text = doc.to_string();
+        let order = ["first", "second", "third", "next"].map(|id| text.find(id).unwrap());
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+        let second_body = doc
+            .blocks()
+            .iter()
+            .find(|(_, block)| block.persisted_id.as_deref() == Some("second"))
+            .unwrap()
+            .1
+            .id;
+        let third_body = doc
+            .blocks()
+            .iter()
+            .find(|(_, block)| block.persisted_id.as_deref() == Some("third"))
+            .unwrap()
+            .1
+            .id;
+        let second_item = aero_core::containers::ancestors(&doc, second_body)
+            .into_iter()
+            .rev()
+            .find(|block| matches!(block.kind, BlockKind::ListItem { .. }))
+            .unwrap()
+            .id;
+        assert!(
+            aero_core::containers::ancestors(&doc, third_body).iter().any(|block| block.id == second_item)
+        );
+    }
+
+    #[test]
+    fn list_level_changes_reject_missing_structural_targets() {
+        let doc = Document::from_text("- only\n");
+        let item = doc.blocks().roots[0].children[0].id;
+        assert!(change_list_level(&doc, item, ListLevelDirection::Indent).is_none());
+        assert!(change_list_level(&doc, item, ListLevelDirection::Outdent).is_none());
     }
 
     #[test]

@@ -94,11 +94,17 @@ pub fn set_focus_shows_source(on: bool, cx: &mut App) {
 use crate::actions::{
     BlockDown, BlockUp, BlurEditor, ConvertBlock, CopySelectedBlocks, CutSelectedBlocks,
     DeleteSelectedBlocks, DocRedo, DocUndo, EditLink, EditSelectedBlock, ExtendBlockDown, ExtendBlockUp,
-    FormatInline, LinkAlias, MenuConfirm, OpenCharacterPalette, SelectBlockDown, SelectBlockUp, SplitBlock,
+    FormatInline, LinkAlias, ListOutdent, MenuConfirm, OpenCharacterPalette, SelectBlockDown, SelectBlockUp,
+    SplitBlock,
 };
 use crate::colors::Paint;
 use ops::{BlockType, Plan};
 use slash::SlashAction;
+
+enum ListLevelOutcome {
+    NotList,
+    Consumed,
+}
 use text_ops::*;
 use units::{Unit, unit_at};
 
@@ -2188,6 +2194,45 @@ impl Editor {
         self.convert_at(offset, target, false, window, cx);
     }
 
+    fn change_focused_list_level(
+        &mut self,
+        direction: ops::ListLevelDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ListLevelOutcome {
+        self.ensure_current_parse();
+        let Some(id) = self.focused_block_id() else { return ListLevelOutcome::NotList };
+        let item = self
+            .doc
+            .blocks()
+            .find(id)
+            .filter(|block| matches!(block.kind, BlockKind::ListItem { .. }))
+            .or_else(|| {
+                aero_core::containers::ancestors(&self.doc, id)
+                    .into_iter()
+                    .rev()
+                    .find(|block| matches!(block.kind, BlockKind::ListItem { .. }))
+            });
+        let Some(item) = item else { return ListLevelOutcome::NotList };
+        if let Some(plan) = ops::change_list_level(&self.doc, item.id, direction) {
+            self.apply_plan(plan, window, cx);
+        }
+        ListLevelOutcome::Consumed
+    }
+
+    fn on_list_outdent(&mut self, _: &ListOutdent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_composing(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if matches!(
+            self.change_focused_list_level(ops::ListLevelDirection::Outdent, window, cx),
+            ListLevelOutcome::NotList
+        ) {
+            cx.propagate();
+        }
+    }
+
     fn on_menu_confirm(&mut self, _: &MenuConfirm, window: &mut Window, cx: &mut Context<Self>) {
         if self.input_composing(window, cx) {
             cx.propagate();
@@ -2205,7 +2250,10 @@ impl Editor {
             let next = presenter::Key { id, part: presenter::Part::Cell(row, col + 1) };
             let (row, col) = if self.presenters.contains_key(&next) { (row, col + 1) } else { (row + 1, 0) };
             self.move_table_cell(id, row, col, window, cx);
-        } else {
+        } else if matches!(
+            self.change_focused_list_level(ops::ListLevelDirection::Indent, window, cx),
+            ListLevelOutcome::NotList
+        ) {
             cx.propagate();
         }
     }
@@ -4777,13 +4825,15 @@ impl Render for Editor {
                 }
             }))
             .track_focus(&self.focus_handle)
-            // 菜单面板由 occlude 排除；在正文链接吞掉捕获事件前关闭菜单。
+            // 菜单面板由 occlude 排除，菜单自身的 outside handler 负责关闭。
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                this.close_block_menu(cx);
                 this.clear_navigation(cx);
                 this.text_drag_anchor = (event.button == MouseButton::Left && !event.modifiers.alt)
                     .then(|| this.unit_under_pointer(event.position))
                     .flatten();
+            }))
+            .on_any_mouse_down(cx.listener(|this, _, _, cx| {
+                this.close_block_menu(cx);
             }))
             .on_action(cx.listener(Self::on_block_up))
             .on_action(cx.listener(Self::on_block_down))
@@ -4799,6 +4849,7 @@ impl Render for Editor {
             )
             .on_action(cx.listener(Self::on_convert_block))
             .on_action(cx.listener(Self::on_menu_confirm))
+            .on_action(cx.listener(Self::on_list_outdent))
             .on_action(cx.listener(Self::on_link_alias))
             .on_action(cx.listener(Self::on_edit_link))
             .on_action(cx.listener(Self::on_open_character_palette))

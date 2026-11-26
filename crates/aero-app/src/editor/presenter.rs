@@ -560,6 +560,7 @@ impl Editor {
                         return;
                     }
                     if let Some((url, _)) = this.link_at(key, event.position, cx) {
+                        this.close_block_menu(cx);
                         cx.stop_propagation();
                         window.prevent_default();
                         this.pending_link = Some((key, url));

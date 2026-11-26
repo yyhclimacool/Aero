@@ -135,8 +135,10 @@ actions!(
         DocRedo,
         /// Esc：块选中态 → 浏览态（编辑态里的 Esc 由文本控件的 `Escape` 动作冒泡到编辑器，先进块选中态）
         BlurEditor,
-        /// `/` 菜单开着时 Tab 确认；否则交给文本控件
+        /// 菜单确认或增加列表结构层级，其他输入场景交给文本控件
         MenuConfirm,
+        /// ⇧Tab：列表正文降低结构层级，其他输入场景保持原行为
+        ListOutdent,
         /// 笔记补全：⇧⏎ 插入并选中显示别名；其余情况仍是软换行。
         LinkAlias,
         /// ⌘K：选区变为行内链接，已有链接选中地址，无选区打开笔记补全。
@@ -376,6 +378,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("down", BlockDown, Some("Input")),
         KeyBinding::new("enter", SplitBlock, Some("Input")),
         KeyBinding::new("tab", MenuConfirm, Some("Input")),
+        KeyBinding::new("shift-tab", ListOutdent, Some("Editor > Input")),
         KeyBinding::new("shift-enter", LinkAlias, Some("Input")),
         KeyBinding::new("cmd-k", EditLink, Some("Editor > Input")),
         #[cfg(target_os = "macos")]

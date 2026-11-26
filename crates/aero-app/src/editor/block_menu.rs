@@ -429,6 +429,16 @@ impl Editor {
             return;
         }
         let Some(block) = self.doc.blocks().find(menu.block) else { return };
+        if key == "list-level" {
+            let direction = match value {
+                Some("1") => ops::ListLevelDirection::Indent,
+                Some("-1") => ops::ListLevelDirection::Outdent,
+                _ => return,
+            };
+            let Some(plan) = ops::change_list_level(&self.doc, menu.block, direction) else { return };
+            self.apply_plan(plan, window, cx);
+            return;
+        }
         let mut attrs = block.attrs.clone();
         if key == "indent-step" {
             let current = aero_core::properties::indent(&attrs) as i32;
@@ -616,9 +626,6 @@ impl Editor {
                 anchored().position(menu.origin).snap_to_window_with_margin(px(8.)).child(
                     h_flex()
                         .items_start()
-                        .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
-                            this.close_block_menu(cx);
-                        }))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                             this.close_block_menu(cx);
                         }))
@@ -647,36 +654,63 @@ impl Editor {
         )
     }
 
+    pub(super) fn can_increase_visual_indent(current: u8, width: Pixels) -> bool {
+        current < 8 && width - px(24.) >= px(160.)
+    }
+
     fn render_block_layout_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let supported =
-            self.block_menu.as_ref().and_then(|m| self.doc.blocks().find(m.block)).is_some_and(|b| {
-                matches!(
-                    b.kind,
-                    aero_core::BlockKind::Paragraph
-                        | aero_core::BlockKind::Heading { .. }
-                        | aero_core::BlockKind::ListItem { .. }
-                )
-            });
+        let block = self.block_menu.as_ref().and_then(|menu| self.doc.blocks().find(menu.block));
+        let supported = block.is_some_and(|b| {
+            matches!(
+                b.kind,
+                aero_core::BlockKind::Paragraph
+                    | aero_core::BlockKind::Heading { .. }
+                    | aero_core::BlockKind::ListItem { .. }
+            )
+        });
+        let list_item = block.is_some_and(|b| matches!(b.kind, aero_core::BlockKind::ListItem { .. }));
+        let current = block.map_or(0, |b| aero_core::properties::indent(&b.attrs));
+        let width = block
+            .and_then(|b| self.unit_bounds.iter().find(|(id, _)| *id == b.id))
+            .map_or(px(COLUMN_WIDTH), |(_, bounds)| bounds.size.width);
+        let can_visual_increase = supported && Self::can_increase_visual_indent(current, width);
+        let can_visual_decrease = supported && current > 0;
+        let (increase_label, decrease_label, key, can_increase, can_decrease) = if list_item {
+            (
+                "增加列表层级",
+                "减少列表层级",
+                "list-level",
+                block.is_some_and(|b| {
+                    ops::can_change_list_level(&self.doc, b.id, ops::ListLevelDirection::Indent)
+                }),
+                block.is_some_and(|b| {
+                    ops::can_change_list_level(&self.doc, b.id, ops::ListLevelDirection::Outdent)
+                }),
+            )
+        } else {
+            ("增加视觉缩进", "减少视觉缩进", "indent-step", can_visual_increase, can_visual_decrease)
+        };
         let rows = [
-            ("左对齐", "align", Some("left")),
-            ("居中", "align", Some("center")),
-            ("右对齐", "align", Some("right")),
-            ("两端对齐", "align", Some("justify")),
-            ("增加视觉缩进", "indent-step", Some("1")),
-            ("减少视觉缩进", "indent-step", Some("-1")),
+            ("左对齐", "align", Some("left"), supported),
+            ("居中", "align", Some("center"), supported),
+            ("右对齐", "align", Some("right"), supported),
+            ("两端对齐", "align", Some("justify"), supported),
+            (increase_label, key, Some("1"), can_increase),
+            (decrease_label, key, Some("-1"), can_decrease),
         ]
         .into_iter()
         .enumerate()
-        .map(|(i, (label, key, value))| {
+        .map(|(i, (label, key, value, enabled))| {
             div()
                 .id(("block-layout", i))
+                .debug_selector(move || format!("block-layout-{i}"))
                 .px_2()
                 .py_1()
                 .text_sm()
                 .rounded(px(4.))
-                .opacity(if supported { 1. } else { 0.4 })
+                .opacity(if enabled { 1. } else { 0.4 })
                 .child(label)
-                .when(supported, |el| {
+                .when(enabled, |el| {
                     el.cursor_pointer().hover(|s| s.bg(cx.theme().list_hover)).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
@@ -687,6 +721,8 @@ impl Editor {
                 })
         });
         v_flex()
+            .debug_selector(|| "block-menu-layout-list".into())
+            .occlude()
             .w(px(180.))
             .p_1()
             .bg(cx.theme().popover)
