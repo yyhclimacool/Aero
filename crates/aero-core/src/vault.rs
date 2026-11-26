@@ -111,6 +111,8 @@ pub enum VaultError {
     Walk(String),
     #[error("{0} already exists")]
     AlreadyExists(String),
+    #[error("文件版本冲突：{0}")]
+    VersionConflict(VaultPath),
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> VaultError + '_ {
@@ -159,7 +161,7 @@ impl Vault {
             let cfg = VaultToml { vault_id: ulid::Ulid::generate().to_string(), format: VAULT_FORMAT };
             fs::create_dir_all(cfg_path.parent().unwrap()).map_err(io_err(&cfg_path))?;
             let body = toml::to_string(&cfg).map_err(|e| VaultError::Config(e.to_string()))?;
-            atomic_write(&cfg_path, body.as_bytes(), true)?;
+            atomic_write(&cfg_path, body.as_bytes(), true, || Ok(()))?;
             cfg.vault_id
         };
         Ok(Vault { root, id })
@@ -288,7 +290,36 @@ impl Vault {
     ///
     /// 创建目录、写入、替换或读取写入后的文件元数据失败时返回错误。
     pub fn write_bytes(&self, p: &VaultPath, bytes: &[u8]) -> Result<FileStamp, VaultError> {
-        self.write_bytes_impl(p, bytes, true)
+        self.write_bytes_impl(p, bytes, true, || Ok(()))
+    }
+
+    /// Replace a file only if its current bytes match the observed version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the observed version changed, the file is read-only,
+    /// or staging or publishing the replacement failed.
+    pub fn replace_bytes(
+        &self,
+        p: &VaultPath,
+        expected: &[u8],
+        bytes: &[u8],
+    ) -> Result<FileStamp, VaultError> {
+        self.validate_local_path(p)?;
+        let path = self.fs_path(p);
+        self.write_bytes_impl(p, bytes, true, || {
+            self.validate_local_path(p)?;
+            if fs::read(&path).map_err(io_err(&path))? != expected {
+                return Err(VaultError::VersionConflict(p.clone()));
+            }
+            if fs::metadata(&path).map_err(io_err(&path))?.permissions().readonly() {
+                return Err(io_err(&path)(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "文件只读",
+                )));
+            }
+            Ok(())
+        })
     }
 
     /// 原子创建新文件，常用于保留冲突副本。
@@ -298,7 +329,7 @@ impl Vault {
     /// 目标已存在、路径经过符号链接，或写入和读取元数据失败时返回错误。
     pub fn create_bytes(&self, p: &VaultPath, bytes: &[u8]) -> Result<FileStamp, VaultError> {
         self.validate_local_path(p)?;
-        self.write_bytes_impl(p, bytes, false)
+        self.write_bytes_impl(p, bytes, false, || Ok(()))
     }
 
     fn write_bytes_impl(
@@ -306,12 +337,13 @@ impl Vault {
         p: &VaultPath,
         bytes: &[u8],
         overwrite: bool,
+        before_publish: impl FnOnce() -> Result<(), VaultError>,
     ) -> Result<FileStamp, VaultError> {
         let path = self.fs_path(p);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(io_err(dir))?;
         }
-        atomic_write(&path, bytes, overwrite)?;
+        atomic_write(&path, bytes, overwrite, before_publish)?;
         let meta = fs::metadata(&path).map_err(io_err(&path))?;
         Ok(FileStamp {
             mtime: meta.modified().map_err(io_err(&path))?,
@@ -512,7 +544,12 @@ fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// 写临时文件、fsync、rename 覆盖。目标已存在时沿用其权限位。
-fn atomic_write(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), VaultError> {
+fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    overwrite: bool,
+    before_publish: impl FnOnce() -> Result<(), VaultError>,
+) -> Result<(), VaultError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = dir.join(format!(".{name}.aero-tmp-{}-{}", std::process::id(), ulid::Ulid::generate()));
@@ -523,6 +560,7 @@ fn atomic_write(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), VaultE
         if let Ok(meta) = fs::metadata(path) {
             let _ = fs::set_permissions(&tmp, meta.permissions());
         }
+        before_publish()?;
         if overwrite {
             fs::rename(&tmp, path).map_err(io_err(path))
         } else {

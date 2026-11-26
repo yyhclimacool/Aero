@@ -15,7 +15,31 @@ struct Cut {
     blocked: Option<String>,
 }
 
+pub(crate) fn restore_pending_cuts(doc: &Document, tokens: &[String]) -> Result<Document, String> {
+    let mut restored = doc.clone();
+    for token in tokens.iter().rev() {
+        restored = restored.without_transaction(token)?;
+    }
+    Ok(restored)
+}
+
 impl Editor {
+    pub(super) fn forget_cut(token: &str, cx: &mut App) {
+        if cx.has_global::<Cuts>() {
+            cx.update_global::<Cuts, _>(|cuts, _| cuts.0.remove(token));
+        }
+    }
+
+    pub(super) fn invalidate_pending_cuts(&mut self, cx: &mut App) {
+        if !self.io.pending_cuts.is_empty() && cx.has_global::<Cuts>() {
+            cx.update_global::<Cuts, _>(|cuts, _| {
+                for token in self.io.pending_cuts.drain(..) {
+                    cuts.0.remove(&token);
+                }
+            });
+        }
+    }
+
     pub(super) fn copy_block_targets(&self, ids: &[BlockId], cx: &mut Context<Self>) {
         self.copy_blocks(block_ops::source(&self.doc, &self.doc.to_string(), ids), cx);
     }
@@ -59,6 +83,7 @@ impl Editor {
             );
             return;
         }
+        self.io.pending_cuts.push(token.clone());
         let cut = Cut {
             editor: cx.weak_entity(),
             vault: self.vault.id().into(),
@@ -122,6 +147,13 @@ impl Editor {
             .as_ref()
             .and_then(|token| cx.try_global::<Cuts>()?.0.get(token))
             .filter(|cut| cut.pending && cut.vault == self.vault.id())
+            .filter(|cut| {
+                if cut.editor.entity_id() == cx.entity_id() {
+                    self.path == cut.change.path
+                } else {
+                    cut.editor.upgrade().is_some_and(|editor| editor.read(cx).path == cut.change.path)
+                }
+            })
             .map(|cut| (cut.editor.clone(), cut.change.clone()));
         let cut = if let Some((weak, mut change)) = cut {
             let token = payload.cut.as_deref().unwrap();
@@ -194,15 +226,28 @@ impl Editor {
         } else {
             None
         };
-        if !success && let Some(mut cut) = cut {
+        if let Some(mut cut) = cut {
+            if success {
+                if let Some(editor) = cut.editor.upgrade() {
+                    editor.update(cx, |e, cx| {
+                        if e.io.pending_cuts.iter().any(|pending| pending == token) {
+                            e.invalidate_pending_cuts(cx);
+                        }
+                    });
+                }
+                return;
+            }
             let restored =
                 cut.editor.upgrade().ok_or_else(|| "剪切来源已关闭，恢复未完成".to_owned()).and_then(
                     |editor| {
                         editor.update(cx, |e, cx| {
                             if Some(e.doc.to_bytes()) == cut.change.before {
+                                e.io.pending_cuts.retain(|pending| pending != token);
                                 return Ok(());
                             }
                             let restored = e.doc.without_transaction(token)?;
+                            e.io.pending_cuts.retain(|pending| pending != token);
+                            e.io.strict_save = true;
                             e.doc = restored;
                             e.doc.take_edits();
                             e.refresh_units();
@@ -232,9 +277,13 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> bool {
         let Ok(restored) = self.doc.without_transaction(token) else { return false };
-        if restored.to_bytes() != loaded.to_bytes() {
+        let pending: Vec<_> =
+            self.io.pending_cuts.iter().filter(|pending| pending.as_str() != token).cloned().collect();
+        let Ok(projected) = restore_pending_cuts(&restored, &pending) else { return false };
+        if projected.to_bytes() != loaded.to_bytes() {
             return false;
         }
+        self.io.pending_cuts = pending;
         self.doc = restored;
         self.doc.take_edits();
         self.refresh_units();

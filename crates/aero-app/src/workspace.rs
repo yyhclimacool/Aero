@@ -264,6 +264,14 @@ impl Workspace {
         }
         match Vault::open(root) {
             Ok(vault) => {
+                if files::busy(vault.id(), cx) {
+                    window.push_notification(
+                        Notification::warning("此笔记库正在完成文件操作，请稍后打开。"),
+                        cx,
+                    );
+                    operation.finish(crate::diagnostics::Outcome::Cancelled);
+                    return;
+                }
                 let journal = self.data_dir.join("transactions").join(vault.id());
                 if let Err(error) = aero_core::transaction::recover(&vault, &journal) {
                     window.push_notification(Notification::error(error).title("工作区事务需要恢复"), cx);
@@ -1565,6 +1573,9 @@ impl Workspace {
             return;
         }
         let editors: Vec<_> = self.open.iter().flat_map(|o| Editor::live_editors(o.vault.id(), cx)).collect();
+        let protected = self.pending_operation.as_ref().is_some_and(|q| {
+            matches!(&q.operation, PendingOperation::File(operation) if operation.uses_editor_snapshots())
+        });
         let is_history = self.pending_operation.as_ref().is_some_and(|q| {
             matches!(
                 &q.operation,
@@ -1575,7 +1586,7 @@ impl Workspace {
             let e = e.read(cx);
             e.has_pending_export()
                 || (!is_history && e.is_deleted())
-                || matches!(e.save_state(), SaveState::Failed(_))
+                || (!protected && matches!(e.save_state(), SaveState::Failed(_)))
         }) {
             if let Some(op) = self.pending_operation.take()
                 && let PendingOperation::File(op) = op.operation
@@ -1587,6 +1598,11 @@ impl Workspace {
                     op.cancel(cx);
                 }
             }
+            if protected {
+                for editor in editors {
+                    editor.update(cx, |editor, cx| editor.resume_io(cx));
+                }
+            }
             window.push_notification(
                 Notification::warning("笔记尚未安全保存，请处理保存错误或导出后重试。").title("Aero"),
                 cx,
@@ -1596,6 +1612,11 @@ impl Workspace {
         let mut waiting = false;
         let diagnostic = self.pending_operation.as_ref().unwrap().diagnostic.clone();
         for editor in editors {
+            if protected {
+                editor.update(cx, |e, _| e.pause_transaction_saves());
+                waiting |= editor.read(cx).save_state() == &SaveState::Saving;
+                continue;
+            }
             match editor.read(cx).save_state() {
                 SaveState::Dirty => {
                     waiting = true;
@@ -2706,6 +2727,7 @@ mod tests {
         });
         let destination =
             cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        wait_until(cx, |_| std::fs::read_to_string(dir.path().join("a.md")).unwrap() == restored_source);
         let paste_count = std::rc::Rc::new(std::cell::Cell::new(0));
         let _pastes = cx.update(|_, cx| {
             let count = paste_count.clone();
@@ -2831,6 +2853,8 @@ mod tests {
         let target = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
         cx.update(|window, cx| target.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
         cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-right");
+        cx.simulate_input(" draft");
         cx.simulate_keystrokes("cmd-v");
         wait_until(cx, |cx| {
             cx.update(|_, cx| {
@@ -2842,6 +2866,7 @@ mod tests {
         cx.run_until_parked();
         wait_until(cx, |_| std::fs::read_to_string(dir.path().join("a.md")).unwrap() == original);
         assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "destination\n");
+        assert_eq!(target.read_with(cx, |e, _| e.index_snapshot().1), "destination draft\n");
         std::fs::set_permissions(&target_path, writable).unwrap();
         cx.update(|window, cx| target.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
         cx.run_until_parked();
@@ -2854,6 +2879,56 @@ mod tests {
         let copied = std::fs::read_to_string(&target_path).unwrap();
         assert!(copied.contains("move me"), "{copied}");
         assert!(!copied.contains(&block), "invalidated token must paste as a copy");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), original);
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
+    fn move_conflict_keeps_external_file_and_frozen_local_draft(cx: &mut TestAppContext) {
+        let original = "move me\n\nremaining\n";
+        let (dir, _data, workspace) = open(cx, Some(original));
+        let path = VaultPath::new("b.md").unwrap();
+        let target_file = dir.path().join(path.as_str());
+        std::fs::write(&target_file, "destination\n").unwrap();
+        let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+        cx.update(|window, cx| {
+            window
+                .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
+        });
+        let source = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        cx.update(|window, cx| source.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape cmd-x");
+        workspace.update_in(cx, |w, window, cx| w.open_note(path.clone(), window, cx));
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                workspace.read(cx).open.as_ref().unwrap().editor().is_some_and(|e| e.read(cx).path() == &path)
+            })
+        });
+        let target = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        cx.update(|window, cx| target.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-right");
+        cx.simulate_input(" draft");
+        std::fs::write(&target_file, "external replacement\n").unwrap();
+        cx.simulate_keystrokes("cmd-v");
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let w = workspace.read(cx);
+                !w.session_busy() && w.pending_operation.is_none()
+            })
+        });
+        cx.executor().advance_clock(std::time::Duration::from_millis(750));
+        wait_until(cx, |cx| {
+            target
+                .read_with(cx, |editor, _| matches!(editor.save_state(), crate::editor::SaveState::Failed(_)))
+        });
+        assert_eq!(std::fs::read_to_string(&target_file).unwrap(), "external replacement\n");
+        assert_eq!(target.read_with(cx, |editor, _| editor.index_snapshot().1), "destination draft\n");
+        assert_eq!(
+            source.read_with(cx, |editor, _| editor.reference_snapshot().1.text().to_string()),
+            original
+        );
         assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), original);
         cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
     }

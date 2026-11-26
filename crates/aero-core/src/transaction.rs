@@ -80,11 +80,21 @@ fn check(vault: &Vault, change: &FileChange, expected: &Option<Vec<u8>>) -> Resu
     if change.before == change.after {
         return Ok(());
     }
-    let path = vault.fs_path(&change.path);
+    check_writable(vault, &change.path)
+}
+
+/// Check whether a transaction can write the file or its closest existing directory.
+///
+/// # Errors
+///
+/// Returns an error for a path outside the vault or a read-only file or directory.
+pub fn check_writable(vault: &Vault, path: &VaultPath) -> Result<(), String> {
+    vault.validate_local_path(path).map_err(|e| e.to_string())?;
+    let path = vault.fs_path(path);
     if let Ok(metadata) = fs::metadata(&path)
         && metadata.permissions().readonly()
     {
-        return Err(format!("文件只读：{}", change.path));
+        return Err(format!("文件只读：{}", path.display()));
     }
     let mut directory = path.parent();
     while let Some(dir) = directory {
@@ -121,8 +131,8 @@ fn apply(
         (None, Some(bytes)) => {
             vault.create_bytes(&change.path, bytes).map_err(|e| e.to_string())?;
         }
-        (Some(_), Some(bytes)) => {
-            vault.write_bytes(&change.path, bytes).map_err(|e| e.to_string())?;
+        (Some(previous), Some(bytes)) => {
+            vault.replace_bytes(&change.path, previous, bytes).map_err(|e| e.to_string())?;
         }
         (Some(_), None) => {
             fs::remove_file(vault.fs_path(&change.path)).map_err(|e| e.to_string())?;
@@ -161,6 +171,16 @@ impl Transaction {
         changes: Vec<FileChange>,
         restorations: HashMap<VaultPath, Vec<u8>>,
     ) -> Result<Self, String> {
+        Self::prepare_with(vault, root, changes, restorations, || Ok(()))
+    }
+
+    fn prepare_with(
+        vault: &Vault,
+        root: &Path,
+        changes: Vec<FileChange>,
+        restorations: HashMap<VaultPath, Vec<u8>>,
+        mut checkpoint: impl FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
         let mut paths = HashSet::new();
         for change in &changes {
             if !paths.insert(change.path.clone()) {
@@ -177,6 +197,7 @@ impl Transaction {
         fs::create_dir_all(root).map_err(|e| e.to_string())?;
         let directory = root.join(ulid::Ulid::generate().to_string().to_ascii_lowercase());
         fs::create_dir(&directory).map_err(|e| e.to_string())?;
+        checkpoint()?;
         let records = changes
             .iter()
             .map(|change| Record {
@@ -202,14 +223,18 @@ impl Transaction {
             for (name, bytes) in [("before", &change.before), ("after", &change.after)] {
                 if let Some(bytes) = bytes {
                     write_synced(&transaction.directory.join(format!("{i}.{name}")), bytes)?;
+                    checkpoint()?;
                 }
             }
             if let Some(bytes) = transaction.restorations.get(&change.path) {
                 write_synced(&transaction.directory.join(format!("{i}.restore")), bytes)?;
+                checkpoint()?;
             }
         }
         transaction.phase(Phase::Prepared)?;
+        checkpoint()?;
         sync_directory(root)?;
+        checkpoint()?;
         Ok(transaction)
     }
 
@@ -472,6 +497,30 @@ mod tests {
             for change in changes {
                 assert_eq!(current(&vault, &change.path).unwrap(), change.before);
             }
+        }
+    }
+
+    #[test]
+    fn interrupted_mirror_and_manifest_publication_leave_the_uncut_source_on_disk() {
+        for failure in 0..7 {
+            let (_temp, vault, root, mut changes) = fixture();
+            let source = changes[0].path.clone();
+            changes[0].after = Some(b"cut source".to_vec());
+            let destination = changes[1].path.clone();
+            let mut step = 0;
+            let result = Transaction::prepare_with(&vault, &root, changes, HashMap::new(), || {
+                step += 1;
+                if step == failure + 1 { Err("interrupted during preparation".into()) } else { Ok(()) }
+            });
+            // Directory, three images, manifest and its parent are the six checkpoints.
+            if failure == 6 {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.is_err(), "checkpoint {failure}");
+            }
+            recover(&vault, &root).unwrap();
+            assert_eq!(vault.read_bytes(&source).unwrap().0, b"first", "checkpoint {failure}");
+            assert!(!vault.exists(&destination), "checkpoint {failure}");
         }
     }
 

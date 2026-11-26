@@ -3,6 +3,7 @@
 use super::*;
 use aero_core::VaultError;
 use aero_core::transaction::{FileChange, Transaction};
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 
 #[derive(Default)]
@@ -85,6 +86,45 @@ pub(crate) enum PastePosition {
     AfterBlock { offset: usize, prefix: String },
 }
 
+pub(crate) struct NoteSnapshot {
+    pub known: aero_core::FileStamp,
+    pub text: aero_core::Snapshot,
+    pub bom: bool,
+    pub ending: aero_core::LineEnding,
+    pub pending_cut: Option<(aero_core::Document, Vec<String>)>,
+}
+
+impl NoteSnapshot {
+    fn agrees_with(&self, other: &Self) -> bool {
+        let tokens = |snapshot: &Self| snapshot.pending_cut.as_ref().map(|(_, tokens)| tokens.clone());
+        self.known.hash == other.known.hash
+            && self.bom == other.bom
+            && self.ending == other.ending
+            && self.text.text() == other.text.text()
+            && tokens(self) == tokens(other)
+    }
+
+    fn has_other_cut(&self, moving: Option<&str>) -> bool {
+        self.pending_cut.as_ref().is_some_and(|(_, tokens)| tokens.last().map(String::as_str) != moving)
+    }
+
+    fn projected_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        self.pending_cut
+            .as_ref()
+            .map(|(doc, tokens)| crate::editor::restore_pending_cuts(doc, tokens).map(|doc| doc.to_bytes()))
+            .transpose()
+    }
+
+    fn bytes(&self, moving: Option<&str>) -> Result<Vec<u8>, String> {
+        if self.has_other_cut(moving)
+            && let Some(bytes) = self.projected_bytes()?
+        {
+            return Ok(bytes);
+        }
+        Ok(aero_core::SourceText::encode(&String::from(self.text.text()), self.bom, self.ending))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum SyncEdit {
     Insert(std::ops::Range<usize>),
@@ -160,6 +200,10 @@ pub(crate) enum Operation {
 }
 
 impl Operation {
+    pub(super) fn uses_editor_snapshots(&self) -> bool {
+        matches!(self, Self::Paste { .. } | Self::Transaction { direction: Some(_), .. })
+    }
+
     pub(super) fn cancel(&self, cx: &mut App) {
         if let Self::Paste { token, cut: Some(_), .. } = self {
             Editor::complete_cut(token, false, cx);
@@ -348,32 +392,58 @@ fn execute_controlled(
     operation: Operation,
     control: Option<&Control>,
 ) -> Result<Outcome, String> {
-    execute_with_paste_snapshot(vault, operation, control, || {})
+    execute_with_paste_snapshot(vault, operation, control, &HashMap::new(), || {})
 }
 
 fn execute_with_paste_snapshot(
     vault: &Vault,
     operation: Operation,
     control: Option<&Control>,
+    editors: &HashMap<VaultPath, NoteSnapshot>,
     on_paste_snapshot: impl FnOnce(),
 ) -> Result<Outcome, String> {
     let mut outcome = Outcome::default();
     match operation {
         Operation::Paste { token, payload, source, destination, before, position, cut, journal } => {
-            let (actual, _) = vault.read_bytes(&destination).map_err(|e| e.to_string())?;
-            if actual != before {
+            let moving = cut.as_ref().map(|_| token.as_str());
+            let (disk, stamp) = vault.read_bytes(&destination).map_err(|e| e.to_string())?;
+            let expected = editors
+                .get(&destination)
+                .map_or_else(|| (disk == before).then_some(stamp.hash), |editor| Some(editor.known.hash));
+            if expected != Some(stamp.hash) {
                 return Err("目标文档已变化，请重新粘贴".into());
             }
             let mut doc = aero_core::Document::from_bytes(&before).map_err(|e| e.to_string())?;
             let (document, metadata) = aero_core::identity::ensure(&doc)?;
             on_paste_snapshot();
-            let plan = aero_core::clipboard::Relocation::prepare(
+            let (mut resolver, mut notes) = aero_core::block_refs::vault_snapshot(vault)?;
+            let mut disk_versions = HashMap::new();
+            for note in &mut notes {
+                let Some(editor) = editors.get(&note.path) else { continue };
+                let disk = note.before.as_deref().ok_or("事务快照缺少磁盘版本")?;
+                if aero_core::hash_bytes(disk) != editor.known.hash {
+                    return Err(format!("文件版本冲突：{}", note.path));
+                }
+                let live = editor.bytes(moving)?;
+                if live == disk {
+                    continue;
+                }
+                let overlay = aero_core::Document::from_bytes(&live).map_err(|e| e.to_string())?;
+                aero_core::identity::read(&overlay)?;
+                let summary = aero_core::links::NoteSummary::from_document(note.path.clone(), &overlay);
+                resolver.insert(note.path.clone(), Some(&summary.title), &summary.aliases);
+                resolver.register_identity(&note.path, &overlay);
+                disk_versions.insert(note.path.clone(), note.before.replace(live.clone()));
+                note.after = Some(live);
+            }
+            let plan = aero_core::clipboard::Relocation::prepare_from_snapshot(
                 vault,
                 &source,
                 &payload,
                 &destination,
                 &document,
                 cut.is_some(),
+                (resolver, notes),
             )?;
             match position {
                 PastePosition::Text(range) => doc = crate::editor::insert_tree(&doc, range, &plan.source)?,
@@ -399,19 +469,40 @@ fn execute_with_paste_snapshot(
             target.after = Some(doc.to_bytes());
             changes.extend(plan.resources);
             let mut history: Vec<_> = changes.iter().filter(|c| c.before != c.after).cloned().collect();
-            let mut restorations = std::collections::HashMap::new();
+            let mut restorations = HashMap::new();
             if let Some(cut) = cut {
-                let current = vault.read_bytes(&cut.path).map_err(|e| e.to_string())?.0;
-                if Some(current) != cut.after {
+                let source = changes.iter().find(|c| c.path == cut.path).ok_or("剪切来源不在笔记库中")?;
+                if source.before != cut.after {
                     return Err("剪切来源已变化，请先撤销源文档中的后续编辑".into());
                 }
-                if let Some(before) = &cut.before {
-                    restorations.insert(cut.path.clone(), before.clone());
+                let disk = disk_versions.get(&cut.path).unwrap_or(&source.before);
+                let recovery = match editors.get(&cut.path) {
+                    Some(editor) => editor.projected_bytes()?,
+                    None => None,
+                }
+                .or_else(|| cut.before.clone());
+                if recovery.as_ref() != disk.as_ref()
+                    && let Some(bytes) = recovery
+                {
+                    restorations.insert(cut.path.clone(), bytes);
                 }
                 if let Some(source) = history.iter_mut().find(|c| c.path == cut.path) {
                     source.before = cut.before;
                 } else {
                     history.push(cut);
+                }
+            }
+            let touched: HashSet<_> = history.iter().map(|change| &change.path).collect();
+            for change in &mut changes {
+                let changed = touched.contains(&change.path);
+                if changed && editors.get(&change.path).is_some_and(|editor| editor.has_other_cut(moving)) {
+                    return Err(format!("{} 还有未完成的剪切，请先撤销或完成该剪切", change.path));
+                }
+                if let Some(disk) = disk_versions.remove(&change.path) {
+                    change.before = disk;
+                    if !changed {
+                        change.after.clone_from(&change.before);
+                    }
                 }
             }
             commit_restoring(vault, &journal, changes, control, restorations)?;
@@ -459,7 +550,23 @@ fn execute_with_paste_snapshot(
             if changes.is_empty() {
                 return Ok(outcome);
             }
-            commit(vault, &journal, changes.clone(), control)?;
+            let mut disk_changes = changes.clone();
+            if direction.is_some() {
+                for change in &mut disk_changes {
+                    let Some(editor) = editors.get(&change.path) else { continue };
+                    if editor.has_other_cut(None)
+                        || change.before.as_deref() != Some(editor.bytes(None)?.as_slice())
+                    {
+                        return Err(format!("{} 的编辑内容已变化，请重试关联操作", change.path));
+                    }
+                    let (bytes, stamp) = vault.read_bytes(&change.path).map_err(|e| e.to_string())?;
+                    if stamp.hash != editor.known.hash {
+                        return Err(format!("文件版本冲突：{}", change.path));
+                    }
+                    change.before = Some(bytes);
+                }
+            }
+            commit(vault, &journal, disk_changes, control)?;
             outcome.touched =
                 changes.iter().filter(|c| c.before != c.after).map(|c| c.path.clone()).collect();
             // Resolve the related parent on the disk worker, before history
@@ -563,6 +670,7 @@ impl Workspace {
             Operation::Paste { token, cut: Some(_), .. } => Some(token.clone()),
             _ => None,
         };
+        let protected = operation.uses_editor_snapshots();
         let editors = Editor::live_editors(vault.id(), cx);
         if let Operation::Transaction { token, direction: Some(redo), changes, .. } = &operation
             && editors.iter().any(|editor| {
@@ -571,12 +679,17 @@ impl Workspace {
                     && e.history_transaction(*redo) != Some(token.as_str())
             })
         {
+            for editor in &editors {
+                editor.update(cx, |e, cx| e.resume_io(cx));
+            }
             window.push_notification(Notification::warning("请先撤销参与文档中的后续编辑。"), cx);
             return;
         }
         set_busy(vault.id(), true, cx);
         for editor in &editors {
-            if !editor.update(cx, |editor, cx| editor.suspend_io(cx)) {
+            if !editor.update(cx, |editor, cx| {
+                if protected { editor.suspend_for_transaction(cx) } else { editor.suspend_io(cx) }
+            }) {
                 for editor in &editors {
                     editor.update(cx, |e, cx| e.resume_io(cx));
                 }
@@ -586,6 +699,33 @@ impl Workspace {
                 return;
             }
         }
+        let snapshots = if protected {
+            let mut snapshots: HashMap<VaultPath, NoteSnapshot> = HashMap::new();
+            for editor in &editors {
+                let editor = editor.read(cx);
+                let path = editor.path();
+                let snapshot = editor.transaction_snapshot();
+                if let Some(previous) = snapshots.insert(path.clone(), snapshot)
+                    && !previous.agrees_with(&snapshots[path])
+                {
+                    let error = format!("{} 在多个窗口中有不同的编辑版本", path);
+                    for editor in &editors {
+                        editor.update(cx, |e, cx| {
+                            e.protect_unsaved_transaction_state();
+                            e.resume_io(cx);
+                        });
+                    }
+                    set_busy(vault.id(), false, cx);
+                    operation.cancel(cx);
+                    window.push_notification(Notification::warning(error), cx);
+                    self.continue_operation(window, cx);
+                    return;
+                }
+            }
+            snapshots
+        } else {
+            HashMap::new()
+        };
         let paths = editors.iter().map(|e| e.read(cx).path().clone()).collect::<Vec<_>>();
         if let Some(open) = self.open.as_mut() {
             for tab in &mut open.tabs {
@@ -601,7 +741,8 @@ impl Workspace {
         let worker_diagnostic = diagnostic.clone();
         let thread = std::thread::spawn(move || {
             worker_diagnostic.stage("disk_work", Default::default());
-            let result = worker_diagnostic.scope(|| execute_controlled(&vault, operation, Some(&control)));
+            let result = worker_diagnostic
+                .scope(|| execute_with_paste_snapshot(&vault, operation, Some(&control), &snapshots, || {}));
             worker_diagnostic.stage("disk_finished", Default::default());
             let loaded = paths
                 .into_iter()
@@ -646,6 +787,13 @@ impl Workspace {
                         && let Some((_, Ok((document, stamp)))) = loaded.iter().find(|(p, _)| p == &path)
                         && editor.update(cx, |e, cx| e.accept_cut_recovery(token, document, *stamp, cx))
                     {
+                        continue;
+                    }
+                    if outcome.is_err()
+                        && protected
+                        && editor.update(cx, |e, _| e.protect_unsaved_transaction_state())
+                    {
+                        editor.update(cx, |e, cx| e.resume_io(cx));
                         continue;
                     }
                     if let Ok(outcome) = &outcome
@@ -752,7 +900,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn paste_rejects_destination_changed_between_initial_read_and_relocation_scan() {
+    fn paste_preparation_keeps_the_source_on_cancellation_and_version_conflict() {
         use aero_core::{VaultPath, clipboard::Payload, transaction::FileChange};
         let dir = tempfile::tempdir().unwrap();
         let journal = tempfile::tempdir().unwrap();
@@ -764,7 +912,7 @@ mod tests {
         let moved = format!("move ^{block}\n");
         let source_before = format!("---\naero:\n  id: {id}\n---\n\n{moved}\nkept\n").into_bytes();
         let source_cut = format!("---\naero:\n  id: {id}\n---\n\nkept\n").into_bytes();
-        vault.create_bytes(&source, &source_cut).unwrap();
+        let source_stamp = vault.create_bytes(&source, &source_before).unwrap();
         vault.create_bytes(&target, b"destination\n").unwrap();
         let token = aero_core::identity::new_block_id();
         let operation = Operation::Paste {
@@ -782,12 +930,32 @@ mod tests {
             position: PastePosition::Text(11..11),
             cut: Some(FileChange {
                 path: source.clone(),
-                before: Some(source_before),
+                before: Some(source_before.clone()),
                 after: Some(source_cut.clone()),
             }),
             journal: journal.path().into(),
         };
-        let result = super::execute_with_paste_snapshot(&vault, operation, None, || {
+        let snapshot = aero_core::Document::from_bytes(&source_cut).unwrap().snapshot();
+        let editors = std::collections::HashMap::from([(
+            source.clone(),
+            super::NoteSnapshot {
+                known: source_stamp,
+                text: snapshot,
+                bom: false,
+                ending: aero_core::LineEnding::Lf,
+                pending_cut: None,
+            },
+        )]);
+        let control = super::Control::default();
+        let cancelled =
+            super::execute_with_paste_snapshot(&vault, operation.clone(), Some(&control), &editors, || {
+                control.cancel()
+            });
+        assert!(matches!(cancelled, Err(message) if message.contains("操作已取消")));
+        assert_eq!(vault.read_bytes(&target).unwrap().0, b"destination\n");
+        assert_eq!(vault.read_bytes(&source).unwrap().0, source_before);
+
+        let result = super::execute_with_paste_snapshot(&vault, operation, None, &editors, || {
             vault.write_bytes(&target, b"external newer text\n").unwrap();
         });
         assert!(
@@ -797,8 +965,8 @@ mod tests {
         assert_eq!(vault.read_bytes(&target).unwrap().0, b"external newer text\n");
         assert_eq!(
             vault.read_bytes(&source).unwrap().0,
-            source_cut,
-            "no transaction writes; the coordinator still owns pending-cut recovery"
+            source_before,
+            "the move must leave its uncut source on disk throughout planning"
         );
         assert_eq!(std::fs::read_dir(journal.path()).unwrap().count(), 0);
     }

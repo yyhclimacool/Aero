@@ -29,8 +29,26 @@ impl Relocation {
         document: &str,
         moving: bool,
     ) -> Result<Self, String> {
+        let snapshot = crate::block_refs::vault_snapshot(vault)?;
+        Self::prepare_from_snapshot(vault, source, origin, destination, document, moving, snapshot)
+    }
+
+    /// Plan a paste against a complete snapshot that includes current editor buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if identities or links cannot be preserved.
+    pub fn prepare_from_snapshot(
+        vault: &Vault,
+        source: &str,
+        origin: &Payload,
+        destination: &VaultPath,
+        document: &str,
+        moving: bool,
+        snapshot: (Resolver, Vec<FileChange>),
+    ) -> Result<Self, String> {
         let origin_path = VaultPath::new(&origin.path).map_err(|e| e.to_string())?;
-        let (resolver, notes) = crate::block_refs::vault_snapshot(vault)?;
+        let (resolver, notes) = snapshot;
         if origin.vault != vault.id() {
             if moving {
                 return Err("跨库剪切只能作为副本粘贴".into());

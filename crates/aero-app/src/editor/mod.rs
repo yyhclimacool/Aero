@@ -15,7 +15,7 @@ mod block_menu;
 mod block_ops;
 mod block_refs_ui;
 mod clipboard_ui;
-pub(crate) use clipboard_ui::insert_tree_after;
+pub(crate) use clipboard_ui::{insert_tree_after, restore_pending_cuts};
 pub(crate) use sync_picker::insert_tree;
 mod color_menu;
 mod colors_ui;
@@ -167,6 +167,8 @@ pub enum Banner {
     Reloaded,
     /// 黄：外部修改与未保存修改冲突，磁盘版本已另存为副本；本地版本已照常落盘
     Conflict { copy: VaultPath },
+    /// A file operation found an external version while the editor held a local draft.
+    ProtectedConflict,
     /// 红：文件已在外部被删除；自动保存停止，内容保留
     Deleted,
 }
@@ -499,6 +501,13 @@ impl Editor {
         stamp: Option<FileStamp>,
         cx: &mut Context<Self>,
     ) {
+        if !self.io.pending_cuts.is_empty()
+            && self.io.pending_cuts.last().is_none_or(|pending| pending != token)
+            && let Ok(restored) = restore_pending_cuts(&self.doc, &self.io.pending_cuts)
+        {
+            self.doc = restored;
+            self.invalidate_pending_cuts(cx);
+        }
         self.focused = None;
         self.selection = None;
         self.selected_node = None;
@@ -541,6 +550,7 @@ impl Editor {
         self.after_doc_change(cx);
         self.save_task = None;
         self.dirty = false;
+        self.io.strict_save = false;
         self.save_state = SaveState::Clean;
         if let Some(stamp) = stamp {
             self.stamp = stamp;
@@ -640,7 +650,10 @@ impl Editor {
 
     /// 给索引用的快照：路径、源文本、磁盘指纹。
     pub fn index_snapshot(&self) -> (VaultPath, String, FileStamp) {
-        (self.path.clone(), self.doc.to_string(), self.stamp)
+        let projected =
+            self.pending_cut_snapshot().and_then(|(doc, tokens)| restore_pending_cuts(&doc, &tokens).ok());
+        let doc = projected.as_ref().unwrap_or(&self.doc);
+        (self.path.clone(), doc.to_string(), self.stamp)
     }
 
     /// 搜索命中定位：第 `ord` 个可索引块（`aero_core::index::indexable_leaves` 的下标）滚到可见位置并短暂高亮。
@@ -2740,8 +2753,13 @@ impl Editor {
             },
         );
         if let Some(affected) = self.doc.undo() {
-            if let Some(token) = self.doc.history_transaction(true).map(str::to_owned) {
-                Self::complete_cut(&token, true, cx);
+            if let Some(token) = self.doc.history_transaction(true)
+                && self.io.pending_cuts.last().is_some_and(|pending| pending == token)
+            {
+                let token = token.to_owned();
+                self.io.pending_cuts.pop();
+                Self::forget_cut(&token, cx);
+                self.io.strict_save = true;
             }
             operation.scope(|| self.after_history(affected, window, cx));
             operation.finish(crate::diagnostics::Outcome::Ok);
@@ -2837,7 +2855,7 @@ impl Editor {
 
     pub fn save_now(&mut self, cx: &mut Context<Self>) {
         self.save_task = None;
-        if !self.dirty || self.io.writing || self.io.suspended || self.is_deleted() {
+        if !self.dirty || self.io.writing || self.io.suspended || self.io.pause_save || self.is_deleted() {
             return;
         }
         self.start_checked_write(io::MissingFile::Skip, cx);
@@ -2858,11 +2876,13 @@ impl Editor {
             ending: self.doc.line_ending,
             epoch: self.io.epoch,
             missing_file,
+            pending_cut: self.pending_cut_snapshot(),
+            strict: self.io.strict_save || self.io.pause_save || !self.io.pending_cuts.is_empty(),
         }
     }
 
     fn start_checked_write(&mut self, missing_file: io::MissingFile, cx: &mut Context<Self>) {
-        if self.io.writing || self.io.suspended {
+        if self.io.writing || self.io.suspended || self.io.pause_save {
             return;
         }
         let request = self.save_request(missing_file);
@@ -2908,12 +2928,19 @@ impl Editor {
                     this.set_banner(Some(Banner::Conflict { copy: copy.clone() }), cx);
                     cx.emit(EditorEvent::PathsTouched(vec![copy]));
                 }
+                if outcome.protected_conflict {
+                    this.set_banner(Some(Banner::ProtectedConflict), cx);
+                }
                 match outcome.result {
                     Ok(Some(stamp)) => {
                         this.stamp = stamp;
                         this.update_local_link_names();
                         if this.doc.version() == version {
                             this.dirty = false;
+                            this.io.strict_save = false;
+                            if this.banner == Some(Banner::ProtectedConflict) {
+                                this.set_banner(None, cx);
+                            }
                             this.save_state = SaveState::Saved(Instant::now());
                             if let Some(copy) = this.io.remove_after_save.take() {
                                 let file = this.vault.fs_path(&copy);
@@ -2950,8 +2977,15 @@ impl Editor {
     }
 
     /// Freeze disk activity while a rename transaction moves and rewrites files.
-    pub(crate) fn suspend_io(&mut self, _cx: &mut Context<Self>) -> bool {
-        if self.io.writing || self.dirty || self.has_pending_export() {
+    pub(crate) fn suspend_io(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.dirty {
+            return false;
+        }
+        self.suspend_for_transaction(cx)
+    }
+
+    pub(crate) fn suspend_for_transaction(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.io.writing || self.io.suspended || self.has_pending_export() {
             return false;
         }
         self.save_task = None;
@@ -2959,12 +2993,13 @@ impl Editor {
         self.io.check_generation += 1;
         self.io.suspended = true;
         for presenter in self.presenters.values() {
-            presenter.textarea.update(_cx, |s, cx| s.set_disabled(true, cx));
+            presenter.textarea.update(cx, |s, cx| s.set_disabled(true, cx));
         }
         true
     }
 
     pub(crate) fn resume_io(&mut self, cx: &mut Context<Self>) {
+        self.io.pause_save = false;
         self.io.suspended = false;
         for presenter in self.presenters.values() {
             presenter.textarea.update(cx, |s, cx| s.set_disabled(false, cx));
@@ -2972,6 +3007,33 @@ impl Editor {
         self.check_external(cx);
         if self.dirty {
             self.schedule_save(cx);
+        }
+    }
+
+    pub(crate) fn pause_transaction_saves(&mut self) {
+        self.io.pause_save = true;
+        self.save_task = None;
+        self.io.checking = None;
+        self.io.check_generation += 1;
+    }
+
+    pub(crate) fn protect_unsaved_transaction_state(&mut self) -> bool {
+        let preserve = self.dirty || !self.io.pending_cuts.is_empty();
+        self.io.strict_save |= preserve;
+        preserve
+    }
+
+    fn pending_cut_snapshot(&self) -> Option<(Document, Vec<String>)> {
+        (!self.io.pending_cuts.is_empty()).then(|| (self.doc.clone(), self.io.pending_cuts.clone()))
+    }
+
+    pub(crate) fn transaction_snapshot(&self) -> crate::workspace::files::NoteSnapshot {
+        crate::workspace::files::NoteSnapshot {
+            known: self.stamp,
+            text: self.doc.snapshot(),
+            bom: self.doc.bom,
+            ending: self.doc.line_ending,
+            pending_cut: self.pending_cut_snapshot(),
         }
     }
 
@@ -3038,6 +3100,18 @@ impl Editor {
             return Ok(None);
         }
         self.save_task = None;
+        if !self.io.pending_cuts.is_empty() || self.io.strict_save {
+            let outcome = self.save_request(io::MissingFile::Skip).save();
+            if let Some(stamp) = outcome.result.map_err(|message| VaultError::Io {
+                path: self.vault.fs_path(&self.path),
+                source: std::io::Error::other(message),
+            })? {
+                self.stamp = stamp;
+                self.dirty = false;
+                self.save_state = SaveState::Saved(Instant::now());
+            }
+            return Ok(None);
+        }
         let conflict = match self.disk_state()? {
             Disk::Changed(disk) => Some(self.backup_disk(&disk)?),
             Disk::Missing => {
@@ -3068,7 +3142,7 @@ impl Editor {
     /// 监听 / 轮询 / 窗口激活时调用：无未保存修改则重载，有则留冲突副本并立即落盘本地版本；
     /// 文件不见了进入"已删除"态，又出现了（比如从废纸篓放回）则解除。
     pub fn check_external(&mut self, cx: &mut Context<Self>) {
-        if self.io.writing || self.io.suspended || self.io.checking.is_some() {
+        if self.io.writing || self.io.suspended || self.io.pause_save || self.io.checking.is_some() {
             return;
         }
         let (vault, path, stamp) = (self.vault.clone(), self.path.clone(), self.stamp);
@@ -3122,6 +3196,9 @@ impl Editor {
                         }
                         if this.dirty || this.doc.version() != version {
                             this.save_now(cx);
+                        } else if !this.io.pending_cuts.is_empty() {
+                            this.set_banner(Some(Banner::ProtectedConflict), cx);
+                            this.save_failed(format!("剪切来源已在磁盘上变化：{}", this.path), cx);
                         } else {
                             match document {
                                 Ok(document) => {
@@ -3151,6 +3228,8 @@ impl Editor {
     }
 
     fn install_document(&mut self, doc: Document, stamp: FileStamp, cx: &mut Context<Self>) {
+        self.invalidate_pending_cuts(cx);
+        self.io.strict_save = false;
         self.wiki = None;
         self.tag_menu = None;
         self.io.epoch += 1;
@@ -3240,16 +3319,21 @@ impl Editor {
 
     /// 横幅"使用磁盘版本"：把冲突副本的内容换进来并落盘到本笔记，副本删掉（内容已在这里，不会丢）。
     pub fn take_disk_version(&mut self, cx: &mut Context<Self>) {
-        let Some(Banner::Conflict { copy }) = self.banner.clone() else { return };
-        if self.io.writing || self.io.suspended {
+        let banner = self.banner.clone();
+        let (source, copy) = match &banner {
+            Some(Banner::Conflict { copy }) => (copy.clone(), Some(copy.clone())),
+            Some(Banner::ProtectedConflict) => (self.path.clone(), None),
+            _ => return,
+        };
+        if self.io.writing || self.io.suspended || self.io.pause_save {
             return;
         }
         let (vault, path) = (self.vault.clone(), self.path.clone());
         let (epoch, version) = (self.io.epoch, self.doc.version());
         self.io.checking = None;
         self.io.check_generation += 1;
-        let source = copy.clone();
-        let read = cx.background_spawn(async move { vault.read(&source) });
+        let read_path = source.clone();
+        let read = cx.background_spawn(async move { vault.read(&read_path) });
         cx.spawn(async move |this, cx| {
             let result = read.await;
             let _ = this.update(cx, |this, cx| {
@@ -3258,23 +3342,27 @@ impl Editor {
                     || this.io.writing
                     || this.io.suspended
                     || this.doc.version() != version
-                    || this.banner != Some(Banner::Conflict { copy: copy.clone() })
+                    || this.banner != banner
                 {
                     return;
                 }
                 match result {
-                    Ok((doc, _)) => {
-                        this.install_document(doc, this.stamp, cx);
-                        this.io.remove_after_save = Some(copy);
-                        this.dirty = true;
-                        this.save_state = SaveState::Dirty;
-                        this.set_banner(None, cx);
-                        this.save_now(cx);
+                    Ok((doc, stamp)) => {
+                        if let Some(copy) = copy {
+                            this.install_document(doc, this.stamp, cx);
+                            this.io.remove_after_save = Some(copy);
+                            this.dirty = true;
+                            this.save_state = SaveState::Dirty;
+                            this.set_banner(None, cx);
+                            this.save_now(cx);
+                        } else {
+                            this.install_document(doc, stamp, cx);
+                            this.set_banner(Some(Banner::Reloaded), cx);
+                        }
                     }
-                    Err(error) => cx.emit(EditorEvent::SaveFailed(format!(
-                        "无法读取冲突副本 {}：{error}",
-                        copy.as_str()
-                    ))),
+                    Err(error) => {
+                        cx.emit(EditorEvent::SaveFailed(format!("无法读取磁盘版本 {source}：{error}")))
+                    }
                 }
             });
         })
@@ -3303,7 +3391,33 @@ impl Editor {
                 ..Default::default()
             },
         );
-        let stamp = match operation.scope(|| self.vault.write_bytes(&path, &self.doc.to_bytes())) {
+        if self.io.suspended
+            || self.io.pause_save
+            || self.io.writing
+            || (self.io.strict_save && path == self.path)
+            || (self.banner == Some(Banner::ProtectedConflict) && self.vault.exists(&path))
+        {
+            return Err(VaultError::Io {
+                path: self.vault.fs_path(&path),
+                source: std::io::Error::other("请使用空闲的新路径另存编辑内容"),
+            });
+        }
+        let projected = self
+            .pending_cut_snapshot()
+            .map(|(doc, tokens)| restore_pending_cuts(&doc, &tokens))
+            .transpose()
+            .map_err(|message| VaultError::Io {
+                path: self.vault.fs_path(&path),
+                source: std::io::Error::other(message),
+            })?;
+        let bytes = projected.as_ref().unwrap_or(&self.doc).to_bytes();
+        let stamp = match operation.scope(|| {
+            if self.banner == Some(Banner::ProtectedConflict) {
+                self.vault.create_bytes(&path, &bytes)
+            } else {
+                self.vault.write_bytes(&path, &bytes)
+            }
+        }) {
             Ok(stamp) => stamp,
             Err(error) => {
                 operation.finish(crate::diagnostics::Outcome::Failed);
@@ -3311,6 +3425,10 @@ impl Editor {
             }
         };
         let old = std::mem::replace(&mut self.path, path.clone());
+        if let Some(projected) = projected {
+            self.install_document(projected, stamp, cx);
+        }
+        self.io.strict_save = false;
         self.stamp = stamp;
         self.dirty = false;
         self.save_task = None;
@@ -3413,6 +3531,14 @@ impl Editor {
                     ("banner-restore", "恢复", Box::new(|this, _, cx| this.restore_deleted(cx))),
                     ("banner-save-as", "另存为…", Box::new(|this, _, cx| this.prompt_save_as(cx))),
                     ("banner-close", "关闭", Box::new(|_, _, cx| cx.emit(EditorEvent::CloseRequested))),
+                ],
+            ),
+            Banner::ProtectedConflict => (
+                theme.warning,
+                "发现外部修改。当前编辑内容保留在此，磁盘版本也已保留。".to_owned(),
+                vec![
+                    ("banner-save-as", "另存为…", Box::new(|this, _, cx| this.prompt_save_as(cx))),
+                    ("banner-disk", "使用磁盘版本", Box::new(|this, _, cx| this.take_disk_version(cx))),
                 ],
             ),
         };

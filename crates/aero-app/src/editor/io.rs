@@ -8,6 +8,9 @@ pub(super) struct IoState {
     pub writing: bool,
     pub pending: Option<WriteJob>,
     pub suspended: bool,
+    pub pending_cuts: Vec<String>,
+    pub strict_save: bool,
+    pub pause_save: bool,
     pub remove_after_save: Option<VaultPath>,
 }
 
@@ -15,6 +18,7 @@ pub(super) struct IoState {
 pub(super) struct SaveOutcome {
     pub result: Result<Option<FileStamp>, String>,
     pub conflict: Option<VaultPath>,
+    pub protected_conflict: bool,
 }
 
 // Accepted writes start immediately, independently of GPUI polling a future. Native
@@ -53,7 +57,9 @@ impl WriteJob {
             let outcome = operation
                 .scope(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)))
                 .unwrap_or_else(|_| SaveOutcome {
-                    result: Err("保存线程意外终止".into()), conflict: None
+                    result: Err("保存线程意外终止".into()),
+                    conflict: None,
+                    protected_conflict: false,
                 });
             if outcome.conflict.is_some() {
                 operation.stage("conflict", Default::default());
@@ -68,7 +74,11 @@ impl WriteJob {
         });
         if let Err(error) = started {
             failed.finish(crate::diagnostics::Outcome::Failed);
-            *result.0.lock().unwrap() = Some(SaveOutcome { result: Err(error.to_string()), conflict: None });
+            *result.0.lock().unwrap() = Some(SaveOutcome {
+                result: Err(error.to_string()),
+                conflict: None,
+                protected_conflict: false,
+            });
         }
         Self { path, epoch, version, result }
     }
@@ -93,6 +103,8 @@ pub(super) struct SaveRequest {
     pub ending: aero_core::LineEnding,
     pub epoch: u64,
     pub missing_file: MissingFile,
+    pub pending_cut: Option<(Document, Vec<String>)>,
+    pub strict: bool,
 }
 
 /// Automatic saves respect a deletion. An explicit save may recreate the file.
@@ -103,25 +115,63 @@ pub(super) enum MissingFile {
 }
 
 impl SaveRequest {
+    pub(super) fn bytes(&self) -> Result<Vec<u8>, String> {
+        match &self.pending_cut {
+            Some((doc, tokens)) => Ok(restore_pending_cuts(doc, tokens)?.to_bytes()),
+            None => {
+                Ok(aero_core::SourceText::encode(&String::from(self.snapshot.text()), self.bom, self.ending))
+            }
+        }
+    }
+
     /// Back up the disk contents when their fingerprint differs from the known version.
     pub(super) fn save(self) -> SaveOutcome {
         let mut conflict = None;
+        let mut protected_conflict = false;
         let result = (|| {
             crate::diagnostics::stage_current("disk_check", Default::default());
+            if self.strict {
+                let (disk, stamp) = match self.vault.read_bytes(&self.path) {
+                    Ok(value) => value,
+                    Err(VaultError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                        return match self.missing_file {
+                            MissingFile::Skip => Ok(None),
+                            MissingFile::Recreate => self
+                                .vault
+                                .create_bytes(&self.path, &self.bytes()?)
+                                .map(Some)
+                                .map_err(|e| e.to_string()),
+                        };
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                if stamp.hash != self.known.hash {
+                    protected_conflict = true;
+                    return Err(format!("文件版本冲突：{}，已保留编辑内容", self.path));
+                }
+                let bytes = self.bytes()?;
+                if disk == bytes {
+                    return Ok(Some(stamp));
+                }
+                aero_core::transaction::check_writable(&self.vault, &self.path)?;
+                return self.vault.replace_bytes(&self.path, &disk, &bytes).map(Some).map_err(|error| {
+                    protected_conflict = matches!(error, VaultError::VersionConflict(_));
+                    error.to_string()
+                });
+            }
             let (state, _) = disk_state(&self.vault, &self.path, self.known)
                 .map_err(|e| format!("无法校验磁盘版本，已停止保存：{e}"))?;
             match state {
                 Disk::Missing if matches!(self.missing_file, MissingFile::Skip) => return Ok(None),
                 Disk::Changed(bytes) => {
                     conflict = Some(
-                        backup(&self.vault, self.conflict_base, &bytes)
+                        backup(&self.vault, self.conflict_base.clone(), &bytes)
                             .map_err(|e| format!("无法保存冲突副本，已停止保存：{e}"))?,
                     );
                 }
                 Disk::Unchanged | Disk::Missing => {}
             }
-            let bytes =
-                aero_core::SourceText::encode(&String::from(self.snapshot.text()), self.bom, self.ending);
+            let bytes = self.bytes()?;
             crate::diagnostics::stage_current(
                 "write_begin",
                 crate::diagnostics::Facts { bytes: bytes.len() as u64, ..Default::default() },
@@ -130,7 +180,7 @@ impl SaveRequest {
             crate::diagnostics::stage_current("write_done", Default::default());
             result
         })();
-        SaveOutcome { result, conflict }
+        SaveOutcome { result, conflict, protected_conflict }
     }
 
     pub(super) fn finish(
@@ -157,7 +207,7 @@ impl SaveRequest {
                 }
             }
             if !dirty {
-                return SaveOutcome { result: Ok(None), conflict };
+                return SaveOutcome { result: Ok(None), conflict, protected_conflict: false };
             }
             let vault = self.vault.clone();
             let mut outcome = self.save();
@@ -254,6 +304,8 @@ mod tests {
             ending: aero_core::LineEnding::CrLf,
             epoch: 7,
             missing_file: MissingFile::Skip,
+            pending_cut: None,
+            strict: false,
         };
         (dir, request)
     }
@@ -286,6 +338,26 @@ mod tests {
     }
 
     #[test]
+    fn pending_cut_save_and_native_barrier_keep_the_restorable_source_on_disk() {
+        let (dir, mut request) = request();
+        let original = "movable\n\nsecond\n\nremaining\n\n";
+        request.known = request.vault.write_bytes(&request.path, original.as_bytes()).unwrap();
+        let mut doc = Document::from_text(original);
+        doc.edit_transaction(vec![Edit::delete(0..9)], "cut").unwrap();
+        doc.edit_transaction(vec![Edit::delete(0..8)], "second-cut").unwrap();
+        doc.edit(Edit::insert(9, " edited")).unwrap();
+        request.snapshot = doc.snapshot();
+        request.pending_cut = Some((doc, vec!["cut".into(), "second-cut".into()]));
+        request.strict = true;
+        let expected = "movable\n\nsecond\n\nremaining edited\n\n";
+        let outcome = request.clone().save();
+        request.known = outcome.result.unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), expected);
+        assert!(request.finish(None, true, None).wait().result.unwrap().is_some());
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), expected);
+    }
+
+    #[test]
     fn native_barrier_failed_backup_never_overwrites_disk() {
         let (dir, mut request) = request();
         std::fs::write(dir.path().join("a.md"), b"external version\n").unwrap();
@@ -301,7 +373,7 @@ mod tests {
         let (release, gate) = mpsc::channel();
         let pending = WriteJob::spawn(request.path.clone(), request.epoch, 0, move || {
             gate.recv().unwrap();
-            SaveOutcome { result: Ok(None), conflict: None }
+            SaveOutcome { result: Ok(None), conflict: None, protected_conflict: false }
         });
         let guard = request.finish(Some(pending), true, None);
         let (dropping, entered) = mpsc::channel();

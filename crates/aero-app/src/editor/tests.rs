@@ -5150,6 +5150,12 @@ fn block_selection_keyboard_flow(cx: &mut TestAppContext) {
     assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some("last".to_owned()));
     assert!(text(&editor, cx).ends_with("# Title\n\n- one!\n- two\n"));
     assert_eq!(selected(&editor, cx), Some(2..3));
+    cx.executor().advance_clock(Duration::from_millis(600));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "# Title\n\n- one!\n- two\n\nlast\n");
+    cx.simulate_keystrokes("cmd-z");
+    focus_unit(&editor, 3, cx);
+    cx.simulate_keystrokes("escape backspace");
 
     // 选择列表外层时，删除整个列表，再删标题。
     cx.update(|window, cx| {
