@@ -224,20 +224,18 @@ impl Editor {
                     {
                         return Err("笔记已变化，请重试".into());
                     }
+                    let link = assignment.link(&this.title());
                     if !assignment.edits.is_empty() {
                         this.doc.edit_group(assignment.edits).map_err(|e| e.to_string())?;
                         this.focused = None;
                         this.after_doc_change(cx);
                     }
-                    let document = assignment.document;
                     let id = assignment.id;
                     match action {
                         IdentityCopy::Link => {
-                            cx.write_to_clipboard(ClipboardItem::new_string(format!(
-                                "[[id:{document}#^{id}]]"
-                            )));
+                            cx.write_to_clipboard(ClipboardItem::new_string(link));
                         }
-                        IdentityCopy::Sync => this.copy_blocks(format!("![[id:{document}#^{id}]]"), cx),
+                        IdentityCopy::Sync => this.copy_blocks(format!("!{link}"), cx),
                         IdentityCopy::Id => {
                             cx.write_to_clipboard(ClipboardItem::new_string(format!("^{id}")))
                         }

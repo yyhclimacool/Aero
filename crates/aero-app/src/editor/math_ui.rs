@@ -3,7 +3,7 @@
 //! 走 9.9 的渲染服务，所以占位、两级缓存、失败回退与取消都和图片共用一套。
 //! 公式在 RaTeX 排版阶段就按主题前景色着色，主题一换缓存键跟着变、自动重排。
 
-use gpui_kit::base::text::{TextView, TextViewStyle};
+use gpui_kit::base::text::TextViewStyle;
 use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -186,7 +186,18 @@ impl super::Editor {
                 let len = range.end.saturating_sub(range.start);
                 this.focus_range(range.clone(), Some(block), false, len, window, cx);
             }))
-            .child(inline_text(view_id, text, view.style.clone()))
+            .child(super::preview::markdown(
+                view_id,
+                self.navigation_markdown(text, None).into(),
+                view.style.clone().with_paragraph_gap(rems(0.)),
+                super::preview::PreviewContext {
+                    state: self.preview.clone(),
+                    editor: cx.entity(),
+                    block,
+                    reveal: 0,
+                    origin: None,
+                },
+            ))
             .into_any_element()
     }
 }
@@ -245,19 +256,6 @@ fn math_source(source: &str, cx: &App) -> AnyElement {
         .text_size(px(13.))
         .text_color(cx.theme().muted_foreground)
         .child(source.trim().to_owned())
-        .into_any_element()
-}
-
-fn inline_text(id: SharedString, text: &str, style: TextViewStyle) -> AnyElement {
-    let wide = text.chars().count() as f32 * super::BODY_FONT_SIZE > super::COLUMN_WIDTH * 0.85;
-    div()
-        .when(wide, |el| el.w_full())
-        .when(!wide, |el| el.flex_none())
-        .child(
-            TextView::markdown(id, aero_core::links::to_markdown(text))
-                .style(style.with_paragraph_gap(rems(0.)))
-                .selectable(false),
-        )
         .into_any_element()
 }
 

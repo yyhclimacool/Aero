@@ -264,6 +264,7 @@ fn insert_sync(
     let mut source = Document::from_bytes(&request.source_before).map_err(|e| e.to_string())?;
     let (_, block) = source.blocks().iter().nth(request.block).ok_or("同步来源块已变化")?;
     let assignment = block_refs::permanent_in(&mut resolver, &request.source, &source, block.id)?;
+    let reference = format!("!{}", assignment.link(&source.title_or(request.source.stem())));
     let same_document = source_index == destination_index;
     let (mut range, replace) = match request.edit {
         SyncEdit::Insert(range) => (range, false),
@@ -287,7 +288,6 @@ fn insert_sync(
         changes[source_index].after = Some(source.to_bytes());
         Document::from_bytes(&request.destination_before).map_err(|e| e.to_string())?
     };
-    let reference = format!("![[id:{}#^{}]]", assignment.document, assignment.id);
     if replace {
         destination.edit(Edit::replace(range, reference)).map_err(|e| e.to_string())?;
     } else {

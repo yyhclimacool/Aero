@@ -16,10 +16,20 @@ struct EmbeddedSource {
     markdown: String,
 }
 
+pub(super) const EMBED_DEPTH: u8 = 3;
+type SourceKey = (VaultPath, Option<String>);
+
+struct SourceLabel {
+    title: String,
+    excerpt: Option<String>,
+    block: Option<String>,
+}
+
 /// 两级缓存。`entries` 按链接原文查找，`resolved` 按解析出的实际路径和片段复用读盘结果。
 #[derive(Default)]
 pub(super) struct Embeds {
-    resolved: HashMap<(VaultPath, Option<String>), Result<EmbeddedSource, String>>,
+    resolved: HashMap<SourceKey, Result<EmbeddedSource, String>>,
+    navigation: HashMap<SourceKey, Result<SourceLabel, String>>,
     pub(super) resolver: Option<aero_core::links::Resolver>,
     entries: HashMap<(String, Option<String>), Entry>,
     targets: HashSet<(String, Option<String>)>,
@@ -33,6 +43,7 @@ pub(super) struct Embeds {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Revision {
     sources: u64,
+    catalog: u64,
     epoch: u64,
     version: u64,
     path: VaultPath,
@@ -42,6 +53,7 @@ impl Embeds {
     pub(super) fn clear_content(&mut self) {
         self.entries.clear();
         self.resolved.clear();
+        self.navigation.clear();
         self.targets.clear();
         self.revision = None;
     }
@@ -73,19 +85,83 @@ pub(super) enum EmbedView {
 }
 
 impl super::Editor {
+    pub(super) fn resolve_reference(
+        &self,
+        target: &str,
+        fragment: Option<&str>,
+        origin: Option<&VaultPath>,
+    ) -> Option<Resolution> {
+        let origin = origin.unwrap_or(&self.path);
+        if target.is_empty() {
+            return Some(Resolution::Resolved {
+                path: origin.clone(),
+                fragment: fragment.map(str::to_owned),
+            });
+        }
+        self.embeds
+            .resolver
+            .as_ref()
+            .or(self.link_preview.resolver.as_ref())
+            .map(|resolver| resolver.resolve(target, fragment, origin.parent()))
+    }
+
+    pub(super) fn navigation_label(
+        &self,
+        target: &str,
+        fragment: &str,
+        origin: Option<&VaultPath>,
+    ) -> Option<String> {
+        let Resolution::Resolved { path, fragment } =
+            self.resolve_reference(target, Some(fragment), origin)?
+        else {
+            return None;
+        };
+        let label = self.embeds.navigation.get(&(path, fragment))?.as_ref().ok()?;
+        Some(format!("{} › {}", label.title, label.excerpt.as_deref()?))
+    }
+
+    pub(super) fn navigation_markdown(&self, source: &str, origin: Option<&VaultPath>) -> String {
+        aero_core::links::to_markdown_with_labels(source, |link| {
+            let fragment = link.fragment.as_deref().filter(|f| f.starts_with('^'))?;
+            self.navigation_label(&link.target, fragment, origin)
+        })
+    }
+
+    pub(super) fn continuation(
+        &self,
+        path: &VaultPath,
+        fragment: Option<&str>,
+    ) -> Option<Result<&str, &str>> {
+        self.embeds
+            .navigation
+            .get(&(path.clone(), fragment.map(str::to_owned)))
+            .map(|v| v.as_ref().map(|label| label.title.as_str()).map_err(String::as_str))
+    }
+
+    pub(super) fn reference_anchor(&self, path: &VaultPath, fragment: &Option<String>) -> Option<String> {
+        self.embeds
+            .navigation
+            .get(&(path.clone(), fragment.clone()))
+            .and_then(|label| label.as_ref().ok()?.block.clone())
+            .or_else(|| fragment.clone())
+    }
+
+    pub(super) fn has_navigation_link(&self, source: &str) -> bool {
+        source.contains("#^")
+            && aero_core::links::scan(source).iter().any(|link| {
+                link.fragment.as_deref().is_some_and(|fragment| {
+                    fragment.starts_with('^') && self.navigation_label(&link.target, fragment, None).is_some()
+                })
+            })
+    }
+
     pub(super) fn embed_view_from(
         &self,
         target: &str,
         fragment: Option<&str>,
         origin: Option<&VaultPath>,
     ) -> EmbedView {
-        let origin = origin.unwrap_or(&self.path);
-        let resolver = self.embeds.resolver.as_ref().or(self.link_preview.resolver.as_ref());
-        let resolution = if target.is_empty() {
-            Some(Resolution::Resolved { path: origin.clone(), fragment: fragment.map(str::to_owned) })
-        } else {
-            resolver.map(|r| r.resolve(target, fragment, origin.parent()))
-        };
+        let resolution = self.resolve_reference(target, fragment, origin);
         if let Some(Resolution::Resolved { path, fragment }) = &resolution {
             if path == &self.path {
                 return match slice(&self.doc, fragment.as_deref()) {
@@ -113,7 +189,8 @@ impl super::Editor {
         match resolution {
             Some(Resolution::Unresolved) => EmbedView::Failed(format!("找不到同步来源：{target}").into()),
             Some(Resolution::Ambiguous { .. }) => EmbedView::Failed("同步来源身份有歧义".into()),
-            _ => self.embed_view(target, fragment),
+            _ if origin.is_none_or(|p| p == &self.path) => self.embed_view(target, fragment),
+            _ => EmbedView::Loading,
         }
     }
     /// 渲染期只读缓存（渲染中不能改自己）：内容由 [`Self::refresh_embeds`] 预取。
@@ -166,21 +243,25 @@ impl super::Editor {
             if debounce {
                 cx.background_executor().timer(Duration::from_millis(100)).await;
             }
-            let Ok((revision, snapshot, vault, directory, overlays)) = this.update(cx, |this, cx| {
+            let Ok((revision, snapshot, vault, directory, overlays, copies)) = this.update(cx, |this, cx| {
                 #[cfg(test)]
                 {
                     this.embeds.scan_count += 1;
                 }
+                let mut copies = HashSet::new();
+                let mut overlay = |editor: &super::Editor| {
+                    if let Some(super::Banner::Conflict { copy }) = &editor.banner {
+                        copies.insert(copy.clone());
+                    }
+                    (!editor.is_deleted()).then(|| (editor.path.clone(), editor.doc.clone()))
+                };
                 let mut overlays: HashMap<_, _> = super::Editor::live_editors(this.vault.id(), cx)
                     .into_iter()
                     .filter(|editor| editor.entity_id() != cx.entity_id())
-                    .filter_map(|editor| {
-                        let editor = editor.read(cx);
-                        (!editor.is_deleted()).then(|| (editor.path.clone(), editor.doc.clone()))
-                    })
+                    .filter_map(|editor| overlay(editor.read(cx)))
                     .collect();
-                if !this.is_deleted() {
-                    overlays.insert(this.path.clone(), this.doc.clone());
+                if let Some((path, doc)) = overlay(this) {
+                    overlays.insert(path, doc);
                 }
                 (
                     this.embed_revision(cx),
@@ -188,12 +269,13 @@ impl super::Editor {
                     this.vault.clone(),
                     this.link_preview.catalog.clone(),
                     overlays,
+                    copies,
                 )
             }) else {
                 return;
             };
             let origin = revision.path.clone();
-            let (targets, resolver, resolved) = cx
+            let (targets, resolver, resolved, navigation) = cx
                 .background_spawn(async move {
                     let source = snapshot.text().to_string();
                     let targets = aero_core::links::scan_embeds(&source)
@@ -201,11 +283,13 @@ impl super::Editor {
                         .filter(|embed| aero_core::attachments::Kind::for_path(&embed.target).is_none())
                         .map(|embed| (embed.target, embed.fragment))
                         .collect();
-                    let mut resolver =
-                        directory.and_then(|d| d.snapshot().ok()).map(|s| s.resolver.clone()).unwrap_or_else(
-                            || aero_core::links::Resolver::from_notes(vault.notes().unwrap_or_default()),
-                        );
-                    for (path, doc) in &overlays {
+                    let directory = directory.unwrap_or_else(|| crate::catalog::Catalog::new(vault.clone()));
+                    let mut resolver = directory.snapshot().map(|s| s.resolver.clone()).unwrap_or_default();
+                    let mut overlays = overlays;
+                    for (path, doc) in &mut overlays {
+                        if doc.is_parse_stale() {
+                            doc.reparse();
+                        }
                         resolver.insert(
                             path.clone(),
                             Some(&doc.title_or(path.stem())),
@@ -213,36 +297,52 @@ impl super::Editor {
                         );
                         resolver.register_identity(path, doc);
                     }
+                    // A conflict backup is a second version of its open source until the user resolves it.
+                    for copy in copies {
+                        resolver.remove_identity(&copy);
+                    }
                     let mut resolved = HashMap::new();
+                    let mut navigation = HashMap::new();
                     let mut queue = std::collections::VecDeque::from([(origin, source, 0u8)]);
                     while let Some((origin, source, depth)) = queue.pop_front() {
-                        if depth == 3 {
-                            continue;
-                        }
-                        for embed in aero_core::links::scan_embeds(&source) {
-                            if aero_core::attachments::Kind::for_path(&embed.target).is_some() {
-                                continue;
-                            }
-                            let resolution = if embed.target.is_empty() {
-                                Resolution::Resolved { path: origin.clone(), fragment: embed.fragment }
+                        let embeds = aero_core::links::scan_embeds(&source)
+                            .into_iter()
+                            .filter(|e| aero_core::attachments::Kind::for_path(&e.target).is_none())
+                            .map(|e| (e.target, e.fragment, depth < EMBED_DEPTH));
+                        let links = aero_core::links::scan(&source)
+                            .into_iter()
+                            .filter(|link| link.fragment.as_deref().is_some_and(|f| f.starts_with('^')))
+                            .map(|link| (link.target, link.fragment, false));
+                        for (target, fragment, expand) in embeds.chain(links) {
+                            let resolution = if target.is_empty() {
+                                Resolution::Resolved { path: origin.clone(), fragment }
                             } else {
-                                resolver.resolve(&embed.target, embed.fragment.as_deref(), origin.parent())
+                                resolver.resolve(&target, fragment.as_deref(), origin.parent())
                             };
                             let Resolution::Resolved { path, fragment } = resolution else {
                                 continue;
                             };
                             let key = (path.clone(), fragment.clone());
-                            if resolved.contains_key(&key) {
+                            if resolved.contains_key(&key) || (!expand && navigation.contains_key(&key)) {
                                 continue;
                             }
-                            let doc = overlays
-                                .get(&path)
-                                .cloned()
-                                .map(std::sync::Arc::new)
-                                .map(Ok)
-                                .unwrap_or_else(|| super::source_cache::read(&vault, &path));
+                            let disk;
+                            let doc = if let Some(doc) = overlays.get(&path) {
+                                Ok(doc)
+                            } else {
+                                disk = super::source_cache::read(&vault, &path);
+                                disk.as_deref().map_err(|e| format!("无法读取笔记：{e}"))
+                            };
+                            let label = doc
+                                .as_ref()
+                                .map_err(Clone::clone)
+                                .and_then(|doc| source_label(doc, &path, fragment.as_deref()));
+                            navigation.insert(key.clone(), label);
+                            if !expand {
+                                continue;
+                            }
                             let result = doc.and_then(|doc| {
-                                slice(&doc, fragment.as_deref()).map(|markdown| EmbeddedSource {
+                                slice(doc, fragment.as_deref()).map(|markdown| EmbeddedSource {
                                     title: doc.title_or(path.stem()),
                                     markdown,
                                 })
@@ -253,13 +353,14 @@ impl super::Editor {
                             resolved.insert(key, result);
                         }
                     }
-                    (targets, resolver, resolved)
+                    (targets, resolver, resolved, navigation)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.embed_revision(cx) == revision {
                     this.embeds.resolver = Some(resolver);
                     this.embeds.resolved = resolved;
+                    this.embeds.navigation = navigation;
                 }
                 this.receive_embed_scan(revision, targets, cx);
             });
@@ -269,6 +370,7 @@ impl super::Editor {
     fn embed_revision(&self, cx: &App) -> Revision {
         Revision {
             sources: super::live_sources::generation(self.vault.id(), cx),
+            catalog: self.link_preview.resolver_generation,
             epoch: self.io.epoch,
             version: self.doc.version(),
             path: self.path.clone(),
@@ -379,22 +481,35 @@ impl super::Editor {
         // read. Dropping the owner prevents that result from being applied.
         self.embeds.scan = None;
         self.embeds.revision = None;
-        if self.embeds.resolved.keys().any(|(path, _)| paths.contains(path)) {
-            self.embeds.resolved.retain(|(path, _), _| !paths.contains(path));
-            self.embeds.revision = None;
-            self.refresh_embeds(cx);
-        }
-        let before = self.embeds.entries.len();
+        self.embeds.navigation.retain(|(path, _), _| !paths.contains(path));
+        self.embeds.resolved.retain(|(path, _), _| !paths.contains(path));
         self.embeds.entries.retain(|_, entry| match entry {
             Entry::Ready { path, .. } => !paths.contains(path),
             Entry::Failed { .. } => false,
             Entry::Loading { path, .. } => !paths.contains(path),
         });
-        if self.embeds.entries.len() != before {
-            self.refresh_embeds(cx);
-            cx.notify();
-        }
+        self.refresh_embeds(cx);
+        cx.notify();
     }
+}
+
+/// Validate the fragment before making the continuation clickable.
+fn source_label(doc: &Document, path: &VaultPath, fragment: Option<&str>) -> Result<SourceLabel, String> {
+    let title = doc.title_or(path.stem());
+    if let Some(id) = fragment.and_then(|f| f.strip_prefix('^')) {
+        let block = aero_core::block_refs::resolve(doc, id)?;
+        let node = doc.blocks().find(block).ok_or("来源块已不存在")?;
+        let excerpt = aero_core::block_refs::excerpt(doc, node);
+        return Ok(SourceLabel {
+            title,
+            excerpt: Some(if excerpt.is_empty() { id.to_owned() } else { excerpt }),
+            block: node.persisted_id.as_ref().map(|id| format!("^{id}")),
+        });
+    }
+    if let Some(heading) = fragment {
+        super::link_preview::fragment_range(doc, Some(heading))?;
+    }
+    Ok(SourceLabel { title, excerpt: None, block: None })
 }
 
 /// 片段对应的源码；`^id` 是那一块，`#标题` 是那一节，没有片段就是整篇（去掉 front matter）。
@@ -423,6 +538,59 @@ mod tests {
     use aero_core::{Document, Edit, VaultPath};
     use gpui_kit::{TestAppContext, VisualTestContext};
     use std::time::Duration;
+
+    #[gpui_kit::test]
+    fn navigation_and_conflicted_embeds_follow_live_edits_and_undo(cx: &mut TestAppContext) {
+        use super::super::{Banner, Editor};
+        const DOC: &str = "d-01arz3ndektsv4rrffq69g5faw";
+        const BLOCK: &str = "b-01arz3ndektsv4rrffq69g5fav";
+        let destination = format!("见 [[id:{DOC}#^{BLOCK}|旧名]]。\n\n![[id:{DOC}#^{BLOCK}|旧名]]\n");
+        let (_dir, vault, _, target) = super::super::tests::open(cx, &destination);
+        let path = VaultPath::new("source.md").unwrap();
+        let copy = VaultPath::new("source.conflict.md").unwrap();
+        let address = format!("id:{DOC}");
+        let fragment = format!("^{BLOCK}");
+        let disk = format!("---\ntitle: 旧标题\naero:\n  id: {DOC}\n---\n\n**原文** ^{BLOCK}\n");
+        vault.create_bytes(&path, disk.as_bytes()).unwrap();
+        let (doc, stamp) = Editor::load(vault.clone(), path.clone()).unwrap();
+        let (source, _) =
+            cx.add_window_view(|_, cx| Editor::new(vault.clone(), path.clone(), doc, stamp, cx));
+        cx.run_until_parked();
+        let label = |cx: &mut TestAppContext| {
+            target.read_with(cx, |e, _| e.navigation_label(&address, &fragment, None))
+        };
+        assert_eq!(label(cx).as_deref(), Some("旧标题 › 原文"));
+        vault.create_bytes(&copy, disk.replace("原文", "磁盘冲突").as_bytes()).unwrap();
+        source.update(cx, |e, cx| {
+            e.doc
+                .edit(Edit::replace(0..e.doc.len(), disk.replace("旧标题", "新标题").replace("原文", "草稿")))
+                .unwrap();
+            e.after_doc_change(cx);
+            e.set_banner(Some(Banner::Conflict { copy: copy.clone() }), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(label(cx).as_deref(), Some("新标题 › 草稿"));
+        target.read_with(cx, |e, cx| {
+            assert!(e.source_conflict(&path, cx));
+            assert!(matches!(e.live_embed(&address, Some(&fragment), None, cx),
+                Some(super::EmbedView::Ready { source, .. }) if source.contains("草稿")));
+            assert_eq!(e.doc.to_string(), destination);
+        });
+        assert_eq!(vault.read(&path).unwrap().0.to_string(), disk);
+        source.update(cx, |e, cx| {
+            e.doc.undo().unwrap();
+            e.after_doc_change(cx);
+            e.set_banner(Some(Banner::ProtectedConflict), cx);
+        });
+        cx.run_until_parked();
+        assert!(label(cx).is_none(), "ordinary duplicate identities remain ambiguous");
+        std::fs::remove_file(vault.fs_path(&copy)).unwrap();
+        target.update(cx, |e, cx| e.invalidate_embeds(std::slice::from_ref(&copy), cx));
+        cx.run_until_parked();
+        assert_eq!(label(cx).as_deref(), Some("旧标题 › 原文"));
+        source.update(cx, |e, cx| e.set_banner(None, cx));
+        target.read_with(cx, |e, cx| assert!(!e.source_conflict(&path, cx)));
+    }
 
     #[gpui_kit::test]
     fn deleted_live_source_invalidates_nested_references_and_recovers(cx: &mut TestAppContext) {

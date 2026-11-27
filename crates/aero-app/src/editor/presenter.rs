@@ -5,6 +5,7 @@
 use aero_core::markup::{Analysis, Mark};
 use gpui_kit::base::input::Markup;
 use gpui_kit::base::text::{LinkStyle, LinkUnderline};
+use gpui_kit::component::WindowExt as _;
 
 use super::*;
 
@@ -167,6 +168,7 @@ impl Editor {
             && aero_core::rich_content::pdf_embed(text).is_none()
             && !has_html_break(text)
             && !self.renders_inline_formulas(id, text, cx)
+            && (self.is_focused_block(id) || !self.has_navigation_link(text))
     }
 
     fn ensure_presenter(&mut self, spec: Spec, window: &mut Window, cx: &mut Context<Self>) {
@@ -541,6 +543,36 @@ impl Editor {
         let p = self.presenters.get(&key)?;
         let focused = self.focused.as_ref().is_some_and(|f| f.textarea == p.textarea);
         let has_links = !p.links.is_empty();
+        if !focused && has_links && self.has_navigation_link(&p.text) {
+            let range = p.range.clone();
+            let newline = p.enter_newline;
+            let view = preview::markdown(
+                format!("paragraph-link-{}-{:?}", key.id.0, key.part).into(),
+                self.navigation_markdown(&p.text, None).into(),
+                self.text_view_style(cx).with_paragraph_gap(rems(0.)),
+                preview::PreviewContext {
+                    editor: cx.entity(),
+                    state: self.preview.clone(),
+                    block: key.id,
+                    reveal: 0,
+                    origin: None,
+                },
+            );
+            return Some(
+                div()
+                    .id(SharedString::from(format!("navigation-{}-{:?}", key.id.0, key.part)))
+                    .w_full()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if !event.is_right_click() {
+                            cx.stop_propagation();
+                            this.focus_range(range.clone(), Some(key.id), newline, range.len(), window, cx);
+                        }
+                    }))
+                    .child(view)
+                    .into_any_element(),
+            );
+        }
         let mut el = div()
             .id(SharedString::from(format!("text-{}-{:?}", key.id.0, key.part)))
             .relative()
@@ -638,10 +670,45 @@ impl Editor {
             return;
         }
         match aero_core::links::decode_note_url(url) {
-            Some((target, fragment)) => cx.emit(EditorEvent::LinkClicked { target, fragment }),
+            Some((target, fragment)) => self.follow_note(target, fragment, None, window, cx),
             None if url.starts_with(aero_core::links::NOTE_URL_PREFIX) => {}
             None => self.open_external_link(url, window, cx),
         }
+    }
+
+    pub(super) fn follow_note(
+        &self,
+        target: String,
+        fragment: Option<String>,
+        origin: Option<&VaultPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if origin.is_some() || fragment.as_deref().is_some_and(|f| f.starts_with('^')) {
+            match self.resolve_reference(&target, fragment.as_deref(), origin) {
+                Some(aero_core::links::Resolution::Resolved { path, fragment }) => {
+                    cx.emit(EditorEvent::OpenNoteFragment { path, fragment });
+                    return;
+                }
+                Some(aero_core::links::Resolution::Ambiguous { .. }) => {
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::warning("引用来源有歧义")
+                            .title("Aero"),
+                        cx,
+                    );
+                    return;
+                }
+                _ if origin.is_some() || self.embeds.resolver.is_some() => {
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::info("找不到引用来源").title("Aero"),
+                        cx,
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        cx.emit(EditorEvent::LinkClicked { target, fragment });
     }
 }
 
@@ -696,6 +763,7 @@ fn has_rich_block(text: &str) -> bool {
     aero_core::parse(text).blocks.iter().any(|block| {
         let source = &text[block.range.clone()];
         aero_core::rich_content::pdf_embed(source).is_some()
+            || preview::is_note_embed(source)
             || aero_core::rich_content::mermaid_source(source).is_some()
     })
 }

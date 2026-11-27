@@ -92,6 +92,15 @@ pub(super) fn generation(vault: &str, cx: &App) -> u64 {
 }
 
 impl Editor {
+    pub(super) fn source_conflict(&self, path: &VaultPath, cx: &App) -> bool {
+        if path == &self.path {
+            return self.has_source_conflict();
+        }
+        cx.try_global::<LiveSources>()
+            .and_then(|s| s.editors.get(&(self.vault.id().into(), path.clone())))
+            .and_then(|editor| editor.upgrade())
+            .is_some_and(|editor| editor.read(cx).has_source_conflict())
+    }
     /// A committed deletion retires this participant before deferred tab-close
     /// events run. Transient owners must not block the next queued operation.
     pub(crate) fn retire_transaction_source(&self, cx: &mut Context<Self>) {

@@ -19,6 +19,11 @@ pub(crate) mod markers;
 
 pub use markers::callout_header;
 
+/// The paragraph body shown in a preview, excluding trailing block identity and attributes.
+pub fn paragraph_body(source: &str) -> &str {
+    &source[..markers::strip_trailing(source).content_len]
+}
+
 use std::ops::Range;
 use std::sync::Arc;
 

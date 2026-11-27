@@ -47,9 +47,7 @@ pub fn candidates_matching(doc: &Document, mut eligible: impl FnMut(&Block) -> b
             if matches!(b.kind, BlockKind::FrontMatter | BlockKind::Marker | BlockKind::Raw) || !eligible(b) {
                 return None;
             }
-            let source = doc.slice(doc.content_range(b)).to_string();
-            let plain = crate::index::plain_text(&source, &b.kind);
-            let excerpt = plain.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+            let excerpt = excerpt(doc, b);
             Some(Candidate {
                 block: b.id,
                 range: doc.range_of(b),
@@ -59,6 +57,13 @@ pub fn candidates_matching(doc: &Document, mut eligible: impl FnMut(&Block) -> b
             })
         })
         .collect()
+}
+
+/// The short, single-line text shown for a block in source pickers and paragraph links.
+pub fn excerpt(doc: &Document, block: &Block) -> String {
+    let source = doc.slice(doc.content_range(block)).to_string();
+    let plain = crate::index::plain_text(&source, &block.kind);
+    plain.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect()
 }
 
 /// Marker 节点也携带前一个块的 ID；不能将它误算成重复定义。
@@ -99,6 +104,15 @@ pub struct PersistentAssignment {
     pub document: String,
     pub id: String,
     pub edits: Vec<Edit>,
+}
+
+impl PersistentAssignment {
+    /// A portable address with a readable source hint, safe to paste into Markdown.
+    pub fn link(&self, title: &str) -> String {
+        let hint = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let hint = hint.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]").replace('|', "｜");
+        format!("[[id:{}#^{}|{hint}]]", self.document, self.id)
+    }
 }
 
 /// Prepare a portable reference whose source and proposed identities are unique in the vault.
@@ -376,6 +390,24 @@ mod tests {
         let doc = Document::from_text("```rs\nunclosed\n");
         assert!(prepare(&doc, candidates(&doc)[0].block).is_err());
         assert_eq!(doc.to_string(), "```rs\nunclosed\n");
+    }
+
+    #[test]
+    fn portable_link_hints_round_trip_without_changing_the_address() {
+        let assignment = PersistentAssignment {
+            document: crate::identity::new_document_id(),
+            id: crate::identity::new_block_id(),
+            edits: Vec::new(),
+        };
+        let link = assignment.link("笔记 | [a] 和 [[b]]");
+        let [span] = crate::links::scan(&link).try_into().unwrap_or_else(|_| panic!("invalid link: {link}"));
+        assert_eq!(span.range, 0..link.len());
+        assert_eq!(span.alias.as_deref(), Some("笔记 ｜ [a] 和 [[b]]"));
+        let sync = format!("!{link}");
+        let embeds = crate::links::scan_embeds(&sync);
+        assert_eq!(embeds[0].range, 0..sync.len());
+        assert_eq!(embeds[0].target, format!("id:{}", assignment.document));
+        assert_eq!(embeds[0].fragment, Some(format!("^{}", assignment.id)));
     }
 
     #[test]

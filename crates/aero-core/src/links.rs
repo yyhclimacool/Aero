@@ -133,7 +133,8 @@ impl Resolver {
         }
     }
 
-    fn remove_identity(&mut self, path: &VaultPath) {
+    /// Exclude a path from identity lookup while keeping its explicit path and display names.
+    pub fn remove_identity(&mut self, path: &VaultPath) {
         if let Some((document, blocks)) = self.identities_of.remove(path) {
             if let Some(id) = document {
                 remove_from_group(&mut self.by_document_id, &id, path);
@@ -680,6 +681,11 @@ pub fn decode_note_url(url: &str) -> Option<(String, Option<String>)> {
 /// 预览预处理：`[[a|别名]]` → `[别名](aero://note/a)`，`[[a#h]]` → `[a > h](aero://note/a#h)`，
 /// `[[#h]]` → `[h](aero://note/#h)`。只替换扫描到的区间，区间外字节原样；没有 `[[` 的文本零拷贝以外不做事。
 pub fn to_markdown(src: &str) -> String {
+    to_markdown_with_labels(src, |_| None)
+}
+
+/// Render resolved navigation labels without changing the Markdown document or link destination.
+pub fn to_markdown_with_labels(src: &str, mut label: impl FnMut(&LinkSpan) -> Option<String>) -> String {
     let mut spans = raw_spans(src);
     if spans.is_empty() {
         return src.to_owned();
@@ -700,13 +706,21 @@ pub fn to_markdown(src: &str) -> String {
                 encode_vault_url(&pointer.path, pointer.fragment.as_deref())
             ));
         } else {
-            let display = match (&span.alias, &span.fragment) {
-                (Some(alias), _) => escape_link_text(alias),
-                (None, Some(fragment)) if span.target.is_empty() => escape_link_text(fragment),
-                (None, Some(fragment)) => {
-                    format!("{} > {}", escape_link_text(&span.target), escape_link_text(fragment))
+            let display = if let Some(text) = label(span) {
+                text.chars()
+                    .flat_map(|c| {
+                        c.is_ascii_punctuation().then_some('\\').into_iter().chain(std::iter::once(c))
+                    })
+                    .collect()
+            } else {
+                match (&span.alias, &span.fragment) {
+                    (Some(alias), _) => escape_link_text(alias),
+                    (None, Some(fragment)) if span.target.is_empty() => escape_link_text(fragment),
+                    (None, Some(fragment)) => {
+                        format!("{} > {}", escape_link_text(&span.target), escape_link_text(fragment))
+                    }
+                    (None, None) => escape_link_text(&span.target),
                 }
-                (None, None) => escape_link_text(&span.target),
             };
             out.push_str(&format!(
                 "[{display}]({})",
@@ -745,8 +759,15 @@ fn sourcepos_range(line_starts: &[usize], text: &str, sp: Sourcepos) -> Option<R
 /// 用文本锚定修正 sourcepos：候选处恰是 `[[` 就照用；否则（表格等已知缺陷）在该行
 /// 找 `]]` 收尾离候选终点最近的 `[[...]]`。
 fn anchor(src: &str, cand: Range<usize>) -> Option<Range<usize>> {
+    let close = |start: usize, limit: usize| {
+        src[start + 2..limit].bytes().enumerate().find_map(|(offset, b)| {
+            let at = start + 2 + offset;
+            (b == b']' && at + 1 < limit && src.as_bytes()[at + 1] == b']' && !escaped_at(src, at))
+                .then_some(at + 2)
+        })
+    };
     if src[cand.start..].starts_with("[[") {
-        let end = cand.start + 2 + src[cand.start + 2..].find("]]")? + 2;
+        let end = close(cand.start, src.len())?;
         return Some(cand.start..end);
     }
     let line_start = src[..cand.start].rfind('\n').map_or(0, |i| i + 1);
@@ -755,7 +776,7 @@ fn anchor(src: &str, cand: Range<usize>) -> Option<Range<usize>> {
     let mut pos = line_start;
     while let Some(rel) = src[pos..line_end].find("[[") {
         let start = pos + rel;
-        let end = start + 2 + src[start + 2..line_end].find("]]")? + 2;
+        let end = close(start, line_end)?;
         let dist = end.abs_diff(cand.end);
         if best.as_ref().is_none_or(|(d, _)| dist < *d) {
             best = Some((dist, start..end));

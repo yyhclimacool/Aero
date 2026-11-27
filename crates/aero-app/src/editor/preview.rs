@@ -49,7 +49,7 @@ pub(super) struct PreviewContext {
     pub(super) origin: Option<aero_core::VaultPath>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct EmbedStack {
     depth: u8,
     chain: Vec<(aero_core::VaultPath, Option<String>)>,
@@ -75,8 +75,9 @@ fn markdown_nested(
     let block = preview.block;
     let rich_editor = editor.clone();
     let rich_origin = preview.origin.clone();
+    let link_origin = preview.origin.clone();
     let embed_preview = preview.clone();
-    let depth = stack.depth;
+    let callout_stack = stack.clone();
     let embed_style = style.clone();
     let embed_id = id.clone();
     let highlight_editor = editor.clone();
@@ -176,7 +177,7 @@ fn markdown_nested(
         .markdown_block_renderer("callout", move |node, _, cx| {
             let callout = node.data::<Callout>().expect("callout parser data");
             let id: SharedString = format!("{id}-callout-{}", callout.offset).into();
-            render_callout(id, callout, style.clone(), &preview, depth, cx)
+            render_callout(id, callout, style.clone(), &preview, &callout_stack, cx)
         })
         .markdown_block_parser(|node, cx| {
             if !matches!(
@@ -213,8 +214,8 @@ fn markdown_nested(
             LinkClick::External => {
                 editor.update(cx, |editor, cx| editor.open_external_link(url, window, cx));
             }
-            LinkClick::Note { target, fragment } => editor.update(cx, |_, cx| {
-                cx.emit(super::EditorEvent::LinkClicked { target, fragment });
+            LinkClick::Note { target, fragment } => editor.update(cx, |editor, cx| {
+                editor.follow_note(target, fragment, link_origin.as_ref(), window, cx);
             }),
             LinkClick::Vault { path, fragment } => editor.update(cx, |_, cx| {
                 cx.emit(super::EditorEvent::VaultLink { path, fragment });
@@ -300,12 +301,9 @@ struct NoteEmbed {
     source: String,
 }
 
-/// 嵌入最多展开三跳，深度上限也约束不同片段之间的递归引用。
-const EMBED_DEPTH: u8 = 3;
-
 /// 只匹配独占段落的笔记嵌入。图片、PDF 等附件由各自的渲染器处理。
 fn note_embed(source: &str) -> Option<NoteEmbed> {
-    let trimmed = source.trim();
+    let trimmed = aero_core::parse::paragraph_body(source.trim());
     let embeds = aero_core::links::scan_embeds(trimmed);
     let [embed] = embeds.as_slice() else { return None };
     if embed.range != (0..trimmed.len()) || aero_core::attachments::Kind::for_path(&embed.target).is_some() {
@@ -339,17 +337,58 @@ fn render_note_embed(
             None => format!("embed-{target}"),
         }
     };
-    if stack.depth >= EMBED_DEPTH {
-        return div()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child("同步引用已达到 3 跳展开上限")
-            .into_any_element();
+    let source = editor.read(cx);
+    let resolution = source.resolve_reference(&embed.target, embed.fragment.as_deref(), origin);
+    if let Some(aero_core::links::Resolution::Resolved { path, fragment }) = &resolution {
+        let anchor = source.reference_anchor(path, fragment);
+        let cycle = stack.chain.iter().any(|(p, f)| p == path && *f == anchor);
+        if cycle || stack.depth >= super::embeds_ui::EMBED_DEPTH {
+            let reason =
+                if cycle { "同步引用形成循环" } else { "同步引用已达到 3 跳展开上限" };
+            return match source.continuation(path, fragment.as_deref()) {
+                Some(Ok(label)) => v_flex()
+                    .id(id)
+                    .debug_selector(move || if cycle { "embed-cycle".into() } else { "embed-depth".into() })
+                    .border_l_3()
+                    .border_color(theme.border)
+                    .pl_3()
+                    .gap_1()
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(reason))
+                    .child(
+                        div()
+                            .id("continue")
+                            .debug_selector(move || {
+                                if cycle { "embed-cycle-link".into() } else { "embed-depth-link".into() }
+                            })
+                            .cursor_pointer()
+                            .text_color(theme.link)
+                            .child(match fragment {
+                                Some(anchor) => format!("继续前往原文 · {label} › {anchor}"),
+                                None => format!("继续前往原文 · {label}"),
+                            })
+                            .on_click(open_source(editor, path.clone(), fragment.clone())),
+                    )
+                    .into_any_element(),
+                Some(Err(error)) => {
+                    embed_source(id, &format!("{} · {error}", embed.source), cx).into_any_element()
+                }
+                None => embed_source(id, &format!("{} · 正在载入…", embed.source), cx).into_any_element(),
+            };
+        }
     }
-    let view = editor
-        .read(cx)
-        .live_embed(&embed.target, embed.fragment.as_deref(), origin, cx)
-        .unwrap_or_else(|| editor.read(cx).embed_view_from(&embed.target, embed.fragment.as_deref(), origin));
+    let view = if stack.depth >= super::embeds_ui::EMBED_DEPTH {
+        match resolution {
+            Some(aero_core::links::Resolution::Ambiguous { .. }) => {
+                EmbedView::Failed("同步来源身份有歧义".into())
+            }
+            Some(aero_core::links::Resolution::Unresolved) => EmbedView::Failed("找不到同步来源".into()),
+            _ => EmbedView::Loading,
+        }
+    } else {
+        source
+            .live_embed(&embed.target, embed.fragment.as_deref(), origin, cx)
+            .unwrap_or_else(|| source.embed_view_from(&embed.target, embed.fragment.as_deref(), origin))
+    };
     let body: AnyElement = match view {
         EmbedView::Loading => {
             div().text_xs().text_color(theme.muted_foreground).child("正在载入…").into_any_element()
@@ -366,34 +405,17 @@ fn render_note_embed(
             )
             .into_any_element(),
         EmbedView::Ready { path, fragment, title, source } => {
-            if stack.chain.iter().any(|(ancestor, anchor)| ancestor == &path && anchor == &fragment) {
-                return div().text_xs().text_color(theme.danger).child("同步引用形成循环").into_any_element();
-            }
             let mut chain = stack.chain.clone();
-            chain.push((path.clone(), fragment.clone()));
-            let click = {
-                let (editor, target, fragment) = (editor.clone(), path.as_str().to_owned(), fragment.clone());
-                move |event: &ClickEvent, _: &mut Window, cx: &mut App| {
-                    if event.is_right_click() {
-                        return;
-                    }
-                    cx.stop_propagation();
-                    // 与点 wikilink 同一条路：工作区负责打开并定位
-                    editor.update(cx, |_, cx| {
-                        cx.emit(super::EditorEvent::LinkClicked {
-                            target: target.clone(),
-                            fragment: fragment.clone(),
-                        });
-                    });
-                }
-            };
+            chain.push((path.clone(), editor.read(cx).reference_anchor(&path, &fragment)));
+            let conflict = editor.read(cx).source_conflict(&path, cx);
+            let click = open_source(editor, path.clone(), fragment.clone());
             let label = match &fragment {
                 Some(f) if !f.is_empty() => format!("{title} › {f}"),
                 _ => title,
             };
             let content = markdown_nested(
                 format!("{id}-body").into(),
-                aero_core::links::to_markdown(&source).into(),
+                editor.read(cx).navigation_markdown(&source, Some(&path)).into(),
                 style.clone(),
                 PreviewContext {
                     state: editor.read(cx).preview.clone(),
@@ -409,6 +431,15 @@ fn render_note_embed(
                 .cursor_pointer()
                 .on_click(click)
                 .child(div().text_xs().text_color(theme.muted_foreground).child(label))
+                .when(conflict, |el| {
+                    el.child(
+                        div()
+                            .debug_selector(|| "embed-source-conflict".into())
+                            .text_xs()
+                            .text_color(theme.warning)
+                            .child("来源有外部修改冲突，正在显示当前编辑内容"),
+                    )
+                })
                 .child(content)
                 .into_any_element()
         }
@@ -427,6 +458,25 @@ fn render_note_embed(
                 .child(body),
         )
         .into_any_element()
+}
+
+fn open_source(
+    editor: &Entity<super::Editor>,
+    path: aero_core::VaultPath,
+    fragment: Option<String>,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let editor = editor.clone();
+    move |event, _, cx| {
+        if !event.is_right_click() {
+            cx.stop_propagation();
+            editor.update(cx, |_, cx| {
+                cx.emit(super::EditorEvent::OpenNoteFragment {
+                    path: path.clone(),
+                    fragment: fragment.clone(),
+                })
+            });
+        }
+    }
 }
 
 /// 渲染不了就显示源码：内容永不丢失。
@@ -1060,7 +1110,7 @@ fn render_callout(
     callout: &Callout,
     style: TextViewStyle,
     preview: &PreviewContext,
-    depth: u8,
+    stack: &EmbedStack,
     cx: &mut App,
 ) -> AnyElement {
     let state = &preview.state;
@@ -1147,15 +1197,21 @@ fn render_callout(
         .text_color(cx.theme().foreground)
         .child(header)
         .when(open && !callout.body.is_empty(), |el| {
-            el.child(div().debug_selector(move || format!("callout-body-{title}")).w_full().min_w_0().child(
-                markdown_nested(
-                    format!("{id}-body").into(),
-                    aero_core::links::to_markdown(&callout.body).into(),
-                    style,
-                    preview.clone(),
-                    EmbedStack { depth, ..Default::default() },
+            el.child(
+                div().debug_selector(move || format!("callout-body-{title}")).w_full().min_w_0().child(
+                    markdown_nested(
+                        format!("{id}-body").into(),
+                        preview
+                            .editor
+                            .read(cx)
+                            .navigation_markdown(&callout.body, preview.origin.as_ref())
+                            .into(),
+                        style,
+                        preview.clone(),
+                        stack.clone(),
+                    ),
                 ),
-            ))
+            )
         })
         .into_any_element()
 }

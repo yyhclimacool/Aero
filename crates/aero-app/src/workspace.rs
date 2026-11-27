@@ -608,6 +608,14 @@ impl Workspace {
             EditorEvent::PathsTouched(paths) => this.on_editor_touched_paths(editor, paths.clone(), cx),
             EditorEvent::Deleted => this.on_editor_deleted(editor, cx),
             EditorEvent::OpenRequested(path) => this.open_note(path.clone(), window, cx),
+            EditorEvent::OpenNoteFragment { path, fragment } => {
+                if !this.session_busy() {
+                    this.open_note(path.clone(), window, cx);
+                    if let Some(fragment) = fragment {
+                        this.navigate_note(path, tabs::Navigation::Fragment(fragment.clone()), window, cx);
+                    }
+                }
+            }
             EditorEvent::LinkClicked { target, fragment } => {
                 this.on_link_clicked(target.clone(), fragment.clone(), window, cx)
             }
@@ -2532,7 +2540,7 @@ mod tests {
         let doc = aero_core::Document::from_bytes(&source_with_id).unwrap();
         let document = aero_core::identity::read(&doc).unwrap().id.unwrap();
         let block = doc.blocks().roots[1].persisted_id.as_deref().unwrap();
-        let reference = format!("![[id:{document}#^{block}]]");
+        let reference = format!("![[id:{document}#^{block}|source]]");
         assert!(inserted.contains(&reference), "{inserted}");
         let focus = |cx: &mut VisualTestContext| {
             cx.update(|window, cx| destination.update(cx, |e, cx| e.test_focus_unit(0, window, cx)));

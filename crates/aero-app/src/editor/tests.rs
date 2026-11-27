@@ -2232,7 +2232,7 @@ fn toolbar_more_menu_copies_a_block_link_and_adds_an_id(cx: &mut TestAppContext)
         item.text().unwrap_or_default()
     });
     let document = aero_core::identity::read(&aero_core::Document::from_text(&body)).unwrap().id.unwrap();
-    assert_eq!(copied, format!("[[id:{document}#^{id}]]"));
+    assert_eq!(copied, format!("[[id:{document}#^{id}|a]]"));
     assert_eq!(body.matches('^').count(), 1, "只写一个块 id：{body}");
 }
 
@@ -2256,7 +2256,7 @@ fn copying_a_sync_reference_writes_one_undoable_source_identity(cx: &mut TestApp
         let document = aero_core::identity::read(doc).unwrap().id.unwrap();
         let block = doc.blocks().roots[1].persisted_id.as_deref().unwrap();
         let item = cx.read_from_clipboard().unwrap();
-        let expected = format!("![[id:{document}#^{block}]]");
+        let expected = format!("![[id:{document}#^{block}|a]]");
         assert_eq!(item.text().as_deref(), Some(expected.as_str()));
         let payload: aero_core::clipboard::Payload = serde_json::from_str(item.metadata().unwrap()).unwrap();
         assert_eq!(payload.document.as_deref(), Some(document.as_str()));
@@ -6157,6 +6157,49 @@ fn backspace_deletes_a_selected_image_block_after_multibyte_text(cx: &mut TestAp
     cx.run_until_parked();
     assert_eq!(text(&editor, cx), "上一段中文。\n");
     assert!(dir.path().join("a.assets/photo.png").is_file(), "删除嵌入不删附件文件");
+}
+
+#[gpui_kit::test]
+fn nested_sync_placeholders_navigate_to_the_resolved_source(cx: &mut TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+    let original = "![[notes/Cycle#^loop]]\n\n![[notes/First]]\n";
+    let (dir, _, _, editor) = open(cx, original);
+    std::fs::create_dir(dir.path().join("notes")).unwrap();
+    for (path, source) in [
+        ("notes/Cycle.md", "> [!NOTE] Cycle\n> ![[Cycle#^loop]]\n\n^loop\n"),
+        ("notes/First.md", "![[Second]]\n"),
+        ("notes/Second.md", "![[Third]]\n"),
+        ("notes/Third.md", "![[Fourth#^end]]\n"),
+        ("notes/Fourth.md", "last body ^end\n"),
+        ("Fourth.md", "wrong target ^end\n"),
+    ] {
+        std::fs::write(dir.path().join(path), source).unwrap();
+    }
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let _subscription = cx.update(|window, cx| {
+        window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
+        editor.update(cx, |e, cx| e.refresh_embeds(cx));
+        let opened = opened.clone();
+        cx.subscribe(&editor, move |_, event, _| {
+            if let super::EditorEvent::OpenNoteFragment { path, fragment } = event {
+                opened.borrow_mut().push((path.as_str().to_owned(), fragment.clone()));
+            }
+        })
+    });
+    settle(cx);
+    for (selector, path, fragment) in
+        [("embed-cycle-link", "notes/Cycle.md", "^loop"), ("embed-depth-link", "notes/Fourth.md", "^end")]
+    {
+        let link = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_click(link.center(), Default::default());
+        settle(cx);
+        assert_eq!(
+            opened.borrow_mut().drain(..).collect::<Vec<_>>(),
+            [(path.to_owned(), Some(fragment.to_owned()))]
+        );
+    }
+    assert_eq!(text(&editor, cx), original);
 }
 
 /// 笔记 / 章节 / 块嵌入：只读渲染目标源码，来源变化跟着更新，自嵌套不会转不出来。

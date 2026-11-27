@@ -24,7 +24,7 @@ pub fn set_preview_mode(mode: LinkPreviewMode, cx: &mut App) {
 pub(super) struct LinkPreview {
     pub(super) catalog: Option<Arc<crate::catalog::Catalog>>,
     pub(super) resolver: Option<Resolver>,
-    resolver_generation: u64,
+    pub(super) resolver_generation: u64,
     resolver_task: Option<Task<()>>,
     subscription: Option<Subscription>,
     window_subscriptions: Option<[Subscription; 2]>,
@@ -310,6 +310,7 @@ impl Editor {
                     Some(&self.doc.title_or(self.path.stem())),
                     &self.doc.front_matter_aliases(),
                 );
+                resolver.register_identity(&self.path, &self.doc);
             }
         }
     }
@@ -746,7 +747,7 @@ impl Editor {
                 .debug_selector(|| "link-preview-rich".into())
                 .child(preview::markdown(
                     format!("link-preview-{}", cx.entity_id()).into(),
-                    aero_core::links::to_markdown(body).into(),
+                    self.navigation_markdown(body, origin.as_ref()).into(),
                     style,
                     preview::PreviewContext {
                         state: self.preview.clone(),

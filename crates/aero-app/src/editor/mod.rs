@@ -138,6 +138,11 @@ pub enum EditorEvent {
     Deleted,
     /// 横幅上的"打开副本"
     OpenRequested(VaultPath),
+    /// A rendered reference already resolved against its own source directory.
+    OpenNoteFragment {
+        path: VaultPath,
+        fragment: Option<String>,
+    },
     /// 预览里点了 wikilink：已解码的目标与可选片段（`target` 为空 = 同篇锚点 `[[#h]]`），工作区负责解析与打开
     LinkClicked {
         target: String,
@@ -623,6 +628,7 @@ impl Editor {
         self.io.checking = None;
         let old_path = std::mem::replace(&mut self.path, path);
         self.repath_link_preview(&old_path, cx);
+        self.publish_live(cx);
         cx.emit(EditorEvent::Changed);
         cx.notify();
     }
@@ -3330,6 +3336,9 @@ impl Editor {
 
     fn set_banner(&mut self, banner: Option<Banner>, cx: &mut Context<Self>) {
         let was_deleted = self.is_deleted();
+        let conflict_changed = self.banner != banner
+            && (self.has_source_conflict()
+                || matches!(banner, Some(Banner::Conflict { .. } | Banner::ProtectedConflict)));
         self.banner_task = None;
         if banner == Some(Banner::Reloaded) {
             self.banner_task = Some(cx.spawn(async move |this, cx| {
@@ -3343,11 +3352,15 @@ impl Editor {
             }));
         }
         self.banner = banner;
-        if was_deleted != self.is_deleted() {
+        if was_deleted != self.is_deleted() || conflict_changed {
             source_cache::invalidate(self.vault.id(), std::slice::from_ref(&self.path));
             self.publish_live(cx);
         }
         cx.notify();
+    }
+
+    fn has_source_conflict(&self) -> bool {
+        matches!(self.banner, Some(Banner::Conflict { .. } | Banner::ProtectedConflict))
     }
 
     fn mark_deleted(&mut self, cx: &mut Context<Self>) {
@@ -4336,7 +4349,7 @@ impl Editor {
                     }))
                     .child(preview::markdown(
                         SharedString::from(format!("callout-body-{}", id.0)),
-                        aero_core::links::to_markdown(&parts.body_text).into(),
+                        self.navigation_markdown(&parts.body_text, None).into(),
                         self.text_view_style(cx),
                         preview::PreviewContext {
                             state: self.preview.clone(),
@@ -4574,7 +4587,7 @@ impl Editor {
             _ => {
                 let text = if text.is_empty() { SharedString::from("\u{200b}") } else { text };
                 // wikilink 在预览里渲染成标准 Markdown 链接（aero://note/…），点击经 on_link_click 回编辑器
-                let rendered: SharedString = aero_core::links::to_markdown(&text).into();
+                let rendered: SharedString = self.navigation_markdown(&text, None).into();
                 // TextView 的解析状态按元素 id 缓存；带上编辑器实体 id，切换笔记后不会复用上一篇的状态
                 let view_id = SharedString::from(format!("blk-{}-{}", cx.entity_id(), id.0));
                 let reveal = if self.highlight == Some(id) { self.reveal_generation } else { 0 };
