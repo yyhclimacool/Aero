@@ -3,7 +3,7 @@
 //! 走 9.9 的渲染服务，所以占位、两级缓存、失败回退与取消都和图片共用一套。
 //! 公式在 RaTeX 排版阶段就按主题前景色着色，主题一换缓存键跟着变、自动重排。
 
-use gpui_kit::base::text::TextViewStyle;
+use gpui_kit::base::input::{InputInline, Markup};
 use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -65,170 +65,54 @@ impl super::Editor {
         }
     }
 
-    /// 段落里的 `$…$`。没有行内公式时返回 None，调用方继续用普通 Markdown 预览。
-    pub(super) fn render_with_inline_math(
+    /// 公式占用正文中的一个字形位置。过高的公式等比缩到当前行高。
+    pub(super) fn inline_math(
         &self,
         text: &str,
-        base: usize,
-        view: InlineMathView,
+        em: f32,
+        foreground: Hsla,
+        markup: &mut Markup,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let formulas = aero_core::highlight::inline_formulas(text);
-        if formulas.is_empty() {
-            return None;
-        }
-        let service = self.images.as_ref()?;
-        let block = view.block;
-        let view_id = &view.id;
-        let em = super::BODY_FONT_SIZE;
-        let foreground = cx.theme().foreground;
+    ) -> (Vec<InputInline>, Vec<std::ops::Range<usize>>, bool) {
+        let Some(service) = &self.images else { return (Vec::new(), Vec::new(), false) };
+        let placeholder = cx.theme().muted;
         let scale = self.scale;
-        let mut parts: Vec<AnyElement> = Vec::new();
-        let mut at = 0usize;
-        for (ix, formula) in formulas.iter().enumerate() {
-            if formula.range.start > at {
-                parts.push(self.inline_text_piece(
-                    &text[at..formula.range.start],
-                    base + at..base + formula.range.start,
-                    format!("{view_id}-t-{ix}").into(),
-                    &view,
-                    cx,
-                ));
-            }
+        let mut images = Vec::new();
+        let mut ranges = Vec::new();
+        let mut pending = false;
+        for formula in aero_core::highlight::inline_formulas(text) {
             let state = service
                 .update(cx, |service, cx| service.math(&formula.latex, false, em, scale, foreground, cx));
-            let range = base + formula.range.start..base + formula.range.end;
-            let hit_range = range.clone();
-            let record_range = range.clone();
-            let editor = cx.weak_entity();
-            parts.push(
-                div()
-                    .on_children_prepainted(move |bounds, _, cx| {
-                        if let Some(bounds) = bounds.first().copied() {
-                            let _ = editor.update(cx, |this, _| {
-                                this.inline_math_hits.push((block, record_range.clone(), bounds));
-                            });
-                        }
-                    })
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("math-inline-hit-{ix}")))
-                            .flex_none()
-                            .cursor_text()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    this.open_math_popup(hit_range.clone(), Some(block), window, cx);
-                                }),
-                            )
-                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                                if event.is_right_click() {
-                                    return;
-                                }
-                                cx.stop_propagation();
-                                this.open_math_popup(range.clone(), Some(block), window, cx);
-                            }))
-                            .child(inline_math_part(ix, &formula.latex, state, scale, em, cx)),
-                    )
-                    .into_any_element(),
-            );
-            at = formula.range.end;
-        }
-        if at < text.len() {
-            parts.push(self.inline_text_piece(
-                &text[at..],
-                base + at..base + text.len(),
-                format!("{view_id}-t-end").into(),
-                &view,
-                cx,
+            ranges.push(formula.range.clone());
+            let (pixels, image) = match state {
+                State::Ready { image, pixels, .. } => (Some(pixels), Some(image)),
+                State::Pending { pixels } => {
+                    pending = true;
+                    (pixels, None)
+                }
+                State::Failed(_) => {
+                    markup.styles.push((
+                        formula.range.clone(),
+                        HighlightStyle { color: Some(cx.theme().danger), ..Default::default() },
+                    ));
+                    markup.fonts.push((formula.range, cx.theme().mono_font_family.clone()));
+                    continue;
+                }
+            };
+            let (width, height) = pixels
+                .map_or((em * formula.latex.chars().count().max(1) as f32 * 0.6, em), |p| {
+                    (p.width as f32 / scale, p.height as f32 / scale)
+                });
+            let ratio = (em / height).min(1.);
+            images.push(InputInline::image(
+                formula.range,
+                size(px(width * ratio), px(height * ratio)),
+                image,
+                placeholder,
             ));
         }
-        Some(div().w_full().flex().flex_wrap().items_start().gap_1().children(parts).into_any_element())
+        (images, ranges, pending)
     }
-
-    /// 公式两侧的文字。正在编辑的那一段用文本框，其余保持预览，避免把 `$…$` 源码画出来。
-    fn inline_text_piece(
-        &self,
-        text: &str,
-        abs: std::ops::Range<usize>,
-        view_id: SharedString,
-        view: &InlineMathView,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if view.editing.as_ref() == Some(&abs)
-            && let Some(focused) = &self.focused
-        {
-            // 文本框默认是宽高 100%。父级没有确定宽度时会变成 0。
-            // 高度交给文本框自己按行数长，不要用字数去估，估矮了会把行尾的字切到下一行。
-            return div()
-                .w_full()
-                .text_size(px(super::BODY_FONT_SIZE))
-                .line_height(relative(super::BODY_LINE_HEIGHT))
-                .debug_selector(|| "math-text".into())
-                .child(gpui_kit::base::input::Textarea::new(&focused.textarea))
-                .into_any_element();
-        }
-        let range = abs;
-        let block = view.block;
-        let wide = text.chars().count() as f32 * super::BODY_FONT_SIZE > super::COLUMN_WIDTH * 0.85;
-        div()
-            .id(view_id.clone())
-            .when(wide, |el| el.w_full())
-            .when(!wide, |el| el.flex_none())
-            .debug_selector(|| "math-text".into())
-            .cursor_text()
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                if event.is_right_click() {
-                    return;
-                }
-                cx.stop_propagation();
-                let len = range.end.saturating_sub(range.start);
-                this.focus_range(range.clone(), Some(block), false, len, window, cx);
-            }))
-            .child(super::preview::markdown(
-                view_id,
-                self.navigation_markdown(text, None).into(),
-                view.style.clone().with_paragraph_gap(rems(0.)),
-                super::preview::PreviewContext {
-                    state: self.preview.clone(),
-                    editor: cx.entity(),
-                    block,
-                    reveal: 0,
-                    origin: None,
-                },
-            ))
-            .into_any_element()
-    }
-}
-
-pub(super) struct InlineMathView {
-    pub(super) block: aero_core::BlockId,
-    pub(super) style: TextViewStyle,
-    pub(super) id: SharedString,
-    /// 正在编辑的文字片段在整篇笔记中的 UTF-8 字节范围。
-    pub(super) editing: Option<std::ops::Range<usize>>,
-}
-
-/// 光标所在的、公式以外的文字区间（相对 `text`）。光标在公式里时，取它前面最近的一段文字。
-pub(super) fn text_span_for_cursor(text: &str, cursor: usize) -> Option<std::ops::Range<usize>> {
-    let formulas = aero_core::highlight::inline_formulas(text);
-    if formulas.is_empty() {
-        return Some(0..text.len());
-    }
-    let mut spans = Vec::new();
-    let mut at = 0usize;
-    for formula in &formulas {
-        spans.push(at..formula.range.start);
-        at = formula.range.end;
-    }
-    spans.push(at..text.len());
-    if let Some(span) =
-        spans.iter().find(|span| span.start <= cursor && cursor < span.end && !span.is_empty())
-    {
-        return Some(span.clone());
-    }
-    spans.into_iter().rev().find(|span| !span.is_empty() && span.end <= cursor)
 }
 
 /// 光标严格落在 `$…$` 内部（不含两端定界符的外侧）时，返回这段源码区间。
@@ -257,36 +141,6 @@ fn math_source(source: &str, cx: &App) -> AnyElement {
         .text_color(cx.theme().muted_foreground)
         .child(source.trim().to_owned())
         .into_any_element()
-}
-
-fn inline_math_part(ix: usize, latex: &str, state: State, scale: f32, em: f32, cx: &App) -> AnyElement {
-    let selector = move || format!("math-inline-{ix}");
-    match state {
-        State::Ready { image, pixels, .. } => {
-            let (width, height) = (pixels.width as f32 / scale, pixels.height as f32 / scale);
-            div()
-                .flex_none()
-                .debug_selector(selector)
-                .child(img(ImageSource::Render(image)).w(px(width)).h(px(height)))
-                .into_any_element()
-        }
-        State::Pending { pixels } => div()
-            .flex_none()
-            .debug_selector(selector)
-            .w(px(pixels.map_or(em * latex.len().max(1) as f32 * 0.6, |p| p.width as f32 / scale)))
-            .h(px(pixels.map_or(em, |p| p.height as f32 / scale)))
-            .rounded(px(4.))
-            .bg(cx.theme().muted)
-            .into_any_element(),
-        State::Failed(_) => div()
-            .flex_none()
-            .debug_selector(|| "math-inline-error".to_owned())
-            .font_family(cx.theme().mono_font_family.clone())
-            .text_size(px(13.))
-            .text_color(cx.theme().danger)
-            .child(format!("${latex}$"))
-            .into_any_element(),
-    }
 }
 
 #[cfg(test)]

@@ -474,19 +474,22 @@ impl FileTree {
         self.document_drop_bounds = None;
         self.rebuild_rows();
         // 普通刷新保留手动滚动位置；只补做初次加载或扫描期间请求的定位。
-        if std::mem::take(&mut self.reveal_after_scan) {
-            self.scroll_to_selection();
+        if self.reveal_after_scan {
+            // An older scan can finish before the one that sees a new note.
+            self.reveal_after_scan = !self.scroll_to_selection() && self.scan_again;
         }
     }
 
-    fn scroll_to_selection(&self) {
-        if let Some(ix) = self.rows.iter().position(|row| match row {
+    fn scroll_to_selection(&self) -> bool {
+        let Some(ix) = self.rows.iter().position(|row| match row {
             Row::Note { path, .. } => self.selected.as_ref() == Some(path),
             Row::Folder { path, .. } => self.selected_folder.as_ref().is_some_and(|p| p.as_str() == path),
             _ => false,
-        }) {
-            self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
-        }
+        }) else {
+            return false;
+        };
+        self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        true
     }
 
     /// 后台扫出来的引用计数（工作区送进来）：用来标出没人引用的附件。
@@ -553,6 +556,11 @@ impl FileTree {
         self.scanning.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn shows_documents(&self) -> bool {
+        self.documents
+    }
+
     /// 树里是否有这篇笔记（上次 `rescan` 时磁盘上的、且没被忽略规则过滤掉）。
     pub fn contains(&self, path: &VaultPath) -> bool {
         self.notes.contains(path)
@@ -572,6 +580,24 @@ impl FileTree {
 
     pub fn selected_folder(&self) -> Option<&VaultPath> {
         self.selected_folder.as_ref()
+    }
+
+    pub(crate) fn set_documents(&mut self, documents: bool, cx: &mut Context<Self>) {
+        if self.documents == documents {
+            return;
+        }
+        self.documents = documents;
+        let path = tree_view_file(&self.vault);
+        let save = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(path, if documents { "documents" } else { "files" }));
+        if let Err(error) = save {
+            self.error = Some(format!("无法保存树视图偏好：{error}"));
+        }
+        self.rebuild_rows();
+        self.scroll_to_selection();
+        cx.notify();
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -941,6 +967,7 @@ impl FileTree {
                     .child(
                         div()
                             .id("tree-view-toggle")
+                            .debug_selector(|| "tree-view-toggle".into())
                             .px_2()
                             .text_xs()
                             .child(if self.documents { "文档 ▾" } else { "文件 ▾" })
@@ -948,19 +975,7 @@ impl FileTree {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.documents = !this.documents;
-                                    let path = tree_view_file(&this.vault);
-                                    if let Some(parent) = path.parent() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                    if let Err(error) = std::fs::write(
-                                        path,
-                                        if this.documents { "documents" } else { "files" },
-                                    ) {
-                                        this.error = Some(format!("无法保存树视图偏好：{error}"));
-                                    }
-                                    this.rebuild_rows();
-                                    cx.notify();
+                                    this.set_documents(!this.documents, cx);
                                 }),
                             ),
                     )

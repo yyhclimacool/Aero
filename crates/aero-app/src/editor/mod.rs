@@ -315,8 +315,6 @@ pub struct Editor {
     block_drop: Option<block_menu::BlockDropHint>,
     dragging_block: bool,
     unit_bounds: Vec<(BlockId, Bounds<Pixels>)>,
-    /// 上一帧行内公式的点击区域（块、源码区间、窗口坐标）。
-    inline_math_hits: Vec<(BlockId, Range<usize>, Bounds<Pixels>)>,
     /// 这一篇暂时整篇显示源码（9.1「查看源码」）。不写入笔记。
     note_source: bool,
     /// 单独打开源码的块。
@@ -458,7 +456,6 @@ impl Editor {
             block_drop: None,
             dragging_block: false,
             unit_bounds: Vec::new(),
-            inline_math_hits: Vec::new(),
             note_source: false,
             source_blocks: HashSet::new(),
             presenters: Default::default(),
@@ -854,17 +851,6 @@ impl Editor {
         }
     }
 
-    fn inline_formula_at_position(&self, id: BlockId, position: Point<Pixels>) -> Option<Range<usize>> {
-        self.inline_math_hits.iter().find_map(|(block, range, bounds)| {
-            (*block == id
-                && position.x >= bounds.left()
-                && position.x < bounds.right()
-                && position.y >= bounds.top()
-                && position.y < bounds.bottom())
-            .then(|| range.clone())
-        })
-    }
-
     /// 公式源码放到弹窗里。文档里的块继续画渲染结果，高度不因为源码而变。
     fn open_math_popup(
         &mut self,
@@ -952,10 +938,6 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(range) = self.inline_formula_at_position(id, position) {
-            self.open_math_popup(range, Some(id), window, cx);
-            return;
-        }
         self.focus_block(id, window, cx);
         if self.focused.as_ref().is_some_and(|focused| focused.math_popup)
             || self.replaying_click
@@ -1047,37 +1029,15 @@ impl Editor {
                 _ => {}
             }
         }
-        if self.renders_inline_formulas(unit_id, &text, cx) {
-            let at = cursor.min(text.len());
-            if let Some(local) = math_ui::inline_formula_containing(&text, at) {
-                self.open_math_popup(range.start + local.start..range.start + local.end, id, window, cx);
-                return;
-            }
-            if let Some(local) = math_ui::text_span_for_cursor(&text, at) {
-                let abs = range.start + local.start..range.start + local.end;
-                let rel = at.saturating_sub(local.start).min(abs.len());
-                self.focus_range(abs, id, nl, rel, window, cx);
-                return;
-            }
-            if let Some(formula) = aero_core::highlight::inline_formulas(&text).into_iter().next() {
-                self.open_math_popup(
-                    range.start + formula.range.start..range.start + formula.range.end,
-                    id,
-                    window,
-                    cx,
-                );
-                return;
-            }
+        if self.images.is_some()
+            && self.hides_markers(cx)
+            && !self.block_shows_source(unit_id)
+            && let Some(local) = math_ui::inline_formula_containing(&text, cursor)
+        {
+            self.open_math_popup(range.start + local.start..range.start + local.end, id, window, cx);
+            return;
         }
         self.focus_range(range, id, nl, cursor, window, cx);
-    }
-
-    /// 有渲染服务时，行内公式留在预览里，文本框只覆盖公式两侧的文字。
-    fn renders_inline_formulas(&self, id: BlockId, text: &str, cx: &App) -> bool {
-        self.images.is_some()
-            && self.hides_markers(cx)
-            && !self.block_shows_source(id)
-            && !aero_core::highlight::inline_formulas(text).is_empty()
     }
 
     /// 聚焦文档偏移 `offset` 处的单位；那里没有块（空段落）时聚焦一个空区间。
@@ -1196,6 +1156,8 @@ impl Editor {
                     // 否则闭合的 `$` 会被当成新字符。
                     if selection.is_empty()
                         && !typing
+                        && !this.input_composing(window, cx)
+                        && this.images.is_some()
                         && this.focused.as_ref().is_some_and(|focused| !focused.math_popup)
                         && !this.note_source
                         && !this
@@ -4461,27 +4423,6 @@ impl Editor {
             return Some(el);
         }
         if self.is_focused_block(b.id) && !self.focused.as_ref().is_some_and(|focused| focused.math_popup) {
-            let full = self.doc.slice(range.clone()).to_string();
-            if self.renders_inline_formulas(b.id, &full, cx)
-                && let Some(mixed) = self.render_with_inline_math(
-                    &full,
-                    range.start,
-                    math_ui::InlineMathView {
-                        block: b.id,
-                        style: self.text_view_style(cx),
-                        id: format!("blk-{}-{}", cx.entity_id(), b.id.0).into(),
-                        editing: self.focused.as_ref().map(|focused| focused.range.clone()),
-                    },
-                    cx,
-                )
-            {
-                let body = Self::painted(
-                    div().w_full().when(matches!(b.kind, BlockKind::Heading { .. }), |el| el.pt_2()),
-                    paint,
-                )
-                .child(mixed);
-                return Some(self.with_gutter(b.id, depth, body.into_any_element(), cx));
-            }
             if matches!(b.kind, BlockKind::Callout { .. })
                 && self.hides_markers(cx)
                 && !self.block_shows_source(b.id)
@@ -4522,7 +4463,9 @@ impl Editor {
                     .child(textarea)
                     .child(self.render_math_block(&source, cx))
                     .into_any_element()
-            } else if aero_core::rich_content::mermaid_source(&full).is_some() {
+            } else if aero_core::rich_content::mermaid_source(&self.doc.slice(range.clone()).to_string())
+                .is_some()
+            {
                 v_flex()
                     .w_full()
                     .gap_2()
@@ -4538,7 +4481,6 @@ impl Editor {
             return None;
         }
         let theme = cx.theme().clone();
-        let base = range.start;
         let text: SharedString = aero_core::containers::local_source(&self.doc, b.id)
             .unwrap_or_else(|| self.doc.slice(range).to_string())
             .into();
@@ -4597,36 +4539,19 @@ impl Editor {
                     Some(color) => style.with_foreground(color),
                     None => style,
                 };
-                if matches!(
-                    b.kind,
-                    BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::ListItem { .. }
-                ) && let Some(mixed) = self.render_with_inline_math(
-                    &text,
-                    base,
-                    math_ui::InlineMathView {
+                preview::markdown(
+                    view_id,
+                    rendered,
+                    style,
+                    preview::PreviewContext {
+                        state: self.preview.clone(),
+                        editor: cx.entity(),
                         block: id,
-                        style: style.clone(),
-                        id: view_id.clone(),
-                        editing: None,
+                        reveal,
+                        origin: None,
                     },
-                    cx,
-                ) {
-                    mixed
-                } else {
-                    preview::markdown(
-                        view_id,
-                        rendered,
-                        style,
-                        preview::PreviewContext {
-                            state: self.preview.clone(),
-                            editor: cx.entity(),
-                            block: id,
-                            reveal,
-                            origin: None,
-                        },
-                    )
-                    .into_any_element()
-                }
+                )
+                .into_any_element()
             }
         };
         let is_heading = matches!(b.kind, BlockKind::Heading { .. });
@@ -4785,7 +4710,6 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::colors::apply_text_selection(cx);
         self.sync_navigation();
-        self.inline_math_hits.clear();
         self.unit_bounds.clear();
         if self.dragging_block && !cx.has_active_drag() {
             self.dragging_block = false;

@@ -199,6 +199,7 @@ impl Workspace {
         );
         let mut this = Workspace {
             data_dir,
+            open: None,
             quick_open: None,
             picker_focus: None,
             recent_commands: Vec::new(),
@@ -223,7 +224,6 @@ impl Workspace {
             tab_name_edit: None,
             window_title: String::new(),
             state,
-            open: None,
             focus_handle: cx.focus_handle(),
             error: None,
             _quit_subscription: quit,
@@ -1104,6 +1104,34 @@ impl Workspace {
             window,
             cx,
         );
+    }
+
+    fn on_import_note_copy(&mut self, _: &ImportNoteCopy, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = &self.open else { return };
+        let vault = open.vault.clone();
+        let directory = open.tree.read(cx).selected_dir().unwrap_or_default();
+        let selection = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("作为副本导入 Markdown 笔记".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = selection.await
+                && let Some(source) = paths.into_iter().next()
+            {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    if this.open.as_ref().is_some_and(|open| Arc::ptr_eq(&open.vault, &vault)) {
+                        this.request_operation(
+                            PendingOperation::File(files::Operation::ImportNoteCopy { source, directory }),
+                            window,
+                            cx,
+                        );
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     /// ⌘⇧D：今日日记 `daily/YYYY-MM-DD.md`，不存在则按模板创建（3.4）。
@@ -2113,6 +2141,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::on_new_vault))
                     .on_action(cx.listener(Self::on_close_vault))
                     .on_action(cx.listener(Self::on_new_note))
+                    .on_action(cx.listener(Self::on_import_note_copy))
                     .on_action(cx.listener(Self::on_open_daily))
                     .on_action(cx.listener(Self::on_delete_note))
                     .on_action(cx.listener(Self::on_trash_note))
@@ -2561,15 +2590,69 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn import_as_copy_prompts_and_opens_a_distinct_note(cx: &mut TestAppContext) {
+        let doc_id = aero_core::identity::new_document_id();
+        let body = format!("---\naero: {{id: {doc_id}}}\n---\n\nbody ^old\n\n[[#^old]]\n");
+        let (dir, _data, workspace) = open(cx, Some(&body));
+        let external = tempfile::tempdir().unwrap();
+        let source = external.path().join("a.md");
+        std::fs::write(&source, &body).unwrap();
+        let window = cx.windows()[0];
+        {
+            let cx = &mut VisualTestContext::from_window(window, cx);
+            cx.update(|window, cx| {
+                window.replace_root(cx, |window, cx| {
+                    gpui_kit::component::Root::new(workspace.clone(), window, cx)
+                });
+                window.dispatch_action(Box::new(crate::actions::ImportNoteCopy), cx);
+            });
+        }
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.files && !options.directories && !options.multiple);
+            Some(vec![source.clone()])
+        });
+        let cx = &mut VisualTestContext::from_window(window, cx);
+        wait_until(cx, |cx| {
+            cx.update(|_, cx| {
+                let w = workspace.read(cx);
+                w.open.as_ref().unwrap().editor().is_some_and(|e| e.read(cx).path().as_str() == "a 1.md")
+            })
+        });
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), body);
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), body);
+        let copy =
+            aero_core::Document::from_bytes(&std::fs::read(dir.path().join("a 1.md")).unwrap()).unwrap();
+        let copied_id = aero_core::identity::read(&copy).unwrap().id.unwrap();
+        assert_ne!(copied_id, doc_id);
+        let span = &aero_core::links::scan(&copy.to_string())[0];
+        assert_eq!(span.target, format!("id:{copied_id}"));
+        let fragment = span.fragment.as_deref().unwrap().strip_prefix('^').unwrap();
+        assert!(aero_core::identity::is_block_id(fragment));
+        assert!(aero_core::block_refs::resolve(&copy, fragment).is_ok());
+        cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().search.read(cx).close_blocking());
+    }
+
+    #[gpui_kit::test]
     fn undo_child_creation_closes_removed_tab_and_parent_can_redo(cx: &mut TestAppContext) {
-        let original = "before\n\n/子文档\n\nafter\n";
-        let (dir, _data, workspace) = open(cx, Some(original));
+        let parent_id = aero_core::identity::new_document_id();
+        let original = format!("---\naero: {{id: {parent_id}}}\n---\n\nbefore\n\n/子文档\n\nafter\n");
+        let (dir, _data, workspace) = open(cx, Some(&original));
         let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
         cx.update(|window, cx| {
             window
                 .replace_root(cx, |window, cx| gpui_kit::component::Root::new(workspace.clone(), window, cx));
         });
         let parent = cx.update(|_, cx| workspace.read(cx).open.as_ref().unwrap().editor().unwrap().clone());
+        let sibling = |title: &str, order: &str| {
+            format!("---\ntitle: {title}\naero: {{parent: {parent_id}{order}}}\n---\n\n正文\n")
+        };
+        let ordered = sibling("Z", ", order: 2048");
+        let legacy2 = sibling("Note 2", "");
+        let legacy10 = sibling("Note 10", "");
+        for (name, body) in [("ordered.md", &ordered), ("legacy2.md", &legacy2), ("legacy10.md", &legacy10)] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
         std::fs::write(dir.path().join("b.md"), "unrelated\n").unwrap();
         workspace.update_in(cx, |w, window, cx| {
             w.open_note(VaultPath::new("b.md").unwrap(), window, cx);
@@ -2578,6 +2661,7 @@ mod tests {
         cx.run_until_parked();
         let command = original.find("/子文档").unwrap();
         workspace.update_in(cx, |w, window, cx| {
+            w.open.as_ref().unwrap().tree.update(cx, |tree, cx| tree.set_documents(false, cx));
             w.request_operation(
                 super::PendingOperation::File(super::files::Operation::CreateChild {
                     parent: VaultPath::new("a.md").unwrap(),
@@ -2600,6 +2684,29 @@ mod tests {
         let child_path = child.read_with(cx, |e, _| e.path().clone());
         let created_parent = std::fs::read(dir.path().join("a.md")).unwrap();
         let created_child = std::fs::read(dir.path().join(child_path.as_str())).unwrap();
+        let created_legacy2 = std::fs::read(dir.path().join("legacy2.md")).unwrap();
+        let created_legacy10 = std::fs::read(dir.path().join("legacy10.md")).unwrap();
+        let relation_order = |bytes: &[u8]| {
+            let doc = aero_core::Document::from_bytes(bytes).unwrap();
+            aero_core::identity::read(&doc).unwrap().order.unwrap()
+        };
+        assert_eq!(std::fs::read(dir.path().join("ordered.md")).unwrap(), ordered.as_bytes());
+        assert_eq!(relation_order(&created_legacy2), 3072);
+        assert_eq!(relation_order(&created_legacy10), 4096);
+        assert_eq!(relation_order(&created_child), 5120);
+        assert_eq!(child_path.as_str(), "未命名.md");
+        let selector = "file-tree-note:未命名.md";
+        wait_until(cx, |cx| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds(selector).is_some()
+        });
+        let mut row = |name| cx.debug_bounds(name).unwrap();
+        assert!(row("file-tree-note:legacy10.md").bottom() <= row(selector).top());
+        cx.update(|_, cx| {
+            let open = workspace.read(cx).open.as_ref().unwrap();
+            assert!(open.tree.read(cx).shows_documents());
+            assert_eq!(open.tree.read(cx).selected(), Some(&child_path));
+        });
         cx.update(|window, cx| {
             child.update(cx, |e, cx| window.focus(&gpui_kit::Focusable::focus_handle(e, cx), cx));
         });
@@ -2608,6 +2715,8 @@ mod tests {
         wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).session_busy()));
         assert!(!dir.path().join(child_path.as_str()).exists());
         assert_eq!(std::fs::read_to_string(dir.path().join("a.md")).unwrap(), original);
+        assert_eq!(std::fs::read(dir.path().join("legacy2.md")).unwrap(), legacy2.as_bytes());
+        assert_eq!(std::fs::read(dir.path().join("legacy10.md")).unwrap(), legacy10.as_bytes());
         cx.update(|_, cx| {
             let open = workspace.read(cx).open.as_ref().unwrap();
             assert_eq!(open.tabs.len(), 2, "undo removes only the internally deleted child tab");
@@ -2622,6 +2731,8 @@ mod tests {
         wait_until(cx, |cx| cx.update(|_, cx| !workspace.read(cx).session_busy()));
         assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), created_parent);
         assert_eq!(std::fs::read(dir.path().join(child_path.as_str())).unwrap(), created_child);
+        assert_eq!(std::fs::read(dir.path().join("legacy2.md")).unwrap(), created_legacy2);
+        assert_eq!(std::fs::read(dir.path().join("legacy10.md")).unwrap(), created_legacy10);
         assert_eq!(std::fs::read_to_string(dir.path().join("b.md")).unwrap(), "unrelated\n");
         cx.update(|_, cx| {
             let open = workspace.read(cx).open.as_ref().unwrap();

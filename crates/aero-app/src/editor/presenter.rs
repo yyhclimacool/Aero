@@ -3,7 +3,7 @@
 //! 折行都不会变；按下鼠标就是在这个控件里放光标，拖动直接选字。
 
 use aero_core::markup::{Analysis, Mark};
-use gpui_kit::base::input::Markup;
+use gpui_kit::base::input::{InputInline, Markup, TextPresentation};
 use gpui_kit::base::text::{LinkStyle, LinkUnderline};
 use gpui_kit::component::WindowExt as _;
 
@@ -47,6 +47,7 @@ pub(super) struct Presenter {
     pub enter_newline: bool,
     /// 链接文字在控件文字里的区间与地址
     pub links: Vec<(Range<usize>, String)>,
+    pub(super) formulas: Vec<Range<usize>>,
     /// 不折行时文字的宽度。只给居中、靠右的单元格量，它们按这个宽度摆位置。
     pub natural_width: Option<Pixels>,
     text: String,
@@ -64,6 +65,10 @@ struct StyleStamp {
     /// 编辑中那一段的选区：落进链接地址时地址要露出来
     selection: Option<Range<usize>>,
     links: Vec<LinkStyle>,
+    navigation_labels: Vec<(Range<usize>, String)>,
+    math_color: Hsla,
+    math_scale: f32,
+    pending_math: bool,
 }
 
 pub(super) struct Spec {
@@ -104,9 +109,7 @@ impl Editor {
             let key = Key::unit(unit.id);
             let range = unit.range.clone();
             match &unit.kind {
-                BlockKind::Paragraph | BlockKind::Heading { .. }
-                    if self.presents_text(unit.id, &text, cx) =>
-                {
+                BlockKind::Paragraph | BlockKind::Heading { .. } if Self::presents_text(&text) => {
                     let checked = unit.list.as_ref().is_some_and(|list| list.checked == Some(true));
                     specs.push(spec(key, range, false, Extra { checked, ..Default::default() }));
                 }
@@ -160,15 +163,12 @@ impl Editor {
         specs
     }
 
-    /// 这一段按文字画。独占一段的图片 / 笔记嵌入与带行内公式的段落另有画法。
-    fn presents_text(&self, id: BlockId, text: &str, cx: &App) -> bool {
+    /// 这一段按文字画。独占一段的图片、笔记和 PDF 嵌入单独渲染。
+    fn presents_text(text: &str) -> bool {
         let trimmed = text.trim();
         !preview::is_image_embed(trimmed)
             && !preview::is_note_embed(trimmed)
             && aero_core::rich_content::pdf_embed(text).is_none()
-            && !has_html_break(text)
-            && !self.renders_inline_formulas(id, text, cx)
-            && (self.is_focused_block(id) || !self.has_navigation_link(text))
     }
 
     fn ensure_presenter(&mut self, spec: Spec, window: &mut Window, cx: &mut Context<Self>) {
@@ -204,6 +204,7 @@ impl Editor {
                 range: spec.range.clone(),
                 enter_newline: spec.enter_newline,
                 links: Vec::new(),
+                formulas: Vec::new(),
                 natural_width: None,
                 text: String::new(),
                 extra: Extra::default(),
@@ -300,14 +301,42 @@ impl Editor {
         let link_styles = |links: &[(Range<usize>, String)]| -> Vec<LinkStyle> {
             links.iter().map(|(_, url)| self.preview_link_style(url, cx)).collect()
         };
+        let block = self.doc.blocks().find(key.id);
+        let prose = key.part == Part::Unit
+            && block.is_some_and(|b| {
+                matches!(
+                    b.kind,
+                    BlockKind::Paragraph | BlockKind::Heading { .. } | BlockKind::ListItem { .. }
+                )
+            });
+        let math_color = block
+            .and_then(|b| crate::colors::of(&self.preview_attrs(b.id, &b.attrs), cx).text)
+            .unwrap_or(cx.theme().foreground);
+        let math_scale = self.scale;
+        let navigation_labels = if p.extra.code || !text.contains("#^") {
+            Vec::new()
+        } else {
+            aero_core::links::scan(&text)
+                .into_iter()
+                .filter_map(|link| {
+                    let fragment = link.fragment.as_deref().filter(|id| id.starts_with('^'))?;
+                    let label = self.navigation_label(&link.target, fragment, None)?;
+                    Some((link.range, label))
+                })
+                .collect()
+        };
         let preview = self.inline_color_preview(&p.range);
         if preview.is_none()
             && let Some(stamp) = &p.styled
             && stamp.text == text
             && stamp.extra == p.extra
             && stamp.dark == dark
+            && stamp.math_color == math_color
+            && stamp.math_scale == math_scale
+            && !stamp.pending_math
             && stamp.selection == selection
             && stamp.links == link_styles(&p.links)
+            && stamp.navigation_labels == navigation_labels
         {
             return;
         }
@@ -335,11 +364,45 @@ impl Editor {
                 },
             ));
         }
-        let stamp = StyleStamp { text, extra: p.extra.clone(), dark, selection, links: link_styles(&links) };
+        let resolved_links = link_styles(&links);
+        let (mut objects, formulas, pending_math) = if prose {
+            let em = match block.map(|b| &b.kind) {
+                Some(BlockKind::Heading { level, .. }) => f32::from(heading_size(*level)),
+                _ => BODY_FONT_SIZE,
+            };
+            self.inline_math(&text, em, math_color, &mut markup, cx)
+        } else {
+            (Vec::new(), Vec::new(), false)
+        };
+        for (span, label) in &navigation_labels {
+            let Some((range, _)) = links.iter().find(|(r, _)| span.start <= r.start && r.end <= span.end)
+            else {
+                continue;
+            };
+            if selection.as_ref().is_some_and(|selection| {
+                selection.is_empty() && range.start < selection.start && selection.start < range.end
+            }) {
+                continue;
+            }
+            objects.push(InputInline::label(range.clone(), label.clone().into()));
+        }
+        let presentation = TextPresentation::default().preserve_words(prose).inline_objects(objects);
+        let stamp = StyleStamp {
+            text,
+            extra: p.extra.clone(),
+            dark,
+            selection,
+            links: resolved_links,
+            navigation_labels,
+            math_color,
+            math_scale,
+            pending_math,
+        };
         let p = self.presenters.get_mut(&key).expect("checked above");
         p.links = links;
+        p.formulas = formulas;
         p.styled = (!previewing).then_some(stamp);
-        p.textarea.update(cx, |ta, cx| ta.set_markup(markup, cx));
+        p.textarea.update(cx, |ta, cx| ta.set_text_presentation(markup, presentation, cx));
     }
 
     /// 源码 → 界面样式。藏起全部成对标记，剩下的字按格式上色、换字体。
@@ -527,14 +590,9 @@ impl Editor {
             return None;
         }
         let ta = p.textarea.read(cx);
-        let offset = ta.offset_for_point(position)?;
-        let text = ta.value();
-        let prev = text[..offset.min(text.len())].char_indices().next_back().map_or(0, |(i, _)| i);
-        [offset, prev].into_iter().find_map(|at| {
-            let (range, url) = p.links.iter().find(|(range, _)| range.contains(&at))?;
-            let end = text[at..].chars().next().map_or(at, |c| at + c.len_utf8());
-            ta.range_to_bounds(&(at..end)).filter(|b| b.contains(&position))?;
-            Some((url.clone(), ta.range_to_bounds(range)?))
+        p.links.iter().find_map(|(range, url)| {
+            let bounds = ta.range_bounds_on_row(range, position.y)?;
+            bounds.contains(&position).then(|| (url.clone(), bounds))
         })
     }
 
@@ -543,36 +601,6 @@ impl Editor {
         let p = self.presenters.get(&key)?;
         let focused = self.focused.as_ref().is_some_and(|f| f.textarea == p.textarea);
         let has_links = !p.links.is_empty();
-        if !focused && has_links && self.has_navigation_link(&p.text) {
-            let range = p.range.clone();
-            let newline = p.enter_newline;
-            let view = preview::markdown(
-                format!("paragraph-link-{}-{:?}", key.id.0, key.part).into(),
-                self.navigation_markdown(&p.text, None).into(),
-                self.text_view_style(cx).with_paragraph_gap(rems(0.)),
-                preview::PreviewContext {
-                    editor: cx.entity(),
-                    state: self.preview.clone(),
-                    block: key.id,
-                    reveal: 0,
-                    origin: None,
-                },
-            );
-            return Some(
-                div()
-                    .id(SharedString::from(format!("navigation-{}-{:?}", key.id.0, key.part)))
-                    .w_full()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        if !event.is_right_click() {
-                            cx.stop_propagation();
-                            this.focus_range(range.clone(), Some(key.id), newline, range.len(), window, cx);
-                        }
-                    }))
-                    .child(view)
-                    .into_any_element(),
-            );
-        }
         let mut el = div()
             .id(SharedString::from(format!("text-{}-{:?}", key.id.0, key.part)))
             .relative()
@@ -585,32 +613,46 @@ impl Editor {
                     this.presenter_mouse_down(key, window, cx);
                 }),
             );
+        if !p.formulas.is_empty() || (!focused && has_links) {
+            el = el.capture_any_mouse_down(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                if event.button != MouseButton::Left || event.modifiers.shift || event.click_count > 1 {
+                    return;
+                }
+                let Some(p) = this.presenters.get(&key) else { return };
+                if this.input_composing(window, cx) {
+                    return;
+                }
+                let ta = p.textarea.read(cx);
+                if let Some(range) = p.formulas.iter().find(|range| {
+                    ta.range_bounds_on_row(range, event.position.y)
+                        .is_some_and(|b| b.contains(&event.position))
+                }) {
+                    let source = p.range.start + range.start..p.range.start + range.end;
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    this.open_math_popup(source, Some(key.id), window, cx);
+                    return;
+                }
+                if !focused && let Some((url, _)) = this.link_at(key, event.position, cx) {
+                    this.close_block_menu(cx);
+                    cx.stop_propagation();
+                    window.prevent_default();
+                    this.pending_link = Some((key, url));
+                }
+            }));
+        }
         if !focused && has_links {
-            el = el
-                .capture_any_mouse_down(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    if event.button != MouseButton::Left || event.modifiers.shift || event.click_count > 1 {
+            el = el.on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                    let Some((pending, url)) = this.pending_link.take() else { return };
+                    if pending != key || this.link_at(key, event.position, cx).is_none_or(|(u, _)| u != url) {
                         return;
                     }
-                    if let Some((url, _)) = this.link_at(key, event.position, cx) {
-                        this.close_block_menu(cx);
-                        cx.stop_propagation();
-                        window.prevent_default();
-                        this.pending_link = Some((key, url));
-                    }
-                }))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseUpEvent, window, cx| {
-                        let Some((pending, url)) = this.pending_link.take() else { return };
-                        if pending != key
-                            || this.link_at(key, event.position, cx).is_none_or(|(u, _)| u != url)
-                        {
-                            return;
-                        }
-                        cx.stop_propagation();
-                        this.follow_link(&url, window, cx);
-                    }),
-                );
+                    cx.stop_propagation();
+                    this.follow_link(&url, window, cx);
+                }),
+            );
         }
         if has_links {
             el = el
@@ -738,11 +780,6 @@ fn fence_body(src: &str, prefix: &str) -> Option<Range<usize>> {
 /// 这张表按单元格画、按单元格编辑。
 pub(super) fn presents_table(text: &str) -> bool {
     table::parse(text).is_some()
-}
-
-/// 段落中的 HTML 换行仍走预览；表格单元格用 hard_breaks 保留源字节。
-fn has_html_break(text: &str) -> bool {
-    text.to_ascii_lowercase().contains("<br")
 }
 
 /// 引用里只有段落（没有列表、代码、嵌套引用）时按文字画；复杂的仍用源码编辑。

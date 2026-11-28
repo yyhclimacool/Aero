@@ -146,15 +146,6 @@ impl super::Editor {
             .or_else(|| fragment.clone())
     }
 
-    pub(super) fn has_navigation_link(&self, source: &str) -> bool {
-        source.contains("#^")
-            && aero_core::links::scan(source).iter().any(|link| {
-                link.fragment.as_deref().is_some_and(|fragment| {
-                    fragment.starts_with('^') && self.navigation_label(&link.target, fragment, None).is_some()
-                })
-            })
-    }
-
     pub(super) fn embed_view_from(
         &self,
         target: &str,

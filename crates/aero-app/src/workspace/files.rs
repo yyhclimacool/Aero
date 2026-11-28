@@ -189,6 +189,10 @@ pub(crate) enum Operation {
         directory: String,
         note: Option<VaultPath>,
     },
+    ImportNoteCopy {
+        source: PathBuf,
+        directory: String,
+    },
     AttachmentRename {
         from: VaultPath,
         to: VaultPath,
@@ -228,6 +232,7 @@ impl Operation {
             Self::Transaction { .. } => "workspace_transaction",
             Self::Create { .. } => "file_create",
             Self::Import { .. } => "file_import",
+            Self::ImportNoteCopy { .. } => "note_copy_import",
             Self::AttachmentRename { .. } => "attachment_rename",
             Self::Trash { .. } => "file_trash",
         }
@@ -238,6 +243,7 @@ impl Operation {
 struct Outcome {
     history: Vec<(String, Vec<FileChange>, Option<bool>)>,
     open: Option<(VaultPath, bool)>,
+    show_documents: bool,
     trashed: Option<VaultPath>,
     removed: Vec<(VaultPath, Option<VaultPath>)>,
     touched: Vec<VaultPath>,
@@ -515,18 +521,30 @@ fn execute_with_paste_snapshot(
                 return Err("创建位置已变化，请重新执行子文档命令".into());
             }
             let (child, changes) = aero_core::relations::child_at(vault, &parent, &doc, range)?;
-            return execute_controlled(
-                vault,
-                Operation::Transaction {
-                    token: aero_core::identity::new_block_id(),
-                    changes,
-                    history_changes: None,
-                    direction: None,
-                    open: Some(child),
-                    journal,
-                },
-                control,
-            );
+            let mut observed: Vec<_> = changes
+                .iter()
+                .filter(|change| change.before.is_some())
+                .map(|change| change.path.clone())
+                .collect();
+            observed.sort();
+            let changes = prepare_transaction(vault, &journal, changes, control, Default::default())?
+                .commit_checked(vault, || {
+                    let mut notes = vault.notes().map_err(|e| e.to_string())?;
+                    let included = notes.binary_search(&child);
+                    if let Ok(index) = included {
+                        notes.remove(index);
+                    } else if vault.exists(&child) {
+                        return Err("新建子文档被笔记库忽略规则排除".into());
+                    }
+                    if notes != observed {
+                        return Err("笔记库文件列表已变化，请重新创建子文档".into());
+                    }
+                    Ok(())
+                })?;
+            outcome.touched = changes.iter().map(|change| change.path.clone()).collect();
+            outcome.history.push((aero_core::identity::new_block_id(), changes, None));
+            outcome.open = Some((child, true));
+            outcome.show_documents = true;
         }
         Operation::Reparent { path, parent, before, journal } => {
             let changes = aero_core::relations::reparent(vault, &path, parent.as_ref(), before.as_ref())?;
@@ -634,6 +652,36 @@ fn execute_with_paste_snapshot(
                     outcome.error.get_or_insert(error);
                 }
             }
+        }
+        Operation::ImportNoteCopy { source, directory } => {
+            let name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| name.to_ascii_lowercase().ends_with(".md") && name.len() > 3)
+                .ok_or("请选择 Markdown（.md）笔记")?;
+            let bytes = std::fs::read(&source).map_err(|error| format!("{name}：{error}"))?;
+            let doc = aero_core::Document::from_bytes(&bytes).map_err(|error| format!("{name}：{error}"))?;
+            let canonical = source.canonicalize().map_err(|error| format!("{name}：{error}"))?;
+            let origin = VaultPath::from_fs(vault.root(), &canonical)
+                .or_else(|_| VaultPath::new(name))
+                .map_err(|error| error.to_string())?;
+            let mut resolver = aero_core::links::Resolver::new();
+            for path in vault.notes().map_err(|error| error.to_string())? {
+                let (note, _) = vault.read(&path).map_err(|error| error.to_string())?;
+                resolver.insert(
+                    path.clone(),
+                    Some(&note.title_or(path.stem())),
+                    &note.front_matter_aliases(),
+                );
+                resolver.register_identity(&path, &note);
+            }
+            let copy = aero_core::clipboard::copy_document(doc, &origin, resolver)?;
+            if let Some(control) = control {
+                control.begin_commit()?;
+            }
+            let (path, _) = create(vault, &directory, &name[..name.len() - 3], &copy.to_bytes(), true)?;
+            outcome.touched.push(path.clone());
+            outcome.open = Some((path, false));
         }
         Operation::AttachmentRename { from, to } => {
             let report = aero_core::rename::RenamePlan::prepare_attachment(vault, from, to)
@@ -863,6 +911,12 @@ impl Workspace {
                     this.set_favorites(this.favorites().into_iter().filter(|p| p != &path).collect(), cx);
                 }
                 if let Some((path, created)) = outcome.open {
+                    if outcome.show_documents {
+                        this.show_sidebar(SidebarTab::Files, cx);
+                        if let Some(open) = &this.open {
+                            open.tree.update(cx, |tree, cx| tree.set_documents(true, cx));
+                        }
+                    }
                     this.open_note(path.clone(), window, cx);
                     if created {
                         this.navigate_note(&path, tabs::Navigation::Write, window, cx);
@@ -896,7 +950,7 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::{Operation, PastePosition, execute, finish_on_shutdown};
-    use aero_core::Vault;
+    use aero_core::{Vault, VaultPath};
     use std::sync::Arc;
 
     #[test]
@@ -969,6 +1023,34 @@ mod tests {
             "the move must leave its uncut source on disk throughout planning"
         );
         assert_eq!(std::fs::read_dir(journal.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn child_excluded_from_the_tree_rolls_back_parent_and_sibling_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".aero/ignore"), "未命名.md\n").unwrap();
+        let parent = VaultPath::new("parent.md").unwrap();
+        let sibling = VaultPath::new("sibling.md").unwrap();
+        let document = aero_core::identity::new_document_id();
+        let parent_bytes = format!("---\naero: {{id: {document}}}\n---\n\n/child\n").into_bytes();
+        let sibling_bytes = format!("---\naero: {{parent: {document}}}\n---\n\nold sibling\n");
+        vault.create_bytes(&parent, &parent_bytes).unwrap();
+        vault.create_bytes(&sibling, sibling_bytes.as_bytes()).unwrap();
+        let start = parent_bytes.len() - "/child\n".len();
+        let result = execute(
+            &vault,
+            Operation::CreateChild {
+                parent: parent.clone(),
+                before: parent_bytes.clone(),
+                range: start..start + 6,
+                journal: dir.path().join(".aero/transactions"),
+            },
+        );
+        assert!(matches!(result, Err(error) if error.contains("忽略规则")));
+        assert_eq!(vault.read_bytes(&parent).unwrap().0, parent_bytes);
+        assert_eq!(vault.read_bytes(&sibling).unwrap().0, sibling_bytes.as_bytes());
+        assert!(!vault.exists(&VaultPath::new("未命名.md").unwrap()));
     }
 
     #[test]

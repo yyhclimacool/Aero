@@ -108,6 +108,23 @@ fn span<T>(node: &Spanned<T>) -> Result<Range<usize>, String> {
 
 /// All returned edits use the original document's coordinates, in descending order.
 pub fn prepare(doc: &Document, patch: &Patch) -> Result<Vec<Edit>, String> {
+    prepare_fields(doc, patch, (patch.parent == Some(None)).then_some("parent"))
+}
+
+/// Install a new identity and remove relationships inherited from the source document.
+pub(crate) fn reset_for_copy(doc: &mut Document, id: String) -> Result<(), String> {
+    let edits = prepare(doc, &Patch { id: Some(id), ..Patch::default() })?;
+    doc.edit_group(edits).map_err(|e| e.to_string())?;
+    doc.reparse();
+    for field in ["parent", "order"] {
+        let edits = prepare_fields(doc, &Patch::default(), Some(field))?;
+        doc.edit_group(edits).map_err(|e| e.to_string())?;
+        doc.reparse();
+    }
+    Ok(())
+}
+
+fn prepare_fields(doc: &Document, patch: &Patch, remove: Option<&str>) -> Result<Vec<Edit>, String> {
     read(doc)?;
     let mut values = Vec::new();
     if let Some(id) = &patch.id {
@@ -127,7 +144,7 @@ pub fn prepare(doc: &Document, patch: &Patch) -> Result<Vec<Edit>, String> {
     if let Some(order) = patch.order {
         values.push(("order", order.to_string()));
     }
-    if values.is_empty() && patch.parent != Some(None) {
+    if values.is_empty() && remove.is_none() {
         return Ok(Vec::new());
     }
     let Some(range) = front_matter(doc) else {
@@ -149,17 +166,18 @@ pub fn prepare(doc: &Document, patch: &Patch) -> Result<Vec<Edit>, String> {
     let flow = source.get(map_span.start..).is_some_and(|s| s.starts_with('{'));
     let mut missing = Vec::new();
     let mut edits = Vec::new();
-    if patch.parent == Some(None)
-        && let Some(node) = mapping.value.get("parent")
+    if let Some(key) = remove
+        && let Some(node) = mapping.value.get(key)
     {
         let value = span(node)?;
-        let colon = source[..value.start].rfind(':').ok_or("无法定位父文档字段")?;
+        let display_error = || format!("无法无损移除 aero.{key}");
+        let colon = source[..value.start].rfind(':').ok_or_else(display_error)?;
         let before = source[..colon].trim_end();
-        let key = ["\"parent\"", "'parent'", "parent"]
+        let spelling = [format!("\"{key}\""), format!("'{key}'"), key.to_owned()]
             .into_iter()
-            .find(|key| before.ends_with(key))
-            .ok_or("无法无损移除父文档字段")?;
-        let start = before.len() - key.len();
+            .find(|key| before.ends_with(key.as_str()))
+            .ok_or_else(display_error)?;
+        let start = before.len() - spelling.len();
         if flow {
             let suffix = &source[value.end..];
             let spaces = suffix.len() - suffix.trim_start().len();
@@ -174,7 +192,7 @@ pub fn prepare(doc: &Document, patch: &Patch) -> Result<Vec<Edit>, String> {
         } else {
             let line = source[..start].rfind('\n').map_or(0, |i| i + 1);
             if !source[line..start].chars().all(char::is_whitespace) {
-                return Err("无法无损移除父文档字段".into());
+                return Err(display_error());
             }
             let end = source[value.end..].find('\n').map_or(source.len(), |i| value.end + i + 1);
             let comment = source[value.end..end].trim_start();
@@ -222,6 +240,8 @@ pub fn prepare(doc: &Document, patch: &Patch) -> Result<Vec<Edit>, String> {
     if patch.id.as_ref().is_some_and(|v| result.id.as_ref() != Some(v))
         || patch.parent.as_ref().is_some_and(|v| &result.parent != v)
         || patch.order.is_some_and(|v| result.order != Some(v))
+        || (remove == Some("parent") && result.parent.is_some())
+        || (remove == Some("order") && result.order.is_some())
     {
         return Err("无法无损修改此种 YAML 元数据结构".into());
     }

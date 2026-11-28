@@ -30,6 +30,7 @@ actions!(
         /// 回到首次运行页
         CloseVault,
         NewNote,
+        ImportNoteCopy,
         /// 今日日记 `daily/YYYY-MM-DD.md`，不存在则创建（3.4）
         OpenDaily,
         ToggleSidebar,
@@ -234,6 +235,13 @@ pub fn commands() -> Vec<Command> {
         Command::new("new-vault", "新建 Vault…", "new vault xj", Global, NewVault),
         Command::new("close-vault", "关闭 Vault", "close vault gb", Vault, CloseVault),
         Command::new("new-note", "新建笔记", "new note xjbj", Vault, NewNote),
+        Command::new(
+            "import-note-copy",
+            "作为副本导入…",
+            "import markdown copy dr fb",
+            Vault,
+            ImportNoteCopy,
+        ),
         Command::new("open-daily", "今日日记", "daily journal jrrj", Vault, OpenDaily),
         Command::new("save", "保存笔记", "save note bcbj", Note, SaveNow),
         Command::new("delete-note", "移到废纸篓", "delete trash ydfzl", NoteTarget, DeleteNote),
@@ -518,6 +526,7 @@ pub fn sync_menus(state: MenuState, cx: &mut App) {
             MenuItem::action("关闭 Vault", CloseVault),
             MenuItem::separator(),
             MenuItem::action("新建笔记", NewNote),
+            MenuItem::action("作为副本导入…", ImportNoteCopy),
             MenuItem::action("今日日记", OpenDaily),
             MenuItem::action("保存", SaveNow),
             MenuItem::separator(),

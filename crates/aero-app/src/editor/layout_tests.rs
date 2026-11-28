@@ -45,6 +45,107 @@ const NOTE: &str = "# 一级标题
 const TABLE_WITH_BREAKS: &str = "| **分类** | **说明** |\n| --- | --- |\n| 第一项 | 1. **训练 内容：**第一行<br>    <br>2. **并行：**第二行 |\n| 第二项 | **加粗<br/>跨行**<BR />末行与 `<br>` |\n\n表格后的正文。\n";
 
 #[gpui_kit::test]
+fn prose_alignment_survives_wrapping_html_breaks_and_preedit(cx: &mut TestAppContext) {
+    use gpui_kit::EntityInputHandler;
+
+    let long_word = "verylongword".repeat(14);
+    let family = "👨‍👩‍👧‍👦";
+    let combining = "é";
+    let lines =
+        format!("短行<br>{}**{family}{combining}** {long_word} 结尾", "中文 English mixed text ".repeat(8));
+    let source = ["left", "center", "right", "justify"]
+        .map(|align| {
+            format!(
+                "{lines} {{align={align} indent=1}}
+
+"
+            )
+        })
+        .concat();
+    let (_dir, editor) = open(cx, &source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.simulate_resize(size(px(910.), px(2050.)));
+    draw(cx);
+
+    let mut offsets = Vec::new();
+    let mut first_row_widths = Vec::new();
+    for ix in 0..4 {
+        let (ta, short, soft, emoji, last, first_width) = cx.update(|_, cx| {
+            let e = editor.read(cx);
+            let key = Key::unit(e.units[ix].id);
+            let handle = e.presenters[&key].textarea.clone();
+            let ta = handle.read(cx);
+            let value = ta.value();
+            let at = |part: &str| {
+                let start = value.find(part).unwrap();
+                start..start + part.len()
+            };
+            let short = ta.range_to_bounds(&at("短行")).unwrap();
+            let soft = ta.range_to_bounds(&at("中文")).unwrap();
+            let emoji = ta.range_to_bounds(&at(family)).unwrap();
+            let combined = ta.range_to_bounds(&at(combining)).unwrap();
+            let long = ta.range_to_bounds(&at(&long_word)).unwrap();
+            let last = ta.range_to_bounds(&at("结尾")).unwrap();
+            let body = at(&lines);
+            let soft_bounds = ta.range_bounds_on_row(&body, soft.center().y).unwrap();
+            assert!(soft.top() > short.top(), "HTML break keeps its own row");
+            assert_eq!(long.size.height, short.size.height, "oversized word stays on one row");
+            assert_eq!(emoji.size.height, short.size.height, "ZWJ sequence stays on one row");
+            assert_eq!(combined.size.height, short.size.height, "combining mark stays with its base");
+            assert!(last.top() > soft.top(), "the text wraps before the end");
+            let first = at(family).start;
+            assert!(matches!(ta.offset_for_point(emoji.center()), Some(offset) if offset == first || offset == first + family.len()));
+            offsets.push(short.left() - ta.input_bounds().left());
+            (handle, short, soft, emoji, last, soft_bounds.size.width)
+        });
+        first_row_widths.push(first_width);
+        if ix == 3 {
+            assert_eq!(
+                last.left(),
+                short.left(),
+                "the final row and the explicit break row stay left-aligned"
+            );
+        }
+        click(cx, soft.center());
+        cx.update(|window, cx| {
+            let e = editor.read(cx);
+            assert_eq!(e.focused.as_ref().unwrap().textarea, ta);
+            let s = ta.read(cx);
+            for (part, before) in [("短行", short), ("中文", soft), (family, emoji), ("结尾", last)] {
+                let start = s.value().find(part).unwrap();
+                assert_eq!(s.range_to_bounds(&(start..start + part.len())), Some(before));
+            }
+            ta.update(cx, |s, cx| {
+                let at = s.value().find("结尾").unwrap();
+                s.set_selected_range(at..at, cx);
+                s.replace_and_mark_text_in_range(None, "にほん😀", None, window, cx);
+            });
+        });
+        draw(cx);
+        cx.update(|window, cx| {
+            let e = editor.read(cx);
+            assert_eq!(e.doc.to_string(), source);
+            assert_eq!(e.focused.as_ref().unwrap().textarea, ta);
+            ta.update(cx, |s, cx| {
+                let marked = s.marked_text_range(window, cx).unwrap();
+                let value = s.value();
+                let at = value.find("にほん😀").unwrap();
+                let expected = s.range_to_bounds(&(at..at + "にほん😀".len())).unwrap();
+                let native_bounds = s.bounds_for_range(marked, s.input_bounds(), window, cx).unwrap();
+                assert_eq!(native_bounds, expected, "IME rect follows the aligned row");
+                s.replace_text_in_range(None, "日本😀", window, cx);
+            });
+        });
+        cx.simulate_keystrokes("cmd-z escape escape");
+        draw(cx);
+        assert_eq!(cx.update(|_, cx| editor.read(cx).doc.to_string()), source);
+    }
+    assert!(offsets[0] < offsets[1] && offsets[1] < offsets[2], "{offsets:?}");
+    assert_eq!(offsets[0], offsets[3]);
+    assert!(first_row_widths[3] > first_row_widths[0], "{first_row_widths:?}");
+}
+
+#[gpui_kit::test]
 fn table_html_breaks_keep_cell_editing_and_visual_lines(cx: &mut TestAppContext) {
     let (_dir, editor) = open(cx, TABLE_WITH_BREAKS);
     let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);

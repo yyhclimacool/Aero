@@ -6,7 +6,7 @@ use crate::{
     links::{Resolution, Resolver},
     transaction::FileChange,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A paste snapshots every managed note before resolving references. Unchanged
 /// observations take part in validation but do not enter user-visible history.
@@ -337,27 +337,7 @@ fn copy_tree_resolved(
     is_local: impl Fn(&crate::links::LinkSpan) -> bool,
 ) -> Result<String, String> {
     let mut doc = Document::from_text(source);
-    let mut mapping = HashMap::new();
-    let mut edits = Vec::new();
-    for (_, block) in doc.blocks().iter().filter(|(_, b)| b.kind != crate::BlockKind::Marker) {
-        let Some(old) = block.persisted_id.as_deref() else { continue };
-        let new = crate::identity::new_block_id();
-        for id in std::iter::once(old).chain(crate::block_refs::aliases(block)) {
-            let key = crate::links::block_identity_key(origin.document.as_deref(), id)
-                .unwrap_or_else(|| id.to_owned());
-            if mapping.insert(key, new.clone()).is_some_and(|previous| previous != new) {
-                return Err(format!("复制内容含歧义块身份：{id}"));
-            }
-        }
-        let mut attrs = block.attrs.clone();
-        crate::properties::set(&mut attrs, "aero-aliases", None);
-        if let Some(edit) = crate::properties::edit(&doc, block.id, &attrs, Some(&new))? {
-            edits.push(edit);
-        }
-    }
-    edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
-    doc.edit_group(edits).map_err(|e| e.to_string())?;
-    doc.reparse();
+    let mapping = regenerate_block_ids(&mut doc, origin.document.as_deref(), crate::identity::new_block_id)?;
     let source = doc.to_string();
     let mut replacements = Vec::new();
     for span in crate::links::scan_for_rename(&source) {
@@ -376,9 +356,205 @@ fn copy_tree_resolved(
     Ok(replace(&source, replacements))
 }
 
+/// Prepare a standalone Markdown copy and remap references resolved within the source document.
+///
+/// # Errors
+///
+/// Returns an error if the source contains ambiguous block identities or its metadata cannot be edited safely.
+pub fn copy_document(
+    mut doc: Document,
+    origin: &VaultPath,
+    mut resolver: Resolver,
+) -> Result<Document, String> {
+    use crate::{identity, links};
+
+    let previous = identity::read(&doc)?.id;
+    let id = std::iter::repeat_with(identity::new_document_id)
+        .find(|id| {
+            previous.as_ref() != Some(id)
+                && matches!(resolver.resolve(&format!("id:{id}"), None, ""), Resolution::Unresolved)
+        })
+        .expect("document ID space is not exhausted");
+    resolver.insert(origin.clone(), Some(&doc.title_or(origin.stem())), &doc.front_matter_aliases());
+    resolver.register_identity(origin, &doc);
+    let mut allocate = || {
+        std::iter::repeat_with(identity::new_block_id)
+            .find(|block| {
+                matches!(
+                    resolver.resolve(&format!("id:{id}"), Some(&format!("^{block}")), ""),
+                    Resolution::Unresolved
+                )
+            })
+            .expect("block ID space is not exhausted")
+    };
+    let mapping = regenerate_block_ids(&mut doc, previous.as_deref(), &mut allocate)?;
+    let source = doc.to_string();
+    let mut edits = Vec::new();
+    for span in links::scan_for_rename(&source) {
+        if span.pointer.is_some() {
+            continue;
+        }
+        let target_id = links::identity_target(&span.target);
+        let is_local = span.target.is_empty()
+            || (target_id.is_some() && target_id == previous.as_deref())
+            || matches!(resolver.resolve(&span.target, span.fragment.as_deref(), origin.parent()),
+                Resolution::Resolved { path, .. } if &path == origin);
+        if !is_local {
+            continue;
+        }
+        let head = match span.fragment.as_deref() {
+            Some(fragment) if fragment.starts_with('^') => {
+                let old = &fragment[1..];
+                let key = links::block_identity_key(target_id.or(previous.as_deref()), old);
+                let Some(new) = mapping.get(key.as_deref().unwrap_or(old)) else { continue };
+                format!("id:{id}#^{new}")
+            }
+            Some(_) if span.target.is_empty() => continue,
+            Some(_) => {
+                // Keep the user's original fragment spelling and optional alias.
+                let target = links::target_range(&source, &span);
+                edits.push(Edit::replace(target, format!("id:{id}")));
+                continue;
+            }
+            None => format!("id:{id}"),
+        };
+        edits.push(Edit::replace(links::head_range(&source, &span), head));
+    }
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+    doc.edit_group(edits).map_err(|e| e.to_string())?;
+    doc.reparse();
+    identity::reset_for_copy(&mut doc, id)?;
+    Ok(doc)
+}
+
+fn regenerate_block_ids(
+    doc: &mut Document,
+    document: Option<&str>,
+    mut new_block: impl FnMut() -> String,
+) -> Result<HashMap<String, String>, String> {
+    use crate::BlockKind;
+
+    let mut mapping = HashMap::new();
+    let mut assigned = std::collections::HashSet::new();
+    let mut by_depth = BTreeMap::<_, Vec<_>>::new();
+    let mut structure = Vec::new();
+    for (depth, block) in doc.blocks().iter().filter(|(_, b)| b.kind != BlockKind::Marker) {
+        let ordinal = structure.len();
+        structure.push((depth, block.kind.clone()));
+        let mut aliases = crate::block_refs::aliases(block).peekable();
+        if block.persisted_id.is_none() && aliases.peek().is_none() {
+            continue;
+        }
+        let id = std::iter::repeat_with(&mut new_block)
+            .find(|id| assigned.insert(id.clone()))
+            .expect("block ID space is not exhausted");
+        for old in block.persisted_id.as_deref().into_iter().chain(aliases) {
+            let key = crate::links::block_identity_key(document, old).unwrap_or_else(|| old.to_owned());
+            if mapping.insert(key, id.clone()).is_some_and(|previous| previous != id) {
+                return Err(format!("复制内容含歧义块身份：{old}"));
+            }
+        }
+        by_depth.entry(depth).or_default().push((ordinal, id));
+    }
+    // A container's property edit can replace its entire source range. Edit
+    // descendants first so the container edit uses their updated source.
+    for (_, batch) in by_depth.into_iter().rev() {
+        let mut edits = {
+            let mut edits = Vec::new();
+            let mut blocks = doc.blocks().iter().filter(|(_, b)| b.kind != BlockKind::Marker).enumerate();
+            for (ordinal, id) in &batch {
+                let (_, (_, block)) = blocks.find(|(index, _)| index == ordinal).ok_or("副本块已不存在")?;
+                let mut attrs = block.attrs.clone();
+                crate::properties::set(&mut attrs, "aero-aliases", None);
+                if let Some(edit) = crate::properties::edit(doc, block.id, &attrs, Some(id))? {
+                    edits.push(edit);
+                }
+            }
+            edits
+        };
+        edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+        if edits.windows(2).any(|pair| pair[1].range.end > pair[0].range.start) {
+            return Err("副本的块元数据范围重叠".into());
+        }
+        doc.edit_group(edits).map_err(|e| e.to_string())?;
+        doc.reparse();
+        let blocks: Vec<_> = doc.blocks().iter().filter(|(_, b)| b.kind != BlockKind::Marker).collect();
+        if !blocks.iter().map(|(depth, b)| (*depth, &b.kind)).eq(structure.iter().map(|(d, k)| (*d, k)))
+            || batch.iter().any(|(ordinal, id)| {
+                let block = blocks[*ordinal].1;
+                block.persisted_id.as_deref() != Some(id)
+                    || crate::block_refs::aliases(block).next().is_some()
+            })
+        {
+            return Err("无法保持副本的原始块结构和身份归属".into());
+        }
+    }
+    Ok(mapping)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copying_a_document_remaps_nested_ids_links_and_embeds() {
+        use crate::{block_refs, identity, links};
+        let old_doc = identity::new_document_id();
+        let other_doc = identity::new_document_id();
+        let old_alias = identity::new_block_id();
+        let source = format!(
+            "---\ntitle: 原文\naero: {{id: {old_doc}, parent: {other_doc}, order: 9, custom: keep}}\n---\n\n\
+             :::highlight {{.bg-yellow}}\ninside {{aero-aliases={old_alias}}} ^inner\n:::\n\n^container\n\n\
+             [[原文|copy]] [[#^inner|here]] ![[id:{old_doc}#^{old_alias}|same]]\n\n\
+             [[source#^container]] [[id:{other_doc}#^inner]] `[[#^inner]]`\n"
+        );
+        let mut bytes = b"\xEF\xBB\xBF".to_vec();
+        bytes.extend(source.replace('\n', "\r\n").bytes());
+        let origin = Document::from_bytes(&bytes).unwrap();
+        let original_block_ids: Vec<_> = origin
+            .blocks()
+            .iter()
+            .filter(|(_, b)| b.kind != crate::BlockKind::Marker)
+            .filter_map(|(_, b)| b.persisted_id.as_deref().map(str::to_owned))
+            .collect();
+        assert_eq!(original_block_ids, ["container", "inner"]);
+        let doc = copy_document(origin, &VaultPath::new("source.md").unwrap(), Resolver::new()).unwrap();
+        let copied = identity::read(&doc).unwrap();
+        let id = copied.id.unwrap();
+        assert_ne!(id, old_doc);
+        assert_eq!(copied.parent, None);
+        assert_eq!(copied.order, None);
+        let text = doc.to_string();
+        assert!(text.contains("custom: keep"));
+        assert!(text.contains(":::highlight {.bg-yellow}"));
+        assert!(text.contains(&format!("[[id:{other_doc}#^inner]] `[[#^inner]]`")));
+        assert!(doc.to_bytes().starts_with(b"\xEF\xBB\xBF---\r\n"));
+        let links = links::scan(&text);
+        assert_eq!(links[0].target, format!("id:{id}"));
+        assert_eq!(links[0].alias.as_deref(), Some("copy"));
+        let inner = links[1].fragment.as_deref().unwrap();
+        let embed = &crate::links::scan_embeds(&text)[0];
+        assert_eq!(embed.fragment.as_deref(), Some(inner));
+        assert_eq!(embed.target, format!("id:{id}"));
+        let block = block_refs::resolve(&doc, &inner[1..]).unwrap();
+        assert!(doc.block_text(doc.blocks().find(block).unwrap()).contains("inside"));
+        assert!(block_refs::resolve(&doc, &links[2].fragment.as_deref().unwrap()[1..]).is_ok());
+        assert!(block_refs::resolve(&doc, "inner").is_err());
+        assert!(block_refs::resolve(&doc, &old_alias).is_err());
+    }
+
+    #[test]
+    fn copying_a_legacy_child_replaces_parent_only_metadata() {
+        let parent = crate::identity::new_document_id();
+        for metadata in [format!("aero:\n  parent: {parent}"), format!("aero: {{parent: {parent}}}")] {
+            let original = Document::from_text(&format!("---\n{metadata}\n---\n\nOld child\n"));
+            let copy = copy_document(original, &VaultPath::new("old.md").unwrap(), Resolver::new()).unwrap();
+            let meta = crate::identity::read(&copy).unwrap();
+            assert!(meta.id.is_some());
+            assert_eq!(meta.parent, None);
+            assert!(copy.to_string().ends_with("\nOld child\n"));
+        }
+    }
 
     #[test]
     fn copied_subtree_rejects_ambiguous_aliases() {

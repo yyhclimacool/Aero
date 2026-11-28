@@ -6304,29 +6304,66 @@ fn inline_math_renders_inside_a_paragraph(cx: &mut TestAppContext) {
         window.replace_root(cx, |window, cx| gpui_kit::component::Root::new(editor.clone(), window, cx));
     });
     settle(cx);
-    let inline = cx.debug_bounds("math-inline-0").expect("行内公式应渲染成位图");
-    assert!(cx.debug_bounds("math-inline-1").is_none(), "代码里的 $ 不是公式");
-    cx.simulate_click(inline.center(), gpui_kit::Modifiers::default());
+    let inline = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let editor = editor.read(cx);
+            let p = &editor.presenters[&super::presenter::Key::unit(editor.units[0].id)];
+            let [formula]: &[_; 1] = p.formulas.as_slice().try_into().expect("one inline formula");
+            p.textarea.read(cx).range_to_bounds(formula).expect("inline formula bounds")
+        })
+    };
+    let before = inline(cx);
+    assert!(before.size.width > gpui_kit::px(8.));
+    cx.update(|_, cx| {
+        let editor = editor.read(cx);
+        let p = &editor.presenters[&super::presenter::Key::unit(editor.units[1].id)];
+        assert!(p.formulas.is_empty(), "code span cannot contain an inline formula");
+    });
+    cx.simulate_click(before.center(), gpui_kit::Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(cx.debug_bounds("math-editor").is_some(), "点公式位图在弹窗里改");
-    let again = cx.debug_bounds("math-inline-0").expect("行内位图还在原来的段落里");
-    assert!((again.origin.y - inline.origin.y).abs() < gpui_kit::px(1.));
+    assert!(cx.debug_bounds("math-editor").is_some(), "formula click opens its source");
+    assert_eq!(inline(cx), before, "opening the popup preserves the formula bounds");
 
-    // 点文字只编辑公式外面的字，源码不进段落。
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     focus_unit(&editor, 0, cx);
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(cx.debug_bounds("math-inline-0").is_some(), "点文字后公式仍是位图");
-    let prose = cx.debug_bounds("math-text").expect("公式旁边的文字要留在版面上");
-    assert!(f32::from(prose.size.width) > 8., "文字不能被挤成 0 宽: {:?}", prose.size);
-    assert!(f32::from(prose.size.height) > 8., "文字不能被挤成 0 高: {:?}", prose.size);
+    assert_eq!(inline(cx), before, "editing the prose preserves the formula bounds");
     cx.update(|_, cx| {
-        let value = editor.read(cx).focused.as_ref().unwrap().textarea.read(cx).value().to_string();
-        assert!(!value.contains('$'), "段落文本框里不能出现公式源码: {value}");
-        assert!(!value.contains("E=mc^2"), "段落文本框里不能出现公式源码: {value}");
-        assert!(value.contains('能') || value.contains('恒'), "文本框里应仍是公式外面的字: {value}");
+        let editor = editor.read(cx);
+        let ta = &editor.presenters[&super::presenter::Key::unit(editor.units[0].id)].textarea;
+        assert_eq!(*ta, editor.focused.as_ref().unwrap().textarea);
+        assert_eq!(ta.read(cx).value().as_ref(), "能量 $E=mc^2$ 守恒");
+    });
+}
+
+#[gpui_kit::test]
+fn block_reference_label_keeps_the_prose_alignment_and_source(cx: &mut TestAppContext) {
+    let source = "# 标题\n\n一条足够长的目标正文，用来验证来源摘要占用真实的排版宽度。 ^anchor\n\n前缀 [[#^anchor]] 后缀 {align=right}\n";
+    let (_dir, _vault, _path, editor) = open(cx, source);
+    let cx = &mut VisualTestContext::from_window(cx.windows()[0], cx);
+    cx.update(|_, cx| editor.update(cx, |e, cx| e.refresh_embeds(cx)));
+    settle(cx);
+    let (ta, link, bounds, suffix) = cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert!(e.navigation_label("", "^anchor", None).is_some());
+        let p = &e.presenters[&super::presenter::Key::unit(e.units[2].id)];
+        let (link, _) = &p.links[0];
+        let state = p.textarea.read(cx);
+        let bounds = state.range_to_bounds(link).unwrap();
+        let suffix_at = state.value().find("后缀").unwrap();
+        let suffix = state.range_to_bounds(&(suffix_at..suffix_at + "后缀".len())).unwrap();
+        assert!(bounds.size.width > gpui_kit::px(150.), "the preview uses the resolved title and excerpt");
+        (p.textarea.clone(), link.clone(), bounds, suffix)
+    });
+    cx.simulate_click(suffix.center(), gpui_kit::Modifiers::default());
+    settle(cx);
+    cx.update(|_, cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.focused.as_ref().unwrap().textarea, ta);
+        assert_eq!(ta.read(cx).range_to_bounds(&link), Some(bounds));
+        assert_eq!(e.doc.to_string(), source);
     });
 }
 

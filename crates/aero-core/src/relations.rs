@@ -2,6 +2,7 @@
 use crate::identity::{self, Metadata, Patch};
 use crate::transaction::FileChange;
 use crate::{Document, Vault, VaultPath};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
@@ -74,14 +75,10 @@ pub fn rows(notes: &[Note]) -> Vec<Row> {
     for group in children.values_mut() {
         group.sort_by(|&a, &b| {
             let order = |i: usize| notes[i].metadata.as_ref().ok().and_then(|m| m.order);
-            match (order(a), order(b)) {
-                (Some(a), Some(b)) => a.cmp(&b),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            }
-            .then_with(|| natural(&notes[a].title).cmp(&natural(&notes[b].title)))
-            .then_with(|| notes[a].path.cmp(&notes[b].path))
+            sibling_order(
+                (order(a), &notes[a].title, &notes[a].path),
+                (order(b), &notes[b].title, &notes[b].path),
+            )
         });
     }
     fn walk(
@@ -104,6 +101,27 @@ pub fn rows(notes: &[Note]) -> Vec<Row> {
     let mut result = Vec::new();
     walk(None, 0, notes, &children, &issues, &mut HashSet::new(), &mut result);
     result
+}
+
+fn sibling_order(
+    (left_order, left_title, left_path): (Option<i64>, &str, &VaultPath),
+    (right_order, right_title, right_path): (Option<i64>, &str, &VaultPath),
+) -> Ordering {
+    left_order
+        .is_none()
+        .cmp(&right_order.is_none())
+        .then(left_order.cmp(&right_order))
+        .then_with(|| natural(left_title).cmp(&natural(right_title)))
+        .then(left_path.cmp(right_path))
+}
+
+const ORDER_STEP: i64 = 1024;
+
+fn numbered_order(index: usize) -> Result<i64, String> {
+    i64::try_from(index)
+        .ok()
+        .and_then(|index| index.checked_add(1)?.checked_mul(ORDER_STEP))
+        .ok_or_else(|| "同级顺序超出范围".into())
 }
 
 fn natural(value: &str) -> String {
@@ -144,8 +162,8 @@ pub fn child_at(
     }
     let (parent_id, edits) = identity::ensure(parent)?;
     let mut parent = parent.clone();
-    let mut order = 0i64;
     let mut observed = Vec::new();
+    let mut siblings = Vec::new();
     let mut ids = HashSet::new();
     for path in vault.notes().map_err(|e| e.to_string())? {
         let (bytes, _) = vault.read_bytes(&path).map_err(|e| e.to_string())?;
@@ -156,13 +174,36 @@ pub fn child_at(
         {
             return Err("文档 ID 重复，请先解决冲突".into());
         }
-        if meta.parent.as_deref() == Some(&parent_id) {
-            order = order.max(meta.order.unwrap_or(0));
-        }
         if &path != parent_path {
+            if meta.parent.as_deref() == Some(&parent_id) {
+                siblings.push((observed.len(), meta.order, doc.title_or(path.stem()), path.clone()));
+            }
             observed.push(FileChange { path, before: Some(bytes.clone()), after: Some(bytes) });
         }
     }
+    if !edits.is_empty() && ids.contains(&parent_id) {
+        return Err("新分配的父文档 ID 已存在，请重试".into());
+    }
+    // Ordered notes already precede all unordered notes. Preserve their
+    // existing values unless the tail has run out of available order numbers.
+    let last = siblings.iter().filter_map(|(_, order, _, _)| *order).max().unwrap_or_default().max(0);
+    let unordered = siblings.iter().filter(|(_, order, _, _)| order.is_none()).count();
+    let renumber = last.checked_add(numbered_order(unordered)?).is_none();
+    let mut order = if renumber { 0 } else { last };
+    if !renumber {
+        siblings.retain(|(_, order, _, _)| order.is_none());
+    }
+    siblings.sort_by(|a, b| sibling_order((a.1, &a.2, &a.3), (b.1, &b.2, &b.3)));
+    for (change, _, _, _) in siblings {
+        order = order.checked_add(ORDER_STEP).ok_or("同级顺序超出范围")?;
+        let change = &mut observed[change];
+        let bytes = change.before.as_deref().ok_or("同级文档已不存在")?;
+        let mut doc = Document::from_bytes(bytes).map_err(|e| e.to_string())?;
+        let edits = identity::prepare(&doc, &Patch { order: Some(order), ..Patch::default() })?;
+        doc.edit_group(edits).map_err(|e| e.to_string())?;
+        change.after = Some(doc.to_bytes());
+    }
+    let order = order.checked_add(ORDER_STEP).ok_or("同级顺序超出范围")?;
     let path = (0..)
         .map(|i| {
             let name = if i == 0 { "未命名.md".to_owned() } else { format!("未命名 {i}.md") };
@@ -176,14 +217,12 @@ pub fn child_at(
         .find(|path| !vault.exists(path))
         .unwrap();
     let mut child = Document::default();
-    let id = identity::new_document_id();
+    let id = std::iter::repeat_with(identity::new_document_id)
+        .find(|id| id != &parent_id && !ids.contains(id))
+        .expect("document ID space is not exhausted");
     let child_edits = identity::prepare(
         &child,
-        &Patch {
-            id: Some(id.clone()),
-            parent: Some(Some(parent_id)),
-            order: Some(order.checked_add(1024).ok_or("同级顺序超出范围")?),
-        },
+        &Patch { id: Some(id.clone()), parent: Some(Some(parent_id)), order: Some(order) },
     )?;
     child.edit_group(child_edits).map_err(|e| e.to_string())?;
     let link = format!("[[id:{id}|{}]]", path.stem());
@@ -195,9 +234,9 @@ pub fn child_at(
     parent.edit_group(edits).map_err(|e| e.to_string())?;
     observed.extend([
         FileChange { path: parent_path.clone(), before: Some(before), after: Some(parent.to_bytes()) },
-        FileChange { path, before: None, after: Some(child.to_bytes()) },
+        FileChange { path: path.clone(), before: None, after: Some(child.to_bytes()) },
     ]);
-    Ok((observed.last().unwrap().path.clone(), observed))
+    Ok((path, observed))
 }
 
 /// Reparent/reorder only metadata. All managed notes are readable and checked
@@ -253,13 +292,7 @@ pub fn reparent(
         .filter(|(p, m)| *p != path && m.parent == parent_id)
         .map(|(p, m)| (p.clone(), m.order, docs[p].title_or(p.stem())))
         .collect();
-    siblings.sort_by(|a, b| {
-        a.1.is_none()
-            .cmp(&b.1.is_none())
-            .then(a.1.cmp(&b.1))
-            .then_with(|| natural(&a.2).cmp(&natural(&b.2)))
-            .then(a.0.cmp(&b.0))
-    });
+    siblings.sort_by(|a, b| sibling_order((a.1, &a.2, &a.0), (b.1, &b.2, &b.0)));
     let insert = match before {
         Some(before) => siblings.iter().position(|s| &s.0 == before).ok_or("排序目标不是同级文档")?,
         None => siblings.len(),
@@ -272,9 +305,9 @@ pub fn reparent(
             (Some(a), Some(b)) => {
                 b.checked_sub(a).filter(|gap| *gap > 1).and_then(|gap| a.checked_add(gap / 2))
             }
-            (Some(a), None) => a.checked_add(1024),
-            (None, Some(b)) => b.checked_sub(1024),
-            (None, None) => Some(1024),
+            (Some(a), None) => a.checked_add(ORDER_STEP),
+            (None, Some(b)) => b.checked_sub(ORDER_STEP),
+            (None, None) => Some(ORDER_STEP),
         }
     } else {
         None
@@ -291,7 +324,10 @@ pub fn reparent(
                 None
             },
             parent: (sibling == path).then(|| parent_id.clone()),
-            order: Some(gap_order.unwrap_or((index as i64 + 1).checked_mul(1024).ok_or("同级顺序超出范围")?)),
+            order: Some(match gap_order {
+                Some(order) => order,
+                None => numbered_order(index)?,
+            }),
         };
         let edits = identity::prepare(doc, &patch)?;
         doc.edit_group(edits).map_err(|e| e.to_string())?;
